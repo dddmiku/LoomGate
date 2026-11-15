@@ -3,6 +3,7 @@ import argparse,json,sys,traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
+from run_wait import wait_run
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);args=p.parse_args();root=Path(args.runtime).resolve();out=Path(args.output).resolve()
 if root.name!='catalog-fixture' or root.drive.upper()!='D:' or out.drive.upper()!='D:':raise SystemExit('synthetic_runtime_required')
 out.mkdir(parents=True,exist_ok=True);base='http://127.0.0.1:17863';report={'actions':[],'page_errors':[],'console_errors':[],'external_requests':[]};stage='start'
@@ -18,8 +19,7 @@ def main():
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:
     page.locator('#run-form button[type=submit]').click()
    result=response.value.json();rid=result['run']['id'];page.locator('#dialog').wait_for(state='hidden')
-   page.wait_for_function("async ([id,status])=>{let d=await (await fetch('api/workbench')).json();return d.runs.some(x=>x.id===id&&x.status===status&&x.finished_at)}",arg=[rid,status])
-   return next(r for r in api('workbench')['runs'] if r['id']==rid)
+   return wait_run(page.request,base+'/admin/api/workbench',rid,status)
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('.hero').wait_for()
   page.request.post(base+'/__fixture/mode/success');initial=stats()

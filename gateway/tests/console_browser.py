@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
+from run_wait import wait_run
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--runtime', required=True)
@@ -56,8 +57,16 @@ def main():
             response=page.request.get(base+'/admin/api/workbench')
             assert response.status==200
             return response.json()
-        def wait_status(key,status):
-            page.wait_for_function("async ([key,status])=>{const r=await fetch('api/workbench');const d=await r.json();return d.runs.some(x=>x.task_key===key&&x.status===status)}",arg=[key,status],timeout=15000)
+        def accept_run(double=False):
+            with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:
+                if double:
+                    page.locator('#run-form button[type=submit]').evaluate('(b)=>{b.click();b.click()}')
+                else:
+                    page.locator('#run-form button[type=submit]').click()
+            assert response.value.status==202
+            run_id=response.value.json()['run']['id']
+            page.locator('#dialog').wait_for(state='hidden')
+            return run_id
         fields=dict(line.split(':',1) for line in (runtime/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
         stage='login'
         page.goto(base+'/admin/')
@@ -196,14 +205,16 @@ def main():
         stage='run-duplicate'
         nav('tasks');page.locator('[data-task=fixture-check] [data-action=run-task]').click()
         before=page.request.get(base+'/__fixture/stats').json()['mutations']
-        page.locator('#run-form button[type=submit]').evaluate('(b)=>{b.click();b.click()}')
-        page.locator('#dialog').wait_for(state='hidden');wait_status('fixture-check','succeeded')
+        run_id=accept_run(double=True)
+        wait_run(page.request,base+'/admin/api/workbench',run_id,'succeeded')
         assert page.request.get(base+'/__fixture/stats').json()['mutations']==before+1
         done('run_double_click_single_mutation_and_server_verification')
         stage='cancel'
-        nav('tasks');page.locator('[data-task=fixture-pending] [data-action=run-task]').click();page.locator('#run-form button[type=submit]').click()
-        page.locator('#dialog').wait_for(state='hidden');page.locator('[data-action=cancel-run]').first.wait_for();page.locator('[data-action=cancel-run]').first.click()
-        wait_status('fixture-pending','canceled');done('actual_task_cancellation')
+        nav('tasks');page.locator('[data-task=fixture-pending] [data-action=run-task]').click()
+        run_id=accept_run()
+        row=page.locator('tr').filter(has=page.get_by_text(run_id,exact=True))
+        row.locator('[data-action=cancel-run]').wait_for();row.locator('[data-action=cancel-run]').click()
+        wait_run(page.request,base+'/admin/api/workbench',run_id,'canceled');done('actual_task_cancellation')
         page.locator('[data-action=reload]').click();page.locator('[data-action=run-detail]').first.wait_for();shot('console-runs.png')
         stage='unconfirmed-submit'
         before=page.request.get(base+'/__fixture/stats').json()['mutations']
