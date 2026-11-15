@@ -18,6 +18,7 @@ func TestWorkbenchManagementBoundaryCannotBeForgedWithHeaders(t *testing.T) {
 	h := NewHandler(Config{Workbench: workbench, Pool: testPoolWith()})
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, "/workbench"}, {http.MethodGet, "/workbench/catalog?provider=fake"},
+		{http.MethodGet, "/workbench/providers"}, {http.MethodGet, "/workbench/accounts"}, {http.MethodGet, "/workbench/models?account=fixture"},
 		{http.MethodPost, "/workbench/run"}, {http.MethodPost, "/workbench/cancel"},
 		{http.MethodPost, "/workbench/schedule"}, {http.MethodPost, "/workbench/schedule/delete"},
 	} {

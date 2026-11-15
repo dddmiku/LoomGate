@@ -36,6 +36,7 @@ type Catalog struct {
 	ExpiresAt time.Time `json:"expires_at"`
 	Stale     bool      `json:"stale"`
 	ErrorCode string    `json:"error_code,omitempty"`
+	RetryAt   time.Time `json:"retry_at,omitempty"`
 }
 type catalogCache struct {
 	snapshot Catalog
@@ -183,15 +184,16 @@ func (c *Client) Catalog(ctx context.Context, account string, force bool) (Catal
 			}
 		}
 		now := time.Now()
-		if !force && now.Before(entry.snapshot.ExpiresAt) {
+		if !force && entry.lastErr == nil && now.Before(entry.snapshot.ExpiresAt) {
 			out := copyCatalog(entry.snapshot)
 			c.mu.Unlock()
 			return out, nil
 		}
-		if !force && now.Before(entry.retryAt) {
+		if now.Before(entry.retryAt) {
 			out := copyCatalog(entry.snapshot)
 			out.Stale = true
 			out.ErrorCode = "refresh_failed"
+			out.RetryAt = entry.retryAt
 			if now.Sub(out.FetchedAt) > time.Hour {
 				out.Models = []Model{}
 			}
@@ -221,6 +223,7 @@ func (c *Client) Catalog(ctx context.Context, account string, force bool) (Catal
 		close(entry.loading)
 		entry.loading = nil
 		out := copyCatalog(entry.snapshot)
+		out.RetryAt = entry.retryAt
 		c.mu.Unlock()
 		if fetchErr != nil {
 			out.Stale = true

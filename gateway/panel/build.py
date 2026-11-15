@@ -66,6 +66,8 @@ def main():
         js += "\n" + fh.read()
     with open(os.path.join(HERE, "workspace.js"), "r", encoding="utf-8") as fh:
         js += "\n" + fh.read()
+    with open(os.path.join(HERE, "catalog.js"), "r", encoding="utf-8") as fh:
+        js += "\n" + fh.read()
     if "/*__APP_JS__*/" not in body:
         sys.stderr.write("body.html 缺少 /*__APP_JS__*/ 占位符\n")
         return 1

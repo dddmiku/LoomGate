@@ -14,7 +14,7 @@ package panel
 
 import "embed"
 
-//go:embed index.html login.html vendor/qrcode.js
+//go:embed index.html login.html vendor/qrcode.js console/*
 var frontendFiles embed.FS
 
 // FrontendFiles 暴露内嵌的前端资源，供 internal/panel 的 Go 面板服务。

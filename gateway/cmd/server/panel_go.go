@@ -49,6 +49,7 @@ func useGoPanel() bool {
 func goPanelOptions(layout unifiedLayout) panel.Options {
 	opts := layout.panel
 	return panel.Options{
+		Console:         os.Getenv("LOOMGATE_REBUILD") == "1",
 		AdminDir:        opts.AdminDir,
 		AuthDir:         opts.AuthDir,
 		TrashDir:        filepath.Join(opts.BaseDir, "auths-trash"),

@@ -10,7 +10,7 @@
 - 新 provider 会话使用 AES-GCM 加密存储，账号身份、启用状态和修订号一起验证完整性。丢失原主密钥时拒绝生成替代密钥。
 - 豆包使用官方客户端对应的接口。模型与活动标识运行时获取，模型缓存按账号和登录修订隔离；失败明确报告，保留时效受限的旧目录，不静默换模型。
 - 豆包当前已实现目录、活动状态和签到接口；真实只读验证获取到模型和任务，签到已由官方客户端操作并回读确认。消息、工具、双登录和完整任务链仍在开发。
-- 新面板已有导航、主题、响应式布局、模型/任务/计划/执行页面；计划增删改和启停经过浏览器与服务端回读验证。其余页面仍需完整验收。
+- 新控制台从独立页面、主题和组件开始实现，采用服务连接、自动化和管理三组导航。账号与动态模型目录、任务与计划、执行记录接真实后端；计划增删改、实际进程重启后的持久化和任务取消经过隔离浏览器验收。完整账号登录与运维控制仍在开发。
 - 离线迁移工具支持 dry-run、副本校验、中断恢复和回滚。构建脚本保留原发布公钥、Android 包名与签名身份，并检查 NDK/CGO。
 
 任务接口与 UI 的存在不代表所有 provider 流程已完成。具体缺口见 [开发状态](docs/development-status.md)。
@@ -23,8 +23,10 @@
 | `gateway/internal/taskproviders` | provider 业务到任务引擎的适配 |
 | `gateway/internal/providers/doubao` | 官方豆包目录、活动与客户端请求 |
 | `gateway/internal/accountvault` | 新 provider 会话的加密存储与并发写保护 |
+| `gateway/internal/providercatalog` | provider 能力、账号和目录管理视图；有界并发与失败隔离 |
 | `gateway/internal/server` | 已有 Chat / Responses / Messages / Gemini 协议 |
 | `gateway/internal/panel`、`gateway/panel` | 管理接口和内嵌前端 |
+| `gateway/panel/console` | 独立的新控制台；不依赖旧面板的布局、样式或组件 |
 | `tools/migration` | 离线复制迁移、校验、恢复与回滚 |
 | `desktop`、`android` | 平台包装与保留签名身份的构建 |
 
@@ -57,6 +59,8 @@ python -X utf8 -m unittest discover -s tools/buildtests -p 'test_*.py'
 ```
 
 开发运行目前通过 `LOOMGATE_REBUILD=1` 选择新工作台，明确停用旧任务调度入口，避免重复派发。它仍是迁移中的开发开关；全量旧任务接入完成前不会作为正式发布方案。测试运行应使用独立配置和数据目录。
+
+新控制台和隔离浏览器验收的启动方式见 [控制台验收](docs/console-acceptance.md)。旧面板资源暂留作兼容测试，不作为新 UI 的设计基础。豆包目录中的模型尚未加入对外推理路由。
 
 ## 迁移与构建
 

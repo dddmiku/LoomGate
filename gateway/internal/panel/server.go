@@ -41,6 +41,8 @@ import (
 // 面板要被塞进网关进程、桌面启动器、安卓 App 三种宿主里，全局状态会让它们互相污染，
 // 也让测试无法并行。
 type Options struct {
+	// Console selects the independently designed LoomGate console for the rebuild runtime.
+	Console bool
 	// AdminDir 存 credentials.json / initial-password.txt。
 	AdminDir string
 	// AuthDir 是账号文件目录（网关的 auths）。
@@ -282,7 +284,11 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 			redirect(w, "./")
 			return
 		}
-		body, err := readAsset(s.assets, "login.html")
+		name := "login.html"
+		if s.opts.Console {
+			name = "console/login.html"
+		}
+		body, err := readAsset(s.assets, name)
 		if err != nil {
 			writeHTML(w, http.StatusInternalServerError, "登录页缺失: "+err.Error())
 			return
@@ -300,6 +306,11 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 		writeHTML(w, http.StatusOK, replaceSessionHint(string(body), s.sessionTTL()))
 		return
 	}
+	// Login resources contain no state; only these exact public assets are served.
+	if s.opts.Console && (path == "/console/style.css" || path == "/console/login.js") {
+		s.consoleAsset(w, path)
+		return
+	}
 	if session == nil {
 		if strings.HasPrefix(path, "/api/") {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "unauthorized",
@@ -312,12 +323,19 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 
 	switch {
 	case path == "/" || path == "/index.html":
-		body, err := readAsset(s.assets, "index.html")
+		name := "index.html"
+		if s.opts.Console {
+			name = "console/index.html"
+		}
+		body, err := readAsset(s.assets, name)
 		if err != nil {
 			writeHTML(w, http.StatusInternalServerError, "面板前端缺失: "+err.Error())
 			return
 		}
 		writeHTML(w, http.StatusOK, body)
+		return
+	case s.opts.Console && path == "/console/app.js":
+		s.consoleAsset(w, path)
 		return
 	case strings.HasPrefix(path, "/vendor/"):
 		// 放在会话检查之后（与 Python 版同序）：vendor 下是面板前端资源，只有

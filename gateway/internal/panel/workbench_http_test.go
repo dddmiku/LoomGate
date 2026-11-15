@@ -38,7 +38,7 @@ func TestWorkbenchInProcessManagementCarriesTimeoutAndParentDeadline(t *testing.
 func TestWorkbenchPanelRequiresSessionAndSameOriginWriteMarker(t *testing.T) {
 	h := newHarness(t)
 	doc := h.writeCredentials()
-	for _, path := range []string{"/api/workbench", "/api/workbench/catalog?provider=fake&accounts=account-a"} {
+	for _, path := range []string{"/api/workbench", "/api/workbench/catalog?provider=fake&accounts=account-a", "/api/workbench/providers", "/api/workbench/accounts", "/api/workbench/models?account=fixture"} {
 		w := h.do(http.MethodGet, path, "", nil)
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("unauthenticated GET %s status=%d", path, w.Code)

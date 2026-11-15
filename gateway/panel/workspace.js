@@ -6,26 +6,16 @@ function loomEmpty(title,text){return '<div class="loom-state"><strong>'+esc(tit
 function loomNotice(id,text){var el=$('#'+id);if(el)el.innerHTML=text?'<div class="loom-notice" role="alert">'+esc(text)+'</div>':'';}
 async function loomState(){var d=await api('api/workbench');LW.providers=d.providers||[];LW.schedules=d.schedules||[];LW.runs=d.runs||[];return d;}
 async function loomRoute(view){
+  if(typeof catalogCancel==='function')catalogCancel();
   var generation=++LW.epoch;var map={providers:'providersNotice',models:'modelsNotice',schedules:'schedulesNotice',executions:'executionsNotice',tasks:'definitionsNotice',migration:'migrationNotice'};
   if(!map[view])return;
   loomNotice(map[view],'');
   try{
     if(view==='models'){await loomModels(false);return;}
     await loomState();if(generation!==LW.epoch)return;
-    if(view==='providers')loomProviders();if(view==='schedules')loomSchedules();if(view==='executions')loomExecutions();if(view==='tasks')await loomTasks();if(view==='migration')loomMigration();
+    if(view==='providers')await loomProviders();if(view==='schedules')loomSchedules();if(view==='executions')loomExecutions();if(view==='tasks')await loomTasks();if(view==='migration')loomMigration();
   }catch(e){loomNotice(map[view],e.status===404?'当前服务尚未启用新的任务工作台。旧版服务能力仍可从账号与系统页面查看。':'无法加载当前数据，请检查服务连接后重试。');}
 }
-function loomProviders(){
-  $('#providerGrid').innerHTML=LW.providers.map(function(p){return '<article class="loom-card"><div class="card-head"><span class="provider-icon">'+esc((LP[p]||p).slice(0,1))+'</span><div><h3>'+esc(LP[p]||p)+'</h3><code>'+esc(p)+'</code></div></div><div class="loom-tags"><span class="loom-tag good">适配器已注册</span><span class="loom-tag">账号独立授权</span></div><p>模型与任务通过当前账号向上游发现。未登录时不会展示虚构的账号数据。</p><div class="card-actions"><button class="btn pri" data-loom-add="'+esc(p)+'">管理账号</button><button class="btn" data-view="tasks">查看任务</button></div></article>';}).join('')||loomEmpty('尚无已注册服务','请先完成服务适配器配置。');
-  $('#providerGrid').innerHTML+='<article class="loom-card"><div class="card-head"><span class="provider-icon">豆</span><div><h3>豆包工作</h3><code>Doubao Desktop</code></div></div><div class="loom-tags"><span class="loom-tag wait">接入调查中</span></div><p>正在核验电脑版的官方登录、模型目录与活动状态。尚未注册为可用服务。</p></article>';
-}
-async function loomModels(force){
-  var d=await api(force?'api/models/refresh':'api/models',force?{}:undefined);LW.models=d.model_meta||d.items||[];
-  if(!Array.isArray(LW.models))LW.models=Object.keys(LW.models).map(function(k){return Object.assign({id:k},LW.models[k]);});
-  if(!LW.models.length&&Array.isArray(d.models))LW.models=d.models.map(function(id){return {id:id};});
-  loomModelCards();
-}
-function loomModelCards(){var q=$('#modelSearch').value.trim().toLowerCase(),cap=$('#modelCapability').value;var rows=LW.models.filter(function(m){return (!q||JSON.stringify(m).toLowerCase().indexOf(q)>=0)&&(!cap||m[cap]===true);});$('#modelCount').textContent=rows.length+' 个模型';$('#modelGrid').innerHTML=rows.map(function(m){return '<article class="loom-card"><div><h3>'+esc(m.name||m.id)+'</h3><code>'+esc(m.id)+'</code></div><p>'+esc(m.description||'上游未提供模型说明')+'</p><div class="loom-tags">'+['vendor','context_length','max_output_tokens'].filter(function(k){return m[k]!=null;}).map(function(k){return '<span class="loom-tag">'+esc(k)+': '+esc(m[k])+'</span>';}).join('')+'</div></article>';}).join('')||loomEmpty('没有匹配的模型','添加账号并同步目录，或调整筛选条件。');}
 async function loomTasks(){
   var results=await Promise.all(LW.providers.map(async function(p){try{var d=await api('api/workbench/catalog?provider='+encodeURIComponent(p));return {tasks:d.tasks||[]};}catch(e){return {tasks:[],failed:p};}}));
   LW.tasks=[];var failed=[];results.forEach(function(r){LW.tasks=LW.tasks.concat(r.tasks);if(r.failed)failed.push(LP[r.failed]||r.failed);});
@@ -61,5 +51,4 @@ document.addEventListener('click',async function(ev){var b=ev.target.closest('[d
   if(b.hasAttribute('data-loom-cancel')){await api('api/workbench/cancel',{id:b.dataset.loomCancel});toast('已请求取消，最终状态以执行记录为准');await loomRoute('executions');}
  }catch(e){toast('操作未完成，请刷新状态后重试。','err');}finally{b.disabled=false;}});
 ['providers','schedules','migration'].forEach(function(v){$('#'+v+'Reload').onclick=function(){loomRoute(v);};});
-$('#modelsReload').onclick=function(){loomModels(true).catch(function(){loomNotice('modelsNotice','同步失败，当前显示的是上次载入结果。');});};$('#modelSearch').oninput=loomModelCards;$('#modelCapability').onchange=loomModelCards;$('#modelProvider').disabled=true;
 $('#definitionsReload').onclick=function(){loomRoute('tasks');};$('#scheduleNew').onclick=function(){loomScheduleEditor();};$('#executionFilters').onsubmit=function(e){e.preventDefault();LW.offset=0;loomRoute('executions');};$('#executionsPrev').onclick=function(){LW.offset=Math.max(0,LW.offset-20);loomExecutions();};$('#executionsNext').onclick=function(){LW.offset+=20;loomExecutions();};

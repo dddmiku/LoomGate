@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/providercatalog"
 	"workbuddy2api/internal/providers/doubao"
 	"workbuddy2api/internal/taskengine"
 	"workbuddy2api/internal/taskproviders"
@@ -45,32 +45,26 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client) (*workben
 	}
 	workbench := &workbenchRuntime{engine: e, vault: vault, doubao: client}
 	base := e.Handler()
+	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, LegacyCounts: func() map[string]providercatalog.Count {
+		counts := map[string]providercatalog.Count{}
+		for _, a := range p.List() {
+			id := "workbuddy"
+			if a.Realm == "trae" {
+				id = "trae"
+			} else if a.Realm != "cn" && a.Realm != "global" {
+				continue
+			}
+			count := counts[id]
+			count.Total++
+			if !a.Disabled {
+				count.Enabled++
+			}
+			counts[id] = count
+		}
+		return counts
+	}})
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && (r.URL.Path == "/workbench/models" || r.URL.Path == "/workbench/accounts") {
-			w.Header().Set("Content-Type", "application/json")
-			accounts, err := vault.List()
-			if err != nil {
-				w.WriteHeader(503)
-				_ = json.NewEncoder(w).Encode(map[string]any{"error": "accounts_unavailable"})
-				return
-			}
-			if r.URL.Path == "/workbench/accounts" {
-				_ = json.NewEncoder(w).Encode(map[string]any{"accounts": accounts})
-				return
-			}
-			type row struct {
-				AccountID string `json:"account_id"`
-				doubao.Catalog
-			}
-			rows := []row{}
-			for _, a := range accounts {
-				if a.Provider != "doubao" || !a.Enabled {
-					continue
-				}
-				snapshot, _ := client.Catalog(r.Context(), a.ID, r.URL.Query().Get("refresh") == "1")
-				rows = append(rows, row{AccountID: a.ID, Catalog: snapshot})
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"catalogs": rows})
+		if catalogs.Route(w, r) {
 			return
 		}
 		base.ServeHTTP(w, r)

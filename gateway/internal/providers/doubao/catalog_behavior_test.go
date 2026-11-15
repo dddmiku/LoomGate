@@ -371,6 +371,28 @@ func TestDoubaoCacheExpirationBackoffAndRecovery(t *testing.T) {
 	}
 }
 
+func TestDoubaoFailedForcedRefreshRemainsStaleAndRespectsCooldown(t *testing.T) {
+	var calls atomic.Int32
+	c := New(fixedSessions(), syntheticTransport(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return fixtureResponse(r, 200, catalogFixture(t, "Initial fixture")), nil
+		}
+		return fixtureResponse(r, 503, `{}`), nil
+	}))
+	if _, err := c.Catalog(context.Background(), "account-a", false); err != nil {
+		t.Fatal(err)
+	}
+	for _, force := range []bool{true, false, true, false} {
+		snapshot, err := c.Catalog(context.Background(), "account-a", force)
+		if err == nil || !snapshot.Stale || len(snapshot.Models) != 1 || snapshot.RetryAt.IsZero() {
+			t.Fatal("failed refresh became a fresh cache or lost retry time")
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatal("manual refresh bypassed failure cooldown")
+	}
+}
+
 func TestDoubaoAncientStaleCatalogIsWithheldAndReturnedSnapshotsAreDetached(t *testing.T) {
 	var fail atomic.Bool
 	response := catalogFixture(t, "Original model")
