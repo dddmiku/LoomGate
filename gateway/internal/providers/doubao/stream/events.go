@@ -57,12 +57,45 @@ func (Event) GoString() string { return "doubao.stream.Event[redacted]" }
 type Reader struct {
 	source *bufio.Reader
 	limits Limits
-	total  int
 	first  bool
 }
 
+// byteBudget belongs to an entire Run, including all resumed and async bodies.
+// Charge actual source reads, including read-ahead, CRLF and comments.
+type byteBudget struct{ remaining int }
+type budgetReader struct {
+	source io.Reader
+	budget *byteBudget
+}
+
+func (r budgetReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.budget.remaining <= 0 {
+		// A one-byte sentinel distinguishes exact EOF from an over-budget byte.
+		// Never return that byte to the parser or grant a new stream a fresh budget.
+		var probe [1]byte
+		n, err := r.source.Read(probe[:])
+		if n > 0 {
+			return 0, ErrLimit
+		}
+		return 0, err
+	}
+	if len(p) > r.budget.remaining {
+		p = p[:r.budget.remaining]
+	}
+	n, err := r.source.Read(p)
+	r.budget.remaining -= n
+	return n, err
+}
+
 func NewReader(source io.Reader, l Limits) *Reader {
-	return &Reader{source: bufio.NewReaderSize(source, 4096), limits: limits(l), first: true}
+	l = limits(l)
+	return newReader(source, l, &byteBudget{remaining: l.TotalBytes})
+}
+func newReader(source io.Reader, l Limits, budget *byteBudget) *Reader {
+	return &Reader{source: bufio.NewReaderSize(budgetReader{source: source, budget: budget}, 4096), limits: limits(l), first: true}
 }
 func (r *Reader) line() (string, error) {
 	var line []byte
@@ -74,17 +107,16 @@ func (r *Reader) line() (string, error) {
 			}
 			return "", err
 		}
-		r.total++
-		if r.total > r.limits.TotalBytes {
-			return "", ErrLimit
-		}
 		if b == '\n' {
 			break
 		}
 		if b == '\r' {
-			if next, err := r.source.Peek(1); err == nil && next[0] == '\n' {
+			next, err := r.source.Peek(1)
+			if err != nil && err != io.EOF {
+				return "", err
+			}
+			if err == nil && next[0] == '\n' {
 				r.source.ReadByte()
-				r.total++
 			}
 			break
 		}
@@ -265,6 +297,9 @@ func (s *State) Apply(cursor *Cursor, event Event, emit func(Update) error) erro
 			return ErrMalformed
 		}
 		row.Meta.Blocks = row.Content.Blocks
+		if cursor.latest != nil && cursor.latest.message == row.Meta.ID {
+			cursor.latest = nil
+		}
 		err = s.replaceMessage(row.Meta, emit)
 		if err == nil {
 			cursor.own(row.Meta)
@@ -275,6 +310,9 @@ func (s *State) Apply(cursor *Cursor, event Event, emit func(Update) error) erro
 		}
 		if decode(event.Data, &row) != nil {
 			return ErrMalformed
+		}
+		if cursor.latest != nil && cursor.latest.message == row.Message.ID {
+			cursor.latest = nil
 		}
 		err = s.replaceMessage(row.Message, emit)
 		if err == nil {
@@ -288,7 +326,8 @@ func (s *State) Apply(cursor *Cursor, event Event, emit func(Update) error) erro
 		}
 		target := cursor.latest
 		msg, ok := s.Messages[target.message]
-		if !ok {
+		if !ok || !target.exists(msg) {
+			cursor.latest = nil
 			return ErrMalformed
 		}
 		block := Block{ID: target.block, Type: target.blockType, Patch: 1, Content: map[string]json.RawMessage{target.key: event.Data}}
@@ -419,6 +458,10 @@ func (s *State) replaceMessage(msg Message, emit func(Update) error) error {
 	return nil
 }
 func (s *State) chunk(cursor *Cursor, data []byte, emit func(Update) error) error {
+	// A content-block operation supersedes the previous delta context; metadata,
+	// TTS and legacy operations between text chunks do not.
+	touchedBlock := false
+	var next *deltaTarget
 	var chunk struct {
 		ID  string `json:"message_id"`
 		Ops []struct {
@@ -443,17 +486,19 @@ func (s *State) chunk(cursor *Cursor, data []byte, emit func(Update) error) erro
 		}
 		switch op.Object {
 		case 1:
+			touchedBlock = true
+			cursor.latest = nil
 			var value struct {
 				Blocks []Block `json:"content_block"`
 			}
 			if op.Type != 3 && decode(op.Value, &value) != nil {
 				return ErrMalformed
 			}
-			if len(chunk.Ops) == 1 && len(value.Blocks) == 1 && op.Type != 3 {
+			if len(chunk.Ops) == 1 && len(value.Blocks) == 1 && op.Type != 3 && value.Blocks[0].Patch != 3 && !value.Blocks[0].Finished {
 				b := value.Blocks[0]
 				if len(b.Content) == 1 {
 					for key := range b.Content {
-						cursor.latest = &deltaTarget{message: msg.ID, block: b.ID, key: key, blockType: b.Type}
+						next = &deltaTarget{message: msg.ID, block: b.ID, key: key, blockType: b.Type}
 					}
 				} else {
 					cursor.latest = nil
@@ -468,7 +513,21 @@ func (s *State) chunk(cursor *Cursor, data []byte, emit func(Update) error) erro
 		}
 	}
 	s.Messages[msg.ID] = msg
+	if touchedBlock && next != nil && next.exists(msg) {
+		cursor.latest = next
+	}
 	return nil
+}
+func (t *deltaTarget) exists(msg Message) bool {
+	if msg.UserType != 2 {
+		return false
+	}
+	for _, b := range msg.Blocks {
+		if b.ID == t.block {
+			return b.Type == t.blockType && !b.Finished && len(b.Content) == 1 && b.Content[t.key] != nil
+		}
+	}
+	return false
 }
 func (s *State) applyBlocks(msg *Message, blocks []Block, outer int, emit func(Update) error) error {
 	if outer == 2 || outer == 3 {

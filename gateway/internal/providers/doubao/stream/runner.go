@@ -118,6 +118,7 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	state := NewState(o.Limits)
+	budget := &byteBudget{remaining: limits(o.Limits).TotalBytes}
 	report := Report{}
 	finish := func(err error) (Report, error) {
 		report.Events = state.Events
@@ -157,7 +158,7 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 					return ErrMalformed
 				}
 				onCancel := context.AfterFunc(attemptCtx, func() { body.Close() })
-				reader := NewReader(body, o.Limits)
+				reader := newReader(body, o.Limits, budget)
 				for {
 					event, readErr := reader.Next(attemptCtx)
 					if readErr != nil {
