@@ -18,15 +18,16 @@ type passportTransport func(*http.Request) (*http.Response, error)
 func (f passportTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 func passportReply(r *http.Request, data any) *http.Response {
 	b, _ := json.Marshal(map[string]any{"message": "success", "data": data})
-	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(b))), Header: http.Header{"Set-Cookie": {"fixture_session=synthetic; Path=/; Secure; HttpOnly"}}, Request: r}
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(b))), Header: http.Header{"Set-Cookie": {"fixture_session=synthetic; Domain=.doubao.com; Path=/; Secure; HttpOnly"}}, Request: r}
 }
+func fixturePrepare(context.Context, *http.Request) error { return nil }
 func bootstrapFixture(context.Context) (StoredProfile, error) {
 	return StoredProfile{Query: url.Values{"aid": {"synthetic-aid"}, "device_platform": {"web"}}, Headers: http.Header{"User-Agent": {"synthetic-agent"}}}, nil
 }
 func TestPassportSMSAuthenticatesBeforeSavingAndResumesCookies(t *testing.T) {
 	requests := []string{}
 	saved := false
-	p := &Passport{Bootstrap: bootstrapFixture, Save: func(c context.Context, id string, profile StoredProfile) error {
+	p := &Passport{Prepare: fixturePrepare, Bootstrap: bootstrapFixture, Save: func(c context.Context, id string, profile StoredProfile) error {
 		if !strings.HasPrefix(id, "doubao-") || profile.Headers.Get("Cookie") == "" {
 			t.Error("verified session not carried to encrypted store")
 		}
@@ -35,7 +36,7 @@ func TestPassportSMSAuthenticatesBeforeSavingAndResumesCookies(t *testing.T) {
 	}}
 	p.Transport = passportTransport(func(r *http.Request) (*http.Response, error) {
 		requests = append(requests, r.URL.Path)
-		if r.URL.Host != "www.doubao.com" {
+		if r.URL.Host != "accounts.doubao.com" {
 			t.Fatal("unexpected host")
 		}
 		if r.Method == "POST" {
@@ -81,7 +82,7 @@ func TestPassportSMSAuthenticatesBeforeSavingAndResumesCookies(t *testing.T) {
 func TestPassportQRScanIsNotSuccessAndExpiryDoesNotRefresh(t *testing.T) {
 	status := "scanned"
 	calls := 0
-	p := &Passport{Bootstrap: bootstrapFixture, Transport: passportTransport(func(r *http.Request) (*http.Response, error) {
+	p := &Passport{Prepare: fixturePrepare, Bootstrap: bootstrapFixture, Transport: passportTransport(func(r *http.Request) (*http.Response, error) {
 		calls++
 		switch r.URL.Path {
 		case "/passport/web/get_qrcode/":
@@ -108,16 +109,43 @@ func TestPassportQRScanIsNotSuccessAndExpiryDoesNotRefresh(t *testing.T) {
 	}
 }
 func TestPassportRefusesUnverifiedIdentityAndManualChallenge(t *testing.T) {
-	p := &Passport{Bootstrap: bootstrapFixture, Transport: passportTransport(func(r *http.Request) (*http.Response, error) {
+	p := &Passport{Prepare: fixturePrepare, Bootstrap: bootstrapFixture, Transport: passportTransport(func(r *http.Request) (*http.Response, error) {
 		return passportReply(r, map[string]any{"error_code": 9999, "description": "synthetic-private-message"}), nil
 	})}
 	r, err := p.Start(context.Background(), authflow.Request{Method: "qr"})
 	if err != nil || r.Status != "manual_action" || strings.Contains(r.Notice, "private-message") {
 		t.Fatal("challenge not safely projected")
 	}
+	if r.ErrorCode != "official_request_rejected" || r.UpstreamCode == nil || *r.UpstreamCode != 9999 {
+		t.Fatal("business code lost or misclassified as verified risk control")
+	}
 	p.Transport = passportTransport(func(r *http.Request) (*http.Response, error) { return passportReply(r, map[string]any{}), nil })
 	r, err = p.verify(context.Background(), &passportState{Profile: StoredProfile{Headers: http.Header{}}})
 	if err != nil || r.Status != "manual_action" {
 		t.Fatal("empty account info accepted")
+	}
+}
+
+func TestPassportMissingSignerIsUnavailableAndHostOnlyCookieCannotBeImported(t *testing.T) {
+	called := false
+	p := &Passport{Bootstrap: bootstrapFixture, Transport: passportTransport(func(*http.Request) (*http.Response, error) { called = true; return nil, nil })}
+	for _, m := range p.Methods() {
+		if m.Available {
+			t.Fatal("profile alone advertised usable official login")
+		}
+	}
+	r, err := p.Start(context.Background(), authflow.Request{Method: "qr"})
+	if err != nil || r.Status != "manual_action" || called {
+		t.Fatal("missing SDK signer issued request")
+	}
+	p.Prepare = fixturePrepare
+	p.Save = func(context.Context, string, StoredProfile) error {
+		t.Fatal("auth-only cookie imported into work session")
+		return nil
+	}
+	st := passportState{Profile: StoredProfile{Headers: http.Header{}}, UserID: "synthetic-user", Cookies: []*http.Cookie{{Name: "fixture_session", Value: "synthetic", Path: "/", Secure: true}}}
+	r, err = p.Step(context.Background(), authflow.Flow{Secret: passportSecret(st)}, "commit", authflow.Input{})
+	if err != nil || r.Status != "manual_action" || r.ErrorCode != "work_session_not_verified" {
+		t.Fatal("cookie domain scope expanded")
 	}
 }

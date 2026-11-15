@@ -43,16 +43,17 @@ func (Input) GoString() string { return "authflow.Input[redacted]" }
 type View struct {
 	ID string `json:"id"`
 	Request
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	NextPollAt time.Time `json:"next_poll_at"`
-	RetryAt    time.Time `json:"retry_at"`
-	ActionURL  string    `json:"action_url,omitempty"`
-	QRURL      string    `json:"qr_url,omitempty"`
-	ErrorCode  string    `json:"error_code,omitempty"`
-	Notice     string    `json:"notice,omitempty"`
-	Revision   uint64    `json:"revision"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	NextPollAt   time.Time `json:"next_poll_at"`
+	RetryAt      time.Time `json:"retry_at"`
+	ActionURL    string    `json:"action_url,omitempty"`
+	QRURL        string    `json:"qr_url,omitempty"`
+	ErrorCode    string    `json:"error_code,omitempty"`
+	UpstreamCode *int64    `json:"upstream_code,omitempty"`
+	Notice       string    `json:"notice,omitempty"`
+	Revision     uint64    `json:"revision"`
 }
 
 // Flow is private storage. Only View may be serialized into management responses.
@@ -67,6 +68,7 @@ func (Flow) String() string   { return "authflow.Flow[redacted]" }
 func (Flow) GoString() string { return "authflow.Flow[redacted]" }
 
 type Result struct {
+	UpstreamCode                                           *int64
 	Status, ActionURL, QRURL, ErrorCode, Notice, AccountID string
 	Secret                                                 json.RawMessage
 	RetryAfter                                             time.Duration
@@ -413,6 +415,7 @@ func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, f
 	}
 	f.Action = ""
 	f.ErrorCode = ""
+	f.UpstreamCode = nil
 	delay := 2 * time.Second
 	for i := 0; i < f.Polls && delay < 8*time.Second; i++ {
 		delay *= 2
@@ -431,6 +434,7 @@ func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, f
 			result.ErrorCode = "invalid_provider_state"
 		}
 		f.ErrorCode = result.ErrorCode
+		f.UpstreamCode = result.UpstreamCode
 		f.Notice = result.Notice
 		f.ActionURL = result.ActionURL
 		f.QRURL = result.QRURL

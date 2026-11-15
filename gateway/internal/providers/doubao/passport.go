@@ -23,6 +23,9 @@ import (
 // invents device IDs or substitutes a paid API. Secrets live only in encrypted flows.
 type Passport struct {
 	Bootstrap func(context.Context) (StoredProfile, error)
+	// Prepare applies the current official SDK context/signatures per request.
+	// A captured signature is not a substitute. No signer means no network login.
+	Prepare   func(context.Context, *http.Request) error
 	Save      func(context.Context, string, StoredProfile) error
 	Transport http.RoundTripper
 }
@@ -36,13 +39,14 @@ type passportState struct {
 
 func (passportState) String() string { return "passportState[redacted]" }
 func (p *Passport) Methods() []authflow.Method {
-	return []authflow.Method{{ID: "sms", Name: "手机号登录", Available: p.Bootstrap != nil, Reason: passportSetupReason(p.Bootstrap != nil)}, {ID: "qr", Name: "扫码登录", Available: p.Bootstrap != nil, Reason: passportSetupReason(p.Bootstrap != nil)}}
+	ready := p.Bootstrap != nil && p.Prepare != nil
+	return []authflow.Method{{ID: "sms", Name: "手机号登录", Available: ready, Reason: passportSetupReason(ready)}, {ID: "qr", Name: "扫码登录", Available: ready, Reason: passportSetupReason(ready)}}
 }
 func passportSetupReason(ready bool) string {
 	if ready {
 		return ""
 	}
-	return "official_sdk_context_required"
+	return "official_sdk_context_and_signer_required"
 }
 
 var passportPhone = regexp.MustCompile(`^\+?[0-9]{1,4} [0-9]{5,15}$`)
@@ -59,8 +63,8 @@ func PassportMix(value string) string {
 }
 func passportSecret(st passportState) json.RawMessage { b, _ := json.Marshal(st); return b }
 func (p *Passport) Start(ctx context.Context, r authflow.Request) (authflow.Result, error) {
-	if p.Bootstrap == nil {
-		return authflow.Result{Status: "manual_action", ErrorCode: "official_sdk_context_required", Notice: "请先配置由官方客户端获取的登录 SDK 上下文。"}, nil
+	if p.Bootstrap == nil || p.Prepare == nil {
+		return authflow.Result{Status: "manual_action", ErrorCode: "official_sdk_context_and_signer_required", Notice: "官方登录需要完整 SDK 上下文与实时签名，当前连接尚未就绪。请先在官方客户端登录。"}, nil
 	}
 	profile, err := p.Bootstrap(ctx)
 	if err != nil {
@@ -146,12 +150,16 @@ func (p *Passport) Step(ctx context.Context, f authflow.Flow, action string, in 
 		}
 		jar, _ := cookiejar.New(nil)
 		origin, _ := url.Parse("https://www.doubao.com/")
-		jar.SetCookies(origin, st.Cookies)
+		authOrigin, _ := url.Parse("https://accounts.doubao.com/")
+		jar.SetCookies(authOrigin, st.Cookies)
 		request, _ := http.NewRequest(http.MethodGet, origin.String(), nil)
 		for _, cookie := range jar.Cookies(origin) {
 			request.AddCookie(cookie)
 		}
 		st.Profile.Headers.Set("Cookie", request.Header.Get("Cookie"))
+		if request.Header.Get("Cookie") == "" {
+			return authflow.Result{Status: "manual_action", ErrorCode: "work_session_not_verified", Notice: "官方登录已核验，但尚无适用于工作服务的会话，未导入账号。"}, nil
+		}
 		if err := p.Save(ctx, id, st.Profile); err != nil {
 			return authflow.Result{}, err
 		}
@@ -215,7 +223,13 @@ func passportRejected(data map[string]any, st passportState) (authflow.Result, b
 	if code == "" || code == "0" {
 		return authflow.Result{}, false
 	}
-	return authflow.Result{Status: "manual_action", Secret: passportSecret(st), ErrorCode: "official_verification_required", ActionURL: "https://www.doubao.com/chat/", Notice: "官方要求额外验证或拒绝了当前请求，请在官方客户端完成验证。不会自动重发短信或验证码。"}, true
+	var number *int64
+	if n, err := strconv.ParseInt(code, 10, 64); err == nil && n >= 0 && n <= 999999999 {
+		number = &n
+	}
+	// A nonzero business code is not proof of a captcha or risk-control failure.
+	// Preserve only the bounded numeric code; descriptions/tickets stay private.
+	return authflow.Result{Status: "manual_action", Secret: passportSecret(st), ErrorCode: "official_request_rejected", UpstreamCode: number, ActionURL: "https://www.doubao.com/chat/", Notice: "官方未接受本次登录请求。具体原因尚未核实，请在官方界面检查；不会自动重发短信或验证码。"}, true
 }
 func passportString(data map[string]any, key string) string {
 	switch value := data[key].(type) {
@@ -240,7 +254,10 @@ func cloneValues(values url.Values) url.Values {
 	return out
 }
 func (p *Passport) request(ctx context.Context, st *passportState, method, path string, values url.Values) (map[string]any, error) {
-	u := url.URL{Scheme: "https", Host: "www.doubao.com", Path: path}
+	if p.Prepare == nil {
+		return nil, errors.New("official_sdk_signer_unavailable")
+	}
+	u := url.URL{Scheme: "https", Host: "accounts.doubao.com", Path: path}
 	q := cloneValues(st.Profile.Query)
 	for k, v := range values {
 		if method == http.MethodGet {
@@ -263,8 +280,14 @@ func (p *Passport) request(ctx context.Context, st *passportState, method, path 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Origin", "https://www.doubao.com")
 	req.Header.Set("Referer", "https://www.doubao.com/chat/")
+	if err := p.Prepare(ctx, req); err != nil {
+		return nil, errors.New("official_sdk_prepare_failed")
+	}
+	if req.URL.Scheme != "https" || req.URL.Host != "accounts.doubao.com" || req.URL.Path != path || req.URL.User != nil || req.Method != method {
+		return nil, errors.New("passport_origin_rejected")
+	}
 	jar, _ := cookiejar.New(nil)
-	origin, _ := url.Parse("https://www.doubao.com/")
+	origin, _ := url.Parse("https://accounts.doubao.com/")
 	jar.SetCookies(origin, st.Cookies)
 	client := http.Client{Timeout: 20 * time.Second, Jar: jar, Transport: p.Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(req)
@@ -293,7 +316,7 @@ func (p *Passport) request(ctx context.Context, st *passportState, method, path 
 	}
 	// Preserve server cookie attributes across requests and encrypted restarts.
 	for _, fresh := range response.Cookies() {
-		if fresh.Domain != "" && fresh.Domain != ".doubao.com" && fresh.Domain != "doubao.com" && fresh.Domain != "www.doubao.com" {
+		if fresh.Domain != "" && fresh.Domain != ".doubao.com" && fresh.Domain != "doubao.com" && fresh.Domain != "accounts.doubao.com" {
 			continue
 		}
 		replaced := false

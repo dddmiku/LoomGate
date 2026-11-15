@@ -22,6 +22,7 @@
 | `gateway/internal/taskengine` | 任务状态、执行、租约、调度与管理接口 |
 | `gateway/internal/taskproviders` | provider 业务到任务引擎的适配 |
 | `gateway/internal/providers/doubao` | 官方豆包目录、活动与客户端请求 |
+| `gateway/internal/providers/doubao/stream` | SSE补丁、终态、异步交接和有界恢复；实时签名待接入 |
 | `gateway/internal/accountvault` | 新 provider 会话的加密存储与并发写保护 |
 | `gateway/internal/authflow` | 加密的认证流程、冷却、取消与中断恢复 |
 | `gateway/internal/providercatalog` | provider 能力、账号和目录管理视图；有界并发与失败隔离 |
@@ -64,6 +65,8 @@ python -X utf8 -m unittest discover -s tools/buildtests -p 'test_*.py'
 新控制台和隔离浏览器验收的启动方式见 [控制台验收](docs/console-acceptance.md)。旧面板资源暂留作兼容测试，不作为新 UI 的设计基础。豆包目录中的模型尚未加入对外推理路由。
 
 新账号接入入口、WorkBuddy/Trae 授权与豆包 SMS/QR 协议状态机见 [账号认证](docs/authentication.md)。真实豆包二维码初始化目前返回拒绝；短信、扫码确认、导入和续期尚未实测成功，不能把隔离测试结果作为生产接入承诺。
+
+Phase 04 已观察官方 UI 成功生成 QR（未扫码），识别出认证主机与 SDK 参数差异；生产实时签名尚未接通。新增流协议模块通过合成 HTTP 与既有抓包离线验证，仍未开放豆包推理路由，见 [协议状态](docs/doubao-stream.md)。
 
 ## 迁移与构建
 

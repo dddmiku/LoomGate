@@ -74,6 +74,6 @@ func main() {
 	printView(r, false)
 }
 func printView(v authflow.View, resumed bool) {
-	b, _ := json.Marshal(map[string]any{"status": v.Status, "error_code": v.ErrorCode, "method": v.Method, "resumed": resumed, "qr_available": v.QRURL != "", "phone_submitted": false, "code_submitted": false, "expires_at": v.ExpiresAt})
+	b, _ := json.Marshal(map[string]any{"status": v.Status, "error_code": v.ErrorCode, "upstream_code": v.UpstreamCode, "method": v.Method, "resumed": resumed, "qr_available": v.QRURL != "", "phone_submitted": false, "code_submitted": false, "expires_at": v.ExpiresAt})
 	fmt.Println(string(b))
 }

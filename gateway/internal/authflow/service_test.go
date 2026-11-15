@@ -217,3 +217,19 @@ func TestBoundedFlowRetentionAndNoOptimisticSuccess(t *testing.T) {
 		t.Fatal("start result bypassed verified commit")
 	}
 }
+
+func TestBoundedProviderBusinessCodeSurvivesWorkflowProjection(t *testing.T) {
+	code := int64(9999)
+	d := &driverStub{start: func(context.Context, Request) (Result, error) {
+		return Result{Status: "manual_action", ErrorCode: "official_request_rejected", UpstreamCode: &code}, nil
+	}}
+	s, _, _, _ := testService(t, d)
+	f, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "qr"})
+	if err != nil || f.UpstreamCode == nil || *f.UpstreamCode != code {
+		t.Fatal("business code lost")
+	}
+	rows, err := s.List()
+	if err != nil || rows[0].UpstreamCode == nil || *rows[0].UpstreamCode != code {
+		t.Fatal("persisted business code lost")
+	}
+}

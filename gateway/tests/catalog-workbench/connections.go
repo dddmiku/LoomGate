@@ -19,7 +19,7 @@ func syntheticPassportBootstrap(context.Context) (doubao.StoredProfile, error) {
 type syntheticPassportTransport struct{ fixture *fixtures }
 
 func (s syntheticPassportTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.URL.Host != "www.doubao.com" {
+	if r.URL.Host != "accounts.doubao.com" {
 		return nil, errors.New("fixture_external_request_blocked")
 	}
 	data := map[string]any{"error_code": 0}
@@ -52,7 +52,7 @@ func (s syntheticPassportTransport) RoundTrip(r *http.Request) (*http.Response, 
 		data = map[string]any{"error_code": 9999, "description": "synthetic-private-rejection"}
 	}
 	b, _ := json.Marshal(map[string]any{"message": "success", "data": data})
-	return &http.Response{StatusCode: 200, Header: http.Header{"Set-Cookie": {"fixture_session=synthetic; Path=/; Secure; HttpOnly"}}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+	return &http.Response{StatusCode: 200, Header: http.Header{"Set-Cookie": {"fixture_session=synthetic; Domain=.doubao.com; Path=/; Secure; HttpOnly"}}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
 }
 
 type syntheticConnection struct{}
