@@ -1,0 +1,328 @@
+// ═══ 更新日志 ═══
+// 2026-09-26：可选首次启动失败后继续后台重试，面板故障不再拖垂网关 API。
+// 2026-09-25：网关托管同版管理台的私有Unix进程，启动就绪后才服务并在优雅退出后回收。
+package panelruntime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"workbuddy2api/internal/runlog"
+	"workbuddy2api/panel"
+)
+
+type Options struct {
+	ConfigPath, BaseDir, AuthDir, AdminDir, AdminSocket, RuntimeDir, LogPath, Python string
+	TrustedProxies                                                                   string
+	// AdminPrefix 面板在网关上的挂载前缀（默认 /admin）。代理据此剥前缀，
+	// 并通过 WB2API_ADMIN_PREFIX 传给面板——面板拼公网回调地址时要用它。
+	AdminPrefix string
+	// RetryInitialFailure 首次启动失败时不放弃：返回错误供调用方记录，同时继续在后台
+	// 按退避重试；面板就绪前 /admin 由代理返回错误页，网关 API 不受影响。
+	RetryInitialFailure bool
+}
+
+type Runtime struct {
+	dir, socket string
+	opts        Options
+	cancel      context.CancelFunc
+	done        chan struct{}
+	transport   *http.Transport
+	// env 是面板子进程的通道相关环境变量（Linux: unix socket 路径；
+	// Windows: 回环 TCP 地址）。由 channel() 按平台给出。
+	env   map[string]string
+	proxy *httputil.ReverseProxy
+	mu    sync.Mutex
+	cmd   *exec.Cmd
+}
+
+func Start(opts Options) (*Runtime, error) {
+	if opts.Python == "" {
+		opts.Python = "python3"
+	}
+	dir, err := os.MkdirTemp("", "wb2panel-")
+	if err != nil {
+		return nil, err
+	}
+	err = fs.WalkDir(panel.Files, ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." {
+			return nil
+		}
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if entry.IsDir() {
+			return os.MkdirAll(path, 0700)
+		}
+		data, err := panel.Files.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(path, data, 0600)
+	})
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &Runtime{dir: dir, socket: filepath.Join(dir, "panel.sock"), opts: opts, cancel: cancel, done: make(chan struct{})}
+	// 面板通信通道按平台选择：Linux/macOS 走 Unix socket，Windows 走回环 TCP
+	// （Python 标准库在 Windows 上没有 UnixStreamServer，见 panel/app.py main()）。
+	// 2026-10-13 桌面打包实测：不分支会在 Windows 上直接崩在面板启动处。
+	r.transport, r.env = r.channel()
+	r.proxy = r.newProxy()
+	ready := make(chan error, 1)
+	go r.supervise(ctx, ready)
+	if err := <-ready; err != nil {
+		if opts.RetryInitialFailure {
+			return r, err
+		}
+		r.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *Runtime) command() *exec.Cmd {
+	// #nosec G204 -- Python is an administrator setting; the script is embedded in the current executable.
+	cmd := exec.Command(r.opts.Python, "-u", filepath.Join(r.dir, "app.py"))
+	overrides := map[string]string{
+		"WB2API_RUNTIME": "native", "WB2API_GATEWAY_DIR": r.opts.BaseDir, "WB2API_CONFIG_PATH": r.opts.ConfigPath,
+		"WB2API_AUTHS_DIR": r.opts.AuthDir, "WB2API_ADMIN_DIR": r.opts.AdminDir, "WB2API_ADMIN_SOCKET": r.opts.AdminSocket,
+		"WB2API_RUNTIME_DIR": r.opts.RuntimeDir, "WB2API_PANEL_SOCKET": r.socket, "WB2API_LOG_PATH": r.opts.LogPath,
+		"WB2API_TRUSTED_PROXIES": "127.0.0.1/32,::1/128", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+		"WB2API_ADMIN_PREFIX": adminPrefixOr(r.opts.AdminPrefix),
+	}
+	// 通道相关变量由 channel() 按平台给出（unix socket 路径或回环 TCP 地址）。
+	for key, value := range r.env {
+		overrides[key] = value
+	}
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := overrides[key]; !replaced {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	for key, value := range overrides {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	cmd.Dir = r.opts.BaseDir
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Stdout = runlog.Output(os.Stdout)
+	cmd.Stderr = runlog.Output(os.Stderr)
+	configureProcess(cmd)
+	return cmd
+}
+
+func (r *Runtime) supervise(ctx context.Context, first chan<- error) {
+	defer close(r.done)
+	defer os.RemoveAll(r.dir)
+	initial := true
+	for {
+		if ctx.Err() != nil {
+			if initial {
+				first <- ctx.Err()
+			}
+			return
+		}
+		_ = os.Remove(r.socket)
+		cmd := r.command()
+		if err := cmd.Start(); err != nil {
+			if initial {
+				first <- err
+				if !r.opts.RetryInitialFailure {
+					return
+				}
+				initial = false
+				if !wait(ctx, initialRetryDelay) {
+					return
+				}
+				continue
+			}
+			log.Printf("[面板] 重启失败：%v", err)
+			if !wait(ctx, time.Second) {
+				return
+			}
+			continue
+		}
+		r.mu.Lock()
+		r.cmd = cmd
+		r.mu.Unlock()
+		exited := make(chan error, 1)
+		go func() { exited <- cmd.Wait() }()
+		err := r.waitReady(ctx, exited)
+		if err != nil {
+			stopProcess(cmd)
+			select {
+			case <-exited:
+			case <-time.After(3 * time.Second):
+				killProcess(cmd)
+				<-exited
+			}
+			if initial {
+				first <- err
+				if !r.opts.RetryInitialFailure {
+					return
+				}
+				initial = false
+				if !wait(ctx, initialRetryDelay) {
+					return
+				}
+				continue
+			}
+			if !wait(ctx, time.Second) {
+				return
+			}
+			continue
+		}
+		if initial {
+			first <- nil
+			initial = false
+		}
+		select {
+		case <-ctx.Done():
+			stopProcess(cmd)
+			select {
+			case <-exited:
+			case <-time.After(5 * time.Second):
+				killProcess(cmd)
+				<-exited
+			}
+			return
+		case err := <-exited:
+			// A Python request thread may have started a helper before the
+			// panel crashed. Reap that private group before starting its successor.
+			killProcess(cmd)
+			log.Printf("[面板] 进程已退出（%v），正在重启内嵌面板", err)
+		}
+		if !wait(ctx, time.Second) {
+			return
+		}
+	}
+}
+
+// initialRetryDelay 首次启动失败后的重试间隔（凭据文件损坏等需要人工处理的故障不宜高频重启）。
+const initialRetryDelay = 10 * time.Second
+
+func wait(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (r *Runtime) waitReady(ctx context.Context, exited chan error) error {
+	deadline := time.Now().Add(15 * time.Second)
+	client := &http.Client{Transport: r.transport, Timeout: time.Second}
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-exited:
+			exited <- err
+			return fmt.Errorf("panel exited before ready: %v", err)
+		default:
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+r.proxyHost()+"/__health", nil)
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return nil
+			}
+		}
+		if !wait(ctx, 50*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
+	return errors.New("embedded panel did not become ready")
+}
+
+func (r *Runtime) Close() { r.cancel(); <-r.done; r.transport.CloseIdleConnections() }
+
+func (r *Runtime) ServeHTTP(w http.ResponseWriter, req *http.Request) { r.proxy.ServeHTTP(w, req) }
+
+// adminPrefixOr 归一化面板挂载前缀（空/仅斜杠 → 默认 /admin），供代理剥前缀与面板共用。
+//
+// 去尾斜杠后还要再判一次空：输入 "/" 会变成 ""，直接返回就会拼出
+// "//trae/callback" 这种坏地址。
+func adminPrefixOr(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "/admin"
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return "/admin"
+	}
+	return prefix
+}
+
+func (r *Runtime) newProxy() *httputil.ReverseProxy {
+	networks := []*net.IPNet{}
+	for _, part := range strings.Split(r.opts.TrustedProxies, ",") {
+		if _, network, err := net.ParseCIDR(strings.TrimSpace(part)); err == nil {
+			networks = append(networks, network)
+		}
+	}
+	// 代理目标：unix 通道下 DialContext 忽略 host，写 localhost 即可；
+	// TCP 通道（Windows）必须给真实地址，否则会去连 localhost:80。
+	target := &url.URL{Scheme: "http", Host: r.proxyHost()}
+	return &httputil.ReverseProxy{Transport: r.transport, Rewrite: func(p *httputil.ProxyRequest) {
+		p.SetURL(target)
+		p.Out.URL.Path = strings.TrimPrefix(p.In.URL.Path, adminPrefixOr(r.opts.AdminPrefix))
+		p.Out.URL.RawPath = ""
+		p.Out.Host = p.In.Host
+		peer, _, err := net.SplitHostPort(p.In.RemoteAddr)
+		if err != nil {
+			peer = p.In.RemoteAddr
+		}
+		ip := net.ParseIP(peer)
+		trusted := false
+		for _, network := range networks {
+			if network.Contains(ip) {
+				trusted = true
+				break
+			}
+		}
+		clientIP := peer
+		if trusted {
+			if forwarded := net.ParseIP(p.In.Header.Get("X-Real-IP")); forwarded != nil {
+				clientIP = forwarded.String()
+			}
+		}
+		p.Out.Header.Del("Forwarded")
+		p.Out.Header.Del("CF-Connecting-IP")
+		p.Out.Header.Set("X-Real-IP", clientIP)
+		p.Out.Header.Set("X-Forwarded-For", clientIP)
+		proto := "http"
+		if p.In.TLS != nil || trusted && p.In.Header.Get("X-Forwarded-Proto") == "https" {
+			proto = "https"
+		}
+		p.Out.Header.Set("X-Forwarded-Proto", proto)
+	}, ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("[面板] 本地代理不可用：%v", err)
+		http.Error(w, "administration temporarily unavailable", http.StatusBadGateway)
+	}}
+}

@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+# ═══ 更新日志 ═══
+# 2026-09-26：镜像构建同样注入发布公钥，与发布包保持一致。
+# 2026-09-25：统一网关与内嵌面板为非root单容器，移除docker.sock依赖并使用完整运行包与目录配置挂载。
+# 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
+# 2026-09-17：注入版本元数据（版本号/提交/构建时间），并改用 PID 1 监督脚本启动，
+#             支撑容器内热更新（交接后容器保持存活，由新实例继续服务）。
+FROM golang:1.26.8-alpine AS build
+WORKDIR /src
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILT_AT=unknown
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
+# 发布签名公钥（仓库内 release-signing.pub）写进二进制：运行时据此强制验签。
+# 文件不存在时留空（开发构建），日志会说明跳过验签。
+RUN RELEASE_KEY="$(cat release-signing.pub 2>/dev/null || true)" \
+ && CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X workbuddy2api/internal/version.Version=${VERSION} -X workbuddy2api/internal/version.Commit=${COMMIT} -X workbuddy2api/internal/version.BuiltAt=${BUILT_AT} -X workbuddy2api/internal/version.ReleaseKey=${RELEASE_KEY}" \
+      -o /out/wb2api ./cmd/server \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/fission_bin ./cmd/fission
+
+FROM alpine:3.23
+ARG VERSION=dev
+ARG TARGETARCH
+# python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+ && adduser -D -u 10001 app \
+ && mkdir -p /app/auths /app/auths-trash /app/data /app/config /app/panel-data \
+ && chown -R app:app /app
+WORKDIR /app
+# 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
+# app 对 root 所有文件无写权限，sed -i 需要写权限。
+COPY --from=build /out/wb2api /app/wb2api
+COPY --from=build /out/signin_bin /app/signin_bin
+COPY --from=build /out/login /app/login
+COPY --from=build /out/credit /app/credit
+COPY --from=build /out/trial_bin /app/trial_bin
+COPY --from=build /out/activity_bin /app/activity_bin
+COPY --from=build /out/fission_bin /app/fission_bin
+COPY login.sh signin.sh credit.sh trial.sh fission.sh /app/
+# PID 1 监督脚本：热更新交接后保持容器存活（见 docker-entrypoint.sh 头注释）。
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+# 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
+COPY scripts/global_region.py /app/scripts/global_region.py
+COPY scripts/task_common.py /app/scripts/task_common.py
+COPY scripts/task_runner.py /app/scripts/task_runner.py
+COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
+COPY scripts/growth_center.py /app/scripts/growth_center.py
+COPY scripts/runtime_bundle.py /app/scripts/runtime_bundle.py
+# compensation_claim.py 是「补偿积分领取」任务的实现（一次性任务，面板手动触发）。
+# 2026-10-19 发现它一直没被 COPY 进镜像——容器里点该任务会报脚本不存在。
+COPY scripts/compensation_claim.py /app/scripts/compensation_claim.py
+RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
+RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
+# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
+COPY config.example.json /app/config.example.json
+RUN python3 /app/scripts/runtime_bundle.py --stage /app --version "${VERSION}" --arch "${TARGETARCH:-$(uname -m)}"
+ENV WB2API_PANEL_ENABLED=1 \
+    WB2API_GATEWAY_DIR=/app \
+    WB2API_ADMIN_DIR=/app/panel-data \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+USER app
+EXPOSE 7863
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
+  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["-config", "/app/config/config.json"]

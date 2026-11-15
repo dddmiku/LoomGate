@@ -1,0 +1,299 @@
+// ═══ 更新日志 ═══
+// 2026-09-26：GET /keys 在密钥库不可读时返回 503 与明确原因。
+// 2026-09-25：管理通道支持每密钥限流策略，未提供保持原值、null恢复无限制。
+// 2026-09-20：密钥管理接口接受可选 expires_at；字段缺省表示保持现状，显式 null 表示无限制。
+// 2026-09-20：增加仅限管理通道的按需复制接口，以及逐密钥重复推理保护设置。
+// 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
+// 2026-09-17：管理接口支持模型绑定字段，与密钥库校验保持一致。
+// 2026-09-17：拆分"路径被活着的进程占用"这一种失败，并支持等旧进程释放后重绑，
+//
+//	供热更新时新实例接手管理 socket（旧版本不会传 FD）。
+package apikeys
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// parseExpiry 把接口传来的 RFC3339 有效期转成时间；空串或 nil 表示无限制。
+// 时间格式或范围不合法时返回 ErrInvalidExpiry，由 replyError 映射成 400。
+func parseExpiry(raw *string) (*time.Time, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	value := strings.TrimSpace(*raw)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil, ErrInvalidExpiry
+	}
+	parsed = parsed.UTC()
+	if !validExpiry(&parsed, time.Now()) {
+		return nil, ErrInvalidExpiry
+	}
+	return &parsed, nil
+}
+
+func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
+	guardDefault := true
+	if len(defaultGuard) > 0 {
+		guardDefault = defaultGuard[0]
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /keys", func(w http.ResponseWriter, r *http.Request) {
+		keys, err := s.ListChecked()
+		if err != nil {
+			log.Printf("ERROR: [密钥管理] 密钥库无法读取：%v", err)
+			reply(w, 503, map[string]any{"ok": false, "message": "密钥库文件不可读，请检查 data/api_keys.json 及其加密密钥（密钥没有被删除）"})
+			return
+		}
+		reply(w, 200, map[string]any{"ok": true, "keys": keys, "max_keys": MaxKeys, "default_reasoning_loop_guard": guardDefault})
+	})
+	mux.HandleFunc("POST /keys", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name               string          `json:"name"`
+			Note               string          `json:"note"`
+			Models             []string        `json:"models"`
+			ReasoningLoopGuard *bool           `json:"reasoning_loop_guard"`
+			GlobalFallbackToCN *bool           `json:"global_fallback_to_cn"`
+			ExpiresAt          *string         `json:"expires_at"`
+			Limits             json.RawMessage `json:"limits"`
+		}
+		if !readBody(w, r, &body) {
+			return
+		}
+		expiresAt, err := parseExpiry(body.ExpiresAt)
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		limits, err := parseLimits(body.Limits)
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		entry, key, err := s.Create(body.Name, body.Note, body.Models,
+			Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
+				GlobalFallbackToCN: body.GlobalFallbackToCN,
+				ExpiresAt:          expiresAt, ExpiresAtSet: true,
+				Limits: limits, LimitsSet: len(body.Limits) > 0})
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		reply(w, 201, map[string]any{"ok": true, "entry": entry, "key": key})
+	})
+	mux.HandleFunc("PATCH /keys/{id}", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name               *string   `json:"name"`
+			Note               *string   `json:"note"`
+			Enabled            *bool     `json:"enabled"`
+			Models             *[]string `json:"models"`
+			ReasoningLoopGuard *bool     `json:"reasoning_loop_guard"`
+			GlobalFallbackToCN *bool     `json:"global_fallback_to_cn"`
+			// ExpiresAt 用 RawMessage 区分「没提这个字段」与「显式传 null」：
+			// 前者保持现状，后者表示改成无限制。
+			ExpiresAt json.RawMessage `json:"expires_at"`
+			Limits    json.RawMessage `json:"limits"`
+		}
+		if !readBody(w, r, &body) {
+			return
+		}
+		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil &&
+			body.ReasoningLoopGuard == nil && body.GlobalFallbackToCN == nil && len(body.ExpiresAt) == 0 && len(body.Limits) == 0 {
+			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
+			return
+		}
+		options := Options{ReasoningLoopGuard: body.ReasoningLoopGuard,
+			GlobalFallbackToCN: body.GlobalFallbackToCN}
+		if len(body.Limits) > 0 {
+			limits, err := parseLimits(body.Limits)
+			if err != nil {
+				replyError(w, err)
+				return
+			}
+			options.Limits, options.LimitsSet = limits, true
+		}
+		if len(body.ExpiresAt) > 0 {
+			if string(bytes.TrimSpace(body.ExpiresAt)) != "null" {
+				var raw string
+				if err := json.Unmarshal(body.ExpiresAt, &raw); err != nil {
+					replyError(w, ErrInvalidExpiry)
+					return
+				}
+				parsed, err := parseExpiry(&raw)
+				if err != nil {
+					replyError(w, err)
+					return
+				}
+				options.ExpiresAt = parsed
+			}
+			options.ExpiresAtSet = true
+		}
+		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models, options)
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		reply(w, 200, map[string]any{"ok": true, "entry": entry})
+	})
+	mux.HandleFunc("POST /keys/{id}/copy", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{}
+		if !readBody(w, r, &body) {
+			return
+		}
+		key, err := s.Secret(r.PathValue("id"))
+		if err != nil {
+			replyError(w, err)
+			return
+		}
+		reply(w, http.StatusOK, map[string]any{"ok": true, "key": key})
+	})
+	mux.HandleFunc("DELETE /keys/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.Delete(r.PathValue("id")); err != nil {
+			replyError(w, err)
+			return
+		}
+		reply(w, 200, map[string]any{"ok": true})
+	})
+	return mux
+}
+
+func readBody(w http.ResponseWriter, r *http.Request, out any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(out)
+	if err == nil {
+		var extra any
+		if decoder.Decode(&extra) != io.EOF {
+			err = errors.New("trailing JSON")
+		}
+	}
+	if err != nil {
+		reply(w, 400, map[string]any{"ok": false, "message": "请输入有效的密钥信息（请求体最多 8 KiB）"})
+		return false
+	}
+	return true
+}
+
+func replyError(w http.ResponseWriter, err error) {
+	code := 500
+	message := "保存密钥失败，请检查网关日志"
+	switch {
+	case errors.Is(err, ErrNotFound):
+		code = 404
+		message = err.Error()
+	case errors.Is(err, ErrInvalid):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrInvalidModels):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrBindingRealm):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrInvalidExpiry):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrLimit):
+		code = 409
+		message = err.Error()
+	case errors.Is(err, ErrInvalidLimits):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrSecretNotStored), errors.Is(err, ErrSecretUnavailable):
+		code = 409
+		message = err.Error()
+	default:
+		log.Printf("[密钥管理] 操作失败：%v", err)
+	}
+	reply(w, code, map[string]any{"ok": false, "message": message})
+}
+
+func reply(w http.ResponseWriter, code int, body any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// ErrSocketBusy 目标路径上已有正在服务的 socket（通常是上一个进程还没退出）。
+var ErrSocketBusy = errors.New("API key socket is already in use")
+
+func ListenUnix(path string) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, errors.New("API key socket path is not a socket")
+		}
+		conn, dialErr := net.DialTimeout("unix", path, 300*time.Millisecond)
+		if dialErr == nil {
+			// 探测用的连接：这里正要报「socket 已被占用」，关闭失败没有可做的补救。
+			_ = conn.Close()
+			return nil, ErrSocketBusy
+		}
+		// 陈旧 socket 先删再 bind。ENOENT 必须忽略：探测（dial 失败）与删除之间，
+		// 持有它的旧实例可能正好收尾自己删掉了这个文件——热更新期间这是常态，
+		// 不是错误。此前直接 return err，导致 WaitUnix 把一个「已经腾空」的路径
+		// 判成硬失败（CI 实测：wait: remove .../admin.sock: no such file or directory，
+		// TestWaitUnixTakesOverAfterRelease 0.30s 即失败）。
+		// 路径不存在时，下面的 net.Listen 本来就能成功——删除只是清理陈旧 inode，
+		// 不是前置条件。
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		// 权限收紧失败：下面要报的是这个错误，listener 顺手关掉即可。
+		_ = listener.Close()
+		return nil, err
+	}
+	return listener, nil
+}
+
+// WaitUnix 在 deadline 内轮询绑定 Unix socket。
+//
+// 热更新时新实例先于旧实例退出就启动，旧实例（v1.3.1 及更早）不会把管理 socket 交出来，
+// 只能等它收尾关闭监听、路径被释放后再绑。不能用同步等待替代：旧实例要等新实例报告
+// 就绪才开始收尾，同步等会直接卡到超时。
+func WaitUnix(path string, deadline, interval time.Duration) (net.Listener, error) {
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	end := time.Now().Add(deadline)
+	for {
+		listener, err := ListenUnix(path)
+		if err == nil {
+			return listener, nil
+		}
+		if !errors.Is(err, ErrSocketBusy) {
+			return nil, err
+		}
+		if time.Now().After(end) {
+			return nil, fmt.Errorf("admin socket still busy after %s: %w", deadline, err)
+		}
+		time.Sleep(interval)
+	}
+}

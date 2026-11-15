@@ -1,0 +1,302 @@
+// ═══ 更新日志 ═══
+// 2026-09-25：为账号池提供有界安全的调度事实 DTO，区分真实权重、成本观测和未执行的阶段。
+package pool
+
+import (
+	"math"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"workbuddy2api/internal/auth"
+)
+
+// Decision contains only facts about one actual selection, never credentials.
+// Counts are stage-local; fallback_* exclusions form a separate scan. Account
+// identifiers are printable UTF-8 display copies limited to 256 bytes.
+// WeightUnits/WeightTotal describe the actual fixed-point lottery, while Weight
+// can also be the ranking score of an LRU choice. CostPer1K is a fresh cached
+// per-model observation (EMA), not this request's charge or a guaranteed price.
+type Decision struct {
+	Mode                 string         `json:"mode"`
+	ReasonCode           string         `json:"reason_code"`
+	SelectionMethod      string         `json:"selection_method"`
+	BlockedBy            string         `json:"blocked_by,omitempty"`
+	ObservedAt           time.Time      `json:"observed_at"`
+	StageCounts          map[string]int `json:"stage_counts"`
+	ExcludedCounts       map[string]int `json:"excluded_counts"`
+	AccountID            string         `json:"account_id,omitempty"`
+	AccountRealm         string         `json:"account_realm,omitempty"`
+	AccountIDTruncated   bool           `json:"account_id_truncated,omitempty"`
+	BoundAccountID       string         `json:"bound_account_id,omitempty"`
+	Weight               *float64       `json:"weight,omitempty"`
+	WeightUnits          *int64         `json:"weight_units,omitempty"`
+	WeightTotal          *int64         `json:"weight_total,omitempty"`
+	CostState            string         `json:"cost_state,omitempty"`
+	CostPer1K            *float64       `json:"cost_per_1k,omitempty"`
+	CostObservedAt       *time.Time     `json:"cost_observed_at,omitempty"`
+	CostSamples          int            `json:"cost_samples,omitempty"`
+	CostUnknownReason    string         `json:"cost_unknown_reason,omitempty"`
+	CostUsedForSelection bool           `json:"cost_used_for_selection"`
+	FallbackKind         string         `json:"fallback_kind,omitempty"`
+	FallbackUntil        *time.Time     `json:"fallback_until,omitempty"`
+}
+
+// PickExcludingForRealmWithDecision selects exactly as PickExcludingForRealm,
+// recording facts under the same lock without an additional draw or re-score.
+// Selection does not reserve a concurrency slot; the caller must still Acquire.
+func (p *Pool) PickExcludingForRealmWithDecision(tried map[string]bool, model, realm string) (*auth.Auth, Decision) {
+	var decision Decision
+	account := p.pickWithDecision(tried, model, realm, &decision)
+	return account, decision
+}
+
+// PickByUIDForModelWithDecision is the observable form of the legacy sticky
+// lookup, retaining its no-realm-filter semantics.
+func (p *Pool) PickByUIDForModelWithDecision(uid, model string) (*auth.Auth, Decision) {
+	return p.PickByUIDForModelRealmWithDecision(uid, model, "")
+}
+
+// PickByUIDForModelRealmWithDecision checks a sticky target's realm before
+// selecting or marking it used; an empty realm retains the legacy behavior.
+func (p *Pool) PickByUIDForModelRealmWithDecision(uid, model, realm string) (*auth.Auth, Decision) {
+	var decision Decision
+	account := p.pickByUIDForModelRealm(uid, model, realm, &decision)
+	return account, decision
+}
+
+func (p *Pool) pickByUIDForModelRealm(uid, model, realm string, d *Decision) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		if d != nil {
+			d.begin("sticky", len(p.byUID), time.Now())
+			d.BoundAccountID, _ = boundedDecisionID(uid)
+			d.stage("evaluated", 1)
+			d.unavailableSticky("missing_account")
+		}
+		return nil
+	}
+	now := time.Now()
+	d.begin("sticky", len(p.byUID), now)
+	if d != nil {
+		d.BoundAccountID, _ = boundedDecisionID(uid)
+		d.stage("evaluated", 1)
+	}
+	if realm != "" && e.a.Realm() != realm {
+		d.unavailableSticky("realm_mismatch")
+		return nil
+	}
+	if reason := e.unavailableReason(now, model); reason != "" {
+		d.unavailableSticky(reason)
+		return nil
+	}
+	d.stage("healthy", 1)
+	// 快过期积分优先：付费模型上，若别的号有快过期积分而本号没有，粘性必须让路。
+	//
+	// 2026-11-04 用户决策（第二次改回，第一次是 2026-11-01 的 v3.15.1，被 v3.15.2
+	// 撤销后现场复发）：生产实测 9862 次决策里 9822 次是 sticky_hit，全池 5 个带
+	// 快过期积分的号一分没动，流量全压在同一个无快过期积分的号上（已花 2000+）。
+	// 粘性主导的负载下，「只在新建会话时优先」等于该特性根本不存在。
+	//
+	// 让路的代价是一次性的换号（handler 解绑后重选并重新绑定），之后会话稳定；
+	// 用户判断这比「快过期积分整批作废」便宜。
+	if p.expiringDeferred(e, model) {
+		if d != nil {
+			d.exclude("expiring_deferred")
+			d.ReasonCode, d.SelectionMethod = "expiring_deferred", "sticky"
+		}
+		return nil
+	}
+	if p.inFlightFull(e) {
+		d.unavailableSticky("in_flight_full")
+		return nil
+	}
+	d.stage("available", 1)
+	if d != nil {
+		d.ReasonCode, d.SelectionMethod = "sticky_hit", "sticky"
+		mc, known := e.modelCostOf(model, now)
+		d.selected(e, decisionCostOf(e, model, now, mc, known), false)
+	}
+	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
+	return e.a
+}
+
+func (d *Decision) begin(mode string, total int, now time.Time) {
+	if d == nil {
+		return
+	}
+	*d = Decision{
+		Mode: mode, ObservedAt: now.UTC(),
+		StageCounts:    map[string]int{"pool_total": total, "evaluated": 0, "healthy": 0, "available": 0},
+		ExcludedCounts: map[string]int{},
+	}
+}
+
+func (d *Decision) stage(key string, count int) {
+	if d != nil {
+		d.StageCounts[key] = count
+	}
+}
+
+func (d *Decision) increment(key string) {
+	if d != nil {
+		d.StageCounts[key]++
+	}
+}
+
+func (d *Decision) exclude(reason string) {
+	if d != nil {
+		d.ExcludedCounts[reason]++
+	}
+}
+
+func (d *Decision) unavailableSticky(reason string) {
+	if d != nil {
+		d.ReasonCode, d.SelectionMethod, d.BlockedBy = "sticky_unavailable", "none", reason
+		d.exclude(reason)
+	}
+}
+
+// This is the shared first-failure predicate for health and selection.
+// Model-level limits and credit exhaustion are the only account-side gates;
+// there is no account-wide rate-limit cooldown (see below).
+//
+// model 非空时，「余额不足」这类账号级硬冷却对**免费模型**豁免：余额耗尽的账号
+// 只是调不了扣积分的模型，免费模型（倍率 x0.00）照常可用——把整个账号从池里摘掉
+// 会让 7 个号白白闲置（2026-10-11 用户反馈：余额不足的号仍能用免费模型）。
+// 判定用的是注入的倍率表（见 modelIsPaid），未注入时该特性整体关闭、行为不变。
+//
+// ═══ 2026-10-18：取消账号级冷却 ═══
+//
+// 用户要求「不要账号冷却，只要模型冷却和积分不足」。此前 429 无重置时间的分支会写
+// 账号级 until（CooldownSoftRate 的有界退避），把整个号从池里摘掉；而 prod 实测
+// 30 个号**全部**是 CoolHard（积分不足）、没有一个真正的账号级 429 冷却——说明这层
+// 状态在实际使用中既没被用上，又会在命中时误伤其他模型。
+//
+// 现在账号只剩三类不可用原因：
+//   - disabled：账号被停用/需重登；
+//   - circuit_breaker：连续 5xx 的强故障信号（与限流无关，仍保留）；
+//   - model_cooldown：该模型被上游限流（唯一的限流维度）；
+// 外加「积分不足」只拦扣积分的模型（不是不可用，是这一层筛选）。
+// accountUsable 报告**账号本身**是否可用——只由账号级事实决定：
+// 未被停用，且熔断器未打开。
+//
+// 它与 unavailableReason 分层不同：后者回答「这个账号能不能服务**这个模型**」，
+// 因此还要叠加余额不足（只挡付费模型）与模型级限流。面板的「可用 / 不可用」
+// 与 /status 的 healthy 计数必须用本函数——账号没被停用、没在熔断就是可用的，
+// 积分只决定它此刻能调哪些模型（用户 2026-10-18：
+// 「可不可用是针对账号的，冷却和积分余额是模型使用方面的」）。
+func (e *entry) accountUsable(now time.Time) bool {
+	if e.disabled {
+		return false
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return false
+	}
+	return true
+}
+
+func (e *entry) unavailableReason(now time.Time, model string) string {
+	if e.disabled {
+		return "disabled"
+	}
+	// 积分不足（CoolHard）只拦扣积分的模型；免费模型不因余额被拦，但**仍要**继续
+	// 判熔断与模型冷却。早先这里在免费模型分支直接 return ""，会跳出整个函数，
+	// 把后面的 breaker / modelCooled 一并跳过——「余额不足 + 该模型又被 6004
+	// 限流」的账号于是在免费模型上被放行、直接撞上游 429。注释声称「继续往下判」，
+	// 代码却没做到（2026-10-18 由模型级隔离测试发现）。
+	//
+	// 注意：账号级 CoolSoft（429 软冷却）已取消，这里只判 CoolHard（积分不足）。
+	if !e.until.IsZero() && now.Before(e.until) && e.coolKind == CoolHard {
+		if e.p.hardCreditBlocksModel(e.a.Realm(), model) {
+			return "account_limit"
+		}
+		// 免费模型 + 余额不足：不返回，继续判熔断/模型冷却。
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return "circuit_breaker"
+	}
+	if e.modelCooled(now, model) {
+		return "model_cooldown"
+	}
+	return ""
+}
+
+type decisionCost struct {
+	state, unknownReason string
+	per1k                *float64
+	observedAt           *time.Time
+	samples              int
+}
+
+// Normal selection passes the very observation used to build the cost tier.
+// Sticky/fallback paths may inspect a cost for context, explicitly marked as
+// not used for selection; they do not calculate a weight or consume a draw.
+func decisionCostOf(e *entry, model string, now time.Time, mc modelCostEntry, known bool) decisionCost {
+	result := decisionCost{state: "unknown"}
+	if !known {
+		switch {
+		case model == "":
+			result.unknownReason = "model_unspecified"
+		case e.modelCost[model].LastSeen.IsZero():
+			result.unknownReason = "unobserved"
+		default:
+			result.unknownReason = "expired"
+		}
+		return result
+	}
+	if math.IsNaN(mc.CostPer1k) || math.IsInf(mc.CostPer1k, 0) {
+		result.unknownReason = "invalid_observation"
+		return result
+	}
+	price := mc.CostPer1k
+	if price <= 0 {
+		price, result.state = 0, "free"
+	} else {
+		result.state = "paid"
+	}
+	observed := mc.LastSeen.UTC()
+	result.per1k, result.observedAt, result.samples = &price, &observed, mc.Samples
+	return result
+}
+
+func (d *Decision) selected(e *entry, cost decisionCost, usedCost bool) {
+	if d == nil {
+		return
+	}
+	d.AccountID, d.AccountIDTruncated = boundedDecisionID(e.a.UID)
+	d.AccountRealm = e.a.Realm()
+	d.CostState, d.CostPer1K, d.CostObservedAt = cost.state, cost.per1k, cost.observedAt
+	d.CostSamples, d.CostUnknownReason, d.CostUsedForSelection = cost.samples, cost.unknownReason, usedCost
+}
+
+func (d *Decision) weight(value float64) {
+	if d != nil && !math.IsNaN(value) && !math.IsInf(value, 0) {
+		d.Weight = &value
+	}
+}
+
+func boundedDecisionID(value string) (string, bool) {
+	const maximum = 256
+	var result strings.Builder
+	result.Grow(min(len(value), maximum))
+	changed := false
+	for value != "" {
+		r, size := utf8.DecodeRuneInString(value)
+		value = value[size:]
+		if (r == utf8.RuneError && size == 1) || !unicode.IsPrint(r) {
+			r, changed = '?', true
+		}
+		if result.Len()+utf8.RuneLen(r) > maximum {
+			changed = true
+			break
+		}
+		result.WriteRune(r)
+	}
+	return result.String(), changed
+}

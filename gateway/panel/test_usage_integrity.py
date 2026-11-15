@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ═══ 更新日志 ═══
+# 2026-09-18：运行真实用量页函数核对日期筛选口径，防止按比例虚构模型明细或把历史总量显示成当日数据。
+# 2026-09-18：显式按 UTF-8 读取 Node 输出，保证 Windows 默认中文代码页下也能执行回归。
+# 2026-09-19：核对失败与未完整用量的日期汇总和可见说明，避免把未知消耗显示为已确认零值。
+
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import unittest
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is required for browser-function checks")
+class UsageIntegrityTests(unittest.TestCase):
+    def run_usage(self, expression):
+        source = Path(__file__).with_name("usage.js")
+        program = """
+const vm = require('vm'); const fs = require('fs');
+const nodes = {usageFilter:{innerHTML:''},usageTiles:{innerHTML:''},
+  usageCoverage:{textContent:'',classList:{toggle(){}}}};
+const context = {document:{addEventListener(){}}, Date, console,
+  $:s=>nodes[s.slice(1)] || null, esc:x=>String(x), exactTokens:x=>String(x)};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+console.log(JSON.stringify(vm.runInContext(process.argv[2], context)));
+"""
+        result = subprocess.run([shutil.which("node"), "-e", program, str(source), expression],
+                                capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_date_filter_does_not_invent_model_breakdowns(self):
+        result = self.run_usage("""US.from='2026-09-17';US.to='2026-09-17';
+usageModelsFor({totals:{total_tokens:200},days:[{day:'2026-09-17',totals:{total_tokens:100}}],
+models:[{model:'a',totals:{total_tokens:100}},{model:'b',totals:{total_tokens:100}}]})""")
+        self.assertEqual(result, [], "daily model data cannot be recovered by proportional scaling")
+
+    def test_date_filter_uses_daily_model_buckets_when_present(self):
+        # 2026-10-13 用户实测：勾选日期后「模型拆分」整列变成「—」点不动。账本新增
+        # 「天 × 模型」两维桶后，筛选态必须仍能给出该范围内的模型拆分。
+        result = self.run_usage("""US.from='2026-10-13';US.to='2026-10-13';
+usageModelsFor({totals:{total_tokens:9999},
+models:[{model:'lifetime-only',totals:{total_tokens:9999}}],
+days:[{day:'2026-10-13',totals:{total_tokens:300}}],
+day_models:[{day:'2026-10-13',models:[
+  {model:'cn:glm-5.3',totals:{total_tokens:200,credit:1.5}},
+  {model:'cn:hy3',totals:{total_tokens:100,credit:0}}]},
+ {day:'2026-10-12',models:[{model:'cn:glm-5.3',totals:{total_tokens:777,credit:9.9}}]}]})""")
+        self.assertEqual([m["model"] for m in result], ["cn:glm-5.3", "cn:hy3"])
+        self.assertEqual(result[0]["totals"]["total_tokens"], 200)
+        self.assertEqual(result[0]["totals"]["credit"], 1.5)
+        self.assertNotIn("lifetime-only", [m["model"] for m in result],
+                         "筛选态不得混入全时段的模型明细")
+
+    def test_date_filter_sums_models_across_selected_days(self):
+        result = self.run_usage("""US.from='2026-10-12';US.to='2026-10-13';
+usageModelsFor({totals:{},models:[],days:[],
+day_models:[{day:'2026-10-13',models:[{model:'cn:glm-5.3',totals:{total_tokens:200,credit:1.5}}]},
+ {day:'2026-10-12',models:[{model:'cn:glm-5.3',totals:{total_tokens:100,credit:0.5}},
+                            {model:'cn:hy3',totals:{total_tokens:50,credit:0}}]},
+ {day:'2026-10-01',models:[{model:'cn:glm-5.3',totals:{total_tokens:5000,credit:99}}]}]})""")
+        byModel = {m["model"]: m["totals"] for m in result}
+        self.assertEqual(byModel["cn:glm-5.3"]["total_tokens"], 300)
+        self.assertEqual(byModel["cn:glm-5.3"]["credit"], 2.0)
+        self.assertEqual(byModel["cn:hy3"]["total_tokens"], 50)
+        self.assertEqual(len(result), 2, "范围外的天不得计入")
+
+    def test_date_filter_reports_missing_credit_as_unknown_not_zero(self):
+        # 缺失 ≠ 0：某天没观测到 credit 时，合计不能显示成「免费」。
+        result = self.run_usage("""US.from='2026-10-13';US.to='2026-10-13';
+usageModelsFor({totals:{},models:[],days:[],
+day_models:[{day:'2026-10-13',models:[{model:'cn:glm-5.3',totals:{total_tokens:100}}]}]})""")
+        self.assertNotIn("credit", result[0]["totals"], "缺观测时不应给出 0 积分")
+
+    def test_no_daily_history_means_no_data_for_selected_day(self):
+        result = self.run_usage("US.from='2026-09-17';US.to='2026-09-17';usageTotalsForScope({totals:{requests:200,total_tokens:9999},days:[]})")
+        self.assertEqual(result.get("requests"), 0)
+        self.assertEqual(result.get("total_tokens"), 0)
+
+    def test_all_time_button_uses_all_time_total(self):
+        result = self.run_usage("renderUsageFilter([{day:'2026-09-17',totals:{requests:5}}],200);$('#usageFilter').innerHTML")
+        self.assertIn("全部<i>200 次</i>", result)
+
+    def test_valid_daily_and_unfiltered_totals_remain_exact(self):
+        result = self.run_usage("""var item={totals:{requests:200},days:[{day:'2026-09-17',totals:{requests:3}},{day:'2026-09-18',totals:{requests:5}}]};
+US.from='2026-09-17';US.to='2026-09-17';var a=usageTotalsFor(item).requests;US.from='';US.to='';[a,usageTotalsFor(item).requests]""")
+        self.assertEqual(result, [3, 200])
+
+    def test_date_filter_preserves_failed_and_unreported_counts(self):
+        result = self.run_usage("""US.from='2026-09-19';US.to='2026-09-19';
+usageTotalsForScope({days:[{day:'2026-09-18',totals:{requests:9,failed_requests:8,unreported_requests:7}},
+{day:'2026-09-19',totals:{requests:3,failed_requests:2,unreported_requests:1}}]})""")
+        self.assertEqual(result.get("requests"), 3)
+        self.assertEqual(result.get("failed_requests"), 2)
+        self.assertEqual(result.get("unreported_requests"), 1)
+
+    def test_unknown_usage_is_visible_without_inventing_tokens(self):
+        result = self.run_usage("""renderUsageTiles({requests:2,failed_requests:1,unreported_requests:1,
+prompt_tokens:5000,cached_tokens:4096,completion_tokens:120,total_tokens:5120});
+({html:$('#usageTiles').innerHTML,note:$('#usageCoverage').textContent})""")
+        self.assertIn("失败或中断", result["html"])
+        self.assertIn("用量未完整返回", result["html"])
+        self.assertIn("5,120 tokens", result["html"])
+        self.assertIn("1 次", result["note"])
+        self.assertNotIn("成功完成的调用", result["html"])
+
+    def test_complete_usage_clears_an_earlier_incomplete_notice(self):
+        result = self.run_usage("""renderUsageTiles({requests:1,unreported_requests:1});
+var previous=$('#usageCoverage').textContent;renderUsageTiles({requests:1,unreported_requests:0});
+({previous:previous,current:$('#usageCoverage').textContent})""")
+        self.assertTrue(result["previous"])
+        self.assertEqual(result["current"], "")
+
+
+if __name__ == "__main__":
+    unittest.main()

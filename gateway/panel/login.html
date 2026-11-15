@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>登录 · workbuddy2api</title>
+<style>
+/* 2026-09-20：登录页跟随 new-api 面板规范——azure 主色、14px 卡片圆角、10px 控件圆角。 */
+:root{
+  --line:#e8e8e8; --line2:#d4d4d4; --bg:#f7f8fa; --surface:#fff; --surface2:#fafafa;
+  --text:#0a0a0a; --text2:#5c5c5c; --text3:#8f8f8f; --accent:#3ea4ec; --accent-2:#2b8fd6;
+  --accent-soft:rgba(62,164,236,.10);
+  --err:#e7000b; --err-soft:rgba(231,0,11,.09); --ok:#009966;
+  --r:14px; --r2:10px; --r3:6px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+html[data-theme=dark]{
+  --line:rgba(255,255,255,.10); --line2:rgba(255,255,255,.18); --bg:#1e1e1e;
+  --surface:#2a2a2a; --surface2:#2f2f2f;
+  --text:#f3f3f3; --text2:#b7b7b7; --text3:#8a8a8a; --accent:#3f9ce0; --accent-2:#5aaeea;
+  --accent-soft:rgba(63,156,224,.16);
+  --err:#ff6467; --err-soft:rgba(255,100,103,.14); --ok:#00bc7d;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:400 14px/1.55 var(--font);-webkit-font-smoothing:antialiased;display:grid;place-items:center;padding:24px}
+.card{width:100%;max-width:392px;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--r);box-shadow:0 8px 28px rgba(10,10,10,.10)}
+.head{display:flex;align-items:center;gap:11px;padding:22px 24px 18px;border-bottom:1px solid var(--line)}
+.mark{width:32px;height:32px;flex:none;border-radius:9px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-size:11px;font-weight:700;letter-spacing:.02em}
+.title{font-size:15.5px;font-weight:600;line-height:1.25;letter-spacing:-.011em}
+.sub{font-size:12px;color:var(--text3);line-height:1.35}
+form{padding:22px 24px 20px;margin:0}
+label{display:block;margin-bottom:15px}
+label .k{display:block;font-size:12px;color:var(--text2);margin-bottom:6px}
+input{width:100%;height:38px;padding:0 12px;border:1px solid var(--line2);border-radius:var(--r2);
+  background:var(--surface);color:var(--text);font:13.5px/1 var(--font);outline:none;
+  transition:border-color .12s ease,box-shadow .12s ease}
+.pw{position:relative;display:block}
+.pw input{padding-right:38px}
+.eye{position:absolute;right:0;top:50%;transform:translateY(-50%);width:34px;height:32px;margin:0;
+  display:grid;place-items:center;background:none;border:0;color:var(--text3);cursor:pointer}
+.eye:hover{color:var(--text2)}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+input::placeholder{color:var(--text3)}
+button{width:100%;height:40px;margin-top:4px;border:0;border-radius:var(--r2);background:var(--accent);
+  color:#fff;font:600 13.5px/1 var(--font);cursor:pointer;transition:background .12s ease}
+button:hover{background:var(--accent-2)}
+button[disabled]{opacity:.6;cursor:default}
+.msg{display:none;align-items:flex-start;gap:9px;margin-bottom:14px;padding:11px 13px;border-radius:var(--r2);
+  border:1px solid var(--err);background:var(--err-soft);color:var(--err);font-size:13px}
+.msg.on{display:flex}
+.foot{padding:14px 24px;border-top:1px solid var(--line);display:flex;align-items:center;
+  justify-content:space-between;gap:10px;font-size:12px;color:var(--text3)}
+.foot code{font-family:var(--mono);font-size:12px}
+.themebtn{background:none;border:0;color:var(--text3);cursor:pointer;width:auto;height:auto;margin:0;
+  font:inherit;font-size:11.5px;padding:0}
+.themebtn:hover{color:var(--text2)}
+.spin{width:12px;height:12px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;
+  border-radius:50%;display:inline-block;vertical-align:-2px;margin-right:7px;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div class="mark">WB</div>
+    <div>
+      <div class="title">workbuddy2api</div>
+      <div class="sub">管理台登录</div>
+    </div>
+  </div>
+  <form id="f" autocomplete="on">
+    <div class="msg" id="msg"><span id="msgText"></span></div>
+    <label>
+      <span class="k">用户名</span>
+      <input id="u" name="username" autocomplete="username" spellcheck="false" autofocus>
+    </label>
+    <label>
+      <span class="k">密码</span>
+      <span class="pw">
+        <input id="p" name="password" type="password" autocomplete="current-password">
+        <button class="eye" id="eye" type="button" aria-label="显示密码" title="显示密码">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 12S5.8 5.4 12 5.4 21.8 12 21.8 12 18.2 18.6 12 18.6 2.2 12 2.2 12Z"/><circle cx="12" cy="12" r="2.7"/></svg>
+        </button>
+      </span>
+    </label>
+    <button id="go" type="submit">登录</button>
+  </form>
+  <div class="foot">
+    <span id="hint">会话有效期 30 天</span>
+    <button class="themebtn" id="theme" type="button">切换主题</button>
+  </div>
+</div>
+<script>
+"use strict";
+var $ = function(s){ return document.querySelector(s); };
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  try{ localStorage.setItem('wb2a-theme', t); }catch(e){}
+}
+(function(){
+  var t = 'light';
+  try{ var v = localStorage.getItem('wb2a-theme'); if (v) t = v; }catch(e){}
+  setTheme(t);
+})();
+$('#theme').addEventListener('click', function(){
+  setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+$('#eye').addEventListener('click', function(){
+  var p = $('#p'), on = p.type === 'password';
+  p.type = on ? 'text' : 'password';
+  this.setAttribute('aria-label', on ? '隐藏密码' : '显示密码');
+  this.setAttribute('title', on ? '隐藏密码' : '显示密码');
+  p.focus();
+});
+function show(text){
+  $('#msgText').textContent = text;
+  $('#msg').classList.add('on');
+}
+$('#f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var go = $('#go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin"></span>登录中';
+  $('#msg').classList.remove('on');
+  try{
+    var r = await fetch('api/auth/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Request':'1'},
+      cache:'no-store',
+      body: JSON.stringify({ username: $('#u').value, password: $('#p').value })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if (r.ok && d.ok){ location.replace('./'); return; }
+    show(d.message || ('登录失败（HTTP ' + r.status + '）'));
+    $('#p').value = '';
+    $('#p').focus();
+  }catch(err){
+    show('无法连接面板：' + (err && err.message || err));
+  }finally{
+    go.disabled = false;
+    go.textContent = '登录';
+  }
+});
+</script>
+</body>
+</html>

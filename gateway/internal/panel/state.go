@@ -1,0 +1,404 @@
+// ═══ 更新日志 ═══
+// 2026-10-13：初版——/api/state 的数据组装（与 panel/app.py 的 build_state 同口径）。
+//
+// 这个接口是面板首屏的唯一数据源：账号列表（含文件层的启停状态 + 账号池的冷却/熔断
+// 台账 + 积分）与全局池统计。三份数据来自三个不同的来源，必须在这里对齐：
+//
+//   - 账号文件（本机 auths 目录）——事实来源是「有哪些账号、文件是否被停用」；
+//   - 网关 /status——事实来源是「账号池认为它现在能不能用」；
+//   - ./credit——事实来源是「它还剩多少积分」。
+//
+// 三者是**独立**的状态，不能互相推导：文件启用不代表池里没被停用（上游封禁是池级
+// 状态），池里健康不代表积分没到期。面板把它们并排显示，让运维看到全貌。
+package panel
+
+import (
+	"context"
+	"strings"
+)
+
+// PoolState 是账号在网关账号池里的状态（对应 /status 的 accounts[] 条目）。
+type PoolState struct {
+	InPool         bool   `json:"inPool"`
+	Healthy        bool   `json:"healthy"`
+	Cooling        bool   `json:"cooling"`
+	Until          any    `json:"until"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabledReason"`
+	InFlight       any    `json:"inFlight"`
+	BreakerFails   any    `json:"breakerFails"`
+	LastSuccess    any    `json:"lastSuccess"`
+	LastErr        any    `json:"lastErr"`
+	// 冷却台账：面板据此显示「为什么冷却、还剩多久」，而不是把凭证有效期的
+	// 「剩 N 天」摆在「冷却中」旁边（用户反馈：看起来像冷却要等 363 天）。
+	CoolRemaining any    `json:"coolRemaining"`
+	CoolKind      string `json:"coolKind"`
+	Reason        string `json:"reason"`
+	// CreditsExhausted：余额耗尽（CoolHard），**不是冷却**。上游没有限制这个号，
+	// 只是积分花完，免费模型照常可用。面板据此显示「余额不足」而不是「冷却中」——
+	// 2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，只是没有
+	// 积分余额而已」。见 pool.Status.CreditsExhausted。
+	CreditsExhausted bool `json:"creditsExhausted"`
+	// FreeModelsUsable：该号的冷却只挡扣积分的模型，免费模型照常可用（仅余额不足
+	// 成立）。面板据此把这一行显示成「余额不足（免费模型可用）」，而不是与真正的
+	// 429 冷却混为一谈——2026-10-15 用户反馈「积分不足的号可以用免费模型，但你直接
+	// 冷却了，后续怎么用他的免费额度」。
+	FreeModelsUsable bool `json:"freeModelsUsable"`
+	SuccessCount     any  `json:"successCount"`
+	ErrTotal         any  `json:"errTotal"`
+	// RateLimitedModels 模型级限流台账（6004/11102）：每模型一行（模型、until、
+	// 上游原始 reset_at、原因）。
+	//
+	// 2026-10-15 补：网关 /status 早就有这个字段（pool.RateLimitedModel），但面板的
+	// PoolState 没有它——组装 StatePayload 时被丢掉，前端账号页永远看不到「哪个模型
+	// 被限流、到几点解除」。用户实测截图反馈：15 个号同时在模型级冷却里，账号页却
+	// 一个都不显示，看起来像「随机 503」。
+	RateLimitedModels []RateLimitedModel `json:"rateLimitedModels,omitempty"`
+}
+
+// modelLimitKind 把模型级台账条目的 reason 归成两类，供面板分别措辞。
+//
+// 判定按 reason 前缀，因为网关侧写入时就是这两个常量：
+// pool.BlockModelBackoff(..., upstream.ModelBlockReason) → "11102 model not available"；
+// 其余（6004 / 429 / 404 / account fault）都是真正的限流或短避让。
+//
+// 刻意不判 until：两类条目都有 until，语义差别在 reason 里。
+func modelLimitKind(reason string) string {
+	if strings.HasPrefix(reason, "11102") {
+		return "unavailable"
+	}
+	return "rate"
+}
+
+// RateLimitedModel 与网关 /status 的 accounts[].rate_limited_models[] 同构
+// （internal/pool.RateLimitedModel 的 JSON 形态）。
+type RateLimitedModel struct {
+	Model   string `json:"model"`
+	Until   any    `json:"until,omitempty"`
+	ResetAt any    `json:"reset_at,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	// Kind 把两类完全不同的「模型级避让」分开，供面板用不同措辞展示。
+	//
+	// 2026-10-18：用户看到 CN 账号下每个模型各列一行「模型限流 … 解除 22:53」，
+	// 问「为什么 cn 全列出来了」。根因不是记录错了——实测那批模型对**全部** 6 个
+	// CN 账号都返回 11102「service info not found」，是模型本身在当前上游不存在，
+	// 网关按 (账号,模型) 负缓存避让是对的。错的是展示：11102 被当成「限流」，
+	// 还配了一个由本地指数退避推算出来的「解除时间」，读起来像「等到 22:53 就能用」，
+	// 实际上到点重试仍然 11102。
+	//
+	//   "rate"     —— 上游限流（6004/429），until 有真实语义，到点确实可能恢复；
+	//   "unavailable" —— 11102「该后端无此模型」，until 只是本地退避窗口，
+	//                    语义是「这段时间别白试」，不是「到点就能用」。
+	Kind string `json:"kind,omitempty"`
+}
+
+// CreditState 是账号的积分信息。
+type CreditState struct {
+	// Supported 恒为 true：WorkBuddy 走 billing/meter、Trae 走 pay API，两者都能查
+	// （./credit 按域分流）。这里保留字段是为了前端不必改结构。
+	Supported           bool  `json:"supported"`
+	Remain              any   `json:"remain"`
+	Size                any   `json:"size"`
+	Used                any   `json:"used"`
+	Packages            any   `json:"packages"`
+	OK                  any   `json:"ok"`
+	Error               any   `json:"error"`
+	Expiring            int64 `json:"expiring"`
+	Expiry              any   `json:"expiry"`
+	ExpiringWindowHours int64 `json:"expiringWindowHours"`
+}
+
+// AccountState 是面板账号行（auth_summary + pool + credits）。
+type AccountState struct {
+	AuthSummary
+	Pool    PoolState   `json:"pool"`
+	Credits CreditState `json:"credits"`
+}
+
+// PoolTotals 是全局池统计（直接透传网关 /status 的 pool 段）。
+type PoolTotals struct {
+	Total any `json:"total"`
+	Healthy any `json:"healthy"`
+	Cooling any `json:"cooling"`
+	// CreditsExhausted 余额不足的账号数——**不算冷却**（见 pool.Status.CreditsExhausted）。
+	CreditsExhausted any `json:"creditsExhausted"`
+	Disabled       any `json:"disabled"`
+	InFlightFull   any `json:"inFlightFull"`
+	RealmTotals    any `json:"realmTotals"`
+	StickySessions any `json:"stickySessions"`
+}
+
+// StatePayload 是 /api/state 的响应体。
+type StatePayload struct {
+	Service        string         `json:"service"`
+	Version        string         `json:"version"`
+	PanelVersion   string         `json:"panelVersion"`
+	ContainerRun   bool           `json:"containerRunning"`
+	Accounts       []AccountState `json:"accounts"`
+	Pool           PoolTotals     `json:"pool"`
+	CreditTotals   any            `json:"creditTotals"`
+	CreditError    any            `json:"creditError"`
+	CreditPending  bool           `json:"creditPending"`
+	PendingRestart bool           `json:"pendingRestart"`
+	// APIKey 恒为空串：面板**不**把调用密钥回传给前端（它是可分发的凭证，
+	// 回显等于把它发给任何能打开面板的人）。保留字段是为了前端不必改结构。
+	APIKey         string `json:"apiKey"`
+	APIKeysManaged bool   `json:"apiKeysManaged"`
+	// LAN 局域网访问状态（2026-10-15）：enabled/listen/allow_cidrs/has_key，
+	// 系统页「局域网访问」卡渲染用。has_key 只说「有没有」，不回传密钥本身。
+	LAN LANState `json:"lan"`
+}
+
+// LANState 是局域网访问开关的当前状态。
+type LANState struct {
+	Enabled    bool   `json:"enabled"`
+	Listen     string `json:"listen"`
+	AllowCIDRs string `json:"allow_cidrs"`
+	HasKey     bool   `json:"has_key"`
+}
+
+// PanelVersion 是面板自身的版本号。报给前端的 version 字段用**网关**版本
+// （面板随网关一起打包，用户看到的应该是网关版本），本值另用 panelVersion 字段，
+// 两者不一致时前端可同时显示——2026-10-10 实测：网关已到 v2.6.19、面板仍显示
+// v2.4.17，用户以为没更新成功。
+const PanelVersion = "2.5.0"
+
+// StateBuilder 组装 /api/state。
+type StateBuilder struct {
+	Store     *AccountStore
+	Gateway   *GatewayClient
+	Credits   *CreditCache
+	Runner    Runner
+	Container string
+	// ConfigPath 是网关 config.json 路径：局域网访问状态（listen/admin_allow_cidrs/
+	// api_key 存在性）从它读，见 lanStateOf。
+	ConfigPath string
+}
+
+// Build 生成首屏状态。forceCredit=true 时等待一次新积分查询。
+func (b *StateBuilder) Build(ctx context.Context, forceCredit bool) StatePayload {
+	pool := b.Gateway.Get(ctx, "/status")
+	poolByUID := map[string]map[string]any{}
+	if accounts, ok := pool["accounts"].([]any); ok {
+		for _, item := range accounts {
+			account, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if uid := jsonString(account["uid"]); uid != "" {
+				poolByUID[uid] = account
+			}
+		}
+	}
+	// 网关版本从 /healthz 取，而不是复用面板自己的 PanelVersion：面板是随网关一起
+	// 打包的，但两个版本号各自维护，长期不动的那个必然漂移。
+	health := b.Gateway.Get(ctx, "/healthz")
+	gatewayVersion := jsonString(health["version"])
+
+	creditRaw := b.Credits.Get(ctx, forceCredit)
+	credByUID, _ := CreditsByUID(creditRaw)
+	creditPending := jsonBool(creditRaw["pending"], false)
+
+	accounts := []AccountState{}
+	for _, entry := range b.Store.List() {
+		summary := Summary(entry)
+		poolEntry := poolByUID[summary.UID]
+		creditEntry := credByUID[summary.UID]
+		row := AccountState{AuthSummary: summary}
+		row.Pool = poolStateFrom(poolEntry)
+		row.Credits = creditStateFrom(creditEntry, poolEntry)
+		accounts = append(accounts, row)
+	}
+
+	// 「有文件被停用、但账号还在池里」= 改动尚未生效，提示用户重启。
+	changed := []string{}
+	for _, account := range accounts {
+		if account.Disabled && account.Pool.InPool {
+			changed = append(changed, account.UID)
+		}
+	}
+
+	return StatePayload{
+		Service:        "wb2api-admin",
+		Version:        firstNonEmpty(gatewayVersion, PanelVersion),
+		PanelVersion:   PanelVersion,
+		ContainerRun:   b.containerRunning(ctx),
+		Accounts:       accounts,
+		Pool:           poolTotalsFrom(pool),
+		CreditTotals:   creditRaw["total"],
+		CreditError:    creditRaw["error"],
+		CreditPending:  creditPending,
+		PendingRestart: len(changed) > 0,
+		APIKey:         "",
+		APIKeysManaged: b.Gateway.Management != nil && b.Gateway.Management.ManagementEnabled(),
+		LAN:            lanStateOf(b.Gateway, b.ConfigPath),
+	}
+}
+
+// lanStateOf 组装局域网访问状态。has_key 判定与 SetLANAccess 的闸门口径一致：
+// api_key 非空，或密钥库文件存在（面板密钥页建的第一把密钥就落它）。
+func lanStateOf(gateway *GatewayClient, configPath string) LANState {
+	enabled, cidrs := LANAccessState(configPath)
+	listen := configString(configPath, "listen")
+	if listen == "" {
+		listen = "127.0.0.1:7863"
+	}
+	hasKey := configString(configPath, "api_key") != ""
+	if !hasKey {
+		if keysFile := configString(configPath, "api_keys_file"); keysFile != "" {
+			hasKey = fileExists(keysFile)
+		}
+	}
+	return LANState{Enabled: enabled, Listen: listen, AllowCIDRs: cidrs, HasKey: hasKey}
+}
+
+// containerRunning 判断网关是否在跑。
+//
+// 原生模式（桌面/安卓）下没有容器可 inspect：判据改成「网关的 HTTP 接口有没有响应」。
+// 不能只看管理 socket——面板本身就是被网关托管的，socket 通了只说明网关进程活着，
+// 而这里要回答的是「服务能不能用」。
+//
+// 实现放在 gatewayServing（见 actions.go），与「添加账号」等操作走**同一个判据**。
+// 两处各写一份时它们会不一致：2026-10-13 真机实测，状态显示「运行中」而添加账号
+// 报「容器未运行」——同一件事两个答案，用户完全无从判断该信哪个。
+func (b *StateBuilder) containerRunning(ctx context.Context) bool {
+	return gatewayServing(ctx, b.Gateway)
+}
+
+// gatewayServing 网关是否在服务：看它回的 service 字段是不是自己。
+//
+// **任何 HTTP 状态码都算连通**——/healthz 在零账号时返回 503，那是「服务活着、只是
+// 池里还没有可服务的号」，正是刚装好还没加号时的正常状态。只认 200 会把首次使用
+// 卡死（v2.15.0 的修复就是为此，v2.16.1 又补了 503 被丢掉响应体的问题）。
+func gatewayServing(ctx context.Context, client *GatewayClient) bool {
+	if client == nil {
+		return false
+	}
+	health := client.Get(ctx, "/healthz")
+	return jsonString(health["service"]) == "workbuddy2api"
+}
+
+func poolStateFrom(entry map[string]any) PoolState {
+	state := PoolState{
+		InPool:         len(entry) > 0,
+		Cooling:        jsonBool(entry["cooling"], false),
+		Disabled:       jsonBool(entry["disabled"], false),
+		DisabledReason: jsonString(entry["disabled_reason"]),
+		Until:          entry["until"],
+		InFlight:       orZero(entry["in_flight"]),
+		BreakerFails:   orZero(entry["breaker_fails"]),
+		LastSuccess:    entry["last_success"],
+		LastErr:        entry["last_err"],
+		CoolRemaining:  orZero(entry["cool_remaining_sec"]),
+		CoolKind:       jsonString(entry["cool_kind"]),
+		Reason:         jsonString(entry["reason"]),
+		// 余额不足（CoolHard）不是冷却：上游没限流这个号，只是没积分。
+		// 见 pool.Status.CreditsExhausted。
+		CreditsExhausted: jsonBool(entry["credits_exhausted"], false),
+		// 余额不足但免费模型可用（见 pool.Status.FreeModelsUsable）。
+		FreeModelsUsable: jsonBool(entry["free_models_usable"], false),
+		SuccessCount:     orZero(entry["success_count"]),
+		ErrTotal:         orZero(entry["err_total"]),
+	}
+	// 模型级限流台账（6004/11102）：原样透传每模型的 until / reset_at / reason。
+	// 网关侧已过滤掉到期条目，这里不再判有效期（少一层口径分叉）。
+	if raw, ok := entry["rate_limited_models"].([]any); ok && len(raw) > 0 {
+		models := make([]RateLimitedModel, 0, len(raw))
+		for _, item := range raw {
+			row, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			reason := jsonString(row["reason"])
+			models = append(models, RateLimitedModel{
+				Model:   jsonString(row["model"]),
+				Until:   row["until"],
+				ResetAt: row["reset_at"],
+				Reason:  reason,
+				Kind:    modelLimitKind(reason),
+			})
+		}
+		if len(models) > 0 {
+			state.RateLimitedModels = models
+		}
+	}
+	// healthy = 在池里 且 没冷却 且 没被池级停用。
+	//
+	// 2026-10-18 口径：余额不足（CreditsExhausted）**不影响**这里。账号是否可用
+	// 只由「是否被停用 / 是否熔断」决定；积分余额与模型冷却属于「这个号此刻能调
+	// 哪些模型」，是模型使用层面的事（用户：「可不可用是针对账号的，冷却和积分余额
+	// 是模型使用方面的」）。面板会把余额不足作为该行的一个标记显示，而不是把它
+	// 算进「不可用」。
+	state.Healthy = state.InPool && !state.Cooling && !state.Disabled
+	return state
+}
+
+func creditStateFrom(credit, pool map[string]any) CreditState {
+	// 快过期积分子集（remain 的一部分）。来源优先级：
+	//   1) ./credit 的 expiring（本次查询时按 WB2A_EXPIRING_SOON 现算，全账号都有）；
+	//   2) 网关 /status 的 credits_expiring（签到任务写的，只覆盖 CN 号且最长滞后 12h）。
+	// 取较大者：两者口径同源（同一上游字段、同一窗口），差异只来自数据新鲜度；
+	// 取大不会漏报「要作废了」，符合这个提示的用途（宁可多提醒，不可漏）。
+	expiring := jsonInt64(credit["expiring"])
+	if fromPool := jsonInt64(pool["credits_expiring"]); fromPool > expiring {
+		expiring = fromPool
+	}
+	return CreditState{
+		Supported:           true,
+		Remain:              credit["remain"],
+		Size:                credit["size"],
+		Used:                credit["used"],
+		Packages:            credit["packages"],
+		OK:                  credit["ok"],
+		Error:               credit["error"],
+		Expiring:            expiring,
+		Expiry:              credit["expiry"],
+		ExpiringWindowHours: jsonInt64(credit["expiring_window_hours"]),
+	}
+}
+
+// poolTotalsFrom 从网关 /status 的响应里取「账号池」汇总。
+//
+// ⚠️ 2026-10-14 修：此前取的是 pool["pool"]（一个**嵌套**对象），但 /status 实际
+// 返回的是**顶层扁平**结构——total / healthy / cooling / disabled / in_flight_full /
+// realm_totals / sticky_sessions 全在最外层，根本没有 "pool" 键。于是这里全部取到
+// nil，前端判据 `pool.total != null` 不成立，账号池卡片永远停在「正在读取…」。
+//
+// 兼容两种形态：优先读嵌套（旧 Python 面板 / 未来若改成嵌套），缺失时回落顶层。
+// 不假设只有一种，是因为面板与网关可以各自独立升级。
+func poolTotalsFrom(pool map[string]any) PoolTotals {
+	section := jsonObject(pool["pool"])
+	pick := func(key string) any {
+		if v, ok := section[key]; ok && v != nil {
+			return v
+		}
+		return pool[key]
+	}
+	return PoolTotals{
+		Total:            pick("total"),
+		Healthy:          pick("healthy"),
+		Cooling:          pick("cooling"),
+		CreditsExhausted: pick("credits_exhausted"),
+		Disabled:         pick("disabled"),
+		InFlightFull:     pick("in_flight_full"),
+		RealmTotals:      pick("realm_totals"),
+		StickySessions:   pick("sticky_sessions"),
+	}
+}
+
+// orZero 把缺失的数值字段补成 0（前端会直接做算术，undefined 会变成 NaN）。
+func orZero(value any) any {
+	if value == nil {
+		return 0
+	}
+	return value
+}
+
+// jsonInt64 取整数值；取不到返回 0。
+func jsonInt64(value any) int64 {
+	number, ok := jsonNumber(value)
+	if !ok {
+		return 0
+	}
+	return int64(number)
+}

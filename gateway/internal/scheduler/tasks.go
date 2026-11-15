@@ -1,0 +1,419 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：手动任务复用可取消生命周期，并计入关停等待，停止后拒绝新任务。
+// 2026-09-15: 新增。排程任务自省 + 手动触发：供 /tasks 端点与账户管理面板读取各类任务的
+//   小时 / 开关 / 下次运行 / 上次完成 / 是否在跑，并可按 key 手动触发任意一类。
+//   互斥复用 dispatch 的 beginTask/endTask，手动触发与定时点不会重复打上游。
+
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"log"
+	"time"
+)
+
+// TaskKey 九类排程任务的稳定对外标识。这是契约：/tasks 端点与管理面板按它寻址，
+// 不要随内部 taskKind 的枚举顺序变动（内部顺序属于实现细节，可直接重排）。
+type TaskKey string
+
+const (
+	TaskKeyCheckin   TaskKey = "checkin"    // 签到 + 余额查询解冻
+	TaskKeyTraeCheck TaskKey = "trae_check" // Trae 域签到（独立站点，独立排程）
+	TaskKeyTravel    TaskKey = "travel"     // 猫猫旅行：领养 / 派出 / 领奖
+	TaskKeyActivity  TaskKey = "activity"   // 活跃上报：连登天数 + 领猫前置
+	TaskKeyKeepalive TaskKey = "keepalive"  // token 保活
+	TaskKeySchool    TaskKey = "school"     // 开学季任务
+	TaskKeyCat       TaskKey = "cat"        // 夜猫子任务
+	TaskKeyGrowth    TaskKey = "growth"     // 成长中心流水线（旅行/任务奖/补登/兑换/抽奖/Buddy盲盒）
+	TaskKeyBalance   TaskKey = "balance"    // 余额刷新（纯读；快过期优先消耗的数据来源）
+	// TaskKeyRunner 成长任务点亮（scripts/task_runner.py ALL --yes）。
+	//
+	// 与 growth 的区别：growth 只领「真完成」的任务，runner 负责把能伪造的
+	// 16 种任务做成 completed（画布/模板/专家/技能/皮肤/资料库…）。两者是
+	// 「先点亮、再领奖」的顺序关系，排程小时必须错开。
+	TaskKeyRunner TaskKey = "runner"
+	// TaskKeyCompensation 补偿积分领取（**一次性任务**，无排程小时）。
+	// 限时活动，到期即无；面板以「跑一次」提供，不进定时候选。
+	TaskKeyCompensation TaskKey = "compensation"
+)
+
+// ErrUnknownTask 未知任务 key；ErrTaskBusy 该任务当前正在执行。
+var (
+	ErrUnknownTask      = errors.New("unknown task key")
+	ErrTaskBusy         = errors.New("task is already running")
+	ErrSchedulerStopped = errors.New("scheduler is stopping")
+)
+
+// TaskInfo 单类任务的对外快照。时间字段用指针：JSON 里 null 表达"从未运行过 / 已禁用无排程"，
+// 与"1970 年"这类哨兵值区分开，前端不必猜。
+type TaskInfo struct {
+	Key    string `json:"key"`
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
+	// Realms 该任务作用于哪些账号域。面板据此**按区域分类**展示任务——
+	// 2026-10-11 用户要求「任务点按照实际账号区域分类」。
+	//
+	// 值必须与任务实现里真实作用的域一致，不能按名字猜：
+	//   - checkin 现在同时覆盖 cn/global（WorkBuddy 端点）与 trae（Trae 自己的端点），
+	//     所以是三个域；其余任务只走 WorkBuddy 端点，trae 账号在调度里被跳过。
+	// 改任务实现时**必须同步改这里**，否则面板会把任务归错组。
+	Realms  []string   `json:"realms"`
+	Hours   []int      `json:"hours"`
+	// FireMinute 小时段内的触发分钟（0 = 整点）。
+	//
+	// 面板据此渲染真实时刻。目前只有 Trae 签到非 0（见 traeFireMinute）：
+	// 它必须排在 CST 日切之后，不能放在 00:00 整点上。前端不硬编码这个值，
+	// 否则改后端忘了改前端就会出现「面板 00:00 / 实际 00:05」的漂移。
+	FireMinute int        `json:"fire_minute"`
+	Enabled    bool       `json:"enabled"`
+	NextRun    *time.Time `json:"next_run"`
+	LastRun    *time.Time `json:"last_run"`
+	Running    bool       `json:"running"`
+}
+
+// key 内部 taskKind → 对外 TaskKey。返回空串表示未登记的种类（不该出现）。
+func (k taskKind) key() TaskKey {
+	switch k {
+	case taskCheckin:
+		return TaskKeyCheckin
+	case taskTraeCheck:
+		return TaskKeyTraeCheck
+	case taskTravel:
+		return TaskKeyTravel
+	case taskActivity:
+		return TaskKeyActivity
+	case taskKeepalive:
+		return TaskKeyKeepalive
+	case taskSchool:
+		return TaskKeySchool
+	case taskCat:
+		return TaskKeyCat
+	case taskGrowth:
+		return TaskKeyGrowth
+	case taskBalance:
+		return TaskKeyBalance
+	case taskRunner:
+		return TaskKeyRunner
+	case taskCompensation:
+		return TaskKeyCompensation
+	}
+	return ""
+}
+
+// kindOf 对外 TaskKey → 内部 taskKind。
+func kindOf(key string) (taskKind, bool) {
+	switch TaskKey(key) {
+	case TaskKeyCheckin:
+		return taskCheckin, true
+	case TaskKeyTraeCheck:
+		return taskTraeCheck, true
+	case TaskKeyTravel:
+		return taskTravel, true
+	case TaskKeyActivity:
+		return taskActivity, true
+	case TaskKeyKeepalive:
+		return taskKeepalive, true
+	case TaskKeySchool:
+		return taskSchool, true
+	case TaskKeyCat:
+		return taskCat, true
+	case TaskKeyGrowth:
+		return taskGrowth, true
+	case TaskKeyBalance:
+		return taskBalance, true
+	case TaskKeyRunner:
+		return taskRunner, true
+	case TaskKeyCompensation:
+		return taskCompensation, true
+	}
+	return 0, false
+}
+
+// describe 任务的展示名与说明。与 README「定时积分任务」一节逐条对应，
+// 面板直接透出，避免同一套文案在两处各写一遍后漂移。
+func describe(k TaskKey) (string, string) {
+	switch k {
+	case TaskKeyCheckin:
+		return "签到（WorkBuddy）", "WorkBuddy 两域每日签到 + 余额查询；余额恢复后自动解冻冷却中的账号"
+	case TaskKeyTraeCheck:
+		return "签到（Trae）", "Trae 站点独立签到；上游 9074 是设备维度限流，换设备号重试一次"
+	case TaskKeyActivity:
+		return "活跃上报", "对话事件连发上报，点亮连登天数、解锁领养前置"
+	case TaskKeyTravel:
+		return "猫猫旅行", "独立排程：领养 / 派出 / 领奖闭环推进"
+	case TaskKeyKeepalive:
+		return "token 保活", "全账号刷新 token；session 失效连续 3 次才禁用"
+	case TaskKeySchool:
+		return "开学季任务", "任务点亮 + claim + 自动抽空抽奖余额；活动下线时自动跳过"
+	case TaskKeyCat:
+		return "夜猫子任务", "夜猫窗口（23:00–08:00 CST）内补一次 black_cat 任务"
+	case TaskKeyGrowth:
+		return "成长中心", "一轮跑完七段：领旅行礼物/派 Buddy → 任务接单与领奖 → 补登卡自动补 → 连登兑换 → 盲盒抽奖 → 能量开 Buddy 盲盒 → 能量与连签展示"
+	case TaskKeyBalance:
+		return "余额刷新", "只读查询各账号积分余额与快过期分桶，驱动「优先消耗快过期积分」选号；关掉签到也建议保留本任务"
+	case TaskKeyRunner:
+		return "成长任务点亮", "一次性任务：把能伪造的成长任务做成已完成（画布/模板/专家/技能/皮肤/资料库等 16 种），跑全部 CN 号；点亮后由「成长中心」领奖"
+	case TaskKeyCompensation:
+		return "补偿积分领取", "一次性任务：领取上游发放的限时补偿积分（如模型服务异常补偿）。每个账号只能领一次，重复运行会跳过已领账号"
+	}
+	return string(k), ""
+}
+
+// realmsOf 返回该任务实际作用的账号域（面板按此分组展示）。
+//
+// 这份表是**任务实现的事实描述**，不是愿望：写错会让面板把任务归到不存在的域下。
+//
+// 2026-10-14 重大变更：**国际版（global）不再参与任何任务**。用户明确要求删掉
+// 国际版任务（「国际版没有任务」）——global 的积分体系与 CN 是两套账，端点虽同构
+// 但大量接口对 global 新号返回 500，而这批号占池子大头（23/34）。现在各任务的
+// realm 门控按 realm 精确排除 global（见 travel.go / scheduler.go 的 RealmGlobal 判断）。
+//
+// 唯一的例外是 checkin 与 balance：global 号仍查余额（纯读，驱动「优先消耗快过期
+// 积分」选号，不触发风控），但不发签到/上报等任何写调用。所以这两个任务的 Realms
+// 标 cn+global，其余任务只标 cn。
+func realmsOf(k TaskKey) []string {
+	switch k {
+	case TaskKeyCheckin:
+		// cn 走完整签到 + 余额；global 只查余额（实现里 RealmGlobal 分支跳过签到）。
+		return []string{"cn", "global"}
+	case TaskKeyTraeCheck:
+		return []string{"trae"}
+	case TaskKeyBalance:
+		// 纯读余额查询，cn 与 global 都跑（trae 在实现里整条跳过）。
+		return []string{"cn", "global"}
+	case TaskKeyCompensation:
+		// 补偿活动只挂在 CN 站；global/trae 打该端点会拿到 401 授权页（实测）。
+		return []string{"cn"}
+	case TaskKeyRunner:
+		// task_runner.py 内部用 auth_skips_cn_task 排除 global/trae，只跑 CN。
+		return []string{"cn"}
+	}
+	// 其余任务只服务 CN：global 在实现里被精确排除。
+	return []string{"cn"}
+}
+
+// scheduleOf 单类任务的排程小时与开关状态（来自 Config，即 config.json 的 schedule 段）。
+//
+// 开关状态**不是**直接读 cfg 的 Disabled 字段：面板改完 config.json 会经
+// SetTaskEnabled 写运行期覆盖，而 cfg 里的值只在启动时抄过一次。读 cfg 会让面板
+// 刚点的开关在任务页上不翻转（显示旧值），直到重启——2026-10-15 用户反馈的
+// 「任务启停都要重启」正是这个。
+func (s *Scheduler) scheduleOf(k TaskKey) ([]int, bool) {
+	kind, ok := kindOf(string(k))
+	if !ok {
+		return nil, false
+	}
+	s.taskMu.Lock()
+	enabled := !s.taskDisabled(kind)
+	s.taskMu.Unlock()
+	switch k {
+	case TaskKeyCheckin:
+		return s.cfg.CheckinHours, enabled
+	case TaskKeyTraeCheck:
+		return s.cfg.TraeCheckHours, enabled
+	case TaskKeyTravel:
+		return s.cfg.TravelHours, enabled
+	case TaskKeyActivity:
+		return s.cfg.ActivityHours, enabled
+	case TaskKeyKeepalive:
+		return s.cfg.KeepaliveHours, enabled
+	case TaskKeySchool:
+		return s.cfg.SchoolHours, enabled
+	case TaskKeyCat:
+		return s.cfg.CatHours, enabled
+	case TaskKeyGrowth:
+		return s.cfg.GrowthHours, enabled
+	case TaskKeyBalance:
+		return s.cfg.BalanceHours, enabled
+	case TaskKeyRunner:
+		// 一次性任务：没有排程小时。返回 nil 小时 = 面板显示「手动」且无下次时点。
+		return nil, enabled
+	case TaskKeyCompensation:
+		// 一次性任务：没有排程小时。返回 nil 小时 = 面板显示「手动」且无下次时点。
+		return nil, enabled
+	}
+	return nil, false
+}
+
+// TaskSnapshot 返回全部任务的当前快照，顺序固定为
+// 签到（WorkBuddy）/ 签到（Trae）/ 猫猫旅行 / 活跃上报 / token 保活 / 开学季 /
+// 夜猫子 / 成长中心 / 余额刷新。
+//
+// 2026-10-14：原 redeem/lottery/makeup 三条独立任务合并为 growth（成长中心）一条
+// ——它们本是一条有依赖的流水线，拆开跑既丢顺序又白等半天（详见 growth_center.go）。
+func (s *Scheduler) TaskSnapshot() []TaskInfo {
+	now := time.Now()
+	keys := []TaskKey{
+		TaskKeyCheckin, TaskKeyTraeCheck, TaskKeyTravel, TaskKeyActivity,
+		TaskKeyKeepalive, TaskKeySchool, TaskKeyCat,
+		TaskKeyGrowth, TaskKeyBalance, TaskKeyRunner, TaskKeyCompensation,
+	}
+	out := make([]TaskInfo, 0, len(keys))
+	for _, key := range keys {
+		name, detail := describe(key)
+		hours, enabled := s.scheduleOf(key)
+		info := TaskInfo{
+			Key: string(key), Name: name, Detail: detail,
+			Hours: hours, Enabled: enabled, Realms: realmsOf(key),
+		}
+		if key == TaskKeyTraeCheck {
+			info.FireMinute = traeFireMinute
+		}
+		// 禁用任务没有下个时点（nextWake 同样跳过），置 nil 而不是留一个假的未来时刻。
+		if enabled {
+			// Trae 走自己的分钟偏移（00:05），其余任务仍是整点——面板显示的
+			// 「下次运行」必须与实际触发同一口径，否则会出现「面板写 00:00、
+			// 实际 00:05 才跑」的假象，排查时会误判成任务没触发。
+			at := nextFire(now, hours)
+			if key == TaskKeyTraeCheck {
+				at = nextTraeFire(now, hours)
+			}
+			if !at.IsZero() {
+				info.NextRun = &at
+			}
+		}
+		s.taskMu.Lock()
+		if t, ok := s.taskLast[key]; ok {
+			last := t
+			info.LastRun = &last
+		}
+		info.Running = s.taskBusy[key]
+		s.taskMu.Unlock()
+		// 内存里没有上次时刻（进程刚重启）时，回落到落盘的完成时刻——
+		// 否则任务页的「上次运行」在每次部署后都变成空白，而日志却还在
+		// （两者取自同一份事实，不该一个有一个没有）。
+		if info.LastRun == nil {
+			if t := taskSink.lastEnded(key); !t.IsZero() {
+				last := t
+				info.LastRun = &last
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// beginTask 占用单类任务；已被占用返回 false。定时入口与手动触发共用，保证不并发。
+func (s *Scheduler) beginTask(k taskKind) bool {
+	key := k.key()
+	if key == "" {
+		return false
+	}
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	if s.stopping || s.lifecycle.Err() != nil || s.taskBusy[key] {
+		return false
+	}
+	s.taskBusy[key] = true
+	s.taskWG.Add(1)
+	return true
+}
+
+// endTask 释放任务并记下完成时刻（供面板显示"上次运行"）。
+func (s *Scheduler) endTask(k taskKind) {
+	key := k.key()
+	if key == "" {
+		return
+	}
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	if !s.taskBusy[key] {
+		return
+	}
+	s.taskBusy[key] = false
+	// 取消函数用完即弃：留着会在下一轮 beginTask 覆盖前被误当成"当前这次"的。
+	// 这里**不调用**它——任务正常结束时不需要取消，调用反而会取消已经结束的 ctx。
+	delete(s.taskCancel, key)
+	s.taskLast[key] = time.Now()
+	taskSink.markEnded(key)
+	s.taskWG.Done()
+}
+
+// TaskContext 为一次任务执行建立**可单独取消**的 ctx。
+//
+// 继承 lifecycle：调度器关停时子任务照常被取消（关停语义不变）；
+// 同时把 cancel 记进 taskCancel，供 StopTask 单独取消这一个任务。
+//
+// 调用方必须已通过 beginTask 占住该 key。
+func (s *Scheduler) TaskContext(k taskKind) (context.Context, context.CancelFunc) {
+	base := s.lifecycle
+	if base == nil {
+		// 零值 Scheduler（测试直接构造 &Scheduler{} 时会出现）没有 lifecycle。
+		// 不在这里兜底会 panic 在下一行的 WithCancel(nil) 上——实测踩到：
+		// 「assignment to entry in nil map」其实是更早的 taskCancel 写入，
+		// 两个 nil 都要挡。
+		base = context.Background()
+	}
+	ctx, cancel := context.WithCancel(base)
+	key := k.key()
+	if key == "" {
+		return ctx, cancel
+	}
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	if s.taskCancel == nil {
+		s.taskCancel = make(map[TaskKey]context.CancelFunc)
+	}
+	// 上一轮的 cancel 若还在（不该发生：endTask 会清），先取消掉避免泄漏。
+	if previous, ok := s.taskCancel[key]; ok {
+		previous()
+	}
+	s.taskCancel[key] = cancel
+	return ctx, cancel
+}
+
+// StopTask 取消正在跑的某个任务，返回是否确实取消了。
+//
+// 语义是**协作式取消**：ctx 被取消后，任务里所有以它为 ctx 的 HTTP 请求会立刻中断，
+// 脚本子进程（任务脚本走 exec）也会被 kill。任务自身在下一个 ctx 检查点退出，
+// 因此返回 true 表示"取消信号已发出"，不代表任务已经停止——面板应继续轮询
+// /tasks 的 running 字段确认。
+//
+// 任务没在跑时返回 false（不是错误：面板可能连点，或任务刚好自己结束了）。
+func (s *Scheduler) StopTask(key string) bool {
+	k, ok := kindOf(key)
+	if !ok {
+		return false
+	}
+	s.taskMu.Lock()
+	cancel, running := s.taskCancel[k.key()]
+	s.taskMu.Unlock()
+	if !running || cancel == nil {
+		return false
+	}
+	log.Printf("scheduler: 收到停止请求，正在取消 %s", key)
+	cancel()
+	return true
+}
+
+// TriggerTask 手动触发单类任务。任务在后台 goroutine 里跑，调用立即返回。
+// 正在执行时返回 ErrTaskBusy——不排队：连点几次就往上堆一串重复的上游调用，
+// 对签到这个"同一时刻只许一次"的接口尤其危险。
+func (s *Scheduler) TriggerTask(key string) error {
+	k, ok := kindOf(key)
+	if !ok {
+		return ErrUnknownTask
+	}
+	if s.lifecycle.Err() != nil {
+		return ErrSchedulerStopped
+	}
+	if !s.beginTask(k) {
+		return ErrTaskBusy
+	}
+	go func() {
+		defer s.endTask(k)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERR: scheduler: 手动触发 %s panic: %v", key, r)
+			}
+		}()
+		log.Printf("scheduler: 手动触发 %s", key)
+		// 用可单独取消的 ctx（而不是全局 lifecycle）：面板的「停止」按钮只该停
+		// 掉这一个任务，不该把整个排程器连同其它任务一起关掉。
+		ctx, cancel := s.TaskContext(k)
+		defer cancel()
+		s.runTask(ctx, k)
+	}()
+	return nil
+}

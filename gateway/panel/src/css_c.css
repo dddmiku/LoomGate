@@ -1,0 +1,265 @@
+/* ══ 控件 / 状态 / 表格 / 抽屉 ═══════════════════════════════════════
+ * 参照 new-api 的 ui/button、ui/input、ui/badge、ui/table：
+ *   · 按钮默认 32px 高、10px 圆角、outline 变体 hover 用 muted 底；
+ *   · 输入框 32px 高、10px 圆角、透明底 + 1px 描边，聚焦时描边转主色；
+ *   · 徽标是全圆角软色药丸（soft 底 + 同色文字）；
+ *   · 表格行高 15 个单位（约 60px 上限），表头用极浅底、无大写变形。
+ * 2026-09-20：控件层重做——统一高度与圆角、补齐 hover/active 反馈、
+ *             表格行高与分隔线收紧、抽屉与弹窗改用统一阴影层级。
+ */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;
+  border:1px solid var(--line-2);border-radius:var(--r2);font-size:13px;font-weight:500;
+  background:var(--surface);color:var(--ink);white-space:nowrap;
+  transition:background .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease),transform .06s var(--ease)}
+.btn:hover{background:var(--sunken);border-color:var(--line-2)}
+.btn:active{transform:translateY(1px)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn.pri:hover{background:var(--accent-2);border-color:var(--accent-2)}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px;border-radius:var(--r3)}
+.btn.ico{width:32px;padding:0}
+.btn.sm.ico{width:28px}
+/* 模型限流行内的小号「检测」按钮：与同行文字基线对齐，不撑高行距。 */
+.btn.sm.probe{height:20px;padding:0 7px;font-size:11.5px;margin-left:6px;vertical-align:baseline;line-height:1}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
+.btn.ghost:hover{background:var(--sunken);color:var(--ink)}
+.btn.dgr:hover{color:var(--err);border-color:var(--err);background:var(--err-soft)}
+/* 常态可见的危险按钮（任务卡片的「停止」）。.dgr 只在 hover 时变色，对「停止」
+   这种需要一眼认出的破坏性动作不够——它只在任务**正在跑**时出现，此时用户需要
+   立刻看到「这里可以停」，而不是把鼠标移上去才发现。 */
+.btn.dgr.solid{color:var(--err);border-color:var(--err);background:var(--err-soft)}
+.btn.dgr.solid:hover{color:var(--surface);background:var(--err);border-color:var(--err)}
+/* 一次性任务的标记（任务卡片右上角，取代开关位置）。 */
+.pill{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;
+  font-size:11px;font-weight:500;color:var(--ink-2);background:var(--sunken);border:1px solid var(--line)}
+.btn[disabled]{opacity:.5;pointer-events:none}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunken);padding:2px;gap:2px}
+.seg button{padding:4px 11px;border-radius:var(--r3);font-size:12.5px;color:var(--ink-2);white-space:nowrap;
+  transition:color .12s var(--ease),background .12s var(--ease)}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed=true]{background:var(--surface);color:var(--ink);font-weight:500;box-shadow:var(--shadow)}
+.seg.grow{display:flex}
+.seg.grow button{flex:1;text-align:center}
+/* 账号页的模型筛选下拉。与 .seg 同高同边框，视觉上并入同一排控件；
+   max-width 防止超长模型名（客户端自选字段，可能很长）把工具栏撑变形。 */
+.sel{height:28px;max-width:200px;padding:0 8px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);color:var(--ink);font:inherit;font-size:12.5px;cursor:pointer}
+.sel:disabled{opacity:.5;cursor:not-allowed}
+.sw{width:32px;height:18px;flex:none;border-radius:999px;background:var(--line-2);position:relative;
+  transition:background .15s var(--ease)}
+.sw::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;
+  background:#fff;transition:transform .15s var(--ease);box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.sw[aria-checked=true]{background:var(--accent)}
+.sw[aria-checked=true]::after{transform:translateX(14px)}
+.sw[disabled]{opacity:.5;pointer-events:none}
+.bdg{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:999px;
+  font-size:12px;font-weight:500;white-space:nowrap;background:var(--sunken);color:var(--ink-2)}
+.bdg i{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+.bdg.ok{background:var(--ok-soft);color:var(--ok)}
+.bdg.w{background:var(--warn-soft);color:var(--warn)}
+.bdg.e{background:var(--err-soft);color:var(--err)}
+.bdg.a{background:var(--info-soft);color:var(--info)}
+.note{display:flex;align-items:center;padding:11px 14px;background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--r2);
+  font-size:13px;color:var(--ink-2);box-shadow:var(--shadow)}
+.note svg{margin-right:10px;flex:none}
+.note.w svg{color:var(--warn)}
+.note.e svg{color:var(--err)}
+.note.a svg{color:var(--info)}
+.note.ok svg{color:var(--ok)}
+.note b{color:var(--ink);font-weight:600}
+.note .g{flex:1;min-width:0;margin-right:10px}
+
+/* ══ 时间轴 ═════════════════════════════════════════════════════════ */
+.tl-row{display:flex;align-items:center;border-bottom:1px solid var(--line);min-height:56px;
+  transition:background .12s var(--ease)}
+.tl-row:last-child{border-bottom:0}
+.tl-row:hover{background:var(--surface-2)}
+.tl-time{width:64px;flex:none;padding-left:16px;font:13px/1 var(--mono);color:var(--ink-2)}
+.tl-main{flex:1;min-width:0;padding:10px 16px 10px 0}
+.tl-nm{font-size:13px;font-weight:500}
+.tl-meta{font-size:12px;color:var(--ink-3);margin-top:2px}
+.tl-acts{display:flex;align-items:center;gap:8px;padding-right:16px}
+
+/* ══ 表格 ═══════════════════════════════════════════════════════════ */
+.tblwrap{overflow-x:auto}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{padding:10px 16px;border-bottom:1px solid var(--line);font-size:12.5px;font-weight:500;
+  color:var(--ink-2);text-align:left;white-space:nowrap;background:var(--surface-2)}
+.tbl td{padding:12px 16px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl tbody tr{transition:background .12s var(--ease)}
+.tbl tbody tr:hover{background:var(--surface-2)}
+.tbl .r{text-align:right}
+/* 操作列：flex 必须挂在 td **里面**的容器上，不能让 td 自己变成 flex。
+ *
+ * 2026-10-08 修复（用户实测反馈「这地方的线没有对齐」）：此前这里是
+ * `.tbl .acts{display:flex;…}`，直接作用于 td。td 一旦不是 table-cell，
+ * 它就被排除在 `border-collapse:collapse` 的边框合并之外——border-bottom
+ * 计算样式仍报 1px，却完全不绘制。实测：同一行在 x=1250 有线、x=1290（操作列
+ * 起点）起无线的硬断点，且行数越多越明显。
+ * 现按密钥表既有约定（td 保持 table-cell，内层 div 做 flex）。 */
+.tbl .row-acts{display:flex;gap:6px;justify-content:flex-end}
+.who{font-size:13px;font-weight:500}
+.sub{font-size:12px;color:var(--ink-3)}
+.cell-in{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;min-width:0}
+.cell-in.act{flex-direction:column;align-items:flex-start;gap:2px}
+.cred{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.cred .v{font:13.5px/1 var(--mono);font-variant-numeric:tabular-nums}
+.cred .m{font-size:12px;color:var(--ink-3);font-family:var(--mono)}
+.cred .bar{width:88px;height:4px;background:var(--sunken);overflow:hidden;border-radius:3px}
+.cred .bar i{display:block;height:100%;background:var(--info)}
+/* 快过期积分提示：到期即作废，用警示色与「已用 N/M」的弱化灰区分开，
+   让运维一眼看到「有积分要浪费了」。悬停给出处置说明。 */
+.cred .expiring{color:var(--warn);font-size:11.5px;cursor:help}
+/* 总览页与积分卡片里的同款提示（不在 .cred 作用域内）。 */
+.expiring{color:var(--warn);cursor:help}
+/* 模型级限流台账行（状态列）：只限个别模型、账号本身可用，与整号冷却不同——
+   用警示色 + 悬停说明区分，避免被当成普通灰副行忽略（看不出为何换号/换模型）。 */
+.sub.rlm{color:var(--warn);cursor:help;display:block}
+.search{display:flex;align-items:center;gap:8px;height:32px;padding:0 11px;border:1px solid var(--line-2);
+  border-radius:var(--r2);background:var(--surface);color:var(--ink-3);min-width:230px;
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.search input{flex:1;min-width:0;border:0;background:none;outline:none;font-size:13px;color:var(--ink)}
+.search input::placeholder{color:var(--ink-3)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;padding:16px}
+.tile{display:flex;flex-direction:column;gap:10px;padding:15px 16px;border:1px solid var(--line);
+  border-radius:var(--r2);min-width:0;background:var(--surface);
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.tile:hover{border-color:var(--line-2);box-shadow:var(--shadow)}
+.tile-t{display:flex;align-items:center;gap:9px}
+.tile .detail{font-size:12px;color:var(--ink-3);min-height:18px}
+.hours{display:flex;gap:5px;flex-wrap:wrap}
+.hour{padding:2px 7px;border:1px solid var(--line);border-radius:var(--r3);background:var(--sunken);
+  font:11.5px/1.6 var(--mono);color:var(--ink-2)}
+.tile-f{display:flex;align-items:center;gap:8px;margin-top:auto}
+.tile-f .meta{font-size:12px;color:var(--ink-3);font-family:var(--mono)}
+.empty{padding:52px 20px;text-align:center;color:var(--ink-3)}
+.empty-t{margin-top:12px;font-size:13.5px;color:var(--ink-2)}
+.empty-s{font-size:12px;margin-top:5px}
+
+/* ══ 日志 / 表单 ════════════════════════════════════════════════════ */
+pre.term{margin:0;padding:14px 16px;background:var(--sunken);color:var(--ink-2);
+  font:12px/1.65 var(--mono);white-space:pre-wrap;word-break:break-word;max-height:58vh;overflow:auto}
+.cred-form .fld{display:block;margin-bottom:13px}
+.cred-form .fld .k{display:block;font-size:12px;color:var(--ink-2);margin-bottom:6px}
+.cred-form input{width:100%;height:34px;padding:0 11px;border:1px solid var(--line-2);border-radius:var(--r2);
+  background:var(--surface);color:var(--ink);font-size:13px;outline:none;
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.cred-form input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.frow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+
+/* ══ 抽屉 / 弹窗 / 提示 ═════════════════════════════════════════════ */
+.scrim{position:fixed;inset:0;z-index:50;background:rgba(10,10,10,.45);opacity:0;pointer-events:none;
+  transition:opacity .16s var(--ease)}
+.scrim.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:60;width:min(420px,100vw);display:flex;
+  flex-direction:column;background:var(--surface);border-left:1px solid var(--line);box-shadow:var(--shadow-2);
+  transform:translateX(101%);transition:transform .2s var(--ease)}
+.drawer.on{transform:none}
+.dh{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.dh h3{flex:1;font-size:15px}
+.dbody{flex:1;overflow:auto;padding:16px}
+.dfoot{display:flex;justify-content:flex-end;gap:9px;padding:13px 16px;border-top:1px solid var(--line)}
+.modal{position:fixed;z-index:70;left:50%;top:50%;width:min(440px,calc(100vw - 32px));
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow-2);
+  opacity:0;pointer-events:none;transform:translate(-50%,-47%);
+  transition:opacity .16s var(--ease),transform .16s var(--ease)}
+.modal.on{opacity:1;pointer-events:auto;transform:translate(-50%,-50%)}
+.modal.wide{width:min(820px,calc(100vw - 32px))}
+.mh{display:flex;align-items:center;gap:11px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.mh h3{flex:1;font-size:15px}
+.mh .mic{width:32px;height:32px;flex:none;display:grid;place-items:center;border-radius:var(--r2)}
+.mh .mic.w{background:var(--warn-soft);color:var(--warn)}
+.mh .mic.e{background:var(--err-soft);color:var(--err)}
+.mh .mic.ok{background:var(--ok-soft);color:var(--ok)}
+.mbody{padding:16px}
+.mtext{font-size:13px;line-height:1.7;color:var(--ink-2)}
+.mfoot{display:flex;justify-content:flex-end;gap:9px;padding:13px 16px;border-top:1px solid var(--line)}
+/* 更新进度对话框里的进度条。放在 .modal 之外单独写，不复用 .metric .bar —— 那些是
+   卡片内的小进度条（4px、无文字），这里是对话框主视觉，要更粗、要能显示百分比。 */
+.upd-progress{height:8px;margin-top:14px;background:var(--sunken);border-radius:4px;overflow:hidden}
+.upd-progress i{display:block;height:100%;width:0;background:var(--accent);border-radius:4px;
+  transition:width .3s var(--ease)}
+/* 总大小未知时（发布没给 size）不显示假的 0%，改成来回滑动的不确定态。 */
+.upd-progress.unknown i{width:35%;animation:updslide 1.15s ease-in-out infinite}
+@keyframes updslide{0%{margin-left:-35%}100%{margin-left:100%}}
+.upd-progress-note{margin-top:9px;font:12px/1.6 var(--mono);color:var(--ink-3)}
+.upd-progress-note b{color:var(--ink-2);font-weight:500}
+.qr-box{display:grid;place-items:center;padding:14px;background:#fff;border:1px solid var(--line);border-radius:var(--r2)}
+.url-box{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);font:12px/1.55 var(--mono);color:var(--ink-2);word-break:break-all}
+.wait{display:flex;align-items:center;gap:9px;margin-top:12px;font-size:13px;color:var(--ink-2)}
+.spin{width:14px;height:14px;flex:none;border-radius:50%;border:2px solid var(--line-2);
+  border-top-color:var(--accent);animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.toasts{position:fixed;right:18px;bottom:18px;z-index:90;display:flex;flex-direction:column;gap:9px;
+  align-items:flex-end}
+.toast{display:flex;align-items:center;gap:10px;padding:11px 14px;background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--r2);box-shadow:var(--shadow-2);font-size:13px;
+  max-width:min(440px,calc(100vw - 36px))}
+.toast.ok svg{color:var(--ok)} .toast.err svg{color:var(--err)} .toast svg{color:var(--ink-2)}
+.scrim-m{position:fixed;inset:0;z-index:29;background:rgba(10,10,10,.45);opacity:0;pointer-events:none;
+  transition:opacity .16s var(--ease);display:none}
+
+/* ══ 窄屏 ═══════════════════════════════════════════════════════════ */
+.menu{display:none}
+@media (max-width:1120px){
+  .pairs,.pairs.wide{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:900px){
+  .side{position:fixed;top:var(--head);left:0;z-index:31;box-shadow:var(--shadow-2);
+    transform:translateX(-101%);transition:transform .2s var(--ease)}
+  .side.open{transform:none}
+  .scrim-m{display:block}
+  .scrim-m.on{opacity:1;pointer-events:auto}
+  .menu{display:inline-flex}
+  .top{padding:0 10px;gap:6px}
+  .wm span{display:none}
+  .inner{padding:16px 14px 72px}
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .tiles{grid-template-columns:minmax(0,1fr);padding:12px}
+  .tl-row{flex-wrap:wrap}
+  .tl-time{width:58px;padding:11px 0 0 16px}
+  .tl-main{padding:11px 16px 0 0}
+  .tl-acts{width:100%;justify-content:flex-end;padding:8px 16px 11px 0}
+  .tblwrap{overflow:visible}
+  .tbl thead{display:none}
+  .tbl tbody tr{display:block;margin:0 0 -1px;padding:12px 14px;border:1px solid var(--line);background:var(--surface)}
+  .tbl tbody tr:hover{background:var(--surface)}
+  .tbl td{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:0}
+  .tbl td::before{content:attr(data-l);color:var(--ink-3);font-size:12px;flex:none}
+  /* 窄屏卡片态：td 变成 flex 行（label 在左、内容在右），内层容器作为它的
+     flex 子项被 space-between 推到右侧，自身再横排按钮——基础规则已足够。
+     这里**不能**用 display:contents：那会把两个按钮提升成 td 的直接子项，
+     被 space-between 撑到卡片两端（实测 430px 下间距 136px、600px 下 221px）。 */
+  .tbl td[data-l=""]::before{display:none}
+  .ph .search{min-width:0;flex:1 1 100%}
+  .toasts{left:14px;right:14px;align-items:stretch}
+}
+@media (max-width:520px){
+  .metrics{grid-template-columns:minmax(0,1fr)}
+}
+/* 顶栏在窄屏只留状态点：品牌名 + 文字状态在 430px 会挤成一行看不清。 */
+@media (max-width:640px){
+  #svcText{display:none}
+  .chip{padding:0 9px}
+  .wm b{font-size:12.5px}
+}
+
+/* ── 域标签（接入 trae 后账号表出现三种来源）─────────────
+ * 纯大写文字 CN/GLOBAL/TRAE 在几十行里扫不出来，用带色胶囊区分：
+ * 一眼能定位「哪个域的号出问题了」。配色只做区分，不表示好坏。
+ */
+.rtag{display:inline-block;padding:1px 6px;border-radius:5px;font-size:10.5px;
+  font-weight:600;letter-spacing:.04em;line-height:1.5;vertical-align:middle;
+  border:1px solid transparent}
+.rtag.cn{background:var(--info-soft);color:var(--info);border-color:var(--info-soft)}
+.rtag.global{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
+/* trae 不用 warn：琥珀是快过期/告警的语义色（积分卡瓷片整块上警示时用的就是它），
+   域胶囊撞上去会把「Trae」误读成「有积分要作废」。分类色只做区分——用紫罗兰。 */
+.rtag.trae{background:var(--vio-soft);color:var(--vio);border-color:var(--vio-soft)}
+/* 「不适用」：该域没有这项能力（如 trae 没有 WorkBuddy 的积分接口）。
+ * 与「—」（暂无数据）区别开，否则运维会以为是查询失败。 */
+.na{color:var(--ink-3);font-size:12px}
+.na.err{color:var(--err);cursor:help}

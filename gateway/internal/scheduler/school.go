@@ -1,0 +1,170 @@
+// school.go 开学季任务与夜猫子任务的脚本类排程：从系统 crontab 迁入 Go scheduler。
+//
+// 背景：school（12:00）与 cat（01:00 夜猫窗口）原由系统 crontab 调
+// scripts/school_open_day_cron.sh 执行——依赖外部系统 cron、容器重建可能丢失、
+// 不在 config 里配置。迁入后成为独立任务，时点由 schedule.school_hours /
+// schedule.cat_hours 配置，school_open_day_cron.sh 保留为手动触发入口。
+// ═══ 更新日志 ═══
+// 2026-09-18：脚本继承排程取消并设置执行上限，关停时终止子进程及阻止后续命令。
+package scheduler
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
+// 策略：从当前工作目录逐级向上找 scripts/school_open_day_2026.py，
+// 找不到回落 os.Getwd()（此时 Run 会因脚本缺失打 WARN，不 panic）。
+// 注意：Go scheduler 在 cmd/server 内以工作目录启动（容器 WORKDIR /app），
+// 若进程以别的工作目录拉起（如 systemd/裸 binary），上溯穷尽后仍以
+// os.Getwd() 兜底，把缺失暴露成 WARN 而非静默。
+func repoRoot() string {
+	if dir := strings.TrimSpace(os.Getenv("WB2API_RUNTIME_DIR")); dir != "" {
+		return dir
+	}
+	start, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	dir := start
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "scripts", "school_open_day_2026.py")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return start
+		}
+		dir = parent
+	}
+}
+
+// scriptRunner 脚本子进程的最小执行面：可被测试替换，避免测试真正拉起 python3。
+type scriptRunner interface {
+	SetDir(string)
+	Run() error
+}
+
+// scriptCmd exec.Cmd 适配器：把 exec.Cmd 的 Dir 字段包装成 SetDir 方法，
+// 满足 scriptRunner 接口（exec.Cmd 本身只有字段没有方法）。
+type scriptCmd struct{ cmd *exec.Cmd }
+
+func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
+
+// Run 接管子脚本的 stdout/stderr 后执行。
+// 不接管时 exec.Cmd 会把子进程输出直接丢弃，开学季/夜猫子任务在容器日志里
+// 只剩一行 "school: ok"——脚本报了什么错、点了几个任务全看不见。
+func (c *scriptCmd) Run() error {
+	return c.RunContext(context.Background())
+}
+
+func (c *scriptCmd) RunContext(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	// #nosec G204 -- 脚本路径由内置清单给出，非请求输入
+	cmd := exec.CommandContext(ctx, c.cmd.Path, c.cmd.Args[1:]...)
+	cmd.Dir, cmd.Env, cmd.Stdin = c.cmd.Dir, c.cmd.Env, c.cmd.Stdin
+	cmd.Stdout, cmd.Stderr = scriptSink{}, scriptSink{}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd.Run()
+}
+
+// newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
+// 工作目录由调用方 SetDir 显式设置仓库根。
+var newScriptCmd = func(program string, args ...string) scriptRunner {
+	// #nosec G204 -- 同上：内置脚本命令
+	return &scriptCmd{cmd: exec.Command(program, args...)}
+}
+
+// pythonCmd 返回执行 scripts/*.py 的解释器名。
+//
+// 默认 "python3"，与容器/Linux 现状完全一致，行为零变更；WB2A_PYTHON
+// 显式指定时优先，供解释器不叫 python3 的环境使用（命名对齐仓库 Go 侧
+// WB2A_* env 约定，如 WB2A_AUTH_DIR / WB2A_LISTEN）。
+//
+// 需要该开关的原因：Windows 官方安装器只提供 python.exe，且 PATH 上常存在
+// Microsoft Store 的 python3.exe App Execution Alias 存根——exec.Command 能找到
+// 它却无法真正执行，脚本类任务统一报 `exit status 9009`。
+// 设 WB2A_PYTHON=python 即可绕过。
+func pythonCmd() string {
+	if v := strings.TrimSpace(os.Getenv("WB2A_PYTHON")); v != "" {
+		return v
+	}
+	return "python3"
+}
+
+// runScriptContext 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
+// 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
+func runScriptContext(ctx context.Context, name, root string, commands [][]string) {
+	for _, cmdArgs := range commands {
+		if ctx.Err() != nil {
+			return
+		}
+		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
+		c.SetDir(root)
+		var err error
+		if runner, ok := c.(interface{ RunContext(context.Context) error }); ok {
+			err = runner.RunContext(ctx)
+		} else {
+			err = c.Run()
+		}
+		if err != nil {
+			log.Printf("WARN: %s（%s）执行失败：%v", name, cmdArgs[1], err)
+			continue
+		}
+		log.Printf("%s 执行成功（%s）", name, cmdArgs[1])
+	}
+}
+
+// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
+// 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
+// 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
+func (s *Scheduler) RunSchoolNow() {
+	s.runSchool(context.Background())
+}
+
+func (s *Scheduler) runSchool(ctx context.Context) {
+	root := repoRoot()
+	runScriptContext(ctx, "school", root, [][]string{
+		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
+	})
+}
+
+// RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
+// black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
+// 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
+func (s *Scheduler) RunCatNow() {
+	s.runCat(context.Background())
+}
+
+func (s *Scheduler) runCat(ctx context.Context) {
+	root := repoRoot()
+	runScriptContext(ctx, "cat", root, [][]string{
+		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
+	})
+}
+
+// RunRunnerNow 立即执行成长任务点亮：task_runner.py ALL --yes。
+//
+// 一次性任务（无排程小时），只由面板「跑一次」触发。跑全部 CN 号——
+// task_runner.py 内部用 auth_skips_cn_task 跳过 global/trae，所以这里传 ALL
+// 不会把 Trae 的 JWT 打向 codebuddy.cn。
+//
+// 不加 --only：全量才覆盖 create_canvas / template_5 / expert_5 /
+// WorkBuddy_Valorant 等 16 种任务；带 --only 就退化成 cat 那种单任务形态了。
+func (s *Scheduler) RunRunnerNow() {
+	s.runRunner(context.Background())
+}
+
+func (s *Scheduler) runRunner(ctx context.Context) {
+	root := repoRoot()
+	runScriptContext(ctx, "runner", root, [][]string{
+		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes"},
+	})
+}

@@ -1,0 +1,1967 @@
+// ═══ 更新日志 ═══
+// 2026-09-24：修正余额刷新清理软限流及账号冷却清空模型限制的错误测试契约。
+package pool
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"workbuddy2api/internal/auth"
+)
+
+// CooldownTestModel 是限流类用例统一使用的模型名。
+//
+// 2026-10-18：账号级限流冷却已删除（用户要求「不要账号冷却，只要模型冷却和积分不足」），
+// pool 不再有 CooldownSoftRate(uid, base, reset, reason) 这种无模型入口——限流一律记在
+// 具体模型上。测试必须显式传模型名，用本常量避免每处重复字面量。
+const CooldownTestModel = "test-model"
+
+// withNoPickGap 临时关闭防并发撞号窗口（minPickGap=0），让纯加权分布测试不受影响。
+func withNoPickGap(t *testing.T) {
+	t.Helper()
+	old := minPickGap
+	minPickGap = 0
+	t.Cleanup(func() { minPickGap = old })
+}
+
+func TestPickHighestCredits(t *testing.T) {
+	withNoPickGap(t)
+	// 三因子加权（credits 比例×10 + 闲置 + 成功率）：积分悬殊时高积分账号应被多数选中，
+	// 但不再像纯 credits 加权那样接近 99%（闲置补偿 + 成功率中性 1.5 拉平了基线）。
+	p := New("")
+	a1 := &auth.Auth{UID: "u1"}
+	a2 := &auth.Auth{UID: "u2"}
+	a3 := &auth.Auth{UID: "u3"}
+	p.Add(a1)
+	p.Add(a2)
+	p.Add(a3)
+	p.SetCredits("u1", 100)
+	p.SetCredits("u2", 50000)
+	p.SetCredits("u3", 300)
+	counts := map[string]int{}
+	for i := 0; i < 3000; i++ {
+		counts[p.Pick("").UID]++
+	}
+	if counts["u2"] <= counts["u1"] || counts["u2"] <= counts["u3"] {
+		t.Errorf("u2 (highest credits) should be picked most: %v", counts)
+	}
+}
+
+func TestPickSkipsCooling(t *testing.T) {
+	p := New("")
+	a1 := &auth.Auth{UID: "u1"}
+	a2 := &auth.Auth{UID: "u2"}
+	p.Add(a1)
+	p.Add(a2)
+	p.SetCredits("u1", 100)
+	p.SetCredits("u2", 50)
+	p.Cooldown("u1", CoolHard, time.Hour, "test")
+	got := p.Pick("")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2", got)
+	}
+}
+
+func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
+	p := New("")
+	a1 := &auth.Auth{UID: "u1"}
+	p.Add(a1)
+	p.SetCredits("u1", 100)
+	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
+	time.Sleep(5 * time.Millisecond)
+	got := p.Pick("")
+	if got == nil || got.UID != "u1" {
+		t.Fatalf("pick=%+v want u1 after cooldown expiry", got)
+	}
+}
+
+func TestPickNilWhenAllDisabled(t *testing.T) {
+	// 全禁用 → 兜底不参与（禁用账号永不参与兜底）→ 返回 nil。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("want nil (all disabled), got %+v", got)
+	}
+}
+
+func TestPickExcluding(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 100)
+	p.SetCredits("u2", 50)
+	tried := map[string]bool{"u1": true}
+	got := p.PickExcludingForRealm(tried, "", "")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2", got)
+	}
+	tried["u2"] = true
+	if got := p.PickExcludingForRealm(tried, "", ""); got != nil {
+		t.Fatalf("want nil, got %+v", got)
+	}
+}
+
+func TestPickExcludingStaysWithinHealthy(t *testing.T) {
+	withNoPickGap(t)
+	// 加权随机不能选出冷却/禁用账号。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u-cold"})
+	p.Add(&auth.Auth{UID: "u-hot"})
+	p.SetCredits("u-cold", 9999)
+	p.SetCredits("u-hot", 1)
+	p.Cooldown("u-cold", CoolHard, time.Hour, "x")
+	for i := 0; i < 20; i++ {
+		got := p.PickExcludingForRealm(nil, "", "")
+		if got == nil || got.UID != "u-hot" {
+			t.Fatalf("iter %d: picked %+v, want only healthy u-hot", i, got)
+		}
+	}
+}
+
+func TestPickWeightedSkewTowardHighCredits(t *testing.T) {
+	withNoPickGap(t)
+	// Top5 三因子加权：单账号 credits 占比足够高时，多数挑中它。
+	p := New("")
+	for _, u := range []string{"w1", "w2", "w3", "w4", "w5", "w6"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 1)
+	}
+	p.SetCredits("w1", 1000)
+	counts := map[string]int{}
+	for i := 0; i < 5000; i++ {
+		counts[p.Pick("").UID]++
+	}
+	mx, mxUID := 0, ""
+	for uid, n := range counts {
+		if n > mx {
+			mx, mxUID = n, uid
+		}
+	}
+	if mxUID != "w1" {
+		t.Errorf("w1 (highest credits) should be picked most: %v", counts)
+	}
+}
+
+func TestPickWeightedUniformWhenAllZero(t *testing.T) {
+	withNoPickGap(t)
+	// credits 全为 0 → 退化为均匀随机，不能只挑固定一个。
+	p := New("")
+	for _, u := range []string{"z1", "z2", "z3"} {
+		p.Add(&auth.Auth{UID: u})
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 30; i++ {
+		seen[p.Pick("").UID] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("uniform fallback should hit all, seen=%v", seen)
+	}
+}
+
+func TestPickWeightedTopFiveOnly(t *testing.T) {
+	withNoPickGap(t)
+	// 第 6 高 credits 的账号在 Top5 之外，权重抽签永远轮不到它。
+	p := New("")
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5", "a6"} {
+		p.Add(&auth.Auth{UID: u})
+	}
+	p.SetCredits("a1", 1000)
+	p.SetCredits("a2", 1000)
+	p.SetCredits("a3", 1000)
+	p.SetCredits("a4", 1000)
+	p.SetCredits("a5", 1000)
+	p.SetCredits("a6", 5) // Top5 之外
+	for i := 0; i < 2000; i++ {
+		if got := p.Pick(""); got == nil || got.UID == "a6" {
+			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
+		}
+	}
+}
+
+func TestPickTopFiveBySuccessRateNotCredits(t *testing.T) {
+	withNoPickGap(t)
+	// C1 回归：top5 短名单必须按三因子权重（含成功率）而非纯 credits 截断。
+	// a1..a5 credits=100 但成功率极低（1/100），a6 credits=90 但成功率 100%。
+	// 纯 credits 排序时 a6（90 < 100）是第 6 名，永远进不了 top5；
+	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮（后续 a6 闲置补偿衰减会合法发散）。
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 选权重最高的候选
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 100)
+		for i := 0; i < 99; i++ {
+			p.NoteError(u) // 成功率 1/(1+99)≈0.03
+		}
+		p.NoteSuccess(u)
+	}
+	p.Add(&auth.Auth{UID: "a6"})
+	p.SetCredits("a6", 90)
+	p.NoteSuccess("a6") // 成功率 100%
+
+	if got := p.Pick(""); got == nil || got.UID != "a6" {
+		t.Fatalf("pick=%v, want a6 (high-success low-credit must enter top5 by weight)", got)
+	}
+}
+
+func TestPickTopFiveByIdleNotCredits(t *testing.T) {
+	withNoPickGap(t)
+	// C1 回归：闲置补偿同样影响短名单。a1..a5 credits=100 但刚被用过（闲置 0），
+	// a6 credits=90 但从未使用（闲置满分）。纯 credits 排序时 a6 进不了 top5；
+	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮。
+	p := New("")
+	now := time.Now()
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 100)
+	}
+	p.Add(&auth.Auth{UID: "a6"})
+	p.SetCredits("a6", 90)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	// a1..a5 全部"刚被用过"，闲置补偿归零；a6 从未使用 → 闲置满分。
+	p.mu.Lock()
+	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		p.byUID[u].lastUsed = now
+	}
+	p.mu.Unlock()
+
+	if got := p.Pick(""); got == nil || got.UID != "a6" {
+		t.Fatalf("pick=%v, want a6 (idle low-credit must enter top5 by weight)", got)
+	}
+}
+
+func TestPickDeterministicViaSetRandomSource(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 100)
+	p.SetCredits("u2", 50)
+	// r=0 ∈ [0,50) → 命中 u1。注入源应使选号完全确定。
+	for i := 0; i < 50; i++ {
+		if got := p.Pick(""); got == nil || got.UID != "u1" {
+			t.Fatalf("iter %d: pick=%+v want u1 (deterministic)", i, got)
+		}
+	}
+}
+
+func TestPickAntiThunderingHerd(t *testing.T) {
+	// 100 goroutine 同时 Pick：防并发撞号窗口内同一账号不应被重复选中。
+	// credits 相同 → 无注入源时加权随机应天然打散；为保证稳定，全部置 0 走均匀随机。
+	p := New("")
+	for i := 0; i < 10; i++ {
+		p.Add(&auth.Auth{UID: fmt.Sprintf("c%02d", i)})
+	}
+	// 关键：验证并发中任意瞬间不会全选同一账号。
+	const N = 100
+	var wg sync.WaitGroup
+	picked := make([]string, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if a := p.Pick(""); a != nil {
+				picked[idx] = a.UID
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	counts := map[string]int{}
+	for _, uid := range picked {
+		if uid != "" {
+			counts[uid]++
+		}
+	}
+	// 选号必须覆盖多个账号，且最热门的账号不超过一半。
+	if len(counts) < 2 {
+		t.Fatalf("anti-thundering-herd failed: all %d picks hit %d account(s) %v", N, len(counts), counts)
+	}
+	for uid, n := range counts {
+		if n > N/2 {
+			t.Errorf("account %s picked %d/%d (>50%%): thundering herd", uid, n, N)
+		}
+	}
+}
+
+func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
+	// top5 全部刚被选中 → LRU 兜底应挑最近最少使用的那个（= 最早 lastUsed）。
+	old := minPickGap
+	minPickGap = time.Hour // 超大窗口：任何 lastUsed 都在窗口内
+	defer func() { minPickGap = old }()
+
+	p := New("")
+	for i := 0; i < 5; i++ {
+		p.Add(&auth.Auth{UID: fmt.Sprintf("a%d", i)})
+	}
+	// 直接构造 lastUsed：不经过 Pick（避免 Pick 改写 lastUsed）。
+	order := []string{"a4", "a3", "a2", "a1", "a0"}
+	p.mu.Lock()
+	for i, uid := range order {
+		p.byUID[uid].lastUsed = time.Now().Add(-time.Duration(len(order)-i) * time.Second) // a4 最旧
+	}
+	p.mu.Unlock()
+
+	got := p.Pick("")
+	if got == nil {
+		t.Fatal("pick returned nil")
+	}
+	if got.UID != "a4" {
+		t.Errorf("LRU fallback picked %s want a4 (oldest lastUsed)", got.UID)
+	}
+}
+
+func TestCooldownPersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.Flush() // 状态变更走 dirty 标志，落盘由 Flush / 后台 goroutine 负责
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	// 余额不足不是冷却（2026-10-18 取消账号级冷却），由 CreditsExhausted 表达。
+	if !ok || !st.CreditsExhausted || st.Reason != "余额不足" {
+		t.Fatalf("credits-exhausted state lost after reload: %+v ok=%v", st, ok)
+	}
+}
+
+func TestDisablePersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if p2.Pick("") != nil {
+		t.Fatal("disabled account picked after reload")
+	}
+	st, _ := p2.Status("u1")
+	if !st.Disabled || st.Reason != "12153 session dead" {
+		t.Errorf("status=%+v", st)
+	}
+}
+
+func TestReenableIfCredits(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.ReenableIfCredits("u1", 500)
+	got := p.Pick("")
+	if got == nil || got.UID != "u1" {
+		t.Fatalf("should reenable, pick=%+v", got)
+	}
+}
+
+func TestReenableZeroCreditsKeepsCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.ReenableIfCredits("u1", 0)
+	st, _ := p.Status("u1")
+	if !st.CreditsExhausted {
+		t.Fatal("zero credits should stay credits-exhausted")
+	}
+}
+
+func TestReenableDoesNotTouchDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	p.ReenableIfCredits("u1", 500)
+	if p.Pick("") != nil {
+		t.Fatal("disabled must not auto-reenable")
+	}
+}
+
+func TestNoteErrorAccumulatesErrTotal(t *testing.T) {
+	// NoteError 语义变更：不再有独立的 err 冷却（CoolErr 已并入熔断器），
+	// 只累计 errTotal（不清零，供成功率权重）并喂熔断器 fails。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteError("u1")
+	p.NoteError("u1")
+	st, _ := p.Status("u1")
+	if st.ErrTotal != 2 {
+		t.Errorf("err_total=%d want 2", st.ErrTotal)
+	}
+	if st.Cooling {
+		t.Errorf("NoteError alone must not set cooling (no CoolErr): %+v", st)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("last_err not set")
+	}
+}
+
+func TestNoteSuccessResetsBreakerNotErrTotal(t *testing.T) {
+	// NoteSuccess 清 fails/熔断（运行态），但不清 errTotal（累计值）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(2, time.Hour, 2*time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1") // 触发熔断
+	if p.internalHealthy("u1") {
+		t.Fatal("breaker should be open (unhealthy) after 2 failures")
+	}
+	p.NoteSuccess("u1")
+	st, _ := p.Status("u1")
+	if st.ErrTotal != 2 {
+		t.Errorf("err_total=%d want 2 (cumulative, not cleared by success)", st.ErrTotal)
+	}
+	if st.Cooling {
+		t.Errorf("success should clear breaker: %+v", st)
+	}
+}
+
+func TestNoteSuccessIncrementsAndRecords(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	before := time.Now()
+	p.NoteSuccess("u1")
+	p.NoteSuccess("u1")
+	st, _ := p.Status("u1")
+	if st.SuccessCount != 2 {
+		t.Errorf("success_count=%d want 2", st.SuccessCount)
+	}
+	if st.LastSuccessTime.Before(before) {
+		t.Errorf("last_success=%v before call", st.LastSuccessTime)
+	}
+	if !st.LastErrTime.IsZero() {
+		t.Errorf("last_err should be zero for fresh success: %v", st.LastErrTime)
+	}
+}
+
+func TestReenableClearsCoolingNotBreaker(t *testing.T) {
+	// C5：签到解冻只清冷却（until/coolKind/reason）+ 更新 credits，不清熔断
+	// （fails/retryCount/breakerUntil）。签到成功只证明余额与 billing 通道恢复，
+	// 不证明 chat 通道健康——熔断仍按 breakerUntil 退避到期或 NoteSuccess 恢复。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntilTomorrow4AM("u1", "余额不足") // 硬冷却（喂 fails，但此时阈值默认 3，不熔断）
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断（fails→阈值1→fails=0, retryCount=1, breakerUntil 非零）
+	p.ReenableIfCredits("u1", 500)
+	st, _ := p.Status("u1")
+	if st.Reason != "" || st.Credits != 500 {
+		t.Errorf("signin should clear reason + set credits=500: %+v", st)
+	}
+	if st.Until != (time.Time{}) {
+		t.Errorf("signin should clear hard-cooling until: %+v", st.Until)
+	}
+	if st.BreakerUntil.IsZero() {
+		t.Fatal("signin must NOT clear breakerUntil (chat health unresolved)")
+	}
+	// 熔断仍在 → 账号仍不可选（直至 breakerUntil 到期）。
+	if p.internalHealthy("u1") {
+		t.Fatal("account should stay unhealthy while breaker active after signin")
+	}
+}
+
+func TestReenableKeepsBreaker(t *testing.T) {
+	// C5 回归锁定新语义：仅熔断（无冷却）的账号，签到解冻不得清熔断。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("precondition: breaker should be open")
+	}
+	p.ReenableIfCredits("u1", 500)
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("signin must not clear breakerUntil")
+	}
+	if p.internalHealthy("u1") {
+		t.Fatal("account should stay unhealthy while breaker active after signin")
+	}
+}
+
+func TestCoolKindPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.Flush()
+
+	// 旧文件缺新字段时零值 → 冷却应仍工作（向后兼容）。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || !st.CreditsExhausted {
+		t.Fatalf("credits-exhausted state lost after reload: %+v ok=%v", st, ok)
+	}
+	if st.CoolKind != "hard_credit" {
+		t.Errorf("cool_kind after reload=%q want hard_credit", st.CoolKind)
+	}
+}
+
+func TestStateRoundTripExtendedFields(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.NoteSuccess("u1") // successCount=1，last_success 非零
+	p.NoteSuccess("u1") // successCount=2
+	p.NoteError("u1")   // errTotal=1（累计），last_err 非零
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// JSON tag 全小写下划线；err_total 落盘，err_count 不再落盘。
+	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_total"`, `"last_success"`, `"last_err"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s:\n%s", want, raw)
+		}
+	}
+	// 运维可见的运行态字段即使零值也显式写出（去 omitempty）：缺失会被误解为"没记录"。
+	for _, want := range []string{`"soft_streak"`, `"session_dead_fails"`, `"credits_expiring"`, `"error_ema"`, `"success_ema"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s（零值也应显式写出）:\n%s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"err_count"`) {
+		t.Errorf("state.json should not write legacy err_count:\n%s", raw)
+	}
+
+	// 重载后字段保留
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok {
+		t.Fatal("no status")
+	}
+	if st.SuccessCount != 2 || st.CoolKind != "hard_credit" {
+		t.Errorf("reloaded portrait=%+v", st)
+	}
+	if st.ErrTotal != 1 {
+		t.Errorf("reloaded err_total=%d want 1", st.ErrTotal)
+	}
+	if st.LastSuccessTime.IsZero() || st.LastErrTime.IsZero() {
+		t.Error("last_success/last_err lost after reload")
+	}
+}
+
+func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
+	// 迁移测试：旧 state.json 只含 err_count（连续错误）→ 加载后 err_total 正确。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	legacy := `{"accounts":{"u1":{"credits":100,"err_count":7}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("legacy account should load")
+	}
+	if st.ErrTotal != 7 {
+		t.Errorf("err_total=%d want 7 (migrated from legacy err_count)", st.ErrTotal)
+	}
+	// 新字段优先：二者并存时取较大者。
+	both := `{"accounts":{"u1":{"credits":100,"err_count":3,"err_total":9}}}`
+	if err := os.WriteFile(fp, []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st2, _ := p2.Status("u1"); st2.ErrTotal != 9 {
+		t.Errorf("err_total=%d want 9 (new field wins over legacy)", st2.ErrTotal)
+	}
+}
+
+func TestStatusCoolKindDefaultsWhenNotCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	st, _ := p.Status("u1")
+	if st.CoolKind != "" || st.CoolRemaining != 0 {
+		t.Errorf("non-cooling portrait=%+v", st)
+	}
+}
+
+func TestNextDay4AMBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		now  string // RFC3339 (UTC 表示)
+		want string // 下一个 04:00（同一时区，UTC 表示）
+	}{
+		{"普通日", "2026-08-28T17:00:00+08:00", "2026-08-29T04:00:00+08:00"},
+		// 凌晨 00:00~04:00 触发硬冷却：当天 04:00 尚未到，冷却应落在当天（而非次日），
+		// 否则多冷约一天（原 bug）。
+		{"凌晨02:30", "2026-08-28T02:30:00+08:00", "2026-08-28T04:00:00+08:00"},
+		{"凌晨00:00", "2026-08-28T00:00:00+08:00", "2026-08-28T04:00:00+08:00"},
+		{"凌晨03:59:59", "2026-08-28T03:59:59+08:00", "2026-08-28T04:00:00+08:00"},
+		{"正好4点", "2026-08-28T04:00:00+08:00", "2026-08-29T04:00:00+08:00"},
+		{"4点刚过", "2026-08-28T04:00:01+08:00", "2026-08-29T04:00:00+08:00"},
+		{"月末(31天月)", "2026-01-31T12:00:00+08:00", "2026-02-01T04:00:00+08:00"},
+		{"月末(28天月)", "2026-02-28T12:00:00+08:00", "2026-03-01T04:00:00+08:00"},
+		{"闰年月末", "2028-02-29T12:00:00+08:00", "2028-03-01T04:00:00+08:00"},
+		{"年末", "2026-12-31T23:59:59+08:00", "2027-01-01T04:00:00+08:00"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			now, err := time.Parse(time.RFC3339, c.now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := time.Parse(time.RFC3339, c.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := nextDay4AM(now); !got.Equal(want) {
+				t.Errorf("nextDay4AM(%v)=%v want %v", c.now, got, want)
+			}
+		})
+	}
+}
+
+func TestCooldownUntilTomorrow4AM(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	before := time.Now()
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	after := time.Now()
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("no status")
+	}
+	// 余额不足不是冷却：Cooling 必须为 false，状态由 CreditsExhausted 表达。
+	if st.Cooling {
+		t.Errorf("余额不足不应标成冷却: %+v", st)
+	}
+	if !st.CreditsExhausted {
+		t.Fatalf("should be credits-exhausted: %+v", st)
+	}
+	if st.Reason != "余额不足" {
+		t.Errorf("reason=%q", st.Reason)
+	}
+	// 冷却截止必须是"此刻之后的最近一个 04:00"：晚于 now、距今不超过 24h
+	//（凌晨 00:00~04:00 触发时落在当天 04:00，其余时段落在次日 04:00，跨度恒 < 24h）。
+	if st.Until.Before(after) {
+		t.Errorf("until %v is in the past (call span %v..%v)", st.Until, before, after)
+	}
+	if st.Until.Hour() != 4 {
+		t.Errorf("until hour=%d want 4", st.Until.Hour())
+	}
+	if d := st.Until.Sub(after); d > 24*time.Hour {
+		t.Errorf("until %v is more than 24h out: %v", st.Until, d)
+	}
+	// 全冷却时余额耗尽（hard）号不参与兜底 → 返回 nil（等签到恢复）。
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("all-hard-cooling should return nil (hard excluded from fallback), got %+v", got)
+	}
+}
+
+func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || st.Until.Hour() != 4 || st.Reason != "余额不足" {
+		t.Errorf("status after reload=%+v ok=%v", st, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 模型级限流退避（原「账号级软冷却」块，2026-10-18 改为模型维度）
+// ---------------------------------------------------------------------------
+//
+// 账号级限流冷却已删除：429 一律记在被限流的那个模型上，账号对其他模型照常可用。
+// 这些用例因此断言「模型台账的 until」，而不是「账号 Cooling」。
+
+// wantModelCoolSec 断言账号对 model 的模型级冷却剩余 ≈ want（±tol 秒），
+// 且账号本身**未被整体冷却**。
+func wantModelCoolSec(t *testing.T, p *Pool, uid, model string, want int64, tol int64) {
+	t.Helper()
+	st, ok := p.Status(uid)
+	if !ok {
+		t.Fatalf("status(%s) missing", uid)
+	}
+	if st.Cooling {
+		t.Fatalf("%s 不应因模型限流被整体冷却: %+v", uid, st)
+	}
+	var got int64 = -1
+	for _, m := range st.RateLimitedModels {
+		if m.Model == model {
+			got = int64(time.Until(m.Until).Seconds() + 0.999)
+		}
+	}
+	if got < 0 {
+		t.Fatalf("%s 的模型 %s 未出现在限流台账: %+v", uid, model, st.RateLimitedModels)
+	}
+	if got < want-tol || got > want+tol {
+		t.Errorf("model_remaining_sec=%d want ~%d (±%d)", got, want, tol)
+	}
+}
+
+// TestCooldownSoftBoundedBackoffIfNotCooling 无重置时间的 429 在**该模型**上有界退避：
+// 从非冷却态触发时按 2 倍增长（本用例封顶 1h 不触及），命中计数随新冷却递增；
+// 冷却中途的兜底探测不推进（见 TestCooldownSoftRateNoDoubleWhenAlreadyCooling）。
+func TestCooldownSoftBoundedBackoffIfNotCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(time.Hour)
+
+	for i, want := range []int64{600, 1200, 2400} {
+		p.forceSoftExpired("u1")
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+		wantModelCoolSec(t, p, "u1", CooldownTestModel, want, 3)
+		if hits := p.byUID["u1"].modelCooldowns[CooldownTestModel].Hits; hits != i+1 {
+			t.Errorf("after call %d: hits=%d want %d", i+1, hits, i+1)
+		}
+	}
+}
+
+// TestCooldownSoftRateResetTimeAligns 带权威重置时间的限流：模型级 until 对齐到
+// 上游重置墙钟、不做退避、不碰账号级 until。
+func TestCooldownSoftRateResetTimeAligns(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(30 * time.Minute)
+	p.SetSoftRateMax(time.Hour)
+
+	p.CooldownSoftRateForModel("u1", 600*time.Second, reset, CooldownTestModel, "429 rate limit")
+	st, _ := p.Status("u1")
+	if st.Cooling || !st.Until.IsZero() {
+		t.Errorf("限流不得写账号级冷却: %+v", st)
+	}
+	mc, ok := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+	if !ok {
+		t.Fatal("模型冷却未写入")
+	}
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("模型 until=%v want ~reset=%v（精确对齐，无退避）", mc.Until, reset)
+	}
+	if mc.Hits != 0 {
+		t.Errorf("带重置时间不累计命中次数，hits=%d want 0", mc.Hits)
+	}
+}
+
+// TestCooldownSoftRateNoDoubleWhenAlreadyCooling 核心回归：冷却中的兜底探测再次撞 429
+// **不得**翻倍/延长（旧实现每次都累加指数，把全池推到封顶）。
+func TestCooldownSoftRateNoDoubleWhenAlreadyCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(time.Hour)
+
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+	first := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+
+	// 冷却中重复触发（兜底探测）→ 时长与命中次数均不变。
+	for i := 0; i < 3; i++ {
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	}
+	again := p.byUID["u1"].modelCooldowns[CooldownTestModel]
+	if again.Hits != first.Hits {
+		t.Errorf("冷却中探测不得推进命中次数: %d → %d", first.Hits, again.Hits)
+	}
+	if again.Until.After(first.Until.Add(time.Second)) {
+		t.Errorf("冷却中探测不得延长 until: %v → %v", first.Until, again.Until)
+	}
+}
+
+func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(250 * time.Second)
+
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 100, 3)
+	p.forceSoftExpired("u1")
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 200, 3)
+	p.forceSoftExpired("u1")
+	p.CooldownSoftRateForModel("u1", 100*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 250, 3)
+}
+
+func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
+	// 未注入 softRateMax → 按 2h 封顶（避免裸用池时退避无上限）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	for i, want := range []int64{600, 1200, 2400, 4800, 7200} {
+		p.forceSoftExpired("u1")
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+		wantModelCoolSec(t, p, "u1", CooldownTestModel, want, 3)
+		if hits := p.byUID["u1"].modelCooldowns[CooldownTestModel].Hits; hits != i+1 {
+			t.Errorf("hits=%d want %d", hits, i+1)
+		}
+	}
+}
+
+func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
+	// 非正值保留原值（风格同 SetBreaker）：0 不应把封顶清零导致无上限。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(0)
+	p.SetSoftRateMax(-time.Second)
+	for i := 0; i < 6; i++ {
+		p.forceSoftExpired("u1")
+		p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	}
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 7200, 3) // 仍是 2h 封顶
+}
+
+func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
+	// 成功即证明该模型恢复 → 清掉该模型的限流记录，下次从基数重来。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	p.forceSoftExpired("u1")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 1200, 3)
+
+	p.NoteSuccess("u1")
+	// 限流是模型维度的状态，NoteSuccess 不清它（它不知道是哪个模型成功）。
+	// 由 handler 在成功路径调用 ClearModelLimit(uid, model)；这里直接验证该入口。
+	p.ClearModelLimit("u1", CooldownTestModel)
+	if st, _ := p.Status("u1"); len(st.RateLimitedModels) != 0 {
+		t.Fatalf("成功后应清限流台账，仍有 %+v", st.RateLimitedModels)
+	}
+	p.forceSoftExpired("u1")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+}
+
+func TestCooldownSoftStreakPreservedByCreditRecovery(t *testing.T) {
+	// 余额查询只证明积分恢复，不能清掉模型限流或熔断。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	p.forceSoftExpired("u1")
+	p.CooldownSoftRateForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "x")
+	failsBefore := p.breakerFails("u1")
+
+	p.ReenableIfCredits("u1", 500)
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Errorf("credit recovery should preserve model rate limit, got %+v", st.RateLimitedModels)
+	}
+	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
+		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
+	}
+}
+
+// forceSoftExpired 把账号的**账号级**冷却与所有模型级冷却强制标记为已到期，
+// 让下一次 CooldownSoftRateForModel 视作「新限流」继续推进退避，而不依赖真实 sleep。
+// 仅测试用。
+func (p *Pool) forceSoftExpired(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.until = time.Time{}
+		for m := range e.modelCooldowns {
+			mc := e.modelCooldowns[m]
+			mc.Until = time.Time{}
+			e.modelCooldowns[m] = mc
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// issue #31：429 6004 模型级限流 → 按上游重置时间收窄冷却 + 模型级豁免选号
+// ---------------------------------------------------------------------------
+
+func TestCooldownSoftForModelParsedUntil(t *testing.T) {
+	// 6004 msg 带「将在 … 重置」→ modelCooldowns[glm-5.3].Until 精确等于解析时间
+	// （wall-clock 判断）。用未来 5 分钟的时间戳：解析后 ≈ now+5m，远短于固定 600s
+	// 基数的指数退避，证明"上游明说重置时间"优先于"600s 起指数退避"。
+	reset := time.Now().Add(5 * time.Minute)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("status missing: %+v", st)
+	}
+	// 6004 模型级冷却：账号级 until 不被写（独立模型冷却），台账携带模型截止。
+	if !st.Until.IsZero() {
+		t.Errorf("until=%v 应为零值（6004 不写账号级 until）", st.Until)
+	}
+	if st.SoftStreak != 0 {
+		t.Errorf("soft_streak=%d 应保持 0（有重置时间绝不指数堆加）", st.SoftStreak)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("rate_limited_models=%+v want [glm-5.3] 的模型级台账", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
+	}
+}
+
+func TestCooldownSoftForModelHonorsResetOverSoftRateMax(t *testing.T) {
+	// 解析时间超出 soft_rate_max → 2026-10-18 起按上游实际时间冷却（不再截断）。
+	// 截断会让号在「假恢复 → 再撞 6004」之间循环：实测上游要 18h，本地只冷 2h。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(10 * time.Minute)
+	reset := time.Now().Add(2 * time.Hour) // 远超旧封顶 10m
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%+v want 1 行", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want 上游墙钟 %v（不截断到 soft_rate_max=10m）",
+			st.RateLimitedModels[0].Until, reset)
+	}
+}
+
+func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
+	// 无解析时间（resetAt 零值）→ 记在**模型**上做有界退避；冷却中的兜底探测不翻倍。
+	// model 为空时只记观测、不施加冷却（账号级冷却已取消）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+	// 仍在冷却中：兜底探测不推进退避。
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 600, 3)
+	// 模型冷却到期后：续一次新限流 → 退避推进到 1200s。
+	p.forceSoftExpired("u1")
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, CooldownTestModel, "429 rate limit")
+	wantModelCoolSec(t, p, "u1", CooldownTestModel, 1200, 3)
+}
+
+// TestPickExcludingForModelSkipsSoftCoolingSameModel 冷却中账号（6004 带解析时间，
+// 已记录模型）+ 同 model 请求 → 仍不可选（现状语义保持）。
+func TestPickExcludingForModelSkipsSoftCoolingSameModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	got := p.PickExcludingForRealm(nil, "glm-5.3", "")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("same-model request must skip cooling u1, got %+v", got)
+	}
+}
+
+// TestPickExcludingForModelAllowsDifferentModel 6004 冷却中的账号 + 不同 model
+// → 视为可用，可选到该号（真·单模型限流，切模型立即可用）。
+func TestPickExcludingForModelAllowsDifferentModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 1000)
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 u1
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
+	if got == nil || got.UID != "u1" {
+		t.Fatalf("different-model request should bypass u1 soft cooling, got %+v", got)
+	}
+}
+
+// TestCooldownSoftWithoutModelRecordsNone 非 6004 的普通软冷却（resetAt 零值，
+// 不写 modelCooldowns）→ 退回账号级 until 冷却，不因模型切换而豁免（现状语义）。
+// 没给模型名的限流：只记错误观测，不施加任何冷却。
+//
+// 2026-10-18 改：账号级限流冷却已取消。此前这条路径退回账号级冷却、把整号摘掉，
+// 现在它的语义是「归不到模型 → 不冷却」，账号照常可选。
+func TestCooldownSoftWithoutModelRecordsNone(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 1000)
+	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "", "429 rate limit")
+	st, _ := p.Status("u1")
+	if st.Cooling || st.CreditsExhausted || !st.Until.IsZero() || len(st.RateLimitedModels) != 0 {
+		t.Errorf("无模型名不得写任何冷却状态: %+v", st)
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("仍应记录 last_err")
+	}
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
+		t.Errorf("账号应仍可选，got %+v", got)
+	}
+}
+
+// TestPickExcludingForModelBreakerStillBlocks 模型豁免只豁免软冷却维度，
+// 熔断（breakerUntil）仍拦截：6004 冷却 + 熔断中的账号，切模型也不可选。
+func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // u1 熔断
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	got := p.PickExcludingForRealm(nil, "hy3-x", "")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("breaker must still block, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ServableNow 的模型级豁免（issue #31 探活侧）：6004 单模型限流时，账号对该模型
+// 不可用但对其他模型仍可选，/healthz 不得因"全号被某一模型限流"而误报 503。
+// ---------------------------------------------------------------------------
+
+func TestServableNowModelExemptCounts(t *testing.T) {
+	// 单号处于 6004 模型级软冷却（带解析时间、记录 modelCooldowns）→ 其他模型仍可达，
+	// ServableNow 必须为 true（与 chat 的 healthyForModel 放行切模型请求同口径）。
+	// 反向（同模型不可选）已由 TestPickExcludingForModelSkipsSoftCoolingSameModel 覆盖；
+	// 本池无其他候选，同模型选号会走全冷却兜底，不在此重复断言。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	if !p.ServableNow() {
+		t.Fatal("model-exempt account must keep pool servable (other models reachable)")
+	}
+}
+
+// 账号级 CoolSoft 已取消：调用它不产生任何不可用，ServableNow 仍为 true。
+func TestServableNowPlainSoftNotExempt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	if !p.ServableNow() {
+		t.Fatal("账号级 CoolSoft 已取消，不应让池变成不可服务")
+	}
+}
+
+func TestServableNowExemptButInFlightFull(t *testing.T) {
+	// 模型豁免形态 + 在途占满 → 仍不可服务（在途维度独立于豁免，探活须叠加判定）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(1)
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	if !p.Acquire("u1") {
+		t.Fatal("acquire should succeed at max=1")
+	}
+	defer p.Release("u1")
+	if p.ServableNow() {
+		t.Fatal("model-exempt but in-flight-full account must not count as servable")
+	}
+}
+
+func TestServableNowExemptButDisabled(t *testing.T) {
+	// 模型豁免形态 + 被禁用（session dead）→ disabled 优先级最高，ServableNow 必须 false。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	p.Disable("u1", "session dead")
+	if p.ServableNow() {
+		t.Fatal("disabled account must never be servable, even in model-exempt form")
+	}
+}
+
+// TestModelCooldownsPreservedByPlainCooldown 账号冷却期间所有模型均不可用，
+// 到期后原模型配额仍生效；两级限制并存而非互相清除。
+func TestModelCooldownsPreservedByPlainCooldown(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	// 1) 6004 带解析时间 → 记录模型 glm-5.3。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	if got := p.PickExcludingForRealm(nil, "hy3-x", ""); got == nil || got.UID != "u1" {
+		t.Fatalf("precondition: different-model should bypass, got %+v", got)
+	}
+	// 2) 账号级 CoolSoft 已取消：再调一次也不会把整号摘掉。
+	p.NoteSuccess("u1")
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	if st, _ := p.Status("u1"); st.Cooling || !st.Until.IsZero() {
+		t.Fatalf("CoolSoft 不得写账号级冷却: %+v", st)
+	}
+	// 3) 换模型请求仍命中旧的 glm-5.3 模型冷却（模型冷却不因账号级调用被清）。
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u2" {
+		t.Fatalf("model limit must survive account-cooldown call, got %+v", got)
+	}
+}
+
+// TestModelCooldownsPersistedToState modelCooldowns 现已持久化（修复重启后 6004
+// 模型级冷却失忆）：带解析时间触发后落盘写入 model_cooldowns 字段，重载后恢复。
+// 旧 state.json 不写该字段时缺省空（向后兼容，见 TestModelCooldownsPersistCompatOldState）。
+func TestModelCooldownsPersistedToState(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// reset 在未来 → 模型级冷却生效（Until 在未来）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	p.Flush()
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json should persist model_cooldowns:\n%s", raw)
+	}
+	// 重载后恢复（Until 在未来，不过滤）。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	n := len(p2.byUID["u1"].modelCooldowns)
+	p2.mu.RUnlock()
+	if n != 1 {
+		t.Errorf("modelCooldowns should restore on reload, found %d entries", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// issue #36：限额台账——/status 透出仍在限额的模型 + 预计恢复时间
+// ---------------------------------------------------------------------------
+
+// TestRateLimitedModelsInStatus 6004 带解析时间 → modelCooldowns 被写入 →
+// Status.RateLimitedModels 输出含限流模型 + 冷却截止 + 上游原始重置墙钟。
+func TestRateLimitedModelsInStatus(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(35 * time.Minute)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("status missing")
+	}
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	if row.Model != "glm-5.3" {
+		t.Errorf("model=%q want glm-5.3", row.Model)
+	}
+	if row.Reason != "6004 model rate limit" {
+		t.Errorf("reason=%q want 6004 model rate limit", row.Reason)
+	}
+	// 6004 模型级冷却不写账号级 until：st.Until 应为零值，模型截止在台账行里。
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
+	}
+	// row.Until = 该模型的独立冷却截止（≈ reset，35m < soft_rate_max 2h 未截断）。
+	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("row.until=%v want ~%v", row.Until, reset)
+	}
+	// ResetAt 是未经 6004 截断的上游重置墙钟（35m < soft_rate_max 2h，因此未被截断）。
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~%v", row.ResetAt, reset)
+	}
+}
+
+// TestRateLimitedModelsHonorsUncappedResetAt 2026-10-18 起 until 不再被 soft_rate_max
+// 截断：台账与冷却截止都等于上游原始重置墙钟（运维按真实恢复时刻观察）。
+func TestRateLimitedModelsHonorsUncappedResetAt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(10 * time.Minute)
+	reset := time.Now().Add(2 * time.Hour) // 远超旧封顶 10m
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%v want 1 行", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	// row.Until = 该模型的冷却截止 = 上游墙钟（不再截断）。
+	if d := row.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("row.until=%v want 上游墙钟 %v", row.Until, reset)
+	}
+	// 6004 模型级冷却不写账号级 until：st.Until 为零值。
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（6004 不写账号级 until）", st.Until)
+	}
+	// reset_at 保留原始 2h 墙钟。
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at=%v want ~2h 后=%v", row.ResetAt, reset)
+	}
+}
+
+// TestRateLimitedModelsExpired 限额到期后台账从 Status 消失（恢复）。
+// 用近未来 30ms 的重置墙钟：初始显示台账，等墙钟过后台账消失 + 账号退出冷却。
+// （带解析时间 6004 的 until 由 resetAt 决定，故等待几百 ms 即可确定性触达过期边界。）
+func TestRateLimitedModelsExpired(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(30 * time.Millisecond)
+	p.CooldownSoftForModel("u1", time.Hour, reset, "glm-5.3", "6004 model rate limit")
+	if st, _ := p.Status("u1"); len(st.RateLimitedModels) != 1 {
+		t.Fatalf("初始应对该模型限额显示台账: %+v", st.RateLimitedModels)
+	}
+	time.Sleep(80 * time.Millisecond) // 越过重置墙钟（until 已过）
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 0 {
+		t.Errorf("到期后台账应消失: %+v", st.RateLimitedModels)
+	}
+	if st.Cooling {
+		t.Errorf("到期后账号应退出冷却: %+v", st)
+	}
+}
+
+// TestRateLimitedModelsNoLimitZeroRegression 未限流 / 普通软冷却账号零回归：
+// RateLimitedModels 必须为空（nil），不产生台账行。
+func TestRateLimitedModelsNoLimitZeroRegression(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "ok"})
+	p.Add(&auth.Auth{UID: "plain"})
+	p.Cooldown("plain", CoolSoft, time.Minute, "429 rate limit") // 普通软冷却（无 modelCooldowns）
+	for _, uid := range []string{"ok", "plain"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("status(%s) missing", uid)
+		}
+		if len(st.RateLimitedModels) != 0 {
+			t.Errorf("uid=%s rate_limited_models=%v want 空（零回归）", uid, st.RateLimitedModels)
+		}
+	}
+}
+
+func TestList(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 42)
+	p.Cooldown("u2", CoolHard, time.Minute, "余额不足")
+	list := p.List()
+	if len(list) != 2 {
+		t.Fatalf("list=%d", len(list))
+	}
+	var s1, s2 Status
+	for _, s := range list {
+		if s.UID == "u1" {
+			s1 = s
+		}
+		if s.UID == "u2" {
+			s2 = s
+		}
+	}
+	if s1.Credits != 42 || s1.Nickname != "nick1" || s1.Disabled || s1.Cooling {
+		t.Errorf("s1=%+v", s1)
+	}
+	// 账号级只剩「积分不足」一种状态：它不是冷却，但要能从 status 读出来。
+	if s2.Cooling || !s2.CreditsExhausted || s2.Reason != "余额不足" {
+		t.Errorf("s2=%+v", s2)
+	}
+}
+
+func TestRemoveMissingFromDir(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
+	if p.Pick("") == nil || p.Pick("").UID != "u2" {
+		t.Fatal("u1 should be removed")
+	}
+	if _, ok := p.Status("u1"); ok {
+		t.Fatal("u1 should not exist")
+	}
+}
+
+func TestFlushPersistsCredits(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || st.Credits != 42 {
+		t.Fatalf("flush not persisted: %+v ok=%v", st, ok)
+	}
+}
+
+func TestAutoFlush(t *testing.T) {
+	old := flushInterval
+	flushInterval = 20 * time.Millisecond
+	defer func() { flushInterval = old }()
+
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 77)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(fp); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("state.json not written by background flusher")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || st.Credits != 77 {
+		t.Fatalf("auto flush not persisted: %+v ok=%v", st, ok)
+	}
+}
+
+func TestFlushIdempotentWhenClean(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Flush() // 无 dirty，不应写盘
+	if _, err := os.Stat(fp); !os.IsNotExist(err) {
+		t.Fatalf("flush on clean pool should not write: %v", err)
+	}
+}
+
+func TestSaveFailureRecordedAndRecovers(t *testing.T) {
+	// stateFp 的父路径是一个普通文件（非目录）→ MkdirAll/WriteFile 必失败，
+	// root 也不可绕过，可靠地触发落盘失败路径。
+	dir := t.TempDir()
+	block := filepath.Join(dir, "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(filepath.Join(block, "state.json"))
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	if p.persistFails == 0 {
+		t.Fatal("persist failure should be recorded (visible), got 0")
+	}
+
+	// 换回可写目录 → 成功后 persistFails 归零（恢复日志由零值门槛触发）。
+	good := filepath.Join(t.TempDir(), "state.json")
+	p2 := New(good)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.SetCredits("u1", 42)
+	p2.Flush()
+	if p2.persistFails != 0 {
+		t.Fatalf("successful save should reset persistFails, got %d", p2.persistFails)
+	}
+	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+		t.Fatalf("state.json not written on success: %v %s", err, raw)
+	}
+}
+
+// TestSaveLockedPermissionDenied 不可写目录触发落盘失败：首错详报出现且无 panic，
+// persistFails 计数累加。chmod 0500 模拟容器内 app(uid 10001) 对 root:root 目录
+// 无写权限的 issue #52 场景。注意：若测试以 root 运行，chmod 不阻写——此时回落到
+// "父路径是文件"的可靠失败路径，保证测试恒定可复现。
+func TestSaveLockedPermissionDenied(t *testing.T) {
+	dir := t.TempDir()
+	stateFp := filepath.Join(dir, "state.json")
+	p := New(stateFp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 7)
+
+	// chmod 0500 让普通用户不可写；root 仍可写（见下方回落）。
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	p.Flush()
+	fails1 := p.persistFails
+
+	if fails1 == 0 {
+		// root 下 chmod 不阻写 → 回落到"父路径是文件"的可靠失败路径重测。
+		block := filepath.Join(t.TempDir(), "block")
+		if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p2 := New(filepath.Join(block, "state.json"))
+		p2.Add(&auth.Auth{UID: "u1"})
+		p2.SetCredits("u1", 7)
+		p2.Flush()
+		if p2.persistFails == 0 {
+			t.Fatal("persist failure should be recorded (chmod or block-path), got 0")
+		}
+		fails1 = p2.persistFails
+	}
+	if fails1 == 0 {
+		t.Fatal("persist failure should be recorded")
+	}
+	// 无 panic 即通过（首错详报已由 notePersistFail 打印，恢复日志由零值门槛触发）。
+}
+
+// TestSaveLockedRecover 先失败后恢复：首错详报 + 恢复日志 + persistFails 归零。
+func TestSaveLockedRecover(t *testing.T) {
+	// 阶段 1：父路径是文件 → 落盘失败，persistFails 累加。
+	block := filepath.Join(t.TempDir(), "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(filepath.Join(block, "state.json"))
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	if p.persistFails == 0 {
+		t.Fatal("first flush should fail (block path)")
+	}
+
+	// 阶段 2：切到可写目录 → 落盘成功，persistFails 归零（恢复日志由零值门槛触发）。
+	good := filepath.Join(t.TempDir(), "state.json")
+	p.stateFp = good
+	p.dirty.Store(true) // 强制再写一次
+	p.Flush()
+	if p.persistFails != 0 {
+		t.Fatalf("successful save should reset persistFails, got %d", p.persistFails)
+	}
+	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+		t.Fatalf("state.json not written on recovery: %v %s", err, raw)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T2 熔断器 + 全冷却兜底 + 指数退避
+// ---------------------------------------------------------------------------
+
+// breakerUntil 曝露内部运行态供测试断言（包内私有 helper）。
+func (p *Pool) breakerUntil(uid string) (time.Time, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return time.Time{}, false
+	}
+	return e.breakerUntil, true
+}
+
+// breakerFails 曝露 entry.fails 供测试断言（包内私有 helper）。
+func (p *Pool) breakerFails(uid string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.byUID[uid].fails
+}
+
+// internalHealthy 曝露 entry.healthy 供测试断言（包内私有 helper）。
+func (p *Pool) internalHealthy(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	return e.healthy(time.Now())
+}
+
+func TestBreakerTripsAtThreshold(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Hour, 6*time.Hour)
+	for i := 0; i < 2; i++ {
+		p.NoteError("u1") // NoteError 只驱动熔断（不再有单独 err 冷却）
+		if bt, ok := p.breakerUntil("u1"); ok && !bt.IsZero() {
+			t.Fatalf("breaker tripped too early at %d: %v", i+1, bt)
+		}
+	}
+	p.NoteError("u1")
+	bt, ok := p.breakerUntil("u1")
+	if !ok || bt.IsZero() {
+		t.Fatalf("breaker should trip at threshold: until=%v ok=%v", bt, ok)
+	}
+}
+
+func TestBreakerSuccessClears(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Hour, 6*time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1")
+	p.NoteError("u1") // 触发熔断
+	if bt, _ := p.breakerUntil("u1"); bt.IsZero() {
+		t.Fatal("breaker should be open")
+	}
+	p.NoteSuccess("u1")
+	if bt, _ := p.breakerUntil("u1"); !bt.IsZero() {
+		t.Fatalf("success should clear breaker, until=%v", bt)
+	}
+	if !p.internalHealthy("u1") {
+		t.Fatal("account should be healthy after success clears breaker")
+	}
+}
+
+func TestBreakerExponentialBackoffCapped(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(3, time.Minute, 4*time.Minute) // threshold=3：连续 3 次失败熔断一次
+	// 连续 9 次失败（无成功）→ 熔断 3 次，retryCount 1→2→3，退避 1m→2m→4m(封顶)。
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			p.NoteError("u1") // 连续失败只驱动熔断
+		}
+	}
+	bt, ok := p.breakerUntil("u1")
+	if !ok || bt.IsZero() {
+		t.Fatal("breaker should be open")
+	}
+	d := time.Until(bt)
+	// 第 3 次熔断：d = min(1m * 2^2, 4m) = 4m
+	if d < 4*time.Minute-time.Second || d > 4*time.Minute+time.Second {
+		t.Errorf("backoff should cap at max=4m, got %v", d)
+	}
+
+	// 对比第 1 次熔断（新账号重新来）：退避应更短。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.SetBreaker(3, time.Minute, 4*time.Minute)
+	for j := 0; j < 3; j++ {
+		p2.NoteError("u1")
+	}
+	bt1, _ := p2.breakerUntil("u1")
+	if d1 := time.Until(bt1); d1 > time.Minute+time.Second {
+		t.Errorf("first trip should be ~1m, got %v", d1)
+	}
+}
+
+// 2026-10-18：账号级冷却（以及随之而来的「全冷却兜底」）已删除。
+// 这一组用例锁定新语义：没有可用账号时如实返回 nil，不再从冷却号里兜底选一个。
+
+// 账号级 until 只表示积分不足；它不会被当成「可兜底」的冷却态。
+func TestNoFallbackForCreditsExhausted(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "early"})
+	p.Cooldown("early", CoolHard, time.Hour, "余额不足")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("积分不足的号不得被兜底选中，got %+v", got)
+	}
+}
+
+func TestFallbackSkipsDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "dead"})
+	p.Disable("dead", "session dead")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("disabled 号不得被兜底选中，got %+v", got)
+	}
+}
+
+// 模型级限流不再产生兜底：被限流的号只对该模型退避，Pick("") 传空模型名时不命中
+// modelCooled，仍可正常选出——这正是「不要账号冷却」的体现。
+func TestModelCooldownDoesNotRemoveAccountFromPick(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Hour, time.Now().Add(time.Hour), "glm-5.3", "6004")
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
+		t.Fatalf("空模型名选号不应受模型级冷却影响，got %+v", got)
+	}
+	if got := p.Pick("glm-5.3"); got != nil {
+		t.Fatalf("该模型被限流时应返回 nil（无兜底），got %+v", got)
+	}
+}
+
+func TestFallbackAllUnavailableReturnsNil(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "h1"})
+	p.Add(&auth.Auth{UID: "h2"})
+	p.Cooldown("h1", CoolHard, time.Hour, "x")
+	p.Cooldown("h2", CoolHard, 2*time.Hour, "x")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("全部不可用时应返回 nil，got %+v", got)
+	}
+}
+
+// 熔断号同样不参与任何兜底（2026-10-15 起上游对熔断号挂着不回）。
+func TestBreakerAccountsNeverFallbackPicked(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "brk"})
+	p.SetBreaker(2, 5*time.Minute, 5*time.Minute)
+	p.NoteError("brk")
+	p.NoteError("brk") // 熔断
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("熔断号不得被兜底选中，got %+v", got)
+	}
+}
+
+func TestFallbackNilWhenAllDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	if got := p.Pick(""); got != nil {
+		t.Fatalf("want nil when all disabled, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3 三因子加权选取
+// ---------------------------------------------------------------------------
+
+// idleWeightOf 曝露 weightOf 的单因子拆解不便，改用完整权重断言（包内私有 helper）。
+func (p *Pool) entryWeight(uid string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byUID[uid]
+	var maxCredits int64
+	for _, x := range p.byUID {
+		if x.credits > maxCredits {
+			maxCredits = x.credits
+		}
+	}
+	return p.weightOf(e, maxCredits, time.Now())
+}
+
+func TestWeightHighCreditsDominates(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "hi"})
+	p.Add(&auth.Auth{UID: "lo"})
+	p.SetCredits("hi", 1000)
+	p.SetCredits("lo", 10)
+	wHi, wLo := p.entryWeight("hi"), p.entryWeight("lo")
+	if wHi <= wLo {
+		t.Errorf("high credits should weigh more: hi=%v lo=%v", wHi, wLo)
+	}
+}
+
+func TestWeightIdleCompensation(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "used"})
+	p.Add(&auth.Auth{UID: "idle"})
+	p.SetCredits("used", 100)
+	p.SetCredits("idle", 100)
+	// used 1 小时前被选中过、idle 从未使用 → idle 权重更高（闲置补偿）。
+	p.mu.Lock()
+	p.byUID["used"].lastUsed = time.Now().Add(-1 * time.Hour)
+	p.mu.Unlock()
+	wUsed, wIdle := p.entryWeight("used"), p.entryWeight("idle")
+	if wIdle <= wUsed {
+		t.Errorf("idle should weigh more: used=%v idle=%v", wUsed, wIdle)
+	}
+}
+
+func TestWeightLowSuccessRateDowngrades(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "good"})
+	p.Add(&auth.Auth{UID: "bad"})
+	p.SetCredits("good", 100)
+	p.SetCredits("bad", 100)
+	p.NoteSuccess("good")
+	p.NoteError("bad")
+	p.NoteError("bad")
+	wGood, wBad := p.entryWeight("good"), p.entryWeight("bad")
+	if wBad >= wGood {
+		t.Errorf("low success rate should weigh less: good=%v bad=%v", wGood, wBad)
+	}
+}
+
+func TestWeightAllZeroCreditsStillWeighted(t *testing.T) {
+	// credits 全 0：权重完全由 idle+successRate 决定，不退化均匀随机（仍可选出更高分者）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "idle"})
+	p.Add(&auth.Auth{UID: "bursty"})
+	// idle 从未使用、bursty 半分钟前刚用过 → idle 权重更高。
+	p.mu.Lock()
+	p.byUID["bursty"].lastUsed = time.Now().Add(-30 * time.Second)
+	p.mu.Unlock()
+	wIdle, wBursty := p.entryWeight("idle"), p.entryWeight("bursty")
+	if wIdle <= wBursty {
+		t.Errorf("idle should outweigh recently-used when credits all zero: idle=%v bursty=%v", wIdle, wBursty)
+	}
+}
+
+func TestWeightTopFiveSelectionChanges(t *testing.T) {
+	withNoPickGap(t)
+	// credits 相差不大时，闲置补偿可让"低分但久置"的账号权重反超"高分但刚用"的账号，
+	// 即使 credits 排序里 b 在前（Top5 内权重排序可与 credits 排序不同）。
+	p := New("")
+	for _, u := range []string{"a", "b"} {
+		p.Add(&auth.Auth{UID: u})
+	}
+	p.SetCredits("a", 90) // a credits 略低，但久置
+	p.SetCredits("b", 100)
+	p.mu.Lock()
+	p.byUID["b"].lastUsed = time.Now()
+	p.byUID["a"].lastUsed = time.Now().Add(-48 * time.Hour)
+	p.mu.Unlock()
+	if wA, wB := p.entryWeight("a"), p.entryWeight("b"); wA <= wB {
+		t.Errorf("idle a should outweigh busy higher-credit b: a=%v b=%v", wA, wB)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T4 在途租约（单账号并发上限）
+// ---------------------------------------------------------------------------
+
+func TestAcquireReleaseLifecycle(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+	if !p.Acquire("u1") {
+		t.Fatal("first acquire should succeed")
+	}
+	if !p.Acquire("u1") {
+		t.Fatal("second acquire should succeed")
+	}
+	if p.Acquire("u1") {
+		t.Fatal("third acquire should fail (limit 2)")
+	}
+	p.Release("u1")
+	if !p.Acquire("u1") {
+		t.Fatal("acquire after release should succeed")
+	}
+}
+
+func TestAcquireUnlimited(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// max=0 不限：连续 acquire 永不拒绝。
+	for i := 0; i < 100; i++ {
+		if !p.Acquire("u1") {
+			t.Fatalf("unlimited acquire %d failed", i)
+		}
+	}
+}
+
+func TestAcquireUnknownUID(t *testing.T) {
+	p := New("")
+	if p.Acquire("nope") {
+		t.Fatal("acquire unknown uid should fail")
+	}
+	p.Release("nope") // 不 panic
+}
+
+func TestPickSkipsInFlightFull(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "full"})
+	p.Add(&auth.Auth{UID: "free"})
+	p.SetCredits("full", 1000)
+	p.SetCredits("free", 1)
+	p.SetMaxInFlight(1)
+	// full 占满唯一名额 → Pick 应跳过它，选 free（即使 credits 更低）。
+	p.Acquire("full")
+	got := p.Pick("")
+	if got == nil || got.UID != "free" {
+		t.Fatalf("pick should skip in-flight-full account, got %+v", got)
+	}
+	p.Release("full")
+	// 释放后可重新被选中（确定性随机源 r=0 → 选 credits 最高的 full）。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	if got := p.Pick(""); got == nil || got.UID != "full" {
+		t.Fatalf("after release full should be pickable, got %+v", got)
+	}
+	p.Release("full")
+}
+
+func TestInFlightCountNotExceedLimit(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+
+	// 并发 50 次 acquire：CAS 保证任一时刻在途数不超上限；每次成功后立即 release。
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if p.Acquire("u1") {
+				// 峰值检查：acquire 成功后立即读计数，应 ≤ 2。
+				p.mu.RLock()
+				if n := p.byUID["u1"].inFlight.Load(); n > 2 {
+					t.Errorf("in-flight exceeded limit: %d", n)
+				}
+				p.mu.RUnlock()
+				p.Release("u1")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 全部释放后计数必须为 0。
+	p.mu.RLock()
+	n := p.byUID["u1"].inFlight.Load()
+	p.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("in-flight should be 0 after all releases, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T6 向后兼容 + 运行态 Status 扩展
+// ---------------------------------------------------------------------------
+
+func TestLoadLegacyStateFile(t *testing.T) {
+	// 旧 state.json 只含 credits/until/disabled 等老字段，缺熔断/在途/成功率新字段。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	// cool_kind=0 即 CoolHard（积分不足）——账号级唯一还在的状态。
+	legacy := `{"accounts":{"legacy":{"credits":123,"until":"2027-01-01T04:00:00+08:00","cool_kind":0,"reason":"余额不足"}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "legacy"})
+	st, ok := p.Status("legacy")
+	if !ok {
+		t.Fatal("legacy account should load")
+	}
+	if st.Credits != 123 || !st.CreditsExhausted || st.Cooling || st.Reason != "余额不足" {
+		t.Errorf("legacy state misloaded: %+v", st)
+	}
+	// 运行态新字段默认零值。
+	if st.InFlight != 0 || st.BreakerFails != 0 || !st.BreakerUntil.IsZero() {
+		t.Errorf("runtime fields should be zero for legacy load: %+v", st)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7 D5: Redis 状态快照镜像 + 择新恢复
+// ---------------------------------------------------------------------------
+
+// memStore 内存假 Store：记录 SaveState（模拟 Redis 快照）并可按需返回 LoadState。
+type memStore struct {
+	mu       sync.Mutex
+	saved    []byte
+	loadData []byte
+	loadOK   bool
+}
+
+func (m *memStore) SaveState(data []byte) {
+	m.mu.Lock()
+	m.saved = append([]byte(nil), data...)
+	m.mu.Unlock()
+}
+func (m *memStore) LoadState() ([]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loadOK {
+		return nil, false
+	}
+	return append([]byte(nil), m.loadData...), true
+}
+
+func TestSaveMirrorsSnapshot(t *testing.T) {
+	// Flush 落盘时同步 fire-and-forget SaveState（带 saved_at）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	ms := &memStore{}
+	p.SetStore(ms)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	ms.mu.Lock()
+	raw := string(ms.saved)
+	ms.mu.Unlock()
+	if !strings.Contains(raw, `"saved_at"`) {
+		t.Fatalf("snapshot should carry saved_at: %s", raw)
+	}
+	if !strings.Contains(raw, `"credits":42`) {
+		t.Fatalf("snapshot should carry account state: %s", raw)
+	}
+}
+
+func TestRestoreUsesRedisWhenNewer(t *testing.T) {
+	// Redis 快照比本地 state.json 新 → 采用 Redis。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	// 本地较旧
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 把本地 mtime 设到过去
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 999 {
+		t.Fatalf("should restore from Redis snapshot: %+v ok=%v", st, ok)
+	}
+}
+
+func TestRestoreUsesLocalWhenNewer(t *testing.T) {
+	// 本地 state.json 比 Redis 快照新 → 本地优先。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":77}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now().Add(-time.Hour)}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 77 {
+		t.Fatalf("should keep local (newer): %+v ok=%v", st, ok)
+	}
+}
+
+func TestRestoreNoRedisUsesLocal(t *testing.T) {
+	// 无 Redis 快照 → 本地优先。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":55}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: false}
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 55 {
+		t.Fatalf("no redis → use local: %+v ok=%v", st, ok)
+	}
+}
+
+func TestStatusExposesRuntimeFields(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+	p.Acquire("u1") // in_flight=1
+	st, _ := p.Status("u1")
+	if st.InFlight != 1 {
+		t.Errorf("in_flight=%d want 1", st.InFlight)
+	}
+	p.SetBreaker(2, time.Hour, 2*time.Hour)
+	p.NoteError("u1") // breaker_fails=1
+	st, _ = p.Status("u1")
+	if st.BreakerFails != 1 {
+		t.Errorf("breaker_fails=%d want 1", st.BreakerFails)
+	}
+	p.Release("u1")
+}
+
+// TestRealmRateStateIgnoresDeadAccountSoftUntil 账号级 until 若残留 CoolSoft
+// （旧版 state.json / 手工写入），不得再被当作「限流」计入 RateLimited：
+// 该字段现在只承载积分不足。模型级限流才是唯一的限流维度。
+func TestRealmRateStateIgnoresDeadAccountSoftUntil(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.mu.Lock()
+	p.byUID["u1"].until = time.Now().Add(time.Hour)
+	p.byUID["u1"].coolKind = CoolSoft
+	p.mu.Unlock()
+
+	state := p.RealmRateStateForModel("cn", "glm-5.3")
+	if state.RateLimited != 0 {
+		t.Fatalf("残留的账号级 CoolSoft 不应计入限流: %+v", state)
+	}
+	// 且它也不再让账号不可用：账号级限流冷却已不存在，旧字段是惰性残留。
+	// （读盘时 coolKind 会被规整，见 transition.go。）
+	if state.Available != 1 || state.Unavailable != 0 {
+		t.Fatalf("残留字段不得继续摘掉账号: %+v", state)
+	}
+}

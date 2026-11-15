@@ -1,0 +1,2106 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ═══ 更新日志 ═══
+# 2026-09-24：运行真实前端函数复现零值时间、刷新乱序、日志内容变化和筛选用量口径，防止字符串检查漏掉行为回退。
+
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import unittest
+
+
+PANEL = Path(__file__).resolve().parent
+NODE = shutil.which("node")
+
+
+class FrontendHarness:
+    """在 Node 里跑真实前端函数的公共夹具。
+
+    单独抽出来是因为后面几个测试类（可读性分组、域完整性）都要用它；
+    直接继承 FrontendBehaviorTests 会把父类那几十条用例在每个子类里重跑一遍。
+    """
+    def run_frontend(self, expression, extra_sources=(), fixtures=()):
+        """在 Node 里跑前端表达式。
+
+        fixtures：要预加载的 JSON 文件名列表，在表达式里以同名的全局变量访问
+        （如 fixtures=("testdata_state_synthetic.json",) → 表达式里用
+        testdata_state_synthetic）。走文件而不是把 JSON 拼进表达式：完整合成状态
+        可能超过 Windows 的 32K 命令行上限
+        （FileNotFoundError: [WinError 206]）。
+        """
+        program = r"""
+const vm = require('vm'), fs = require('fs'), path = require('path');
+const nodes = new Map();
+// 归一化：document.querySelector('#x') 与 getElementById('x') 必须指向同一个节点，
+// 否则同一元素会被存成两个 key——模块用 getElementById 绑定、测试用 $() 读取，
+// 两边看到的是不同对象，断言必然假失败。
+function norm(id) {
+  const s = String(id);
+  return s.charAt(0) === '#' ? s.slice(1) : s;
+}
+function node(rawId) {
+  const id = norm(rawId);
+  if (!nodes.has(id)) nodes.set(id, {innerHTML:'', textContent:'', value:'', disabled:false,
+    options:[], style:{}, attrs:{}, events:{},
+    // classList 必须**记录**状态而不是空实现：进度条的「不确定态」靠
+    // bar.classList.add('unknown') 表达，空实现会让断言永远看不出差异。
+    classList:(function(){const set=new Set();
+      return {add(c){set.add(c)},remove(c){set.delete(c)},
+        toggle(c,f){if(f===undefined)f=!set.has(c);f?set.add(c):set.delete(c);return f},
+        contains(c){return set.has(c)},_all(){return Array.from(set)}};})(),
+    setAttribute(k,v){this.attrs[k]=String(v)}, getAttribute(k){return this.attrs[k]},
+    removeAttribute(k){delete this.attrs[k]}, addEventListener(k,v){this.events[k]=v},
+    querySelector(s){return node(id+' '+s)},querySelectorAll(){return []}});
+  return nodes.get(id);
+}
+// window 必须存在：requests.js 等模块在加载时就会写 window.loadRequests /
+// window.openRequestsForKey，缺了它整个脚本会在解析期抛错，测试根本进不到断言。
+const win = {addEventListener(){}, location:{origin:'http://fixture.invalid',hash:'#overview'}};
+const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON, Object, Array, String, Number, Boolean, Error, RegExp, Math,
+  setTimeout(){return 1},clearTimeout(){},setInterval(){return 1},clearInterval(){},
+  location:{origin:'http://fixture.invalid',hash:'#overview',replace(){}},
+  history:{replaceState(){}},localStorage:{getItem(){return null},setItem(){}},
+  document:{readyState:'loading',hidden:false,documentElement:node('html'),
+    // getElementById 必须存在：requests.js 的 node() 走的就是它，缺了会让
+    // 整个模块在 init() 里抛错，测试永远进不到断言（此前 requests.js 从未被测过）。
+    getElementById:node, querySelector:node, querySelectorAll(){return []}, addEventListener(){}}};
+vm.createContext(context);
+for (const source of ['app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
+  vm.runInContext(fs.readFileSync(path.join(process.argv[1],source),'utf8'),context);
+// 预加载 fixture：变量名 = 去掉 .json 的文件名，表达式里直接引用。
+for (const name of String(process.argv[4]||'').split(',').filter(Boolean)) {
+  const raw = fs.readFileSync(path.join(process.argv[1], name), 'utf8');
+  context[name.replace(/\.json$/, '')] = JSON.parse(raw);
+}
+Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',context))
+  .then(result=>console.log(JSON.stringify(result)))
+  .catch(error=>{console.error(error);process.exitCode=1});
+"""
+        env = dict(os.environ, TZ="Asia/Shanghai")
+        result = subprocess.run([NODE, "-e", program, str(PANEL), expression,
+                                 ",".join(extra_sources), ",".join(fixtures)],
+                                capture_output=True, text=True, encoding="utf-8", env=env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class FrontendBehaviorTests(FrontendHarness, unittest.TestCase):
+    def test_zero_success_timestamp_does_not_hide_error_only_activity(self):
+        html = self.run_frontend("""
+S.data={accounts:[{uid:'fixture',pool:{inPool:true,cooling:true,coolRemaining:30,
+lastSuccess:'0001-01-01T00:00:00Z',lastErr:'2026-09-24T06:00:00Z'}}]};
+renderAccounts(); return $('#acctRows').innerHTML;
+""")
+        self.assertIn("无成功记录", html)
+        self.assertIn("最近错误", html)
+        self.assertNotIn("从未", html)
+
+    def test_account_with_no_timestamps_is_not_described_as_having_succeeded(self):
+        html = self.run_frontend("""
+S.data={accounts:[{uid:'fixture',pool:{inPool:true,healthy:true,
+lastSuccess:'0001-01-01T00:00:00Z',lastErr:'0001-01-01T00:00:00Z'}}]};
+renderAccounts(); return $('#acctRows').innerHTML;
+""")
+        self.assertIn("无记录", html)
+        self.assertNotIn("从未", html)
+
+    def test_credential_valid_for_another_hour_is_not_expired(self):
+        html = self.run_frontend("""
+S.data={accounts:[{uid:'fixture',expiresAt:Date.now()/1000+3600,
+pool:{inPool:true,healthy:true}}]};
+renderAccounts(); return $('#acctRows').innerHTML;
+""")
+        self.assertNotIn("凭证已过期", html)
+        self.assertIn("凭证剩", html)
+
+    def test_rerendering_account_rows_does_not_restart_cooldown(self):
+        result = self.run_frontend("""
+var clock=1000000;Date.now=function(){return clock};S.loadedAt=clock;
+S.data={accounts:[{uid:'fixture',pool:{inPool:true,cooling:true,coolRemaining:120}}]};
+renderAccounts();var first=$('#acctRows').innerHTML;
+clock+=60000;renderAccounts();var second=$('#acctRows').innerHTML;
+return {first:first.match(/data-cool-end="(\\d+)"/)[1],
+second:second.match(/data-cool-end="(\\d+)"/)[1],html:second};
+""")
+        self.assertEqual(result["first"], result["second"])
+        self.assertIn("剩 1:00", result["html"])
+
+    def test_expired_cooldown_does_not_repeatedly_reload_the_same_snapshot(self):
+        result = self.run_frontend("""
+var clock=1000000;Date.now=function(){return clock};
+var entry=$('#countdown');entry.setAttribute('data-cool-end',clock-1000);
+document.querySelectorAll=function(){return [entry]};
+var callbacks=[],calls=0;setTimeout=function(cb){callbacks.push(cb);return 1};
+loadAll=async function(){calls++};
+tickCooldowns();await callbacks[0]();tickCooldowns();
+return {scheduled:callbacks.length,loads:calls};
+""")
+        self.assertEqual(result, {"scheduled": 1, "loads": 1})
+
+    def test_latest_state_load_wins_when_responses_arrive_out_of_order(self):
+        result = self.run_frontend("""
+var requests=[], seen=[];
+api=function(path){return path.indexOf('api/state')===0
+  ? new Promise(resolve=>requests.push(resolve)) : Promise.resolve({tasks:[]});};
+render=function(){seen.push(S.data.revision)};svc=function(){};scheduleCreditRetry=function(){};
+var older=loadAll(), newer=loadAll();
+requests[1]({revision:2});await newer;requests[0]({revision:1});await older;
+return {revision:S.data.revision,seen:seen,busy:busyDepth};
+""")
+        self.assertEqual(result, {"revision": 2, "seen": [2], "busy": 0})
+
+    def test_stale_failed_state_load_does_not_hide_latest_success(self):
+        result = self.run_frontend("""
+var requests=[], status=[], errors=[];
+api=function(path){return path.indexOf('api/state')===0
+  ? new Promise((resolve,reject)=>requests.push({resolve,reject})) : Promise.resolve({tasks:[]});};
+render=function(){};svc=function(up){status.push(up)};scheduleCreditRetry=function(){};
+toast=function(message){errors.push(message)};
+var older=loadAll(), newer=loadAll();
+requests[1].resolve({revision:2});await newer;
+requests[0].reject(new Error('stale request failed'));await older;
+return {status:status,errors:errors,busy:busyDepth};
+""")
+        self.assertEqual(result, {"status": [True], "errors": [], "busy": 0})
+
+    def test_logs_refresh_when_same_sequence_status_and_duration_have_new_content(self):
+        html = self.run_frontend("""
+var calls=0;api=async function(){return {ok:true,rows:[{seq:1,status:'200',total:'1.0s',
+time:'12:00:00',model:++calls===1?'global:old-model':'global:new-model',
+in:calls===1?'100':'500',hit:'0',tok:'5',rate:'5',mode:'stream'}]};};
+await loadLogs();await loadLogs();return $('#logRows').innerHTML;
+""")
+        self.assertIn("global:new-model", html)
+        self.assertNotIn("global:old-model", html)
+
+    def test_changing_log_limit_during_fetch_fetches_the_requested_limit(self):
+        result = self.run_frontend("""
+var requested=[], release;
+api=function(path){requested.push(path);return requested.length===1
+  ? new Promise(resolve=>{release=resolve})
+  : Promise.resolve({ok:true,rows:[{seq:2,status:'200',total:'2s',model:'new-limit'}]});};
+CURRENT_VIEW='logs';S.logLines=120;var pending=loadLogs();
+S.logLines=500;await loadLogs();release({ok:true,rows:[{seq:1,status:'200',total:'1s',model:'old-limit'}]});
+await pending;return {requested:requested,html:$('#logRows').innerHTML};
+""")
+        self.assertEqual(result["requested"], ["api/logs?lines=120", "api/logs?lines=500"])
+        self.assertIn("new-limit", result["html"])
+        self.assertNotIn("old-limit", result["html"])
+
+    def test_usage_bars_use_selected_period_as_denominator(self):
+        html = self.run_frontend("""
+US.from=US.to='2026-09-23';renderUsageRows([
+{key_id:'a',name:'A',totals:{requests:100,total_tokens:100000},days:[{day:US.from,totals:{requests:1,total_tokens:10}}]},
+{key_id:'b',name:'B',totals:{requests:10,total_tokens:100},days:[{day:US.from,totals:{requests:1,total_tokens:100}}]}]);
+return $('#usageRows').innerHTML;
+""")
+        self.assertIn('width:100%', html)
+        self.assertIn('width:10%', html)
+
+    def test_usage_empty_period_does_not_list_unrelated_lifetime_rows(self):
+        html = self.run_frontend("""
+US.from=US.to='2026-09-23';renderUsageRows([
+{key_id:'old',name:'old lifetime row',totals:{requests:20,total_tokens:200},
+days:[{day:'2026-09-22',totals:{requests:20,total_tokens:200}}]}]);
+return $('#usageRows').innerHTML;
+""")
+        self.assertIn("这个时间范围没有用量记录", html)
+        self.assertNotIn("old lifetime row", html)
+
+    def test_historical_usage_does_not_show_future_last_use_as_in_period(self):
+        result = self.run_frontend("""
+US.from=US.to='2026-09-23';return usageLastUsedFor({
+last_used_at:'2026-09-24T01:00:00Z',days:[{day:'2026-09-23',totals:{requests:5}}]});
+""")
+        self.assertEqual(result, "")
+
+    def test_last_use_within_selected_range_remains_visible(self):
+        result = self.run_frontend("""
+US.from=US.to='2026-09-23';return usageLastUsedFor({
+last_used_at:'2026-09-23T01:00:00Z',days:[{day:'2026-09-23',totals:{requests:5}}]});
+""")
+        self.assertEqual(result, "2026-09-23T01:00:00Z")
+
+    def test_global_refresh_reloads_the_visible_usage_and_log_pages(self):
+        result = self.run_frontend("""
+var calls=[];loadAll=function(){calls.push('state')};loadUsage=function(){calls.push('usage')};
+loadLogs=function(){calls.push('logs')};
+CURRENT_VIEW='usage';location.hash='#usage';$('#btnRefresh').events.click();
+CURRENT_VIEW='logs';location.hash='#logs';$('#btnRefresh').events.click();return calls;
+""")
+        self.assertEqual(result, ["state", "usage", "state", "logs"])
+
+
+    def test_update_page_reports_a_disabled_gateway(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:false,current:'v2.4.10',commit:'111b07023e0a',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, check:$('#btnUpdCheck').disabled,
+        state:$('#updState').textContent, hint:$('#updHint').textContent,
+        body:$('#updRows').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "关闭热更新后「立即更新」按钮必须禁用")
+        self.assertTrue(result["check"], "关闭热更新后「检查更新」按钮必须禁用")
+        self.assertEqual(result["state"], "已关闭")
+        self.assertIn("update.enabled", result["body"])
+        self.assertIn("手工部署", result["body"])
+
+    def test_update_page_keeps_the_normal_ui_when_enabled(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v2.4.10',state:'idle',latest_tag:'v2.4.11',update_ready:true}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"])
+        self.assertIn("v2.4.11", result["hint"])
+
+    def test_update_apply_disabled_when_already_latest(self):
+        """已是最新版本时「立即更新」必须禁用。
+
+        2026-09-28 实测 bug：面板只看 busy，没看 update_ready，于是显示「已是最新版本」
+        的同时按钮仍可点——点下去会白下载、白验签、白交接一次，把服务重启一遍而版本号不变。
+        """
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.23',
+  latest_tag:'v2.4.23',update_ready:false,checked_at:'2026-09-28T14:36:17Z',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, check:$('#btnUpdCheck').disabled,
+        hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "已是最新版本时「立即更新」必须禁用")
+        self.assertFalse(result["check"], "已是最新版本时「检查更新」仍应可用")
+        self.assertIn("已是最新版本", result["hint"])
+
+    def test_update_apply_enabled_when_an_update_exists(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.22',
+  latest_tag:'v2.4.23',update_ready:true,checked_at:'2026-09-28T14:36:17Z',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"], "有可升级版本时「立即更新」必须可用")
+        self.assertIn("可升级到", result["hint"])
+
+    def test_update_apply_enabled_before_first_check(self):
+        """还没检查过远端时允许点「立即更新」：网关会先查一次远端版本。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'public',current:'v2.4.22',state:'idle'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, hint:$('#updHint').textContent};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["apply"], "未检查过远端时应允许点，由网关先查一次")
+        self.assertIn("检查远端版本", result["hint"])
+
+    def test_update_page_reports_private_repo_without_token(self):
+        """私有仓库未配令牌：不可用，且必须说明原因（而不是一个无法解释的失败）。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,visibility:'private',current:'v2.4.23',
+  unavailable_reason:'发布仓库已转为私有，匿名读不到 Release；把仓库改回公开，或配置 update.token'}};
+renderUpdate();
+return {apply:$('#btnUpdApply').disabled, state:$('#updState').textContent,
+        hint:$('#updHint').textContent, body:$('#updRows').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["apply"], "私有仓库未配令牌时「立即更新」必须禁用")
+        self.assertEqual(result["state"], "不可用")
+
+    def test_requests_filters_are_wired_and_sent(self):
+        """筛选控件必须真的绑上并发出请求。
+
+        2026-09-30 用户反馈「筛选不行、下拉箭头没用」：服务端筛选已实测正常，
+        所以先锁定前端契约——提交表单要读取四个控件并把它们发进查询串。
+        """
+        result = self.run_frontend("""
+var sent=[];
+api=function(url){sent.push(url);return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});};
+// 框架里 document.addEventListener 是空实现，DOMContentLoaded 不会触发，
+// 所以显式走一次 loadRequests 让 init() 绑定事件（真实页面由 go() 调用）。
+window.loadRequests();
+$('#requestKeyFilter').value='legacy';
+$('#requestModelFilter').value='global:deepseek-v4.1-flash';
+$('#requestStatusFilter').value='success';
+$('#requestIDFilter').value='req_ABC';
+var handler=$('#requestFilters').events.submit;
+if(!handler) return {bound:false};
+handler({preventDefault:function(){}});
+// fetchPage 是异步的：框架的 setTimeout 是空实现，所以用微任务等它把请求发出去。
+return Promise.resolve().then(function(){}).then(function(){}).then(function(){
+  return {bound:true, url:sent[sent.length-1]||''};
+});
+""", extra_sources=("requests.js",))
+        self.assertTrue(result["bound"], "requestFilters 必须绑定 submit 处理")
+        url = result["url"]
+        self.assertIn("key_id=legacy", url, "调用密钥筛选未进入查询串")
+        self.assertIn("status=success", url, "请求状态筛选未进入查询串")
+        self.assertIn("request_id=req_ABC", url, "请求 ID 筛选未进入查询串")
+
+    def test_request_facets_populate_the_datalists(self):
+        """筛选项必须来自服务端 facets，而不是当前页那 20 条。
+
+        2026-09-30 用户反馈「箭头点开什么都没有」：旧实现只从当前页收集，
+        不在本页的密钥/模型永远选不到，首次加载前下拉是空的。
+        """
+        result = self.run_frontend("""
+var asked=[];
+api=function(url){
+  asked.push(url);
+  if(String(url).indexOf('facets')>=0)
+    return Promise.resolve({ok:true,keys:[{id:'legacy',name:'dddmiku'},{id:'key_9',name:'热情'}],
+                            models:['global:deepseek-v4.1-flash','cn:hy3'],truncated:false});
+  return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});
+};
+window.loadRequests();
+return Promise.resolve().then(function(){}).then(function(){}).then(function(){
+  // 桩节点不会把 innerHTML 解析成 options，所以直接断言写入的内容——
+  // 真实浏览器里的解析已单独用无头 Chrome 验证过（2/2 选项）。
+  return {asked:asked, keys:$('#requestKeyOptions').innerHTML, models:$('#requestModelOptions').innerHTML};
+});
+""", extra_sources=("requests.js",))
+        self.assertTrue(any('facets' in u for u in result["asked"]), "必须请求 /requests/facets")
+        # 下拉只显示名称：value 是展示名，不再同时带 label（否则同一密钥显示两行）。
+        self.assertIn('value="dddmiku"', result["keys"], "密钥下拉应显示名称")
+        self.assertNotIn('label=', result["keys"], "不应再用 label 渲染第二行")
+        self.assertNotIn('value="legacy"', result["keys"], "不应把管理 ID 当显示项")
+        self.assertIn('global:deepseek-v4.1-flash', result["models"], "模型下拉应含完整模型名")
+
+    def test_request_key_filter_resolves_name_back_to_id(self):
+        """下拉显示名称，但提交必须换回管理 ID——否则筛选会查不到任何记录。"""
+        result = self.run_frontend("""
+var sent=[];
+api=function(url){
+  if(String(url).indexOf('facets')>=0)
+    return Promise.resolve({ok:true,keys:[{id:'legacy',name:'dddmiku'}],models:['m'],truncated:false});
+  sent.push(url);
+  return Promise.resolve({ok:true,items:[],total:0,offset:0,limit:20});
+};
+window.loadRequests();
+var wait=Promise.resolve();
+for(var i=0;i<8;i++) wait=wait.then(function(){});
+return wait.then(function(){
+  $('#requestKeyFilter').value='dddmiku';
+  $('#requestFilters').events.submit({preventDefault:function(){}});
+  var w2=Promise.resolve();
+  for(var j=0;j<8;j++) w2=w2.then(function(){});
+  return w2.then(function(){ return sent; });
+});
+""", extra_sources=("requests.js",))
+        # facets 桩数据里 dddmiku 对应 legacy
+        joined = " ".join(result)
+        self.assertIn("key_id=legacy", joined, "名称应被解析回管理 ID")
+        self.assertNotIn("key_id=dddmiku", joined, "不应把名称直接当 ID 发出")
+
+    def test_overview_credit_breaks_down_by_realm(self):
+        """首页积分要分列国际与国内。
+
+        两套账来自不同上游、不同计费，混在一起看不出哪边快用完。
+        合计保留，下面按域小计（与「账号池」的 realmTotals 同一惯例）。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:100,size:400}},
+  {uid:'g2',realm:'global',pool:{inPool:true},credits:{remain:50,size:200}},
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:30,size:100}}]};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn('rtag global', result, "应列出国际瓷片")
+        self.assertIn('rtag cn', result, "应列出国内瓷片")
+        self.assertIn("150", result, "国际小计应为 100+50")
+        self.assertIn("30", result, "国内小计应为 30")
+        self.assertIn("180", result, "合计仍应为 180")
+        self.assertIn("占 83%", result, "国际应标出占剩余的份额")
+        self.assertIn("占 17%", result, "国内应标出占剩余的份额")
+
+    def test_overview_credit_skips_absent_realm(self):
+        """某域一个号都没取到积分时不显示该行，避免堆空行。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:100,size:400}}]};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn('rtag global', result)
+        self.assertNotIn('rtag cn', result)
+
+    def test_model_picker_shows_multiplier_badges(self):
+        """模型选择器必须显示扣费倍率——用户此前不知道各模型倍率是多少。
+
+        倍率来自 /api/models 的 credits 字段（面板透传 /v1/models）。按档位配色：
+        免费（0）/ 低（<0.5）/ 高（≥0.5），解析不出倍率时如实标「倍率未知」。
+        """
+        result = self.run_frontend("""
+KS.modelItems=[
+  {id:'cn:hy3', credits:'x0.00', vendor:'j', supports_reasoning:true},
+  {id:'cn:deepseek-v4.1-flash', credits:'x0.11', vendor:'f', supports_tool_call:true},
+  {id:'cn:glm-5.3', credits:'x0.79', vendor:'e'},
+  {id:'cn:mystery', vendor:'?'}
+];
+$('#keyModels').value='cn:hy3, cn:glm-5.3';
+renderModelPanel();
+renderModelTags();
+return {panel:$('#keyModelPanel').innerHTML, tags:$('#keyModelTags').innerHTML};
+""", extra_sources=("keys.js",))
+        panel, tags = result["panel"], result["tags"]
+        self.assertIn("免费", panel, "零倍率应显示「免费」")
+        self.assertIn("x0.11", panel, "应显示低倍率原文")
+        self.assertIn("x0.79", panel, "应显示高倍率原文")
+        self.assertIn("mrate free", panel, "免费档应用 free 配色")
+        self.assertIn("mrate low", panel, "低倍率档应用 low 配色")
+        self.assertIn("mrate high", panel, "高倍率档应用 high 配色")
+        self.assertIn("倍率未知", panel, "解析不出倍率时如实标注，不编造")
+        # 已选中的两个模型在面板里打勾、在标签区显示为可移除的 chip。
+        self.assertEqual(panel.count("✓"), 2, "已选模型应有对勾")
+        self.assertIn("cn:hy3", tags)
+        self.assertIn('data-drop-model="cn:glm-5.3"', tags, "标签应带移除按钮")
+
+    def test_model_picker_rate_parsing(self):
+        """倍率解析要能吃下上游的各种写法，解析不出返回 null 而不是 0。"""
+        result = self.run_frontend("""
+return {
+  plain: parseRate('x0.79'),
+  suffixed: parseRate('x0.11 credits'),
+  bare: parseRate('0.06'),
+  zero: parseRate('x0.00'),
+  empty: parseRate(''),
+  missing: parseRate(undefined),
+  junk: parseRate('credits'),
+  cls_free: rateClass(0),
+  cls_low: rateClass(0.11),
+  cls_high: rateClass(0.79),
+  cls_none: rateClass(null)
+};
+""", extra_sources=("keys.js",))
+        self.assertEqual(result["plain"], 0.79)
+        self.assertEqual(result["suffixed"], 0.11)
+        self.assertEqual(result["bare"], 0.06)
+        self.assertEqual(result["zero"], 0.0)
+        self.assertIsNone(result["empty"], "空串不是 0，是未知")
+        self.assertIsNone(result["missing"])
+        self.assertIsNone(result["junk"])
+        self.assertEqual(result["cls_free"], "free")
+        self.assertEqual(result["cls_low"], "low")
+        self.assertEqual(result["cls_high"], "high")
+        self.assertEqual(result["cls_none"], "")
+
+
+    def test_model_picker_filters_as_you_type(self):
+        """输入关键词要实时筛出相关模型，且最相关的排最前。
+
+        纯子串匹配会把 `global:*` 和 `glm-*` 混在一起（"gl" 同时命中 global 前缀），
+        第一眼看不到想找的；所以按「去掉 realm 前缀后的模型名开头命中」优先排序。
+        """
+        result = self.run_frontend("""
+KS.modelItems=[
+  {id:'cn:glm-5.3', credits:'x0.79'},
+  {id:'cn:glm-5.3-flash', credits:'x0.06'},
+  {id:'global:deepseek-v4.1-flash', credits:'x0.00'},
+  {id:'global:hy3', credits:'x0.00'},
+  {id:'cn:hy3', credits:'x0.00'}
+];
+KS.modelQuery='gl';
+var ids = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='glm flash';
+var narrow = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='zzz';
+var none = filteredModelItems().map(function(i){return i.id;});
+KS.modelQuery='';
+var all = filteredModelItems().map(function(i){return i.id;});
+return {gl:ids, narrow:narrow, none:none, allCount:all.length};
+""", extra_sources=("keys.js",))
+        # "gl" 命中 4 个（glm-* 两个 + global:* 两个），但模型名开头的排最前。
+        self.assertEqual(result["gl"][:2], ["cn:glm-5.3", "cn:glm-5.3-flash"],
+                         "去掉 realm 前缀后以关键词开头的模型必须排最前")
+        self.assertEqual(len(result["gl"]), 4, "global:* 也是相关项，不能隐藏")
+        self.assertEqual(result["narrow"], ["cn:glm-5.3-flash"], "多词全命中（顺序无关）")
+        self.assertEqual(result["none"], [], "无匹配返回空")
+        self.assertEqual(result["allCount"], 5, "空关键词不过滤")
+
+    def test_model_picker_count_badge_and_empty_state(self):
+        """过滤时显示「筛出/总数」计数，无匹配时给出可读的空态而不是空白面板。"""
+        result = self.run_frontend("""
+KS.modelItems=[{id:'cn:glm-5.3'},{id:'cn:hy3'}];
+KS.modelQuery='zzz';
+renderModelPanel();
+var empty = $('#keyModelPanel').innerHTML;
+var badgeEmpty = $('#keyModelCount').textContent;
+KS.modelQuery='glm';
+renderModelPanel();
+var badgeOne = $('#keyModelCount').textContent;
+KS.modelQuery='';
+renderModelPanel();
+var badgeAll = $('#keyModelCount').textContent;
+return {empty:empty, badgeEmpty:badgeEmpty, badgeOne:badgeOne, badgeAll:badgeAll};
+""", extra_sources=("keys.js",))
+        self.assertIn("没有匹配", result["empty"])
+        self.assertIn("zzz", result["empty"], "空态应回显用户输入的关键词")
+        self.assertEqual(result["badgeEmpty"], "0/2")
+        self.assertEqual(result["badgeOne"], "1/2")
+        self.assertEqual(result["badgeAll"], "", "不过滤时不显示计数徽标")
+
+
+    def test_expiring_credits_are_surfaced(self):
+        """快过期积分必须显示出来——到期即作废，运维得知道有积分要浪费了。
+
+        数据来自网关 /status 的 credits_expiring（签到/积分任务按 expiring_soon
+        窗口判定），面板经 /api/state 透传成 credits.expiring。三处都要显示：
+        总览卡片、积分卡片合计、账号行。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}},
+  {uid:'u2',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,used:100,expiring:0}}
+],pool:{total:2,healthy:2}};
+renderMetrics();
+var metrics=$('#metrics').innerHTML;
+renderCredit();
+var credit=$('#creditPanel').innerHTML;
+renderAccounts();
+var rows=$('#acctRows').innerHTML;
+return {metrics:metrics, credit:credit, rows:rows};
+""")
+        self.assertIn("即将过期", result["metrics"], "总览卡片应提示有积分快过期")
+        self.assertIn("120", result["metrics"])
+        self.assertIn("快过期", result["credit"], "积分卡片应显示快过期合计")
+        self.assertIn("120", result["credit"])
+        self.assertIn("即将作废", result["credit"])
+        self.assertIn("其中 120 即将过期", result["rows"], "账号行应标出该号的快过期积分")
+
+    def test_no_expiring_credits_shows_nothing(self):
+        """没有快过期积分时不显示任何相关文案（大多数时候如此，不该占位）。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:0}}
+],pool:{total:1,healthy:1}};
+renderMetrics(); var m=$('#metrics').innerHTML;
+renderCredit();   var c=$('#creditPanel').innerHTML;
+renderAccounts(); var r=$('#acctRows').innerHTML;
+return {m:m,c:c,r:r};
+""")
+        for part, name in ((result["m"], "总览"), (result["c"], "积分卡"), (result["r"], "账号行")):
+            self.assertNotIn("过期", part, "%s 不该在无快过期积分时出现提示" % name)
+
+    def test_expiring_rows_are_escaped_not_html(self):
+        """mrow 会转义值（防 XSS），所以快过期提示必须用它的 cls 上色，不能塞 HTML。
+
+        2026-10-10 实测踩到：直接传 <span> 会把标签当字面文本显示出来。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}}
+],pool:{total:1,healthy:1}};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertNotIn("&lt;span", result, "快过期提示不该把 HTML 当文本输出")
+        self.assertNotIn("<span class=\"expiring\">", result, "mrow 会转义，不能塞 HTML")
+        self.assertIn('class="v w"', result, "应改用 mrow 的 cls 参数上警示色")
+
+    def test_disabled_count_uses_pool_state_too(self):
+        """总览「账号」卡的停用数必须把池级停用算进去。
+
+        2026-10-10 用户反馈「卡片数字打架」：账号卡读文件级停用（.disabled 后缀，
+        线上 28 个文件一个都没有 → 恒显示 0 个停用），而账号池卡读网关 /status
+        （7 个池级停用）。两卡并排却各说各话。运维关心「有几个号现在用不了」，
+        所以取并集。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true}},
+  {uid:'b',disabled:true, pool:{inPool:false}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+renderMetrics();
+var m=$('#metrics').innerHTML;
+renderAccounts();
+return {m:m, rows:$('#acctRows').innerHTML};
+""")
+        # 3 个号里 2 个用不了（1 个池级 + 1 个文件级）。
+        self.assertIn("1 启用", result["m"], "并集口径：只有 c 是启用的")
+        self.assertIn("2 个停用", result["m"])
+        # 账号行也按同一口径标停用。
+        self.assertEqual(result["rows"].count("已停用"), 2)
+
+    def test_account_off_filter_matches_metric_card(self):
+        """「停用」筛选与总览卡片同口径（否则筛选出的行数对不上卡片数字）。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true}},
+  {uid:'b',disabled:true, pool:{inPool:false}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+S.filter='off'; renderAccounts();
+var off=$('#acctRows').innerHTML;
+S.filter='on'; renderAccounts();
+var on=$('#acctRows').innerHTML;
+S.filter='all'; return {off:off, on:on};
+""")
+        self.assertIn("a", result["off"])
+        self.assertIn("b", result["off"])
+        self.assertNotIn(">c<", result["off"].replace("<td", "<td"), "启用的号不该出现在停用筛选里")
+        self.assertIn("c", result["on"])
+
+    def test_pool_disabled_account_offers_revive(self):
+        """池级停用的号给「复活」按钮，不是「启用」。
+
+        文件级改名对池级停用无效（文件本来就在池里），只有 /accounts/revive
+        能清网关侧的 disabled+reason。混用会让运维点了没反应。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',disabled:false,pool:{inPool:true,disabled:true,disabledReason:'12153 session dead'}},
+  {uid:'c',disabled:false,pool:{inPool:true,disabled:false}}
+],pool:{total:2,healthy:1,disabled:1}};
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn('data-revive="a"', result, "池级停用应提供复活按钮")
+        self.assertIn("12153 session dead", result, "悬停应显示停用原因")
+        self.assertEqual(result.count("data-revive"), 1, "正常号不该有复活按钮")
+
+    def test_credits_page_renders_breakdown(self):
+        """积分有效期页按分档渲染，并标出最近到期。
+
+        分档来自 cmd/credit 直查上游 billing/meter（含 global 号，不受签到跳过影响）。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',nickname:'n1',realm:'cn',pool:{inPool:true},
+   credits:{remain:1000,size:2000,used:1000,expiring:300,
+     expiry:{within_1d:100,within_3d:200,within_7d:300,within_30d:400,later:0,
+             unlimited:0,next_end:'2026-10-11T09:00:00+08:00'}}},
+  {uid:'u2',nickname:'n2',realm:'global',pool:{inPool:true},
+   credits:{remain:500,size:500,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:500}}}
+],pool:{total:2,healthy:2},creditTotals:{expiring:300,expiring_window_hours:168}};
+renderCreditsPage();
+return {head:$('#creditsHead').innerHTML, bars:$('#creditsBars').innerHTML,
+        rows:$('#creditsRows').innerHTML, meta:$('#creditsMeta').textContent};
+""")
+        # 7 天内 = 100+200+300 = 600。
+        self.assertIn("600", result["head"], "头部应显示 7 天内到期的累计值")
+        self.assertIn("占剩余", result["head"])
+        # 分档条：只渲染非零档位。
+        self.assertIn("1 天内", result["bars"])
+        self.assertIn("30 天内", result["bars"])
+        self.assertIn("不会过期", result["bars"])
+        self.assertNotIn("30 天后", result["bars"], "零值档位不渲染")
+        # 账号行：两个号都在，且最近到期有值。
+        self.assertIn("n1", result["rows"])
+        self.assertIn("n2", result["rows"])
+        self.assertIn("2 个账号", result["meta"])
+
+    def test_credits_page_orders_by_urgency(self):
+        """积分有效期页按「7 天内到期」降序：有作废风险的号排最上面。"""
+        result = self.run_frontend("""
+function acct(uid,soon){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('low',1),acct('high',99),acct('mid',50)],
+  pool:{total:3,healthy:3},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        self.assertLess(result.index("high"), result.index("mid"), "到期多的应排前面")
+        self.assertLess(result.index("mid"), result.index("low"))
+
+    def test_credits_tab_counts_accounts_with_expiring(self):
+        """侧栏计数 = 有积分将在窗口内到期的账号数；为 0 时显示 —（不占位）。"""
+        result = self.run_frontend("""
+function acct(uid,soon){return {uid:uid,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('a',5),acct('b',0)],pool:{}};
+renderCreditsTab();
+var one=$('#tabCredits').textContent;
+S.data={accounts:[acct('a',0)],pool:{}};
+renderCreditsTab();
+var none=$('#tabCredits').textContent;
+return {one:one, none:none};
+""")
+        self.assertEqual(result["one"], "1")
+        self.assertEqual(result["none"], "—")
+
+    def test_expiring_scalar_falls_back_when_no_breakdown(self):
+        """只有标量 expiring（旧网关/旧数据）时仍要显示提示，不能被分档分支吞掉。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'u1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,used:100,expiring:120}}
+],pool:{total:1,healthy:1}};
+renderMetrics();
+var m=$('#metrics').innerHTML;
+renderAccounts();
+return {m:m, rows:$('#acctRows').innerHTML};
+""")
+        self.assertIn("120", result["m"], "无分档时应回落到标量 expiring")
+        self.assertIn("其中 120 即将过期", result["rows"])
+
+    def test_synthetic_full_state_renders(self):
+        """独立合成 28 个账号，覆盖 7 个池级停用、5 个到期账号与 12,264 分汇总。"""
+        result = self.run_frontend("""
+S.data = testdata_state_synthetic;
+Date.now=function(){return Date.parse(S.data._fixture.now)};
+renderMetrics();
+var m = $('#metrics').innerHTML;
+renderCreditsPage();
+var head = $('#creditsHead').innerHTML, bars = $('#creditsBars').innerHTML;
+renderCreditsTab();
+var tab = $('#tabCredits').textContent;
+renderAccounts();
+var rows = $('#acctRows').innerHTML;
+return {m:m, head:head, bars:bars, tab:tab,
+        rowsLen:rows.length,
+        offBadges:(rows.match(/已停用/g) || []).length,
+        revive:(rows.match(/data-revive/g) || []).length,
+        expiring:(rows.match(/即将过期/g) || []).length};
+""", fixtures=("testdata_state_synthetic.json",))
+        # 总览卡片：7 个池级停用要算进「账号」卡（此前恒显示 0，用户截图反馈过）。
+        self.assertIn("7 个停用", result["m"], "账号卡必须把池级停用算进来")
+        self.assertIn("12,264", result["m"], "总览应显示 7 天内到期的合计（带千分位）")
+        # 积分有效期页：头部汇总 + 分档条都要有内容。
+        self.assertIn("12,264", result["head"])
+        self.assertIn("7 天内", result["bars"])
+        self.assertIn("30 天内", result["bars"])
+        self.assertEqual(result["tab"], "5", "侧栏计数 = 有快过期积分的账号数")
+        # 账号页：7 个停用徽标、7 个复活按钮、5 行快过期提示。
+        self.assertEqual(result["offBadges"], 7)
+        self.assertEqual(result["revive"], 7)
+        self.assertEqual(result["expiring"], 5)
+        self.assertGreater(result["rowsLen"], 10000, "账号表应真的渲染出行")
+
+    def test_schedule_shows_absolute_times(self):
+        """到期日程要给出具体时刻与金额，不只是「N 天内」的分档。"""
+        result = self.run_frontend("""
+function acct(uid, sch){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+S.data={accounts:[
+  acct('a',[{end:'2026-10-15T10:41:23+08:00',amount:1560,packages:3},
+            {end:'2026-10-16T09:00:07+08:00',amount:385}]),
+  acct('b',[{end:'2026-10-15T10:41:23+08:00',amount:100}])
+],pool:{},creditTotals:{expiring_window_hours:168}};
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, picker:$('#schedAccount').innerHTML};
+""")
+        rows = result["rows"]
+        self.assertIn("10/15", rows, "应显示具体日期")
+        self.assertIn("10:41", rows, "应显示具体时刻")
+        self.assertIn("1,660", rows, "同一时刻的两个号应合并（1560+100）")
+        self.assertIn("385", rows)
+        # 时刻升序：10/15 那行在 10/16 之前。
+        self.assertLess(rows.index("10/15"), rows.index("10/16"))
+        # 账号选择器列出有日程的号。
+        self.assertIn('data-a="a"', result["picker"])
+        self.assertIn('data-a="b"', result["picker"])
+
+    def test_schedule_scope_and_account_filters(self):
+        """范围（窗口内）与账号筛选都要生效。"""
+        result = self.run_frontend("""
+function acct(uid, sch){return {uid:uid,nickname:uid,realm:'cn',pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+var soon = new Date(Date.now()+2*86400000).toISOString();
+var far  = new Date(Date.now()+60*86400000).toISOString();
+S.data={accounts:[
+  acct('a',[{end:soon,amount:50},{end:far,amount:70}]),
+  acct('b',[{end:far,amount:30}])
+],pool:{},creditTotals:{expiring_window_hours:168}};
+SCHED_STATE.scope='all'; SCHED_STATE.account='';
+renderSchedule(); var all=$('#schedRows').innerHTML;
+SCHED_STATE.scope='soon'; renderSchedule(); var soonOnly=$('#schedRows').innerHTML;
+SCHED_STATE.scope='all'; SCHED_STATE.account='a'; renderSchedule(); var oneAcct=$('#schedRows').innerHTML;
+SCHED_STATE.account='';
+return {all:all, soon:soonOnly, one:oneAcct};
+""")
+        self.assertIn("50", result["all"])
+        # a 的 70 与 b 的 30 是同一时刻 → 合并成 100（这正是"同一波一起作废"的读法）。
+        self.assertIn("100", result["all"])
+        self.assertIn("a、b", result["all"], "合并行应列出两个号")
+        # 窗口内（7 天）只剩 soon 那笔。
+        self.assertIn("50", result["soon"])
+        self.assertNotIn("100", result["soon"], "60 天后的不该出现在窗口内")
+        # 只看账号 a：只剩 a 的两笔，b 不再出现在涉及账号里。
+        self.assertIn("50", result["one"])
+        self.assertIn("70", result["one"])
+        self.assertNotIn("a、b", result["one"], "筛选账号后不该出现别的号")
+
+    def test_schedule_marks_truncation(self):
+        """日程被截断时要说明，免得用户以为"就这些"。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,
+      schedule:[{end:'2026-10-15T10:00:00+08:00',amount:10}],schedule_truncated:true}}}
+],pool:{},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn("40 笔", result, "应说明截断与合并口径")
+        self.assertIn("合计仍等于剩余积分", result)
+
+    def test_schedule_empty_state(self):
+        """没有日程时给空态，而不是空白表。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100,schedule:[]}}}
+],pool:{},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn("没有到期日程", result)
+
+    def test_synthetic_schedule_renders(self):
+        """119 笔独立合成日程应渲染具体日期与账号选择器。"""
+        result = self.run_frontend("""
+S.data = testdata_state_synthetic;
+Date.now=function(){return Date.parse(S.data._fixture.now)};
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, picker:$('#schedAccount').innerHTML};
+""", fixtures=("testdata_state_synthetic.json",))
+        self.assertIn("/", result["rows"], "应渲染出具体到期时刻")
+        self.assertIn('data-a="', result["picker"])
+        # 合成日程固定包含 10 月日期，避免依赖任何原账号的时间。
+        self.assertIn("10/", result["rows"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class VersionAndModelRefreshTest(unittest.TestCase):
+    """锁定两处用户实测反馈的修复。
+
+    1) 顶栏版本号渲染成 "wv2.6.26"：网关版本号自带 "v" 前缀（VERSION 文件是
+       "v2.6.26"），前端又补了一个，于是出现两个 v。
+    2) 打开密钥编辑时要自动回源刷新模型列表（含倍率）——上游会调价、会员折扣会变，
+       原先每次都得手点「刷新模型」才看得到当前值。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.keys_js = (PANEL / "keys.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+
+    def test_version_prefix_is_not_duplicated(self):
+        # 不能无条件拼 'v'：要先看版本号是不是已经带了。
+        self.assertNotIn("' · v' + d.version", self.app_js)
+        self.assertIn("charAt(0) !== 'v'", self.app_js)
+        # 打包产物同样生效。
+        self.assertIn("charAt(0) !== 'v'", self.index)
+
+    def test_editor_open_triggers_silent_refresh(self):
+        self.assertIn("refreshKeyModels({toast:false})", self.keys_js)
+        self.assertIn("refreshKeyModels({toast:false})", self.index)
+        # 静默：自动刷新失败不该弹错误打断编辑。
+        self.assertIn("opts.toast !== false", self.keys_js)
+
+    def test_manual_refresh_still_toasts(self):
+        """手动点刷新仍要有反馈（不能因为抽函数把提示弄丢）。"""
+        self.assertIn("toast('模型列表已刷新", self.keys_js)
+        self.assertIn("btnRefreshModels", self.keys_js)
+
+
+
+class UndefinedFunctionReferenceTest(unittest.TestCase):
+    """禁止「调用了但没定义」的顶层函数。
+
+    2026-10-11 实测：我在删废弃函数时把 `readClipboardIntoCallback` 一起删了，
+    而它仍在 renderTraeAuth 里被注册成按钮回调——用户点「从剪贴板读取并添加」
+    直接报 `readClipboardIntoCallback is not defined`。JS 是运行时解析的，
+    删函数不会在语法检查（node --check）里报错，只在实际点击时炸。
+
+    这里把「作为回调传递的函数名」抽出来逐个查定义，覆盖这一类错误。
+    """
+
+    SOURCES = ("app.js", "keys.js", "usage.js", "requests.js", "update.js", "logs.js")
+
+    def test_event_handler_callbacks_are_defined(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        blobs = {}
+        for name in self.SOURCES:
+            path = os.path.join(here, name)
+            if os.path.exists(path):
+                blobs[name] = open(path, encoding="utf-8").read()
+        # 定义名：既收顶层函数，也收**任意缩进的嵌套函数**——面板里不少回调是
+        # 闭包内的局部函数（如 requests.js 的 closeDetail），只收顶层会误报。
+        defined = set()
+        for body in blobs.values():
+            for m in re.finditer(r"(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", body):
+                defined.add(m.group(1))
+            for m in re.finditer(r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=", body):
+                defined.add(m.group(1))
+            for m in re.finditer(r"([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s*)?function", body):
+                defined.add(m.group(1))
+        # 作为回调直接传递的名字：addEventListener('x', NAME) 或 addEventListener('x', NAME)
+        referenced = set()
+        for body in blobs.values():
+            for m in re.finditer(r"addEventListener\(\s*['\"][\w]+['\"]\s*,\s*([A-Za-z_$][\w$]*)\s*\)", body):
+                referenced.add(m.group(1))
+        missing = sorted(n for n in referenced if n not in defined)
+        self.assertEqual(missing, [], "这些回调被注册但未定义：%s" % missing)
+
+    def test_trae_flow_callbacks_exist(self):
+        """Trae 授权流程的两个按钮回调必须在打包产物里存在。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+        for fn in ("readClipboardIntoCallback", "submitTraeCallback", "renderTraeAuth"):
+            with self.subTest(fn=fn):
+                self.assertIn("function " + fn, index,
+                              "%s 被调用但未定义" % fn)
+
+
+class SelectorTargetExistsTest(unittest.TestCase):
+    """禁止「解引用了不存在的元素 id」。
+
+    2026-10-11 实测两连：先是 `readClipboardIntoCallback is not defined`（函数被删），
+    再是 `var btn = $('#drSubmit')` —— 按钮已改名 `drSubmit2`，旧 id 取不到，
+    `$()` 返回 null，下一行 `.disabled` 直接抛异常，**整个函数静默失败**，
+    用户看到的就是「点了没反应」。
+
+    这类错误 node --check 抓不到（语法合法），只能靠「id 是否存在」的静态核对。
+    """
+
+    def _blobs(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        js = {}
+        for name in ("app.js", "keys.js", "usage.js", "requests.js", "update.js", "logs.js"):
+            path = os.path.join(here, name)
+            if os.path.exists(path):
+                js[name] = open(path, encoding="utf-8").read()
+        index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+        return js, index
+
+    def test_dollar_selectors_target_known_ids(self):
+        js, index = self._blobs()
+        # 所有会被创建的 id：HTML 静态的 + JS 里动态拼的（两种引号）。
+        known = set(re.findall(r'\bid="([\w-]+)"', index))
+        for body in js.values():
+            known |= set(re.findall(r'''id=["']([\w-]+)["']''', body))
+        missing = set()
+        for name, body in js.items():
+            for m in re.finditer(r"\$\(['\"]#([\w-]+)['\"]\)\s*\.\s*([\w]+)", body):
+                if m.group(1) not in known:
+                    missing.add("%s: #%s .%s" % (name, m.group(1), m.group(2)))
+        self.assertEqual(sorted(missing), [],
+                         "这些选择器指向不存在的 id：%s" % sorted(missing))
+
+    def test_trae_buttons_use_current_ids(self):
+        """Trae 授权页的按钮 id 与 submitTraeCallback 里取的要一致。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        body = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        start = body.index("function renderTraeAuth()")
+        block = body[start:body.index("function renderWait()", start)]
+        # 渲染出的按钮 id
+        rendered = set(re.findall(r'''id=["']([\w-]+)["']''', block))
+        self.assertIn("drSubmit2", rendered)
+        self.assertIn("drPaste", rendered)
+        self.assertIn("drReopen", rendered)
+        # submitTraeCallback 必须取 drSubmit2，不能取已废弃的 drSubmit
+        sub = body[body.index("async function submitTraeCallback()"):]
+        sub = sub[:sub.index("\n}")]
+        self.assertIn("$('#drSubmit2')", sub)
+        self.assertNotIn("$('#drSubmit')", sub,
+                         "drSubmit 是扫码流程的按钮，Trae 流程用 drSubmit2")
+
+
+class TraeCheckTaskGroupingTest(FrontendHarness, unittest.TestCase):
+    """Trae 签到是独立任务，必须单独成组、单独可触发。
+
+    用户要求：「trae 的签到走 trae 的定时，workbuddy 的走 workbuddy 的，他们不是
+    同一个站点」。后端已把 trae 拆成 TaskKeyTraeCheck（realms=['trae']），
+    面板按 t.realms 分组，所以这里锁的是「分组真的把两个签到分到不同域下」。
+    """
+
+    def test_two_checkin_tasks_land_in_different_realm_groups(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c1',realm:'cn'},{uid:'g1',realm:'global'},{uid:'t1',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9,21],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+renderTasks();
+return $('#taskList').innerHTML;
+""")
+        # 两个签到任务必须都在，且各自挂在正确的域组下。
+        self.assertIn("签到（WorkBuddy）", result)
+        self.assertIn("签到（Trae）", result)
+        cn = result.index("国内版 CN")
+        gl = result.index("国际版 Global")
+        tr = result.index("Trae CN")
+        self.assertLess(cn, gl, "域组顺序应为 cn → global → trae")
+        self.assertLess(gl, tr)
+        # WorkBuddy 签到落在 CN 组内（cn 与 trae 之间），Trae 签到落在 Trae 组内。
+        self.assertLess(cn, result.index("签到（WorkBuddy）"))
+        self.assertLess(result.index("签到（WorkBuddy）"), tr)
+        self.assertGreater(result.index("签到（Trae）"), tr)
+
+    def test_trae_task_can_be_triggered_independently(self):
+        """独立任务意味着它有独立的「跑一次」按钮，key 是 trae_check。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'t1',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+renderTasks();
+return $('#taskList').innerHTML;
+""")
+        self.assertIn('data-run="trae_check"', result,
+                      "Trae 签到应有自己的手动触发按钮")
+
+
+class AccountLimitSortTest(FrontendHarness, unittest.TestCase):
+    """账号页「按解除模型限流的时间排序」+ 模型筛选。
+
+    需求来源（2026-10-18）：「账户页面价格排序，解除模型限流的时间来，要求可以筛选模型」。
+    排序键用 until（网关避让截止）而不是 resetAt：until 才是网关真的会再试的时刻，
+    resetAt 是上游承诺的重置墙钟，在 soft_rate_max 截断时比 until 晚、不兑现也常见。
+
+    同批修正：11102「该后端无此模型」（kind='unavailable'）与真正的限流
+    （kind='rate'）必须分开——用户看到 CN 账号下每个模型各列一行「模型限流 …
+    解除 22:53」问「为什么 cn 全列出来了」。实测那批模型对**全部** 6 个 CN 账号都
+    返回 11102，是模型下线/改名，不是等待。
+    """
+
+    def _accounts(self):
+        # 三个号：A 的 m1 最早解除、B 的 m2 最晚、C 完全没被限流。
+        # 用固定墙钟，避免 Date.now() 漂移让断言变得不确定。
+        return """
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[
+ {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004',kind:'rate'}]}},
+ {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'m2',until:new Date(BASE+9*H).toISOString(),reason:'11102 model not available',kind:'unavailable'},
+   {model:'m1',until:new Date(BASE+5*H).toISOString(),reason:'6004',kind:'rate'}]}},
+ {uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true}}
+]};
+"""
+
+    def test_sorts_by_earliest_limit_release(self):
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # A 最早解除（2h），B 次之（最早 5h），C 无限制排最后。
+        self.assertLess(result.index(">A<"), result.index(">B<"))
+        self.assertLess(result.index(">B<"), result.index(">C<"))
+
+    def test_unavailable_entry_is_not_rendered_at_all(self):
+        """11102 整类不渲染（2026-10-18 用户：「甚至连这句话都不需要显示出来」）。
+
+        它表示模型本身不存在/已改名，与账号无关，上游也没给恢复时刻；列出来只会让
+        每个账号挂一排「模型不可用」，把真正在倒计时的限流淹没。后端已不再下发这类
+        条目，前端再挡一层，避免旧 state.json 的存量条目漏出来。
+        """
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertNotIn("模型不可用 m2", result)
+        self.assertNotIn("上游无此模型", result)
+        self.assertNotIn("模型限流 m2", result)
+        # m1 是真正的限流，仍用「解除」措辞。
+        self.assertIn("模型限流 m1", result)
+
+    def test_unavailable_is_excluded_from_model_picker(self):
+        """模型下拉只收限流类：11102 的模型混进来会让人以为等到点就能用。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return $('#acctModel').innerHTML;
+""")
+        self.assertIn("m1", result)
+        self.assertNotIn('value="m2"', result, "11102 的模型不该进「限流解除」下拉")
+
+    def test_filtering_by_rate_model_excludes_unavailable_only_accounts(self):
+        """筛 m1（限流）时，只有 m2（11102）的号不该出现。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m1';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn(">A<", result)
+        self.assertIn(">B<", result)
+        self.assertNotIn(">C<", result)
+
+    def test_filters_by_model_and_uses_that_models_release_time(self):
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m1';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # 只有 A 与 B 有 m1；C（无限流）必须被筛掉。
+        self.assertIn(">A<", result)
+        self.assertIn(">B<", result)
+        self.assertNotIn(">C<", result)
+
+    def test_model_filter_ignored_unless_sorting_by_limit(self):
+        """非「限流解除」排序下模型筛选不生效——按积分排却只剩被限流的号没有意义。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort=''; S.acctModel='m2';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn(">A<", result)
+        self.assertIn(">B<", result)
+        self.assertIn(">C<", result)
+
+    def test_default_sort_puts_unlimited_first(self):
+        """默认排序下没有被限流的号排最前（2026-10-18 用户：「没有被限流的号不应该
+        在最前面吗」）。
+
+        此前 acctSort='' 直接沿用后端顺序（账号文件名顺序），被限流的号碰巧排在
+        前面时看起来像「限流优先」，与「谁现在能用」的直觉相反。现在显式分档：
+        健康 → 余额不足 → 账号级约束 → 模型限流 → 停用。
+
+        注意 A/B 都各有一条 unavailable（11102）条目——那类不算限流，不能把它们
+        挤到 C 后面。
+        """
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        # C 没有任何限流 → 必须在最前。
+        self.assertLess(result.index(">C<"), result.index(">A<"))
+        self.assertLess(result.index(">C<"), result.index(">B<"))
+
+    def test_default_sort_orders_disabled_last(self):
+        """停用的号排在所有在用号后面；余额不足排在模型限流前。"""
+        result = self.run_frontend("""
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[
+ {uid:'off',nickname:'OFF',realm:'cn',disabled:true,pool:{disabled:true}},
+ {uid:'lim',nickname:'LIM',realm:'cn',pool:{inPool:true,rateLimitedModels:[
+   {model:'m1',until:new Date(BASE+2*H).toISOString(),reason:'6004',kind:'rate'}]}},
+ {uid:'poor',nickname:'POOR',realm:'cn',pool:{inPool:true,creditsExhausted:true}},
+ {uid:'ok',nickname:'OK',realm:'cn',pool:{inPool:true,healthy:true}}
+]};
+S.acctSort='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertLess(result.index(">OK<"), result.index(">POOR<"),
+                        "健康号应排在余额不足之前")
+        self.assertLess(result.index(">POOR<"), result.index(">LIM<"),
+                        "余额不足只影响付费模型，应排在模型限流之前")
+        self.assertLess(result.index(">LIM<"), result.index(">OFF<"),
+                        "停用需要人工介入，排最后")
+
+    def test_model_options_come_from_pool_not_hardcoded(self):
+        """下拉选项必须来自当前池子里**正在被限流**的模型，不写死模型清单。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit';
+renderAccounts();
+return {html:$('#acctModel').innerHTML, disabled:$('#acctModel').disabled,
+        value:$('#acctModel').value};
+""")
+        self.assertIn("m1", result["html"])
+        self.assertNotIn('value="m3"', result["html"])
+        self.assertFalse(result["disabled"])
+        self.assertEqual(result["value"], "")
+
+    def test_model_picker_disabled_when_nothing_is_limited(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true}}]};
+S.acctSort='limit'; S.acctModel='';
+renderAccounts();
+return {disabled:$('#acctModel').disabled, html:$('#acctModel').innerHTML};
+""")
+        self.assertTrue(result["disabled"])
+        self.assertNotIn("<option value=\"m", result["html"])
+
+    def test_switching_away_from_limit_sort_clears_model_filter(self):
+        """切走「限流解除」时必须清掉模型筛选，否则切回来会莫名其妙只剩几行。"""
+        result = self.run_frontend(self._accounts() + """
+S.acctSort='limit'; S.acctModel='m1';
+var handler=$('#acctSort').events.click;
+handler({target:{closest:function(){return {getAttribute:function(){return 'credit'}}}}});
+return {sort:S.acctSort, model:S.acctModel};
+""")
+        self.assertEqual(result, {"sort": "credit", "model": ""})
+
+    def test_kind_falls_back_to_reason_when_backend_omits_it(self):
+        """老后端不带 kind 时按 reason 前缀兜底，前后端可独立升级。"""
+        result = self.run_frontend("""
+return {a:rlmKind({reason:'11102 model not available'}),
+        b:rlmKind({reason:'6004 model rate limit'}),
+        c:rlmKind({reason:'11102 model not available', kind:'rate'})};
+""")
+        self.assertEqual(result["a"], "unavailable")
+        self.assertEqual(result["b"], "rate")
+        # 显式 kind 优先于 reason 推断。
+        self.assertEqual(result["c"], "rate")
+
+
+class UnavailableModelsHiddenTest(FrontendHarness, unittest.TestCase):
+    """11102「该后端无此模型」整类不在账号页出现。
+
+    2026-10-18 用户两轮反馈：
+      1.「只有被使用的模型，被明确告知冷却，才在账号里显示模型级的冷却」
+      2.「甚至连这句话都不需要显示出来」
+    实测那批模型（glm-4.6 / kimi-k2-thinking / minimax-m2.5 …）是模型下线/改名，
+    与账号无关，上游也没给恢复时刻。列出来就是一片「模型不可用」，把真正在倒计时
+    的 6004 淹没。后端已不再下发这类条目（pool.rateLimitedModelsLocked 按 reason
+    前缀排除 11102），前端再挡一层，防止旧 state.json 的存量条目漏出来。
+    """
+
+    def _fixture(self):
+        return """
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+function unavail(names){ return names.map(function(n){
+  return {model:n, until:new Date(BASE+6*H).toISOString(),
+          reason:'11102 model not available', kind:'unavailable'}; }); }
+S.data={accounts:[
+ {uid:'a',nickname:'A',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
+   unavail(['glm-4.6','kimi-k2-thinking'])}},
+ {uid:'b',nickname:'B',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:
+   unavail(['glm-4.6','minimax-m2.5'])}},
+ {uid:'c',nickname:'C',realm:'cn',pool:{inPool:true,healthy:true,rateLimitedModels:[
+   {model:'deepseek-v4.1-flash', until:new Date(BASE+18*H).toISOString(),
+    resetAt:new Date(BASE+18*H).toISOString(), reason:'6004 model rate limit', kind:'rate'}]}}
+]};
+"""
+
+    def test_no_unavailable_rows_in_account_table(self):
+        result = self.run_frontend(self._fixture() + """
+S.acctSort=''; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        for name in ("glm-4.6", "kimi-k2-thinking", "minimax-m2.5"):
+            self.assertNotIn("模型不可用 " + name, result)
+        self.assertNotIn("上游无此模型", result)
+
+    def test_real_rate_limit_still_rendered(self):
+        """6004 是上游明确告知的模型限流，必须保留（截图 39 那种形态）。"""
+        result = self.run_frontend(self._fixture() + """
+S.acctSort=''; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertIn("模型限流 deepseek-v4.1-flash", result)
+        self.assertIn("解除", result)
+
+    def test_legacy_state_entries_do_not_leak(self):
+        """旧 state.json 恢复的存量 11102 条目也不渲染（前端兜底）。"""
+        result = self.run_frontend("""
+var BASE=Date.parse('2026-10-18T12:00:00Z'), H=3600000;
+S.data={accounts:[{uid:'a',nickname:'A',realm:'trae',pool:{inPool:true,healthy:true,
+ rateLimitedModels:[{model:'x-gone', until:new Date(BASE+6*H).toISOString(),
+   reason:'11102 model not available', kind:'unavailable'}]}}]};
+S.realm=''; S.acctSort=''; S.acctModel='';
+renderAccounts();
+return $('#acctRows').innerHTML;
+""")
+        self.assertNotIn("模型不可用 x-gone", result)
+        self.assertNotIn("上游无此模型", result)
+
+
+class RealmBreakdownCompletenessTest(unittest.TestCase):
+    """概览里的分域小计必须覆盖**全部域**，顺序与文案统一。
+
+    2026-10-11 用户实测：接入 trae 后积分分域仍只写死 `[['global','国际'],['cn','国内']]`，
+    trae 被漏掉——合计 63,125，但分域只列了 33,501 + 10,673，差额正是没显示的 trae。
+    同时两处文案不一致（账号池「国内/国际」，积分「国际/国内」且顺序相反）。
+
+    现在域顺序与文案集中在 REALM_ORDER / REALM_LABEL / REALM_SHORT，三处共用。
+    """
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.app_js = open(os.path.join(here, "app.js"), encoding="utf-8").read()
+        self.index = open(os.path.join(here, "index.html"), encoding="utf-8").read()
+
+    def test_single_source_for_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("var REALM_ORDER = ['cn', 'global', 'trae']", body)
+                self.assertIn("REALM_SHORT", body)
+
+    def test_no_hardcoded_realm_pairs(self):
+        """禁止再出现写死的域列表——那正是 trae 被漏掉的原因。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertNotIn("[['global', '国际'], ['cn', '国内']]", body)
+                self.assertNotIn("k === 'cn' ? '国内'", body)
+
+    def test_credit_breakdown_iterates_all_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function renderCredit()")
+                block = body[start:body.index("function taskState(", start)]
+                self.assertIn("REALM_ORDER.forEach", block,
+                              "积分分域必须遍历 REALM_ORDER，不能写死两域")
+
+    def test_pool_breakdown_iterates_all_realms(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function renderPool()")
+                block = body[start:body.index("function renderCredit()", start)]
+                self.assertIn("REALM_ORDER.forEach", block)
+                self.assertIn("mtile(k,", block, "分域必须走 mtile 瓷片")
+
+    def test_realm_defs_precede_first_use(self):
+        """REALM_ORDER 必须在任何 render 调用之前赋值。
+
+        var 声明会提升但赋值不会：定义在文件后半段时，前面的 renderPool() 读到的
+        是 undefined，`REALM_ORDER.forEach` 直接抛异常、整块面板空白。
+        """
+        body = self.index
+        def_line = body.index("var REALM_ORDER = ")
+        # init() 里会调用 go() → renderPool()
+        init_line = body.index("  go(v);\n  loadAll();")
+        self.assertLess(def_line, init_line,
+                        "REALM_ORDER 必须先于 init 里的首次渲染赋值")
+
+
+class ReadabilityGroupingTest(FrontendHarness, unittest.TestCase):
+    """概览卡的分组、积分页的自适应列与域分组。
+
+    2026-10-11 用户反馈「列表显示看的不是很清晰」并点名积分有效期页。三处问题：
+      1) 概览两卡把「整体汇总」和「分域明细」平铺成一串同样的 mrow，分不清分组；
+      2) 积分页固定 8 列，多数档位整列都是「—」，真正有数字的那格被灰墙淹没；
+      3) 积分页账号不分组，30 行混在一起看不出哪个域的积分要作废。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+
+    def test_overview_cards_group_their_breakdown(self):
+        """两卡的分域明细必须包在 mgroup 里，不能与总量行平铺成一片。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn("mgroup('按区域'", block,
+                                  "%s 的分域明细必须走 mgroup 分组" % fn)
+
+    def test_mgroup_is_defined_and_escapes(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function mgroup(", body)
+                start = body.index("function mgroup(")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("esc(title)", block, "分组标题必须转义")
+
+    def test_overview_summary_uses_cells_not_mrow(self):
+        """两卡的汇总区必须是两列小格（mcell），不再是 label→value 一长条。
+
+        2026-10-11 用户第二次反馈「大列表没优化」：v2.7.7 只加了分组线，
+        汇总行还是一长条竖排，每行只用到一半宽度。
+        """
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn('<div class="mcells">', block,
+                                  "%s 的汇总必须走 mcells 格子" % fn)
+                    self.assertNotIn("mrow('池内总数'", block)
+                    self.assertNotIn("mrow('已用'", block)
+
+    def test_overview_realm_breakdown_uses_tiles(self):
+        """分域明细必须是瓷片（mtile），带域胶囊 + 比例条。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                for fn in ("function renderPool()", "function renderCredit()"):
+                    start = body.index(fn)
+                    block = body[start:body.index("\n}", start)]
+                    self.assertIn("mtile(", block, "%s 的分域必须走 mtile" % fn)
+
+    def test_pool_tiles_show_health_ratio(self):
+        """账号池瓷片的条 = 该域健康占比，副注说明不可用数。"""
+        result = self.run_frontend("""
+S.data={pool:{total:4,healthy:3,cooling:0,disabled:1,
+  realmTotals:{cn:{total:2,healthy:2},global:{total:2,healthy:1,disabled:1}}}};
+renderPool();
+return $('#poolPanel').innerHTML;
+""")
+        self.assertIn('rtag cn', result)
+        self.assertIn('rtag global', result)
+        self.assertIn("全部可用", result, "全健康的域应说明")
+        self.assertIn("1 个不可用", result, "有停用的域应说明")
+        # 条宽：cn 100%，global 50%
+        self.assertIn('width:100%', result)
+        self.assertIn('width:50%', result)
+
+    def test_credit_tiles_warn_when_expiring(self):
+        """积分瓷片：该域有快过期积分时整块上警示，并在副注标出数额。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,expiring:50,
+    expiry:{within_1d:0,within_3d:0,within_7d:50,within_30d:0,later:0,unlimited:0}}},
+  {uid:'g1',realm:'global',pool:{inPool:true},credits:{remain:300,size:400,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:300}}}
+],pool:{total:2,healthy:2}};
+renderCredit();
+return $('#creditPanel').innerHTML;
+""")
+        self.assertIn('mtile w', result, "有快过期的域整块要上警示")
+        self.assertIn('50 快过期', result)
+        self.assertIn("占 25%", result)
+        self.assertIn("占 75%", result)
+
+    def test_zero_value_cells_still_render_meaningful_zeros(self):
+        """停用 0 / 熔断 0 要渲染（那是「健康」的证明）；快过期 0 不渲染。
+
+        2026-10-18：账号级限流冷却已删除，只剩熔断（breaker）与停用两种账号级
+        不可用原因，池子卡片的这一格随之从「冷却中」改名为「熔断中」。
+        旧断言按「冷却中」匹配会一直失败（本条在改动前即已红）。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'c1',realm:'cn',pool:{inPool:true},credits:{remain:100,size:200,expiring:0}}
+],pool:{total:1,healthy:1,cooling:0,disabled:0,inFlightFull:0,stickySessions:0}};
+renderPool(); var pool=$('#poolPanel').innerHTML;
+renderCredit(); var credit=$('#creditPanel').innerHTML;
+return {pool:pool, credit:credit};
+""")
+        self.assertIn("熔断中", result["pool"], "熔断 0 保留——它是健康状态的说明")
+        self.assertIn("已停用", result["pool"], "停用 0 保留")
+        self.assertNotIn("快过期", result["credit"], "没有快过期积分时不该出现这个格子")
+        self.assertNotIn("状态", result["credit"], "无错误/无查询中时不该有状态行")
+
+    def test_credits_columns_follow_the_data(self):
+        """积分页列必须按实际非零档位生成，不能写死八列。
+
+        生产快照里 1/3 天内两档全为零——写死列时那两列整列是「—」。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'cn',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:60,within_30d:40,later:0,unlimited:0}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsThead').innerHTML;
+""")
+        self.assertIn("7 天内", result)
+        self.assertIn("30 天内", result)
+        self.assertNotIn("1 天内", result, "零值档位不该出现列")
+        self.assertNotIn("3 天内", result, "零值档位不该出现列")
+
+    def test_credits_omits_next_end_when_nothing_expires(self):
+        """全是「不会过期」的余额时，「最近到期」整列无意义，必须去掉。"""
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'a',nickname:'a',realm:'trae',pool:{inPool:true},
+   credits:{remain:500,size:500,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:500,next_end:''}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return {thead:$('#creditsThead').innerHTML, rows:$('#creditsRows').innerHTML};
+""")
+        self.assertIn("不会过期", result["thead"])
+        self.assertNotIn("最近到期", result["thead"], "无到期时间时不该留这一列")
+        self.assertIn("500", result["rows"])
+
+    def test_credits_rows_group_by_realm(self):
+        """积分页账号行按域分组，组头带域标签与快过期合计。"""
+        result = self.run_frontend("""
+function acct(uid,realm,soon){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:soon,
+    expiry:{within_1d:0,within_3d:0,within_7d:soon,within_30d:0,later:0,unlimited:0}}};}
+S.data={accounts:[acct('g1','global',5),acct('c1','cn',50),acct('t1','trae',0)],
+  pool:{total:3,healthy:3},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        for realm in ("CN", "GLOBAL", "TRAE"):
+            self.assertIn('class="rtag ' + realm.lower() + '"', result,
+                          "缺少 %s 的分组行" % realm)
+        # 组顺序必须是 REALM_ORDER（cn → global → trae），不跟数据顺序走。
+        self.assertLess(result.index('rtag cn'), result.index('rtag global'))
+        self.assertLess(result.index('rtag global'), result.index('rtag trae'))
+        self.assertIn("50", result, "组头应给出该域的快过期合计")
+
+    def test_credits_realm_filter_scopes_the_page(self):
+        """积分页的域筛选只作用于本页，且与账号页的 S.realm 互不影响。"""
+        result = self.run_frontend("""
+function acct(uid,realm){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100}}};}
+S.data={accounts:[acct('g1','global'),acct('c1','cn')],pool:{total:2,healthy:2},creditTotals:{}};
+S.realm='cn';              // 账号页筛成 CN
+S.creditRealm='global';    // 积分页筛成 Global
+renderCreditsPage();
+var meta=$('#creditsMeta').textContent, rows=$('#creditsRows').innerHTML;
+var head=$('#creditsHead').innerHTML;
+return {meta:meta, rows:rows, head:head, acctRealm:S.realm};
+""")
+        self.assertIn("g1", result["rows"])
+        self.assertNotIn("c1", result["rows"], "积分页筛选必须真的过滤行")
+        self.assertIn("国际", result["head"], "头部应标出当前筛选的域")
+        self.assertEqual(result["acctRealm"], "cn", "不能把账号页的筛选覆盖掉")
+
+    def test_schedule_excludes_realms_without_expiry(self):
+        """到期日程必须排除没有逐笔到期的域，且计数里说明排除了几个。
+
+        Trae 的 pay API 只给总额、没有逐包到期时间。不排除的话它会被算进
+        「取到的账号」，让空态读起来像数据缺失。
+        """
+        result = self.run_frontend("""
+function acct(uid,realm,sch){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,schedule:sch}}};}
+S.data={accounts:[
+  acct('c1','cn',[{end:'2026-10-20T00:00:00+08:00',amount:100}]),
+  acct('t1','trae',[])
+],pool:{total:2,healthy:2},creditTotals:{}};
+renderSchedule();
+return {rows:$('#schedRows').innerHTML, count:$('#schedCount').textContent,
+        picker:$('#schedAccount').innerHTML};
+""")
+        self.assertIn("1 个无到期概念的账号已排除", result["count"])
+        self.assertNotIn("t1", result["picker"], "选择器不该列出无日程的域")
+
+    def test_schedule_marks_multi_realm_entries(self):
+        """同一时刻跨域一起到期时要标出两个域——它们是两套账。"""
+        result = self.run_frontend("""
+function acct(uid,realm){return {uid:uid,nickname:uid,realm:realm,pool:{inPool:true},
+  credits:{remain:100,size:100,used:0,expiring:0,
+    expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:0,
+      schedule:[{end:'2026-10-20T00:00:00+08:00',amount:100}]}}};}
+S.data={accounts:[acct('c1','cn'),acct('g1','global')],pool:{total:2,healthy:2},creditTotals:{}};
+renderSchedule();
+return $('#schedRows').innerHTML;
+""")
+        self.assertIn('rtag cn', result)
+        self.assertIn('rtag global', result)
+        self.assertIn("200", result, "同一时刻的金额应合并")
+
+    def test_missing_realm_falls_back_to_cn(self):
+        """没有 realm 字段的账号按 cn 归类，不能掉进「其它」桶。
+
+        后端 app.py 的账号解析就是 `or "cn"`；前端若不归一化，空域的号会被
+        realmOf 之外的分组逻辑漏掉，而 realmTag 又把它画成 CN——同一行自相矛盾。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[
+  {uid:'n1',nickname:'n1',pool:{inPool:true},
+   credits:{remain:100,size:100,used:0,expiring:0,
+     expiry:{within_1d:0,within_3d:0,within_7d:0,within_30d:0,later:0,unlimited:100}}}
+],pool:{total:1,healthy:1},creditTotals:{}};
+renderCreditsPage();
+return $('#creditsRows').innerHTML;
+""")
+        self.assertIn('class="rtag cn"', result, "缺省域应归到 CN 组")
+        self.assertIn("国内版 CN", result)
+        self.assertNotIn("其它", result)
+
+
+class TaskLogLiveRefreshTest(FrontendHarness, unittest.TestCase):
+    """任务日志弹窗：自动刷新 + 显示最近一次。
+
+    2026-10-11 用户要求：「日志实时刷新，然后能看到最近一次的日志」。两件事：
+
+    1) 打开弹窗期间自动轮询（原来只有手动点刷新，会错过整个执行过程）；
+       间隔按状态分档——运行中 2 秒，跑完 5 秒。
+    2) 后端区分「当前这一轮」与「上一次那一轮」，空闲时给**最近一次**的完整日志，
+       所以打开弹窗立刻能看到上次跑了什么，不必先自己触发一遍。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_modal_polls_while_open(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function lgSchedule()", body)
+                # 打开时启动轮询、关闭时停表。
+                self.assertIn("lgSchedule()", body[body.index("async function openTaskLog("):])
+                close = body[body.index("function closeLogModal(){"):]
+                close = close[:close.index("\n}")]
+                self.assertIn("lgStopTimer()", close, "关弹窗必须停表，否则后台一直轮询")
+
+    def test_poll_interval_adapts_to_running_state(self):
+        """运行中 2 秒、空闲 5 秒——日志在长时看的人等不起 5 秒。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function lgSchedule()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("LG.running ? 2000 : 5000", block)
+
+    def test_status_line_shows_running_and_last_run(self):
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("function lgStatusText()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("运行中", block)
+                self.assertIn("最近一次", block)
+        # 弹窗头部要有承载它的元素，否则文案无处可写。
+        self.assertIn('id="lgStatus"', self.body)
+        self.assertIn('id="lgStatus"', self.index)
+
+    def test_renders_running_and_last_run_from_api(self):
+        """走真实渲染：running/endedAt 来自后端，状态行必须跟着变。"""
+        result = self.run_frontend("""
+logKey='trae_check';
+LG.running=true; LG.endedAt=''; lgRenderStatus();
+var running = $('#lgStatus').textContent;
+LG.running=false; LG.endedAt='2026-10-11T14:00:00Z'; lgRenderStatus();
+var done = $('#lgStatus').textContent;
+LG.endedAt=''; lgRenderStatus();
+var none = $('#lgStatus').textContent;
+return {running:running, done:done, none:none};
+""")
+        self.assertIn("运行中", result["running"])
+        self.assertIn("最近一次", result["done"])
+        self.assertEqual(result["none"], "", "既没在跑也没跑过时不该占位")
+
+    def test_empty_state_tells_user_how_to_get_a_log(self):
+        """从没跑过时的空态要说明下一步，而不是干巴巴一句「没有输出」。
+
+        这条只做静态核对：空态文案在 loadTaskLog 里，走真实渲染需要网络桩
+        （api() 走 fetch，测试环境没有），静态断言同样能锁住措辞。
+        """
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("async function loadTaskLog()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("跑一次", block, "空态应指引用户去点「跑一次」")
+                self.assertIn("还没有跑过", block)
+
+    def test_content_change_detection_avoids_needless_rewrite(self):
+        """内容没变就不重写 DOM：自动刷新 2 秒一次，重写会打断选中与滚动。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("async function loadTaskLog()")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("LG.lastSig", block)
+                self.assertIn("return;", block, "指纹一致应提前返回")
+
+
+class TaskRealmFilterTest(FrontendHarness, unittest.TestCase):
+    """任务页顶部要有区域切换：域多了以后整页滚太久才看得到后面的域。
+
+    2026-10-11 用户反馈：「区域从顶部加个选项，不然太长了」。选项由 JS 按
+    「当前真有任务的域」动态生成（含「全部」），不是写死的——哪些域有任务
+    随池子变化，写死会让新域无法筛选。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_header_has_realm_filter(self):
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn('id="taskRealm"', body,
+                              "任务页头部需要区域切换容器")
+
+    def test_options_are_generated_not_hardcoded(self):
+        """选项必须动态生成——写死会让新增的域无法筛选。"""
+        for name, body in (("app.js", self.app_js), ("index.html", self.index)):
+            with self.subTest(name=name):
+                self.assertIn("function renderTaskRealmSeg(", body)
+                start = body.index("function renderTaskRealmSeg(")
+                block = body[start:body.index("\n}", start)]
+                self.assertIn("groups.map", block, "选项应按域列表生成")
+                self.assertIn("realmShort", block, "按钮文案用统一的域简称")
+
+    def test_filters_rendered_groups(self):
+        """选中某域时只渲染那一组。"""
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm='trae'; renderTasks();
+return {seg:$('#taskRealm').innerHTML, list:$('#taskList').innerHTML};
+""")
+        self.assertIn("签到（Trae）", result["list"])
+        self.assertNotIn("签到（WorkBuddy）", result["list"], "筛 trae 时不该渲染别的域")
+        # 按钮上要有 aria-pressed 标记当前选中项。
+        self.assertIn('data-r="trae" aria-pressed="true"', result["seg"])
+        self.assertIn('data-r="" aria-pressed="false"', result["seg"])
+
+    def test_all_option_shows_every_realm(self):
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true},
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm=''; renderTasks();
+return {seg:$('#taskRealm').innerHTML, list:$('#taskList').innerHTML};
+""")
+        self.assertIn("签到（Trae）", result["list"])
+        self.assertIn("签到（WorkBuddy）", result["list"])
+        self.assertIn("全部", result["seg"])
+
+    def test_falls_back_when_selected_realm_disappears(self):
+        """选中的域从池里消失（账号被删）时回落到「全部」。
+
+        不回落的后果是卡在一个空页上：按钮还在、点「全部」也没用（选中项
+        已经不存在了），用户只能刷新页面。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'t',realm:'trae'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'trae_check',name:'签到（Trae）',realms:['trae'],hours:[10],enabled:true}
+]};
+S.taskRealm='global';   // global 已经没有账号了
+renderTasks();
+return {realm:S.taskRealm, list:$('#taskList').innerHTML};
+""")
+        self.assertEqual(result["realm"], "", "选中的域消失后应回落到「全部」")
+        self.assertIn("签到（Trae）", result["list"])
+
+    def test_filter_is_independent_of_other_pages(self):
+        """任务页的筛选只作用于本页，不动账号页/积分页的筛选。
+
+        三个页面的筛选是三个不同的使用场景；联动会导致「在账号页筛了 CN，
+        切到任务页只剩一半」这种意外。
+        """
+        result = self.run_frontend("""
+S.data={accounts:[{uid:'c',realm:'cn'},{uid:'g',realm:'global'}],pool:{}};
+S.tasks={available:true,tasks:[
+ {key:'checkin',name:'签到（WorkBuddy）',realms:['cn','global'],hours:[9],enabled:true}
+]};
+S.realm='cn'; S.creditRealm='global'; S.taskRealm='';
+renderTasks();
+var taskRealmAfter=S.taskRealm;
+// 反过来：改任务页筛选不该动另外两个。
+S.taskRealm='global'; renderTasks();
+return {taskRealmAfter:taskRealmAfter, acct:S.realm, credit:S.creditRealm};
+""")
+        self.assertEqual(result["taskRealmAfter"], "", "任务页筛选不该被其它页带动")
+        self.assertEqual(result["acct"], "cn", "账号页筛选不该被任务页改动")
+        self.assertEqual(result["credit"], "global", "积分页筛选不该被任务页改动")
+
+
+class CreditUsageDisplayTest(FrontendHarness, unittest.TestCase):
+    """用量统计页与密钥管理页都要显示「用了多少积分」。
+
+    2026-10-12 用户要求。后端 usage 账本本来就按密钥累计 credit（实测全站
+    16721.15），只是面板没展示——这次只是把它透出来，没有新增采集。
+
+    三态必须分清，否则会把「没有观测」误报成「用了 0」：
+      - 数字（含 0）→ 显示；
+      - null（上游没回传 credit，缺失≠0）→ 「—」+ 悬停说明；
+      - 账本不可用 → 「—」+ 说明原因。
+    """
+
+    def setUp(self):
+        self.app_js = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.keys_js = (PANEL / "keys.js").read_text(encoding="utf-8")
+        self.usage_js = (PANEL / "usage.js").read_text(encoding="utf-8")
+        self.index = (PANEL / "index.html").read_text(encoding="utf-8")
+        self.body = (PANEL / "src" / "body.html").read_text(encoding="utf-8")
+
+    def test_usage_page_has_credit_column(self):
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                start = body.index("usageRows")
+                head = body[:start]
+                head = head[head.rindex("<thead>"):]
+                self.assertIn("已用积分", head, "用量表应有「已用积分」列")
+
+    def test_keys_page_shows_credit_in_usage_column(self):
+        """密钥表：积分并入「总用量」列，不单开一列。
+
+        单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
+        「有效期」与「创建时间」合成了一列（见 test_layout 的列宽约束）。
+        """
+        for name, body in (("body.html", self.body), ("index.html", self.index)):
+            with self.subTest(name=name):
+                key_table = body[body.index("key-table"):body.index("</table>", body.index("key-table"))]
+                self.assertIn("总用量与积分", key_table)
+                self.assertNotIn("已用积分", key_table, "密钥表不得为积分单开一列")
+
+    def test_credit_three_states_are_distinguished(self):
+        """数字 / null / 账本不可用 三态渲染不同。"""
+        result = self.run_frontend("""
+return {
+  num: usageCreditText({credit: 1234.56}),
+  zero: usageCreditText({credit: 0}),
+  small: usageCreditText({credit: 0.02}),
+  missing: usageCreditText({}),
+  nullv: usageCreditText({credit: null})
+};
+""")
+        self.assertEqual(result["num"], "1,235")
+        self.assertEqual(result["zero"], "0", "真 0 要显示 0，不能与「没有观测」混同")
+        self.assertEqual(result["small"], "0.02")
+        self.assertEqual(result["missing"], "—")
+        self.assertEqual(result["nullv"], "—")
+
+    def test_keys_credit_cell_explains_missing(self):
+        """密钥页的「—」要带悬停说明，区分「上游没回传」与「账本读不到」。"""
+        result = self.run_frontend("""
+return {
+  noObs: keyCreditCell({credit: null, usage_available: true}),
+  noLedger: keyCreditCell({credit: null, usage_available: false}),
+  has: keyCreditCell({credit: 1234.56, usage_available: true}),
+  zero: keyCreditCell({credit: 0, usage_available: true})
+};
+""", extra_sources=("keys.js",))
+        self.assertIn("上游未回传", result["noObs"])
+        self.assertIn("累计用量暂不可读", result["noLedger"])
+        self.assertIn("1,235", result["has"])
+        self.assertEqual(result["zero"], "0", "真 0 直接渲染 0，不带「—」说明")
+
+    def test_model_breakdown_includes_credit(self):
+        """「按模型」拆分行要同时给 token 与积分——按模型看贵不贵比看 token 直接。"""
+        result = self.run_frontend("""
+renderUsageRows([
+ {key_id:'k1',name:'a',masked_key:'x',models:[
+   {model:'cn:glm-5.3',totals:{total_tokens:1000,credit:12.5}},
+   {model:'global:deepseek-v4.1-flash',totals:{total_tokens:2000,credit:0}}],
+  totals:{requests:2,total_tokens:3000,credit:12.5}}
+], {});
+US.open={k1:true};
+renderUsageRows([
+ {key_id:'k1',name:'a',masked_key:'x',models:[
+   {model:'cn:glm-5.3',totals:{total_tokens:1000,credit:12.5}},
+   {model:'global:deepseek-v4.1-flash',totals:{total_tokens:2000,credit:0}}],
+  totals:{requests:2,total_tokens:3000,credit:12.5}}
+], {});
+return $('#usageRows').innerHTML;
+""")
+        self.assertIn("cn:glm-5.3", result)
+        self.assertIn("12.5", result, "按模型应带该模型的积分")
+        self.assertIn("0", result, "免费模型显示 0")
+
+    def test_panel_api_passes_credit_through(self):
+        """面板的密钥列表接口必须把 credit 透出来（与 total_tokens 同源一次取）。"""
+        src = (PANEL / "app.py").read_text(encoding="utf-8")
+        start = src.index("def keys_with_usage")
+        block = src[start:src.index("\n    def ", start + 10)]
+        self.assertIn('entry["credit"]', block)
+        self.assertIn('entry["total_tokens"]', block)
+        # 同一次遍历里取两个字段：分两次取会在并发写入下对不上。
+        self.assertIn("totals, credits = {}, {}", block)
+
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class UpdateProgressModalTest(FrontendHarness, unittest.TestCase):
+    """点「立即更新」后的进度对话框。
+
+    2026-10-13 用户要求「下载改为弹窗加进度条」。此前的实现只在更新卡片里查
+    `#updProgress`，而**那个元素从来没有出现在页面里**——`if (prog)` 永远为假，
+    进度条实际上一次都没渲染过。这组用例同时锁住「元素存在」与「进度真的在动」。
+    """
+
+    def test_progress_element_exists_in_markup(self):
+        """#updProgress 从未存在过的那次教训：JS 查的元素必须在页面里有。"""
+        html = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
+        self.assertIn('id="updModalBar"', html, "进度条元素必须真的在页面里")
+        self.assertIn('id="updModal"', html)
+        self.assertIn('id="updModalClose"', html)
+
+    def test_downloading_shows_percentage(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:20000000,downloaded_bytes:5000000,progress:0.25}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        note:$('#updModalNote').innerHTML,
+        width:$('#updModalBar i').style.width,
+        unknown:$('#updModalBar').classList.contains('unknown'),
+        open:$('#updModal').classList.contains('on')};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "正在更新")
+        self.assertEqual(result["width"], "25%")
+        self.assertIn("4.8 MB", result["note"])
+        self.assertIn("19.1 MB", result["note"])
+        self.assertIn("25%", result["note"])
+        self.assertFalse(result["unknown"])
+        self.assertTrue(result["open"])
+
+    def test_unknown_size_uses_indeterminate_bar(self):
+        """发布没给 size 时不能显示假的 0%——那看起来像卡住了。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:0,downloaded_bytes:1200000}};
+openUpdateModal(); renderUpdate();
+return {unknown:$('#updModalBar').classList.contains('unknown'),
+        width:$('#updModalBar i').style.width, note:$('#updModalNote').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertTrue(result["unknown"], "总大小未知时必须走不确定态")
+        self.assertIn("1.1 MB", result["note"])
+
+    def test_handover_shows_full_bar_and_reassures(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'handover',asset_size:100}};
+openUpdateModal(); renderUpdate();
+return {text:$('#updModalText').textContent, note:$('#updModalNote').textContent,
+        width:$('#updModalBar i').style.width};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["width"], "100%")
+        self.assertIn("切换", result["text"])
+        self.assertIn("不会中断", result["note"])
+
+    def test_failure_stops_and_reports_the_reason(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'failed',
+  last_error:'下载资产与签名清单不一致'}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className, close:$('#updModalClose').textContent,
+        open:$('#updModal').classList.contains('on')};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "更新失败")
+        self.assertIn("签名清单不一致", result["text"])
+        self.assertIn("e", result["icon"])
+        self.assertEqual(result["close"], "关闭")
+        self.assertTrue(result["open"], "失败时不该自动收起，用户要读到原因")
+
+    def test_reopening_after_failure_resets_the_icon(self):
+        """重试时图标必须回到「进行中」：否则标题写着正在更新、图标还是红叹号。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'failed',last_error:'x'}};
+openUpdateModal(); renderUpdate();
+var afterFail=$('#updModalIcon').className;
+openUpdateModal();
+return {afterFail:afterFail, afterReopen:$('#updModalIcon').className,
+        title:$('#updModalTitle').textContent};
+""", extra_sources=("update.js",))
+        self.assertIn("e", result["afterFail"])
+        self.assertEqual(result["afterReopen"], "mic w")
+        self.assertEqual(result["title"], "正在更新")
+
+    def test_completion_switches_to_done(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'handover',asset_size:100}};
+openUpdateModal(); renderUpdate();
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',asset_size:100}};
+renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className, width:$('#updModalBar i').style.width};
+""", extra_sources=("update.js",))
+        self.assertEqual(result["title"], "更新完成")
+        self.assertIn("v3.0.1", result["text"])
+        self.assertIn("ok", result["icon"])
+        self.assertEqual(result["width"], "100%")
+
+    def test_modal_closed_means_no_rendering(self):
+        """没打开对话框时，状态变化不得把对话框内容改掉（避免下次打开看到旧值）。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:100,downloaded_bytes:50}};
+renderUpdate();
+return {open:$('#updModal').classList.contains('on'),
+        text:$('#updModalText').textContent,
+        width:String($('#updModalBar i').style.width)};
+""", extra_sources=("update.js",))
+        self.assertFalse(result["open"])
+        self.assertNotEqual(result["width"], "50%")
+        self.assertEqual(result["width"], "undefined")
+
+    def test_idle_before_any_progress_is_not_reported_as_done(self):
+        """提交更新后的第一次轮询可能比网关状态更新更早，此时 state 仍是 idle。
+
+        若不看「是否经历过进行中的阶段」，会把「刚开始」直接误报成「更新完成」
+        ——用户看到「已切换到新版本」，而实际上什么都没发生。
+        """
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'idle',asset_size:100}};
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
+        icon:$('#updModalIcon').className};
+""", extra_sources=("update.js",))
+        self.assertNotEqual(result["title"], "更新完成")
+        self.assertEqual(result["title"], "正在更新")
+        self.assertNotIn("ok", result["icon"])
+
+    def test_zero_bytes_download_is_shown_as_zero_not_dash(self):
+        """upBytes(0) 是「—」（表示缺失），但下载进度里的 0 是真实的 0 字节。"""
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'downloading',
+  asset_size:20000000,downloaded_bytes:0}};
+openUpdateModal(); renderUpdate();
+return {note:$('#updModalNote').innerHTML};
+""", extra_sources=("update.js",))
+        self.assertIn("0 B", result["note"])
+        self.assertNotIn("— /", result["note"])
+
+
+@unittest.skipUnless(NODE, "Node.js is required for frontend behavior checks")
+class PoolCardStateTest(FrontendHarness, unittest.TestCase):
+    """「账号池」卡的四态。
+
+    2026-10-13 用户截图反馈：卡片显示「0 / 0 健康 · 全部可用」并涂成绿色，而池里
+    明明有 34 个号。两个缺陷叠在一起：
+
+      1. 池数据缺失时（网关未就绪 / 首屏还没拿到 /status），代码把「没有数据」当成
+         「0 个账号」渲染，还因为 healthy === total === 0 涂成绿色「全部可用」——
+         读起来像「一切正常」，而实际是「还不知道」。
+      2. 那句「全部可用」的判据 healthy === total 在真实池子里**永远不成立**：
+         线上 24/34（3 冷却 + 7 停用），只要有一个号不可用就不等，于是这句话一次
+         都没出现过。真正该说的是「不可用的有几个」，与进度条同一口径。
+    """
+
+    def _card(self, expr):
+        """只取「账号池」这一张卡（到下一个 metric 为止）。
+
+        不能切到页面末尾：后面的「可用积分」卡在积分取不到时自己会带 `class="s e"`，
+        会把「池卡没涂红」的断言污染成假失败（2026-10-13 写这条用例时踩到）。
+        """
+        return self.run_frontend(expr + """
+var h=$('#metrics').innerHTML; var i=h.indexOf('账号池');
+var rest=h.slice(i); var end=rest.indexOf('<div class="metric"', 1);
+return {card: end > 0 ? rest.slice(0, end) : rest};
+""", extra_sources=())["card"]
+
+    def test_missing_pool_data_is_not_reported_as_all_available(self):
+        """池数据缺失时不能显示「0 / 0 全部可用」——那是「还不知道」，不是「都正常」。"""
+        card = self._card("S.data={accounts:[],pool:{}};renderMetrics();")
+        self.assertNotIn("全部可用", card)
+        self.assertIn("正在读取", card)
+        # 中性色：不能涂绿（绿=好消息），也不能涂红（红=故障）。
+        self.assertNotIn('class="s ok"', card)
+        self.assertNotIn('class="s e"', card)
+
+    def test_gateway_not_ready_says_so(self):
+        card = self._card("S.data={accounts:[],pool:{},ok:false};renderMetrics();")
+        self.assertIn("网关未就绪", card)
+        self.assertNotIn("全部可用", card)
+
+    def test_partly_unavailable_counts_them(self):
+        """真实线上口径：24/34 必须说出「10 个不可用」，而不是沉默或说全部可用。
+
+        2026-10-18：余额不足（CoolHard）不再算「不可用」——账号可用性只由停用与
+        熔断决定，积分只影响能调哪些模型（用户：「可不可用是针对账号的，冷却和积分
+        余额是模型使用方面的」）。所以不可用 = total - healthy，可由熔断 + 停用解释；
+        本用例的 3 必须显示成「熔断中」而不是「冷却中」。
+        """
+        card = self._card("S.data={accounts:[],pool:{total:34,healthy:24,cooling:3,disabled:7}};renderMetrics();")
+        self.assertIn("24 / 34", card)
+        self.assertIn("10 个不可用", card)
+        self.assertIn("3 熔断中", card)
+        self.assertNotIn("全部可用", card)
+
+    def test_fully_available_only_when_every_account_is_healthy(self):
+        card = self._card("S.data={accounts:[],pool:{total:5,healthy:5}};renderMetrics();")
+        self.assertIn("全部可用", card)
+        self.assertIn('class="s ok"', card)
+
+    def test_all_unavailable_is_red(self):
+        card = self._card("S.data={accounts:[],pool:{total:3,healthy:0,cooling:0,disabled:3}};renderMetrics();")
+        self.assertIn("3 个不可用", card)
+        self.assertIn('class="s e"', card)
+
+    def test_pool_panel_shows_empty_state_instead_of_zero_bar(self):
+        """详情卡也要空态：否则是一条全空的进度条 + 「0 / 0 健康」。"""
+        result = self.run_frontend("""
+S.data={accounts:[],pool:{}};renderPool();
+return {panel:$('#poolPanel').innerHTML};
+""")
+        self.assertIn("empty", result["panel"])
+        self.assertIn("正在读取账号池", result["panel"])
+        self.assertNotIn("/ 0 健康", result["panel"])

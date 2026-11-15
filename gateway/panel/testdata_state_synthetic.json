@@ -1,0 +1,1490 @@
+{
+  "_fixture": {
+    "origin": "independently_generated_from_test_assertions",
+    "now": "2026-10-10T00:00:00+08:00",
+    "contains_real_accounts": false
+  },
+  "ok": true,
+  "version": "dev-synthetic",
+  "accounts": [
+    {
+      "uid": "synthetic-account-01",
+      "nickname": "合成账号 01",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1800,
+        "size": 2000,
+        "used": 200,
+        "expiring": 1000,
+        "expiry": {
+          "within_1d": 250,
+          "within_3d": 250,
+          "within_7d": 500,
+          "within_30d": 100,
+          "later": 200,
+          "unlimited": 500,
+          "next_end": "2026-10-10T12:00:00+08:00",
+          "schedule": [
+            {
+              "end": "2026-10-10T12:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T12:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T12:02:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T12:03:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T12:04:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T09:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T09:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T09:02:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T09:03:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T09:04:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:02:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:03:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:04:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:05:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:06:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:07:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:08:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T10:09:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T09:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T09:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T09:00:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T09:01:00+08:00",
+              "amount": 100,
+              "packages": 1
+            }
+          ],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-02",
+      "nickname": "合成账号 02",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-03",
+      "nickname": "合成账号 03",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-04",
+      "nickname": "合成账号 04",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 2800,
+        "size": 3000,
+        "used": 200,
+        "expiring": 2000,
+        "expiry": {
+          "within_1d": 500,
+          "within_3d": 500,
+          "within_7d": 1000,
+          "within_30d": 100,
+          "later": 200,
+          "unlimited": 500,
+          "next_end": "2026-10-10T13:30:00+08:00",
+          "schedule": [
+            {
+              "end": "2026-10-10T13:30:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T13:31:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T13:32:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T13:33:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T13:34:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T10:30:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T10:31:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T10:32:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T10:33:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T10:34:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:30:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:31:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:32:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:33:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:34:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:35:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:36:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:37:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:38:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T11:39:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T10:30:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T10:31:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T10:30:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T10:31:00+08:00",
+              "amount": 100,
+              "packages": 1
+            }
+          ],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-05",
+      "nickname": "合成账号 05",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-06",
+      "nickname": "合成账号 06",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-07",
+      "nickname": "合成账号 07",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-08",
+      "nickname": "合成账号 08",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-09",
+      "nickname": "合成账号 09",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-10",
+      "nickname": "合成账号 10",
+      "realm": "cn",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-11",
+      "nickname": "合成账号 11",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 3800,
+        "size": 4000,
+        "used": 200,
+        "expiring": 3000,
+        "expiry": {
+          "within_1d": 750,
+          "within_3d": 750,
+          "within_7d": 1500,
+          "within_30d": 100,
+          "later": 200,
+          "unlimited": 500,
+          "next_end": "2026-10-10T17:00:00+08:00",
+          "schedule": [
+            {
+              "end": "2026-10-10T17:00:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T17:01:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T17:02:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T17:03:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T17:04:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T14:00:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T14:01:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T14:02:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T14:03:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T14:04:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:00:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:01:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:02:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:03:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:04:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:05:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:06:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:07:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:08:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T15:09:00+08:00",
+              "amount": 150,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T14:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T14:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T14:00:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T14:01:00+08:00",
+              "amount": 100,
+              "packages": 1
+            }
+          ],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-12",
+      "nickname": "合成账号 12",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-13",
+      "nickname": "合成账号 13",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-14",
+      "nickname": "合成账号 14",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-15",
+      "nickname": "合成账号 15",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 4800,
+        "size": 5000,
+        "used": 200,
+        "expiring": 4000,
+        "expiry": {
+          "within_1d": 1000,
+          "within_3d": 1000,
+          "within_7d": 2000,
+          "within_30d": 100,
+          "later": 200,
+          "unlimited": 500,
+          "next_end": "2026-10-10T19:00:00+08:00",
+          "schedule": [
+            {
+              "end": "2026-10-10T19:00:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T19:01:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T19:02:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T19:03:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T19:04:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T16:00:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T16:01:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T16:02:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T16:03:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T16:04:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:00:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:01:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:02:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:03:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:04:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:05:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:06:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:07:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:08:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T17:09:00+08:00",
+              "amount": 200,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T16:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T16:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T16:00:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T16:01:00+08:00",
+              "amount": 100,
+              "packages": 1
+            }
+          ],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-16",
+      "nickname": "合成账号 16",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-17",
+      "nickname": "合成账号 17",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-18",
+      "nickname": "合成账号 18",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-19",
+      "nickname": "合成账号 19",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 3064,
+        "size": 3264,
+        "used": 200,
+        "expiring": 2264,
+        "expiry": {
+          "within_1d": 566,
+          "within_3d": 566,
+          "within_7d": 1132,
+          "within_30d": 100,
+          "later": 200,
+          "unlimited": 500,
+          "next_end": "2026-10-10T21:00:00+08:00",
+          "schedule": [
+            {
+              "end": "2026-10-10T21:00:00+08:00",
+              "amount": 114,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T21:01:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T21:02:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T21:03:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-10T21:04:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T18:00:00+08:00",
+              "amount": 114,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T18:01:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T18:02:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T18:03:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-12T18:04:00+08:00",
+              "amount": 113,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:00:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:01:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:02:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:03:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:04:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:05:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:06:00+08:00",
+              "amount": 126,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:07:00+08:00",
+              "amount": 125,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-15T19:08:00+08:00",
+              "amount": 125,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T18:00:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-10-25T18:01:00+08:00",
+              "amount": 50,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T18:00:00+08:00",
+              "amount": 100,
+              "packages": 1
+            },
+            {
+              "end": "2026-11-25T18:01:00+08:00",
+              "amount": 100,
+              "packages": 1
+            }
+          ],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-20",
+      "nickname": "合成账号 20",
+      "realm": "global",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-21",
+      "nickname": "合成账号 21",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-22",
+      "nickname": "合成账号 22",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-23",
+      "nickname": "合成账号 23",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": true,
+        "disabledReason": "synthetic disabled state",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-24",
+      "nickname": "合成账号 24",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-25",
+      "nickname": "合成账号 25",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-26",
+      "nickname": "合成账号 26",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-27",
+      "nickname": "合成账号 27",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    },
+    {
+      "uid": "synthetic-account-28",
+      "nickname": "合成账号 28",
+      "realm": "trae",
+      "disabled": false,
+      "pool": {
+        "inPool": true,
+        "disabled": false,
+        "disabledReason": "",
+        "cooldown": 0,
+        "rateLimitedModels": []
+      },
+      "credits": {
+        "remain": 1000,
+        "size": 1200,
+        "used": 200,
+        "expiring": 0,
+        "expiry": {
+          "within_1d": 0,
+          "within_3d": 0,
+          "within_7d": 0,
+          "within_30d": 0,
+          "later": 0,
+          "unlimited": 1000,
+          "next_end": "",
+          "schedule": [],
+          "schedule_truncated": false
+        }
+      }
+    }
+  ],
+  "pool": {
+    "total": 28,
+    "healthy": 21,
+    "disabled": 7,
+    "cooling": 0,
+    "off": 0,
+    "creditsExhausted": 0,
+    "byRealm": {
+      "cn": {
+        "total": 10,
+        "healthy": 7,
+        "disabled": 3,
+        "cooling": 0,
+        "off": 0
+      },
+      "global": {
+        "total": 10,
+        "healthy": 7,
+        "disabled": 3,
+        "cooling": 0,
+        "off": 0
+      },
+      "trae": {
+        "total": 8,
+        "healthy": 7,
+        "disabled": 1,
+        "cooling": 0,
+        "off": 0
+      }
+    }
+  },
+  "creditTotals": {
+    "remain": 39264,
+    "size": 44864,
+    "used": 5600,
+    "expiring": 12264,
+    "expiring_window_hours": 168
+  },
+  "tasks": []
+}

@@ -1,0 +1,70 @@
+/* ══ 积分有效期页 ═══════════════════════════════════════════════════
+ * 参照总览的 .metrics 卡片与 .comp 进度条：
+ *   · 顶部三张卡复用 .metric 的排版（标题 / 大数字 / 说明三行）；
+ *   · 分档条沿用「色块 + 宽度百分比 + 百分比文字」的既有语言，
+ *     颜色按紧迫度递进（err 最急 → info → 中性 → ok 不会过期）。
+ * 2026-10-10 新建：积分按套餐分批到期，原先只在总览卡上做了一行条件提示
+ *           （窗口内无积分时整块不出现），运维看不到「哪天、哪个号、多少分要作废」。
+ */
+
+.exp-hd{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:16px}
+.exp-hd .metric{margin:0}
+
+/* 分档条：每档一行（标签 + 数值 / 进度条 / 百分比）。
+   用 grid 让三列对齐，条宽按占剩余的比例；极小值给 1% 下限以免完全看不见。 */
+.exp-bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:18px}
+.exp-bar{padding:12px 14px;border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);min-width:0}
+.exp-bar-h{display:flex;align-items:baseline;gap:8px;font-size:12.5px;color:var(--ink-2)}
+.exp-bar-h b{margin-left:auto;font:600 15px/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
+.exp-bar-t{height:5px;margin-top:9px;background:var(--sunken);border-radius:3px;overflow:hidden}
+.exp-bar-t i{display:block;height:100%;background:var(--ink-3);border-radius:3px;
+  transition:width .3s var(--ease)}
+.exp-bar-s{margin-top:6px;font-size:11.5px;color:var(--ink-3);font-family:var(--mono)}
+/* 紧迫度配色：1/3 天用 err，7 天用 warn，30 天用 info，之后中性，不会过期用 ok。 */
+.exp-bar.e .exp-bar-t i{background:var(--err)}
+.exp-bar.w .exp-bar-t i{background:var(--warn)}
+.exp-bar.a .exp-bar-t i{background:var(--info)}
+.exp-bar.ok .exp-bar-t i{background:var(--ok)}
+.exp-bar.e .exp-bar-h b{color:var(--err)}
+.exp-bar.w .exp-bar-h b{color:var(--warn)}
+
+/* 表格里的数字：1 天内到期的用警示色标出来，其余保持普通字重；
+   零值用极浅色「—」，避免一排 0 抢注意力。 */
+.exp-urgent{color:var(--err);font-weight:600}
+.exp-zero{color:var(--ink-3)}
+
+/* 账号表的域分组行：跨整行的浅底标题条，把「哪个域的积分要作废」分开。
+   数字列随数据自适应（只留非零档位），所以分组行的 colspan 由 JS 算，
+   这里不能写死。
+   备注用 float:right 而不是 flex——td 必须保持 table-cell，否则
+   `border-collapse:collapse` 不再绘制它的边框（见 TableBorderCollapseTests）。 */
+.credits-table .tbl-grp td{background:var(--surface-2);padding:8px 16px;border-bottom:1px solid var(--line)}
+.credits-table .tbl-grp .rtag{margin-right:8px}
+.credits-table .tbl-grp .g-nm{font-size:12.5px;font-weight:600;color:var(--ink-2)}
+.credits-table .tbl-grp .g-sub{float:right;font-size:12px;color:var(--ink-3);
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+/* 窄屏卡片态：分组行还原成普通块，浮动的备注改为紧随其后。 */
+@media (max-width:900px){
+  .credits-table .tbl-grp td{display:block;padding:9px 14px}
+  .credits-table .tbl-grp .g-sub{float:none;margin-left:8px}
+}
+
+@media (max-width:900px){
+  .exp-hd{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:640px){
+  .exp-bars{grid-template-columns:minmax(0,1fr)}
+}
+
+/* ══ 到期日程表 ════════════════════════════════════════════════════
+ * 绝对时刻用等宽字体（一列时刻能对齐扫读），并按紧迫度上色：
+ * 3 天内 err、7 天内 warn、30 天内 info、更远保持中性。
+ */
+.sched-t{font:12.5px/1 var(--mono);font-variant-numeric:tabular-nums}
+.sched-t.e{color:var(--err);font-weight:600}
+.sched-t.w{color:var(--warn);font-weight:500}
+.sched-t.a{color:var(--info)}
+.sched-trunc{padding:10px 0;line-height:1.6}
+/* 账号选择器可能有很多号：横向滚动而不是撑破面板。 */
+#schedAccount{max-width:100%;overflow-x:auto}
+#schedAccount button{max-width:150px;overflow:hidden;text-overflow:ellipsis}

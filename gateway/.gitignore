@@ -1,0 +1,76 @@
+# Auth & secrets
+auths/
+data/
+*.key
+*.pem
+*.env
+.env
+.env.*
+
+# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
+/login
+/credit
+/wb2api
+/signin_bin
+
+# Config with secrets (use config.example.json)
+config.json
+
+# Build artifacts
+*.tmp
+__pycache__/
+
+# 真实会话测试载荷（私人对话内容，绝不入库）
+real2.json
+real_input.json
+replay_full.json
+combined.json
+*.bak-*
+build.log
+
+# Backups (contains auth tokens)
+backups/
+
+# IDE
+.idea/
+.vscode/
+LOOP.md
+PLAN.md
+SPEC.md
+
+# 设计/计划文档（但 README.md 必须进版本库）
+
+# Runtime credentials, backups, and diagnostic captures
+/auths-trash/
+/config.json.*
+/artifacts/
+*.tmp-*
+*.bak
+*.bak.*
+*.bak-*
+*.before-*
+*.old.*
+*.log
+/real_input.json
+/big_payload.json
+**/*-wire-*.request.json
+/trial_bin
+/activity_bin
+# 本地构建的探针二进制：不进仓库（10 MB 级，且与平台绑定）。
+/traeprobe.exe
+
+# Admin panel runtime data and bytecode
+/panel-data/
+/config/
+/panel/*.lock
+/panel/__pycache__/
+# 面板在源码目录里直接运行时会把凭证与初始密码落在 panel/ 下（默认 AUTH_DIR=源码目录）。
+# 两者都是机密，绝不能入库。
+/panel/credentials.json
+/panel/initial-password.txt
+
+# 单文件分发的构建中间产物：build.py 会把网关与辅助程序临时拷进
+# cmd/desktop/embedded/ 供 go:embed 读取，编完立刻删除。这里是双保险——
+# 一旦某次构建被中断，十几 MB 的二进制不会误入库。
+cmd/desktop/embedded/*
+!cmd/desktop/embedded/.PLACEHOLDER

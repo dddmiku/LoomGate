@@ -1,0 +1,179 @@
+# 接口兼容性
+
+网关适配 `/v1/responses` 与 `/v1/chat/completions`，把请求转换为上游格式，并把结果还原给客户端。请求结构可以接受，不代表选定的上游模型、账号或渠道一定支持该能力。
+
+v2.3.0 的四协议入口总览见 [agent 接入](agent-compatibility.md)，另外两种协议见 [Anthropic Messages](anthropic-messages.md) 与 [Gemini generateContent](gemini.md)，nf 地址填写见 [六模式指南](narrafork.md)。
+
+## Responses
+
+| 能力 | 当前行为 |
+|---|---|
+| 文本输入与历史消息 | 支持；客户端应发送所需的完整历史 |
+| 图片输入 | 转换已支持的图片内容块，受入站大小和出站图片预算限制 |
+| function 工具 | 支持声明、调用、结果与历史往返；`strict:true` 参数在成功终态前按 JSON Schema 校验 |
+| custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
+| namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
+| `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
+| 压制期心跳与提前开流 | 循环保护压住输出时（最长 60 秒），网关会先开流或发心跳：Responses 先发 `response.created`/`in_progress`，Messages 先发 `message_start` 并周期 `ping`，Chat 契约路径在已开流后发 SSE 注释。回调与读上游在同一 goroutine，不引入并发写 |
+| 已开始流的失败 | 流已经开始后，失败在流内交付（Responses `response.failed`、Messages `error` 事件、Chat SSE `error` 帧），不再往已开始的 SSE 流里写 JSON 体 |
+| 11140（`request illegal`） | 按 `displayMsg` 分野：带内容审核标记（`did not pass the safety review` / `未通过安全审核`）→ 请求级内容拦截，不罚账号；默认直接回给调用方，配置 `pool.max_soft_rotations` 后先换号再试。无该标记 → 账号级授权故障，**连续两次**才硬禁用（第一次只换号） |
+| 模型名 `[1m]` 后缀 | 接受 Anthropic 的 1M 别名（`model[1m]`／`[1M]`）：去掉后缀后按同一模型路由并把请求体里的名字归一（v2.4.17 起）；仅含后缀的畸形名字不改动 |
+| 原生 Chat 用量帧 | 按 OpenAI 规范：仅显式 `stream_options.include_usage=true` 时下发（缺省与 `false` 都不发）；内部账本与协议校验始终读取完整上游用量 |
+| Anthropic 顶层不支持块 | `document`、`search_result`、`web_search_tool_result`、`server_tool_use`、`tool_reference` 等在上游没有对应形态，一律替换为文字占位 `[unsupported content block: …]`（2.4.7 起覆盖顶层与嵌套位置），不再整条 400 |
+| Anthropic 工具调用 id | 只要求「同一条 assistant 消息内唯一、且不与尚未配对的上一个调用重复」；跨轮复用同一个 id（很多客户端每轮重新编号）已放行（2.4.7 起） |
+| Anthropic 流起始 | 上游请求已发出但 5 秒内没有首帧时，网关先发 `message_start` 并每 10 秒 `ping`，避免循环保护压制期客户端零字节等待 |
+| Responses 拒答 | 拒答文本按 `output_text` 交付：面向 Responses 的客户端（Codex）无法解析含 `refusal` 的条目，会把整条 item 丢弃，用户只能看到空回合（2.4.7 起） |
+| Anthropic 内容块 | 上游可承载的只有 text/image；历史里出现 `document`、`tool_reference`、`search_result` 等块时替换为文字占位，不再整条请求 400（2.4.6 起） |
+| 客户端渠道校验 | 上游会按系统提示里的「客户端归属」句判定未批准渠道（11128）。网关先原样发送，被拒后按档位断词重发：已实测指纹（Codex、Claude Code）→ 通用归属句 → 消息正文全量断词。零宽字符不改变语义，正常请求正文不变，任何客户端都不会因为自称是谁而被挡在门外 |
+| `parallel_tool_calls` | 保留；显式 false 而上游仍返回多个调用时，2.4.2 起只交付第一个并记日志（此前整轮失败） |
+| `text.format` | 支持 text、json_object、json_schema；结构化格式检查最终文本输出 |
+| `text.verbosity` | 接受有效字符串声明但不转发；上游没有对应的风格开关 |
+| `reasoning.effort` / `summary` | 转发，具体可用档位由模型决定 |
+| `prompt_cache_key` | 保留；它不是服务端历史存储 |
+| `truncation` | 省略/disabled 保留完整历史；auto 与其它未支持策略返回 400 |
+| `reasoning.context` / `mode` | 不支持，明确拒绝非空语义设置，不原样回显为已执行 |
+| 仅含原生 `encrypted_content` 的 reasoning | 别的服务签发的密文（网关与上游都读不懂）跳过并计数，不转发密文、也不整条拒绝；有可读推理的历史继续保留 |
+| 未知历史 item 类型 | 忽略其不支持的元数据，不把它提升为用户消息或聊天正文 |
+| 未知内容块类型 | Responses 内容适配器返回 400，避免接受后静默丢失正文 |
+| `previous_response_id`、`store=true`、`background=true` | 不支持，返回 400 |
+| 非空 `conversation` / `prompt`、`item_reference` | 不支持服务端会话、模板和引用解析，返回 400 |
+
+历史 item 与消息 content 是两个层级：未知的状态/扩展 item 可以忽略；已知消息里的正文不能因为转换器不认识内容类型而被静默丢掉。已支持的文字、图片和 refusal 内容会保留，工具结果中的 refusal 也不会变成空输出。
+
+custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行或语法约束保证。当前 custom 调用通过最终 `input` 与 `response.output_item.done` 交付；不声明完整支持专用 `custom_tool_call_input.delta/done` 事件族。
+
+## 工具选择与严格约束
+
+| 选择方式 | 成功完成时的约束 |
+|---|---|
+| `auto` | 模型可返回正文或已声明工具调用；没有声明时不允许幻觉工具 |
+| `none` | 不得返回工具调用 |
+| `required` | 至少声明一个可执行工具，且成功结果必须包含声明集合内的调用 |
+| 指定 function/custom | 必须恰好调用一次所指定的工具 |
+| `allowed_tools` | 只向上游提供选中的工具，并检查返回调用没有超出该子集；mode 支持 auto 或 required |
+
+`allowed_tools` 是 `tool_choice` 的一种对象形式，不是附加后按 auto 忽略。下面是选择已声明命名空间函数时的 `tool_choice` 值：
+
+```json
+{
+  "type": "allowed_tools",
+  "mode": "required",
+  "tools": [
+    {"type": "function", "namespace": "catalog", "name": "lookup"}
+  ]
+}
+```
+
+引用必须对应已声明且可执行的 function/custom 工具，类型和命名空间也必须匹配。非法 mode、未声明引用、required 下的空子集返回 400；重复的同一子集引用会去重。原始工具声明和返回时的公开名称保持不变。
+
+`strict:true` 函数参数按声明的 JSON Schema 校验，非法 schema 或外部 schema 引用在请求阶段拒绝。`strict:false` 或未声明 strict 的函数保持尽力模式，不额外套用严格参数 schema；工具名称、参数形状和完整性仍按相应协议路径检查。
+
+工具参数完整性在本次上游流的 `[DONE]` 或合法 EOF 收尾时校验。早到的 `finish_reason` 后仍可接收参数增量或完整消息快照；正文和思考继续流式发送，工具身份和参数在整组校验通过后才交付，成功结束标记只发送一次。缺失、残缺、非 JSON 对象参数、重复调用身份和未声明工具都会失败，不自动猜测工具操作。`length`、`content_filter` 保留不完整状态和已有正文，但不交付未完成工具。
+
+`text.format=json_schema` 检查最终文本是否匹配 schema；`json_object` 要求完整 JSON 对象，不能带 Markdown 围栏或尾随文字。可以先返回工具调用，随后再给最终结构化文本。纯拒答以及明确的 length/content_filter 不完整结果有独立语义，不会被 required 或指定工具约束强改成工具违约。
+
+## 内置工具的边界
+
+`web_search`、`tool_search` 及其版本后缀声明，以及 nf 默认的 `image_generation` 声明可以出现在两种接口中，但会从出站工具列表过滤。接受声明只用于兼容客户端默认元数据，不代表网关已实现联网搜索、工具发现或图片生成。过滤通过 `X-WB2API-Ignored-Tools`、Warning 和能力接口明确说明。
+
+- 过滤后没有可执行工具，且选择为省略、auto 或 none 时，可移除无意义的工具控制字段。
+- 只剩不可执行内置工具却要求 required，或强制选择被过滤的工具时，前置返回 400，不发送上游请求，也不静默降级为 auto。
+- 混合声明中的 function/custom 仍按工具选择规则处理。
+- 需要服务端能力的 file_search、mcp、computer_use、code_interpreter、local_shell 等内置类型不受支持，返回明确错误。默认 image_generation 声明可过滤，强制选择它仍拒绝。
+
+这里区分的是工具的 type；用户声明的普通 function 不会仅因名称类似内置工具就被当成内置类型。
+
+## 命名空间与长工具名
+
+命名空间子函数支持 Responses 顶层 `name/parameters` 形式，也支持嵌套 `function.name/function.parameters` 形式。分组的使用说明会保留到出站描述。相同命名空间内的重复工具身份会被拒绝，不靠覆盖顺序猜选工具。
+
+一般出站名使用 `命名空间__工具名`。超过 64 字节时生成稳定短别名，采用保留 UTF-8 边界的前缀与摘要后缀，碰撞后缀也受长度限制。顶层长工具名同样处理。声明、历史调用、工具选择和回程还原共用映射；客户端继续使用原始名称，无需自行猜短别名。
+
+命名空间调用的回程形状例如：
+
+```json
+{
+  "type": "function_call",
+  "name": "lookup",
+  "namespace": "catalog",
+  "call_id": "call_example",
+  "arguments": "{\"query\":\"hello\"}"
+}
+```
+
+`/v1/chat/completions` 不接受 namespace/custom 类型声明；需要它们时使用 Responses 接口。直接 Chat 的普通 function 长名与兼容的 legacy function 字段也会同步映射和恢复。
+
+## Chat Completions
+
+直接 Chat 支持普通消息、function 工具和兼容的 legacy `functions/function_call` 形态。`response_format` 支持 text、json_object、json_schema。所有请求都复用上述工具完成校验，并逐个检查返回的 choice；无工具声明也不会跳过校验。
+
+流式请求中的正文、思考和 refusal 保持实时输出；工具身份、参数、成功 finish、末尾 usage 和 `[DONE]` 在完整校验后交付。按片段进展发送保活，避免缓冲工具时长时间没有下行数据。迟到的上游错误保留错误信封，不先发可执行参数再补报错。非流式输出违约返回 502，截断结果同样不附带工具负载。
+
+已经发出的增量无法撤回，因此调用方必须检查最终状态或流内错误。收到 HTTP 200 或若干正文片段不能视为完整成功。Chat 的其他结构合法的内容形态可继续交给选定上游处理，不等同于网关保证该模态可用。
+
+## 完成状态
+
+- 正常完成：`response.completed`，内部状态为 completed。
+- 输出上限或内容过滤截断：`response.incomplete`，携带 `incomplete_details`。
+- 上游流错误、意外结束或输出契约不满足：`response.failed` 或相应 HTTP 错误。
+- refusal 按拒答字段和 `response.refusal.delta/done` 保留，不伪装成普通正文，也不把纯拒答当作缺少必需工具。
+- 不完整或无效工具的身份/参数不会通过 delta、done 或最终 output 交付，不仅是省略成功 done。
+- `tool_calls/function_call` 结束原因没有实际调用时，返回 missing_tool_call 失败。
+- 非数组 tool_calls 是格式错误；null 或空数组配合正常正文结束仍可接受。
+
+工具条目建立后，增量与最终结果保持同一 item/call 身份；早于名称到达的参数会暂存，不能靠猜测工具身份提前交付。失败或截断不会用成功工具终态掩盖缺失的数据。
+
+Responses 的同一 output item 只发送一次 `response.output_item.added`，增量与收尾引用同一身份，结束后不复用该 item ID。推理与工具或正文交错时，后续推理追加到尚未结束的 reasoning 条目；摘要增量只包含新增文本，不重放此前片段。最终 output 与流内条目的身份和顺序保持一致。
+
+`response.completed` 是一次响应的协议终态，不是整个用户任务的验收结论。工具调用与纯文字均可正常完成；模型只用文字预告下一步时，不能仅凭协议终态判断已完成所有工作。接入约定见 [Codex 接入](codex.md#预告文字与回合结束)。
+
+## 重复推理的失败状态
+
+指定 DeepSeek 模型触发重复短行保护时，网关默认先在同一账号上重发一次；重发通常能拿到干净的一轮，调用方看不到这次内部重试。只有重发仍循环、或客户端已经收到内容时，才回报错误码：推理侧为 `upstream_reasoning_loop`（「检测到重复推理循环…」），正文侧为 `upstream_output_loop`（「检测到重复输出循环…」），两者都可附字符数与重复覆盖计数。正文侧单独设码，便于调用方区分「模型在思考里打转」与「重复正文正在刷屏」。非流式 Chat 与 Responses 返回 HTTP 422；已开始的流式请求保留 HTTP 200，Chat 返回错误事件，Responses 以 `response.failed` 结束，不附带成功终态。重发没能建立时返回 502 并写回原因。把 `features.reasoning_loop_stop_only` 设为 `true` 可改为只停不重发，命中即如实回报错误；管理台「系统」页可以直接热切换这个开关，改完立即作用于后续请求，不需要重启。
+
+网关自身不对此类失败轮换账号或冷却，重发固定落在同一账号，已有会话绑定保留；客户端是否重试取决于其策略。账本保留已观测的原始用量（含被丢弃那一轮的计费），并同时增加失败和用量未完整返回计数。保护默认开启且可关闭；它可能误判合法短行重复，也不能检测所有循环，详细范围见 [重复推理保护](configuration.md#重复推理保护)。
+
+## 思考模式的推理回灌（上游 11155）
+
+Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 而没有可读内容时，网关跳过该条并在诊断里计数（Codex 默认带 `reasoning.encrypted_content`，整条拒绝会让这种会话之后每个请求都 400）；既不把密文换成空串，也不把它当可读推理转发。nf 自己先把推理转成普通正文的情况见 [客户端边界](narrafork.md#nf-077-的已知边界)。
+
+转换层会合并连续 assistant 片段，保留正文、多模态内容、工具调用及可用推理内容，兼容对消息形状敏感的上游。11155 不能单独证明是某一个字段缺失，也可能涉及历史消息结构；应检查客户端实际发送的历史形状，而不是把所有情况归结为模型能力或账号故障。
+
+## 常见错误
+
+| 错误 | 排查方向 |
+|---|---|
+| `invalid_api_key` | 密钥缺失、停用或删除 |
+| `api_key_expired` | 密钥有效期已过；在管理台重新设置有效期后即可继续使用 |
+| `invalid_request` | 输入结构、工具选择、schema 或不支持的服务端能力 |
+| `request_body_too_large` | 入站请求超过配置上限 |
+| `response_contract_violation` | 模型的成功结果未满足声明的工具或输出约束 |
+| `missing_tool_call` | 工具结束原因缺少实际调用 |
+| `upstream_reasoning_loop` | 重复短行推理触发保护；整理上下文后重试，合法重复场景可关闭保护 |
+| `upstream_output_loop` | 重复短行正文触发保护；整理上下文后重试，合法重复场景可关闭保护 |
+| `upstream_invalid_request` | 上游拒绝请求参数 |
+| `upstream_channel_rejected` | 上游拒绝调用渠道 |
+| `upstream_waf_blocked` | 上游入口拦截请求正文 |
+| `content_blocked` | 上游内容策略拒绝 |
+| `context_length_exceeded` | 模型上下文超限 |
+| `rate_limit_exceeded` | 账号或模型限流 |
+| 国际版 `code 14017`（trial not activated） | 账号缺注册地；网关自动补交并重试，见[配置说明](configuration.md) |
+
+渠道拒绝、入口拦截和模型内容拒绝是不同原因。首次请求按正常转换发送；特定上游拦截可能触发有界的同路径字符串兼容重试，重试仍失败则返回对应错误，不保证任意请求都能通过。具体上游拦截规则不是静态协议承诺。
+
+## 验证范围
+
+公开回归使用合成数据，覆盖工具子集与选择、严格/非严格参数、长名往返、refusal、未知历史项隔离、正文/图片保留、SSE 增量、截断与迟到错误，以及交错推理的条目生命周期和重复推理保护。可检查 [协议回归](../internal/server/protocol_diagnosis_test.go)、[输出完整性回归](../internal/server/responses_output_integrity_test.go)、[请求结构校验](../internal/server/request_validation_test.go)、[推理生命周期回归](../internal/server/responses_reasoning_lifecycle_test.go) 和 [保护及用量回归](../internal/server/reasoning_loop_guard_test.go)。
+
+这些检查不能等同于全部账号、模型、渠道和客户端组合均已实测通过。开源实现的固定提交、采用原则及未照搬的边界见 [协议实现参考](protocol-references.md)。
+
+## 已知限制（如实记录，不伪造）
+
+- `message_start.usage` 的缓存拆分在上游首帧时还不可知，此时网关不编造拆分，而是给出一个**输入量估算**（`EstimateInputTokens` 口径，偏保守），让客户端在轮次进行中就能显示 token 计数；`input_tokens` 的**权威值**与缓存字段都在 `message_delta` 给出（上游只在流末尾报用量）。有实测拆分时首帧直接报实测的非缓存量，估算值让位。估算值偏高约 2 倍，量级正确但不是精确值。
+- Anthropic `tool_use.id` 沿用上游的 `call_…` 形状而非 `toolu_…`；回填配对按原样工作，客户端一般不校验前缀。
+- thinking 块不带 `signature`：上游不提供可用签名，伪造一个「Anthropic 签名」会更糟；客户端把思考块放回历史时，网关按无签名历史接收。
+- `stop_sequence` 无法报告：上游不回显命中的停止串，仍按 `end_turn` 收尾（不做猜测）。
+- `n>1` 现为明确拒绝（上游只返回单个选择）；`logprobs` 请求会透传 choice 级 `logprobs`（缺失补 `null`），`top_logprobs` 是否生效取决于上游。
+- 工具调用参数为空串（无参数工具）时，交付给客户端的一律写成 `{}`；带工具调用的回合 `finish_reason` 归一为 `tool_calls`。
+- 请求体 `Content-Encoding` 支持 gzip、deflate（zlib 与裸 deflate 均接受）、zstd、identity。
+- Responses 协议没有 Anthropic 那样的提前开流：循环保护压制期（最长 60 秒）客户端可能收不到任何字节，需要给写入器加锁并发写才能安全补齐，留待后续版本。

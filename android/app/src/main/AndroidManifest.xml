@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ═══ 更新日志 ═══
+     2026-10-13：初版——安卓清单：前台服务 + 单 Activity（WebView 承载面板）。
+
+     ═══ 权限只申请真正需要的三个 ═══
+       - INTERNET：网关要打上游（WorkBuddy / Trae）。
+       - FOREGROUND_SERVICE：网关必须常驻（排程任务靠它跑），没有前台服务
+         会被系统在几分钟内杀掉。
+       - POST_NOTIFICATIONS：Android 13+ 的前台服务通知需要运行时授权。
+         不加这个权限的话通知不显示，而**前台服务会因此被降级甚至杀掉**——
+         用户看到的症状是「App 自己停了」。
+
+     刻意不申请的：
+       - 存储权限：账号与密钥全部落在应用私有目录，不需要外部存储。
+       - 网络状态/唤醒锁：本 App 不依赖 Wi-Fi 状态，也不主动持有唤醒锁
+         （前台服务已经足够保活；持唤醒锁反而会耗电到被系统清算）。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 自更新必须声明这一条：安卓 8.0 起，拉起系统安装器安装**别的 APK** 的
+         应用必须持有 REQUEST_INSTALL_PACKAGES。缺了它，系统安装器会**直接结束、
+         不弹任何界面、也不写任何日志**——2026-10-13 真机实测（vivo V2020A /
+         Android 10）：点了「安装更新」后 `com.android.packageinstaller` 一闪而过，
+         logcat 里连一条 PackageInstallerActivity 都没有，用户看到的是
+         「点了没反应」。加上之后确认框才出现。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:label="WorkBuddy 网关"
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <!-- 明文 HTTP 必须允许：面板与 API 都在 127.0.0.1 上走 http。
+             这不影响外部流量——App 不发任何外部明文请求（上游全是 https）。 -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 把更新下来的 APK 以 content:// 交给系统安装器。
+             Android 7 起 file:// 跨进程会抛 FileUriExposedException，而
+             packageinstaller 是另一个进程；androidx 的 FileProvider 需要引依赖，
+             这个 App 刻意不引 androidx，所以自己实现一个最小的（见 ApkProvider）。
+
+             exported=false + grantUriPermissions=true：只有拿到我们显式授权的
+             那个 Intent 才读得到，外部应用直接访问会被拒。 -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.workbuddy2api.app.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <service
+            android:name=".GatewayService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+    </application>
+
+</manifest>

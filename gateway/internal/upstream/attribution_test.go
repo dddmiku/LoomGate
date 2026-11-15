@@ -1,0 +1,392 @@
+// attribution_test.go 用量归属头 + 客户端 IP 透传单测。
+package upstream
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"workbuddy2api/internal/auth"
+)
+
+// chatHeadersReq 构造一个 chat 请求并应用 ChatHeaders，发到测试 server，
+// 返回 server 捕获到的所有头。便于断言归属/IP 头。
+// clientIP 为透传参数（PassthroughIP 开启时注入；空串表示不透传）。
+func chatHeadersReq(t *testing.T, c *Client, a *auth.Auth, clientIP string) http.Header {
+	t.Helper()
+	var captured http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Clone()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	c.ChatBaseCN = srv.URL
+	c.ChatHTTP = srv.Client()
+	c.HTTP = srv.Client()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("new req: %v", err)
+	}
+	c.ChatHeaders(req, a, clientIP, ChatMeta{})
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	return captured
+}
+
+// looksLikeUUID 校验官方 acp-connection-id 的 8-4-4-4-12 文本形态（小写 hex）。
+// 官方抓包（005742_0068 / 005747_0101）里该头恒为这一形态。
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TestAgentPurposeHeadersSet ClientName 配 WorkBuddy 时四头齐全跟随该值。
+func TestAgentPurposeHeadersSet(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{ClientName: "WorkBuddy"}
+	h := chatHeadersReq(t, c, a, "")
+	for _, tc := range []struct {
+		header string
+		want   string
+	}{
+		{"X-Agent-Purpose", "conversation"},
+		{"X-IDE-Name", "WorkBuddy"},
+		{"X-IDE-Type", "WorkBuddy"},
+		{"X-Product", "SaaS"},
+	} {
+		if got := h.Get(tc.header); got != tc.want {
+			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
+		}
+	}
+}
+
+// TestAttributionIncludesIDEVersion client_name + client_version 都配时，
+// X-IDE-* 四头齐全（Name/Type/Product 跟随 client_name，Version 跟随 client_version）。
+func TestAttributionIncludesIDEVersion(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{ClientName: "WorkBuddy", ClientVersion: "6.0.0"}
+	h := chatHeadersReq(t, c, a, "")
+	for _, tc := range []struct {
+		header string
+		want   string
+	}{
+		{"X-Agent-Purpose", "conversation"},
+		{"X-IDE-Name", "WorkBuddy"},
+		{"X-IDE-Type", "WorkBuddy"},
+		{"X-IDE-Version", "6.0.0"},
+		{"X-Product", "SaaS"},
+	} {
+		if got := h.Get(tc.header); got != tc.want {
+			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
+		}
+	}
+	// X-IDE-Version 缺省（client_version 空）= 内置默认 defaultClientVersion，且四头齐全。
+	c2 := &Client{ClientName: "WorkBuddy"}
+	h2 := chatHeadersReq(t, c2, a, "")
+	if got := h2.Get("X-IDE-Version"); got != defaultClientVersion {
+		t.Errorf("X-IDE-Version = %q want %q (default)", got, defaultClientVersion)
+	}
+	// 显式 ClientName="SaaS" 时 X-IDE-Version 不设（还原旧行为：只有 X-Product=SaaS）。
+	c3 := &Client{ClientName: "SaaS"}
+	h3 := chatHeadersReq(t, c3, a, "")
+	if got := h3.Get("X-IDE-Version"); got != "" {
+		t.Errorf("X-IDE-Version = %q want empty (client_name=SaaS)", got)
+	}
+}
+
+// TestProductDefaultWorkBuddyFingerprint ClientName 空（缺省）时对齐官方桌面端指纹：
+// X-Product=SaaS（部署形态，抓包原文）且 X-IDE-* / X-Agent-Purpose 四头齐全。
+func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{} // ClientName 空 → 默认 WorkBuddy 指纹
+	h := chatHeadersReq(t, c, a, "")
+	for hdr, want := range map[string]string{
+		"X-Product":       "SaaS",
+		"X-IDE-Name":      "WorkBuddy",
+		"X-IDE-Type":      "WorkBuddy",
+		"X-IDE-Version":   defaultClientVersion,
+		"X-Agent-Purpose": "conversation",
+		"X-Agent-Intent":  "craft",
+		"X-Agent-Type":    "main",
+	} {
+		if got := h.Get(hdr); got != want {
+			t.Errorf("%s = %q want %q (default fingerprint)", hdr, got, want)
+		}
+	}
+	// SDK 指纹头：官方走 @openai Node SDK，出站必带 x-stainless-* 组。
+	for hdr, want := range map[string]string{
+		"x-stainless-lang":            "js",
+		"x-stainless-runtime":         "node",
+		"x-stainless-os":              "Windows",
+		"x-stainless-arch":            "x64",
+		"x-stainless-package-version": "6.25.0",
+		"x-stainless-retry-count":     "0",
+	} {
+		if got := h.Get(hdr); got != want {
+			t.Errorf("%s = %q want %q (sdk fingerprint)", hdr, got, want)
+		}
+	}
+	// ACP/隐私声明头（官方 chat 请求 100% 携带）：
+	// X-Private-Data 按 realm 取值——CN=false / global=true（2026-10-29 V5.9.3
+	// 抓包 _wb_capture_new 033/039；5.8.x 时代两域都是 true）。本用例是 CN 账号。
+	// x-codebuddy-request 恒 1；acp-connection-id 为官方 8-4-4-4-12 UUID 形态。
+	if got := h.Get("X-Private-Data"); got != "false" {
+		t.Errorf("X-Private-Data = %q want %q (CN 域官方取值)", got, "false")
+	}
+	if got := h.Get("x-codebuddy-request"); got != "1" {
+		t.Errorf("x-codebuddy-request = %q want %q (official channel marker)", got, "1")
+	}
+	if acp := h.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want UUID form (fallback)", acp)
+	}
+	// 链路族四件套：traceparent / b3 / 父跨度。
+	if tp := h.Get("traceparent"); len(tp) != 55 || tp[:3] != "00-" {
+		t.Errorf("traceparent = %q want W3C 55-char form", tp)
+	}
+	if b3 := h.Get("b3"); b3 == "" {
+		t.Errorf("b3 = %q want single-line b3", b3)
+	}
+	if ps := h.Get("X-B3-ParentSpanId"); len(ps) != 16 {
+		t.Errorf("X-B3-ParentSpanId = %q want 16 hex", ps)
+	}
+}
+
+// TestProductSaaSOptOut 显式 ClientName="SaaS" 时 X-Product=SaaS 且不设 X-IDE-*（还原旧行为）。
+func TestProductSaaSOptOut(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{ClientName: "SaaS"} // 显式退出指纹伪造
+	h := chatHeadersReq(t, c, a, "")
+	if got := h.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
+	}
+	// X-IDE-Name/Type 不应被设置。
+	for _, hdr := range []string{"X-IDE-Name", "X-IDE-Type", "X-Agent-Purpose"} {
+		if got := h.Get(hdr); got != "" {
+			t.Errorf("%s = %q want empty (SaaS opt-out)", hdr, got)
+		}
+	}
+}
+
+// TestProductWorkBuddy_WhenConfigured client_name 只手写 X-IDE-*；X-Product 恒为
+// 部署形态 "SaaS"（官方抓包），不跟随 client_name。
+func TestProductWorkBuddy_WhenConfigured(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{ClientName: "WorkBuddy"}
+	h := chatHeadersReq(t, c, a, "")
+	if got := h.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
+	}
+	// client_name 其他值：X-IDE-* 跟随，X-Product 仍是 SaaS。
+	c2 := &Client{ClientName: "MyEditor"}
+	h2 := chatHeadersReq(t, c2, a, "")
+	if got := h2.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
+	}
+	if got := h2.Get("X-IDE-Name"); got != "MyEditor" {
+		t.Errorf("X-IDE-Name = %q want %q", got, "MyEditor")
+	}
+}
+
+// TestACPConnectionIDPassthrough acp-connection-id 的取值链：
+// GatewayRequestID 非空时把它渲染成官方 UUID 形态（同请求全部尝试共享一个连接 ID）；
+// 空时兜底新生成；任何情况下都不发空值、不发无横线的 32 hex。
+//
+// 形态要求来自官方抓包（005742_0068 / 005747_0101）：该头恒为 8-4-4-4-12。
+func TestACPConnectionIDPassthrough(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{}
+
+	var captured http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Clone()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	c.ChatBaseCN = srv.URL
+	c.ChatHTTP = srv.Client()
+	c.HTTP = srv.Client()
+
+	send := func(meta ChatMeta) http.Header {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
+		if err != nil {
+			t.Fatalf("new req: %v", err)
+		}
+		c.ChatHeaders(req, a, "", meta)
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return captured
+	}
+
+	// 32 hex 的 GatewayRequestID：渲染成同值的带横线 UUID 形态。
+	h := send(ChatMeta{GatewayRequestID: "3f2b1c4d5e6f708192a3b4c5d6e7f809"})
+	if got := h.Get("acp-connection-id"); got != "3f2b1c4d-5e6f-7081-92a3-b4c5d6e7f809" {
+		t.Errorf("acp-connection-id = %q want same value in UUID form", got)
+	}
+	// X-Private-Data 与 GatewayRequestID 无关，按 realm 取值（本用例 CN 账号 = false）。
+	if got := h.Get("X-Private-Data"); got != "false" {
+		t.Errorf("X-Private-Data = %q want false (CN 域)", got)
+	}
+	// x-codebuddy-request：官方 chat 请求固定携带的通道标记。
+	if got := h.Get("x-codebuddy-request"); got != "1" {
+		t.Errorf("x-codebuddy-request = %q want %q", got, "1")
+	}
+
+	// 已是带横线 UUID：原样保留（入站透传场景）。
+	h2 := send(ChatMeta{GatewayRequestID: "01a145a5-ddd6-73b8-b103-f04d4cf5730e"})
+	if got := h2.Get("acp-connection-id"); got != "01a145a5-ddd6-73b8-b103-f04d4cf5730e" {
+		t.Errorf("acp-connection-id = %q want passthrough of hyphenated UUID", got)
+	}
+
+	// 非常规值：净化后形态不符 → 退回新生成的 UUID，绝不发脏值/短值。
+	h3 := send(ChatMeta{GatewayRequestID: "bad\nvalue"})
+	if acp := h3.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want generated UUID form", acp)
+	}
+	// 兜底路径：GatewayRequestID 为空 → 新生成的 UUID。
+	h4 := send(ChatMeta{})
+	if acp := h4.Get("acp-connection-id"); !looksLikeUUID(acp) {
+		t.Errorf("acp-connection-id = %q want UUID form (fallback)", acp)
+	}
+}
+
+// TestIPNotForwarded_ByDefault PassthroughIP 缺省 false：即使传入非空 clientIP 也不注入任何 IP 头。
+func TestIPNotForwarded_ByDefault(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	// 即使 clientIP 参数非空，PassthroughIP 关闭也不透传。
+	c := &Client{}
+	h := chatHeadersReq(t, c, a, "10.0.0.1")
+	for _, hdr := range []string{"X-Forwarded-For", "X-Real-IP", "X-Client-IP"} {
+		if got := h.Get(hdr); got != "" {
+			t.Errorf("%s = %q want empty (passthrough off)", hdr, got)
+		}
+	}
+}
+
+// TestIPForwarded_WhenEnabled PassthroughIP=true 且 clientIP 参数非空时三头透传。
+func TestIPForwarded_WhenEnabled(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{PassthroughIP: true}
+	h := chatHeadersReq(t, c, a, "203.0.113.5")
+	for _, hdr := range []string{"X-Forwarded-For", "X-Real-IP", "X-Client-IP"} {
+		if got := h.Get(hdr); got != "203.0.113.5" {
+			t.Errorf("%s = %q want %q", hdr, got, "203.0.113.5")
+		}
+	}
+}
+
+// TestIPForwarded_NoLeakWhenClientIPEmpty PassthroughIP=true 但 clientIP 为空时不注入 IP 头。
+func TestIPForwarded_NoLeakWhenClientIPEmpty(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{PassthroughIP: true}
+	h := chatHeadersReq(t, c, a, "")
+	for _, hdr := range []string{"X-Forwarded-For", "X-Real-IP", "X-Client-IP"} {
+		if got := h.Get(hdr); got != "" {
+			t.Errorf("%s = %q want empty (no clientIP)", hdr, got)
+		}
+	}
+}
+
+// TestClientIPConcurrentNoCrossTalk 并发 goroutine 各自带不同 clientIP 调 ChatHeaders，
+// 断言每个请求捕获到的 IP 头严格等于自己的 IP——验证按请求传递后无跨请求串扰
+// （旧实现读写共享 ClientIP 字段会张冠李戴，-race 下暴露竞态）。
+func TestClientIPConcurrentNoCrossTalk(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{PassthroughIP: true}
+
+	// 共享一个测试 server：所有 goroutine 打到同一 server，各自捕获请求头。
+	var mu sync.Mutex
+	captured := map[string]string{} // clientIP -> 实际捕获到的 X-Forwarded-For
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		captured[r.Header.Get("X-Forwarded-For")] = r.Header.Get("X-Forwarded-For")
+		mu.Unlock()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	c.ChatBaseCN = srv.URL
+	c.ChatHTTP = srv.Client()
+	c.HTTP = srv.Client()
+
+	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"}
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		go func(myIP string) {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
+			if err != nil {
+				t.Errorf("new req: %v", err)
+				return
+			}
+			// 每个请求独立构造头：clientIP 作为参数传入，不存在共享可污染。
+			c.ChatHeaders(req, a, myIP, ChatMeta{})
+			resp, err := c.HTTP.Do(req)
+			if err != nil {
+				t.Errorf("do: %v (ip=%s)", err, myIP)
+				return
+			}
+			resp.Body.Close()
+		}(ip)
+	}
+	wg.Wait()
+
+	// 每个 IP 都应被至少一次请求携带到上游（出现在 captured 里）。
+	for _, ip := range ips {
+		if _, ok := captured[ip]; !ok {
+			t.Errorf("clientIP %q never reached upstream (cross-talk/lost)", ip)
+		}
+	}
+}
+
+// TestExtractClientIP 从入站请求取 X-Forwarded-For 首段，回落 X-Real-IP，皆空返回空。
+func TestExtractClientIP(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		xff  string
+		real string
+		want string
+	}{
+		{"xff_single", "1.2.3.4", "", "1.2.3.4"},
+		{"xff_multi_first", "1.2.3.4, 5.6.7.8", "", "1.2.3.4"},
+		{"real_fallback", "", "9.9.9.9", "9.9.9.9"},
+		{"none_empty", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://x", nil)
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if tc.real != "" {
+				req.Header.Set("X-Real-IP", tc.real)
+			}
+			if got := ExtractClientIP(req); got != tc.want {
+				t.Errorf("ExtractClientIP = %q want %q", got, tc.want)
+			}
+		})
+	}
+}

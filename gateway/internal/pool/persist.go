@@ -1,0 +1,473 @@
+// 持久化：本地 state.json 落盘/加载、Redis 快照镜像（StoreSnapshotter）、
+// 后台 flusher、择新恢复（RestoreFromSnapshot）。
+// ═══ 更新日志 ═══
+// 2026-09-18：缺失本地文件时恢复有效远端快照，写盘失败保留待写状态，关闭时等待后台落盘退出。
+// 2026-09-18：多实例先锁定并合并本实例变更，再用唯一临时文件原子替换；Redis 镜像使用合并后状态。
+// 2026-09-18：快照导入重置计数基线但保留恢复下限，并把账号删除代次贯穿文件与 Redis 恢复。
+package pool
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"workbuddy2api/internal/auth"
+)
+
+var flushInterval = 5 * time.Second
+
+// persistLogEvery 连续落盘失败每 N 次打一条提醒（flusher 5s 一把 ≈ 1 分钟一次），
+// 避免磁盘持续满/权限丢失时日志刷屏。
+const persistLogEvery = 100
+
+// snapshot 池状态快照（Redis 镜像用）。与本地 state.json 同源（stateFile），
+// 额外带 savedAt 时间戳供"择新恢复"（比较本地与 Redis 快照的新旧）。
+type snapshot struct {
+	stateFile
+	SavedAt time.Time `json:"saved_at"`
+}
+
+// StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
+// 与本地 state.json 并存，作启动恢复备份：本地缺失或快照不早于本地时采用，否则本地优先。
+type StoreSnapshotter interface {
+	SaveState(data []byte)
+	LoadState() ([]byte, bool)
+}
+
+// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
+// 本地文件缺失或不晚于有效快照时恢复；本地较新、快照缺失/无 savedAt，或其他 stat 错误时保留本地。
+// 必须在 SyncToDir 之前调用（SyncToDir 只增删不入值），恢复来源会写入日志。
+func (p *Pool) RestoreFromSnapshot() {
+	store := p.store
+	if store == nil || p.stateFp == "" {
+		return
+	}
+	localInfo, localErr := os.Stat(p.stateFp)
+	raw, ok := store.LoadState()
+	if !ok {
+		if localErr == nil {
+			log.Printf("[pool] 恢复来源=本地 state.json（无 Redis 快照）")
+		}
+		return
+	}
+	var snap snapshot
+	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
+		// 快照无 savedAt：无法比较新旧，本地优先。
+		log.Printf("[pool] 恢复来源=本地 state.json（Redis 快照无 saved_at）")
+		return
+	}
+	if os.IsNotExist(localErr) || (localErr == nil && !localInfo.ModTime().After(snap.SavedAt)) {
+		// 快照不早于本地 → 采用快照。
+		p.mu.Lock()
+		p.applySnapshotLocked(snap)
+		p.mu.Unlock()
+		p.dirty.Store(true)
+		log.Printf("[pool] 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
+		return
+	}
+	log.Printf("[pool] 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
+}
+
+// startFlusher 启动后台周期落盘 goroutine（每 flushInterval 检查 dirty 标志）。
+// goroutine 在 p.Close 关闭 stopCh 时退出；此前若无人 Close，goroutine 会持续运行
+// （issue:goroutine 泄漏——New 每调一次泄漏一个，且无停止机制）。
+func (p *Pool) startFlusher() {
+	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
+	p.stopCh = make(chan struct{})
+	p.flusherDone = make(chan struct{})
+	go func() {
+		defer close(p.flusherDone)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.stopCh:
+				return
+			case <-t.C:
+				p.mu.Lock()
+				if p.dirty.Swap(false) {
+					p.saveLocked()
+				}
+				p.mu.Unlock()
+			}
+		}
+	}()
+}
+
+// Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
+// 进程退出前应调用（main 的优雅停机路径），替代裸 Flush——既停 goroutine 又补落盘。
+// stateFp 为空（未起 flusher）时仅做一次 Flush。
+func (p *Pool) Close() {
+	p.closeOnce.Do(func() {
+		if p.stopCh != nil {
+			close(p.stopCh)
+			<-p.flusherDone
+		}
+	})
+	p.Flush()
+}
+
+// Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
+func (p *Pool) Flush() {
+	p.mu.Lock()
+	if p.dirty.Swap(false) {
+		p.saveLocked()
+	}
+	p.mu.Unlock()
+}
+
+// load 从本地 state.json 读回持久化状态（无文件/解析失败静默跳过，零状态启动）。
+// New 构造时调用；恢复用 placeholder 凭证，Add/SyncToDir 时换全。
+func (p *Pool) load() {
+	raw, err := os.ReadFile(p.stateFp)
+	if err != nil {
+		return
+	}
+	var sf stateFile
+	if json.Unmarshal(raw, &sf) != nil {
+		// 损坏的持久化文件必须隔离，不能只 return：mergedStateLocked 会反复读同一个
+		// 文件并解析失败，于是此后每一次保存都失败，账号状态/冷却/配额全部不再落盘
+		// （2026-09-30 审计发现）。重命名保留证据，让下一次保存从干净状态重建。
+		quarantine := p.stateFp + ".corrupt"
+		if renameErr := os.Rename(p.stateFp, quarantine); renameErr != nil {
+			log.Printf("WARN: [账号池] 状态文件损坏且无法隔离：%v", renameErr)
+		} else {
+			log.Printf("WARN: [账号池] 状态文件损坏，已移到 %s，从空状态启动", quarantine)
+		}
+		return
+	}
+	p.applyAccountsLocked(sf.Accounts)
+	p.persistBase = sf
+}
+
+// applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
+// 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
+func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+	now := time.Now()
+	for uid, s := range accounts {
+		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
+		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
+		errTotal := s.ErrTotal
+		if int64(s.ErrCount) > errTotal {
+			errTotal = int64(s.ErrCount)
+		}
+		// creditsExpiring 恢复时钳到 [0, credits]（与 SetCreditsDetailed 的写入钳制
+		// 对称）：state.json 手工脏数据/旧版本 bug 数据不得让 expiring/credits > 1
+		// 放大 ×8 权重项。
+		expiring := s.CreditsExpiring
+		if expiring < 0 {
+			expiring = 0
+		}
+		if expiring > s.Credits {
+			expiring = s.Credits
+		}
+		// 成功率 EMA：新字段直接恢复；旧 state.json 缺字段时从 successCount/errTotal
+		// 反推初始值（归一到 [0,1] 区间：EMA 初值 = 历史比率），向后兼容且不丢历史信号。
+		// 无任何记录（success_ema==error_ema==0 且计数为 0）保持零值 → weightOf 走
+		// 1.5 中性偏信任分支。
+		successEMA, errorEMA := s.SuccessEMA, s.ErrorEMA
+		if successEMA == 0 && errorEMA == 0 {
+			if obs := s.SuccessCount + errTotal; obs > 0 {
+				successEMA = float64(s.SuccessCount) / float64(obs)
+				errorEMA = float64(errTotal) / float64(obs)
+			}
+		}
+		// 账号级 until/coolKind 现在只承载积分不足（CoolHard）。旧版 state.json 里可能
+		// 残留 CoolSoft（账号级限流冷却），读入时必须丢弃：否则它会让
+		// RealmRateState/counts 等按「账号级软冷却」分支处理的旧代码继续把账号判成
+		// 不可用，而写侧已经永远不会再产生这种状态（2026-10-18 取消账号级冷却）。
+		//
+		// 2026-10-18 修复（prod 实测）：CoolHard 是 iota 的 0，与 JSON 缺字段的零值
+		// 完全同值，所以 `kind != CoolHard` 永远拦不住零值——**每个** state.json 条目
+		// 都被恢复成「余额不足」。它只在 statusOf 的 Cooling 分支被读取，而 Cooling
+		// 也包含纯熔断（breakerUntil 未来、until 零值），于是 6 个积分 4178~5425、
+		// 直连上游正常的 CN 号全被显示成 hard_credit。
+		// 真正的判据只能是 until：零值 = 从未冷却过（或已过期），此时 kind 没有意义；
+		// 只有 until 在生效时 kind 才承载「这是余额不足」。
+		kind, until := s.CoolKind, s.Until
+		if kind != CoolHard || until.IsZero() {
+			kind, until = 0, time.Time{}
+		}
+		e := &entry{
+			p:                 p,
+			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:           s.Credits,
+			disabled:          s.Disabled,
+			reason:            s.Reason,
+			until:             until,
+			coolKind:          kind,
+			successCount:      s.SuccessCount,
+			errTotal:          errTotal,
+			successEMA:        successEMA,
+			errorEMA:          errorEMA,
+			lastErr:           s.LastErr,
+			lastSuccess:       s.LastSuccess,
+			softStreak:        s.SoftStreak,
+			sessionDeadFails:  s.SessionDeadFails,
+			accountFaultFails: s.AccountFaultFails,
+			reviewFails:       s.ReviewFails,
+			creditsExpiring:   expiring,
+		}
+		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
+		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
+		if s.BreakerUntil != nil && !s.BreakerUntil.IsZero() && now.Before(*s.BreakerUntil) {
+			e.breakerUntil = *s.BreakerUntil
+			e.retryCount = s.RetryCount
+		}
+		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
+		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
+		if len(s.ModelCooldowns) > 0 {
+			e.modelCooldowns = make(map[string]modelCooldown, len(s.ModelCooldowns))
+			for m, smc := range s.ModelCooldowns {
+				if smc.Until.IsZero() || !now.Before(smc.Until) {
+					continue // 过期/零值丢弃
+				}
+				e.modelCooldowns[m] = modelCooldown{
+					Until:   smc.Until,
+					ResetAt: smc.ResetAt,
+					Reason:  smc.Reason,
+				}
+			}
+			if len(e.modelCooldowns) == 0 {
+				e.modelCooldowns = nil
+			}
+			// 旧版本写下的 state.json 可能带任意多条模型级冷却，读入即裁剪到上限，
+			// 否则重启后立刻又占住一份无界内存（2026-09-30 深度体检发现）。
+			e.trimModelCooldowns()
+		}
+		p.byUID[uid] = e
+	}
+}
+
+// applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
+func (p *Pool) applySnapshotLocked(s snapshot) {
+	p.stateIntents = nil
+	for uid := range p.byUID {
+		if _, exists := s.Accounts[uid]; !exists {
+			change := p.stateIntentLocked(uid)
+			change.deleted, change.deletedEpoch = true, s.AccountEpochs[uid]
+		}
+	}
+	p.byUID = map[string]*entry{}
+	p.applyAccountsLocked(s.Accounts)
+	if p.persistBase.Accounts == nil {
+		p.persistBase.Accounts = make(map[string]stateAccount)
+	}
+	if p.persistBase.AccountEpochs == nil {
+		p.persistBase.AccountEpochs = make(map[string]uint64)
+	}
+	for uid, epoch := range s.AccountEpochs {
+		p.persistBase.AccountEpochs[uid] = max(p.persistBase.AccountEpochs[uid], epoch)
+	}
+	for uid, e := range p.byUID {
+		base, known := p.persistBase.Accounts[uid]
+		base.SuccessCount, base.ErrTotal, base.ErrCount = e.successCount, e.errTotal, 0
+		p.persistBase.Accounts[uid] = base
+		change := p.stateIntentLocked(uid)
+		change.importedCounters, change.importedSuccess, change.importedErrors = true, e.successCount, e.errTotal
+		if !known {
+			change.created, change.createdEpoch = true, s.AccountEpochs[uid]
+		}
+	}
+}
+
+// saveLocked 把内存状态原子落盘（tmp + rename），并 fire-and-forget 镜像一份快照
+// 到 Redis（择新恢复备份）。失败走 notePersistFail 节流日志。调用方必须已持 p.mu。
+func (p *Pool) saveLocked() {
+	if p.stateFp == "" {
+		return
+	}
+	if dir := filepath.Dir(p.stateFp); dir != "" {
+		// 0700 与密钥库（internal/apikeys）和用量账本（internal/usage）的建目录口径一致：
+		// 这个目录里放的是 state.json 等运行数据，不该让同机其他用户能列目录。
+		// MkdirAll 对已存在的目录是空操作，所以存量部署的权限不受影响。
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			p.notePersistFail(err)
+			return
+		}
+	}
+	unlock, err := lockPoolState(p.stateFp)
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	defer unlock()
+	current := p.stateOverviewLocked()
+	sf, err := p.mergedStateLocked(current)
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	raw, err := json.MarshalIndent(sf, "", "  ")
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p.stateFp), ".pool-state-*.tmp")
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		p.notePersistFail(err)
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		p.notePersistFail(err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	if err := os.Rename(tmp.Name(), p.stateFp); err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	// 目录 fsync：rename 只保证「目录项替换」对已刷盘的文件生效，崩溃时若不刷目录，
+	// 重命名可能丢失（旧文件回来或新文件消失）。tmp.Sync() 只覆盖内容（2026-09-30 审计）。
+	if dir, openErr := os.Open(filepath.Dir(p.stateFp)); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	current.AccountEpochs = cloneAccountEpochs(sf.AccountEpochs)
+	p.persistBase = current
+	p.stateIntents = nil
+	p.dirty.Store(false)
+	if p.persistFails > 0 {
+		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
+		log.Printf("[pool] state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
+		p.persistFails = 0
+	}
+	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
+	if p.store != nil {
+		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
+		if err == nil {
+			p.store.SaveState(snapRaw)
+		}
+	}
+}
+
+// notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
+// 首败（状态成功→失败）打一条详细 WARN：包含路径、err、目录权限/属主、当前 uid/gid、
+// 修复建议（chown 或改用 named volume）；随后每 persistLogEvery 次再复报一条，避免刷屏。
+// 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
+// "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
+func (p *Pool) notePersistFail(err error) {
+	p.dirty.Store(true)
+	if p.persistFails == 0 {
+		log.Printf("WARN: [pool] state.json 落盘失败（首次详报）: path=%s err=%v %s",
+			p.stateFp, err, persistFailDiag(p.stateFp))
+	} else if p.persistFails%persistLogEvery == 0 {
+		log.Printf("ERR: [pool] state.json 连续落盘失败 %d 次: path=%s err=%v",
+			p.persistFails, p.stateFp, err)
+	}
+	p.persistFails++
+}
+
+// persistFailDiag 收集落盘失败时的环境诊断信息：目录是否存在、权限/属主、
+// 当前进程 uid/gid，并给出对齐修复建议。供首错详报，定位 issue #52 这类
+// bind mount 目录属主不匹配导致不可写的场景。
+func persistFailDiag(stateFp string) string {
+	dir := filepath.Dir(stateFp)
+	var b strings.Builder
+	info, statErr := os.Stat(dir)
+	switch {
+	case statErr != nil:
+		fmt.Fprintf(&b, "stat_dir=%s err=%v（目录不存在或不可访问）", dir, statErr)
+	case info == nil:
+		fmt.Fprintf(&b, "stat_dir=%s info=nil", dir)
+	default:
+		mode := info.Mode().Perm()
+		fmt.Fprintf(&b, "dir=%s mode=%o owner_uid=%d owner_gid=%d",
+			dir, mode, statUID(info), statGID(info))
+	}
+	if uid, gid := os.Getuid(), os.Getgid(); uid >= 0 && gid >= 0 {
+		fmt.Fprintf(&b, " proc_uid=%d proc_gid=%d", uid, gid)
+	}
+	b.WriteString(" fix=chown -R 10001:10001 ./data 或改用 named volume（见 docker-compose.yml）")
+	return b.String()
+}
+
+// cooledReasonLocked 对非 disabled 账号，若 until 已过期/零值，清空 coolKind/reason
+// （惰性清理僵尸 reason）。disabled 账号的 reason 是禁用原因，照常保留。落盘（stateOverviewLocked）
+// 与 status（statusOf）共用本判断，避免两条路径口径不一致导致 reason 残留（最多 5s 落盘窗口）。
+func cooledReasonLocked(e *entry, now time.Time) (coolKind CoolKind, reason string) {
+	if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
+		return e.coolKind, e.reason
+	}
+	return 0, ""
+}
+
+// stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
+func (p *Pool) stateOverviewLocked() stateFile {
+	now := time.Now()
+	sf := stateFile{Accounts: map[string]stateAccount{}, AccountEpochs: cloneAccountEpochs(p.persistBase.AccountEpochs)}
+	for uid, e := range p.byUID {
+		// 模型级冷却落盘（复用既有落盘循环，不新增遍历）。只写 Until 在未来的条目，
+		// 与恢复时过期过滤同口径——落盘即清理，避免 state.json 残留已过期条目。
+		var mcs map[string]stateModelCooldown
+		if len(e.modelCooldowns) > 0 {
+			mcs = make(map[string]stateModelCooldown, len(e.modelCooldowns))
+			for m, mc := range e.modelCooldowns {
+				if mc.Until.IsZero() || !now.Before(mc.Until) {
+					continue // 已过期：不落盘（惰性清理）
+				}
+				mcs[m] = stateModelCooldown{
+					Until:   mc.Until,
+					ResetAt: mc.ResetAt,
+					Reason:  mc.Reason,
+				}
+			}
+			if len(mcs) == 0 {
+				mcs = nil
+			}
+		}
+		// 熔断器 breakerUntil + retryCount 落盘（惰性过滤：仅未过期才写出）。
+		// breakerUntil 已过期/零值时不写 breaker_until + retry_count——过期时退避
+		// 已无意义，保留 retryCount 是无用退避指数。与恢复侧过期过滤同口径。
+		// BreakerUntil 用指针：未过期时取地址写出，过期/零值留 nil（omitempty 省略）。
+		var breakerUntil *time.Time
+		var retryCount int
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			bu := e.breakerUntil
+			breakerUntil = &bu
+			retryCount = e.retryCount
+		}
+		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
+		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
+		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
+		// 账号的 reason 是禁用原因，不在冷却语义内，照常保留。
+		// 与 statusOf（state.go）共用 cooledReasonLocked，保证落盘与查询同口径。
+		coolKind, reason := cooledReasonLocked(e, now)
+		sf.Accounts[uid] = stateAccount{
+			Credits:           e.credits,
+			Disabled:          e.disabled,
+			Reason:            reason,
+			Until:             e.until,
+			CoolKind:          coolKind,
+			SuccessCount:      e.successCount,
+			ErrTotal:          e.errTotal,
+			SuccessEMA:        e.successEMA,
+			ErrorEMA:          e.errorEMA,
+			LastSuccess:       e.lastSuccess,
+			LastErr:           e.lastErr,
+			SoftStreak:        e.softStreak,
+			SessionDeadFails:  e.sessionDeadFails,
+			AccountFaultFails: e.accountFaultFails,
+			ReviewFails:       e.reviewFails,
+			BreakerUntil:      breakerUntil,
+			RetryCount:        retryCount,
+			CreditsExpiring:   e.creditsExpiring,
+			ModelCooldowns:    mcs,
+		}
+	}
+	return sf
+}

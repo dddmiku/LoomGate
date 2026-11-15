@@ -1,0 +1,930 @@
+// catalog.go — Trae 域的动态模型目录（含消费倍率）。
+//
+// 为什么必须动态拉：模型清单是**账号/时段相关**的，静态表一定滞后。2026-10-11 实测：
+// 我原先照参考项目的别名表写了一张静态清单，里面根本没有客户端真实在用的
+// `deepseek-v4.1-flash`（Trae 面板里显示为 DeepSeek-V4.1-Flash），用户一眼就发现漏了。
+//
+// 上游端点：POST {gateway}/api/ide/v1/get_detail_param
+// 返回 config_info_list，每项含 config_name / display_name / usage / is_invisible_to_user，
+// 以及一个 **JSON 字符串** display_contact_config，倍率就在里面：
+//
+//	"consumption_rate":{"enable":true,"data":{"rate":0.78}}
+//	"discount":{"enable":true,"data":{"original_consumption_rate":0.78,
+//	             "consumption_rate":0.39,"member_discount":50}}
+//
+// 过滤规则（对齐参考实现）：
+//   - usage 非 chat_completion 的（summary 之类）不是可选对话模型；
+//   - custom_model_* 是路由配置不是模型；
+//   - is_invisible_to_user=true 的（browser_use_subagent / explore_sub_agent_v2 等
+//     内部子代理）不对外公布。
+package trae
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"workbuddy2api/internal/auth"
+)
+
+// CatalogPath 模型目录端点（旧形状，仅排障探针使用；主路径见 BatchCatalogPath）。
+const CatalogPath = "/api/ide/v1/get_detail_param"
+
+// BatchCatalogPath 是客户端真正使用的批量目录端点（2026-10-16 抓包确证）。
+const BatchCatalogPath = "/api/ide/v1/batch_get_detail_param"
+
+// catalogTTL 目录缓存时长。模型清单变化很慢，而这是展示端点——每次都打上游会把
+// 展示变成高频调用，失败时还会反复重试。
+const catalogTTL = 30 * time.Minute
+
+// CatalogModel 目录里的一个模型。
+type CatalogModel struct {
+	// ConfigName 出站用的精确名（config_name），大小写敏感。
+	ConfigName string
+	// DisplayName 上游给人类看的名字（display_name），可能为空。
+	DisplayName string
+	// Rate 消费倍率。来自 consumption_rate.rate；有折扣时取折后价
+	// （discount.consumption_rate）。0 表示上游没给倍率（不是"免费"）。
+	Rate float64
+	// HasRate 报告倍率是否真的从上游读到了。缺失 ≠ 0。
+	HasRate bool
+	// Multimodal 是否多模态（custom_model 要透传的字段）。
+	Multimodal bool
+	// MaxMode 账号目录是否标注该模型支持 1M max 档。
+	//
+	// 判据对齐参考 _fetch_solo_model_configs：顶层 max_mode 或
+	// display_config.max_mode 任一为真。max 六件套**只在它为真时**生效——
+	// 绝不凭空造 1M 上限（模型不支持会被上游拒）。
+	MaxMode bool
+	// DevModelName / MaxModelName 是 model_detail_list 里的**出站真名**。
+	//
+	// 2026-10-16 抓包确证：上游要求 model_name 带档位后缀，普通档 `__dev`、
+	// 1M 档 `__max`（双下划线，不是单横线）。同一个 config_name 的两档
+	// prompt_max_tokens 不同（glm-5.3-flash：168000 vs 936000）。
+	// 网关旧实现按 `-max` 后缀猜，等于两档都没走对。
+	DevModelName string
+	MaxModelName string
+	// DevPromptMax / MaxPromptMax 是两档各自的上下文上限（来自 model_detail_list）。
+	DevPromptMax int64
+	MaxPromptMax int64
+	// Functions 记录该模型出现在哪些 function 的目录里。
+	//
+	// 必须记：不同 function 的模型集**不一样**（实测 solo_agent 有 67 个，
+	// solo_agent_remote 只有 45 个；qwen3.8-flash / kimi-k2.8-preview 只在
+	// solo_agent 里）。网关按请求是否带工具在 solo_agent_remote 与
+	// solo_work_remote 之间路由，若目标 function 的表里没有这个模型，上游会回
+	// `config item is empty for config opt`（ConfigName 用了干净名，因为那张表
+	// 没给 model_detail_list，取不到 __dev 真名）。出站前用 Functions 校验，
+	// 不在就退回 solo_agent——那里一定有它。
+	Functions map[string]bool
+	// Hidden 报告该模型在**所有**出现的表里都被标了 is_invisible_to_user。
+	//
+	// 语义是「Trae 界面不显示」，不是「不可调用」：kimi-k2 在 chat_v3 / builder
+	// 标了 invisible，但实测 chat_v3 能正常出词。所以 Hidden 只影响对外公布
+	// （ModelIDsFromCatalog / /v1/models），不影响出站选择——用户显式点名
+	// 某个 Hidden 模型时仍应照常发出去。
+	//
+	// 注意是「全部标了」才 Hidden：只要有一张表没标（kimi-k2 的 inline_chat），
+	// 它就不是纯内部模型。
+	Hidden bool
+	// Profiles 记录**每个 function 各自**的出站真名与档位上限。
+	//
+	// 为什么不能只留一份（2026-10-18 实测）：同一 config_name 在不同 function 的
+	// 表里对应**不同的 model_name**，甚至有的表把它映射到别的模型：
+	//
+	//	code-review-judge 在 code_reviewer 表里的真名是 deepseek-V3.1__dev
+	//	Doubao-Seed-2.0-Code 在 solo_work_lite 表里的真名是 Doubao-Seed-2.1-Turbo__dev
+	//	deepseek-V3.1 只在 code_reviewer 里，kimi-k2 在 chat_v3/builder 里
+	//
+	// 合并时若只按「第一个非空」保留一份，出站到别的 function 就会把 A 表的真名
+	// 发给 B 表 → `config item is empty for config opt`。所以按 function 分别存，
+	// 出站时用**目标 function 自己那张表**的真名。
+	Profiles map[string]CatalogFunctionProfile
+}
+
+// CatalogFunctionProfile 是某模型在**一个** function 目录里的出站参数。
+type CatalogFunctionProfile struct {
+	// DevModelName 普通档出站真名（优先 `__dev` 结尾的条目；没有后缀时取该表
+	// 里第一个 model_name，例如 doubao_1_8 的 `doubao_1_8` / `kimi-k2__v2`）。
+	DevModelName string
+	// MaxModelName 1M 档出站真名（`__max` 结尾）。
+	MaxModelName string
+	DevPromptMax int64
+	MaxPromptMax int64
+}
+
+// catalogEntry 是带时间的缓存项。
+type catalogEntry struct {
+	models  []CatalogModel
+	fetched time.Time
+	err     error
+}
+
+var (
+	catalogMu    sync.Mutex
+	catalogCache = map[string]catalogEntry{}
+)
+
+// FetchCatalog 拉取指定账号的模型目录（带缓存）。
+//
+// 失败时返回上一次成功的快照（若有）并把错误一并返回：展示端点宁可显示稍旧的
+// 真实清单，也不要因为一次网络抖动就变成空列表——空列表会让用户以为模型没了。
+func FetchCatalog(ctx context.Context, a *auth.Auth) ([]CatalogModel, error) {
+	started := time.Now()
+	defer observeSpan(ctx, "catalog", started)
+	key := a.UID
+	catalogMu.Lock()
+	cached, ok := catalogCache[key]
+	catalogMu.Unlock()
+	if ok && time.Since(cached.fetched) < catalogTTL {
+		observeSpan(ctx, "catalog_cache_hit", started)
+		return cached.models, cached.err
+	}
+
+	observeSpan(ctx, "catalog_cache_miss", started)
+	models, err := fetchCatalogUpstream(ctx, a)
+	catalogMu.Lock()
+	if err != nil && ok && len(cached.models) > 0 {
+		// 保留旧快照，只把错误记下来（下次还会重试）。
+		catalogCache[key] = catalogEntry{models: cached.models, fetched: cached.fetched, err: err}
+		catalogMu.Unlock()
+		return cached.models, err
+	}
+	catalogCache[key] = catalogEntry{models: models, fetched: time.Now(), err: err}
+	catalogMu.Unlock()
+	return models, err
+}
+
+// InvalidateCatalog 作废某账号的目录缓存（面板「刷新模型」用）。
+func InvalidateCatalog(uid string) {
+	catalogMu.Lock()
+	defer catalogMu.Unlock()
+	if uid == "" {
+		catalogCache = map[string]catalogEntry{}
+		return
+	}
+	delete(catalogCache, uid)
+}
+
+// catalogFunctionAll 是 llm_utils_chat 侧「模型最全」的那个 function。
+//
+// 实测（2026-10-16）：同一账号下 solo_agent 有 67 个模型，solo_agent_remote 只有 45 个。
+//
+// 2026-10-18 起**不再**用它当退回目标：出站 function 由 FunctionForModel 按目录
+// 逐个模型挑（专用表里的模型必须发到专用表）。它只作为 functionPreference 的
+// 一个候选保留。
+const catalogFunctionAll = "solo_agent"
+
+// catalogFunctions 是 batch_get_detail_param 要问的 function 列表。
+//
+// 必须一次问全：上游按 function 逐个返回 config_info_list，只问一个（旧实现问
+// solo_work_lite）会拿到一张不完整的表——实测同一个账号 solo_agent 有 67 个模型，
+// 而 solo_work_lite 只有 46 个，且**公开可用的模型列表不同**。列表抄自客户端抓包
+// （2026-10-16），顺序与客户端一致。
+var catalogFunctions = []string{
+	"ui_builder_v2", "solo_coder", "chat_v3", "solo_builder", "builder_v3", "builder",
+	"chat", "inline_chat", "git_ai", "custom_agent_generation", "utils", "code_reviewer",
+	"code_review_summary", "solo_agent", "solo_agent_remote", "solo_work_remote",
+	"solo_agent_lite", "solo_work_lite", "solo_design_lite", "solo_design_remote",
+	"multimodal", "system_diagnosis",
+}
+
+func fetchCatalogUpstream(ctx context.Context, a *auth.Auth) ([]CatalogModel, error) {
+	// ═══ 接口形状（2026-10-16 抓包修正）═══
+	//
+	// 旧实现打的是 POST /api/ide/v1/get_detail_param，body
+	// {"function":"solo_work_lite",...}。实测该组合对 trae 账号**恒返回空列表**
+	// （`{"config_info_list":[]}`），于是 max_mode / multimodal 全部取不到，
+	// 网关只能退回静态别名表——「max 档从未生效」的根因就在这里。
+	//
+	// 客户端真实用的是 **batch_get_detail_param**，body 是
+	// {"functions":[...22 个...],"agent_type":"solo_agent","current_config_info":
+	// {"config_name":...,"is_custom_model":false},"biz_context":{"window_type":"Agent"}}，
+	// 响应是 {"function_configs":[{"function":"solo_agent","config_info_list":[...]}]}。
+	// 实测同一个账号该接口返回 2.17 MB / 373 条模型条目（旧接口 0 条）。
+	//
+	// agent_type 必须给 "solo_agent"：它决定每个 function 返回哪张模型表。
+	body, _ := json.Marshal(map[string]any{
+		"functions":                 catalogFunctions,
+		"agent_type":                "solo_agent",
+		"current_config_info":       map[string]any{"config_name": "", "is_custom_model": false},
+		"mode_type":                 0,
+		"access_type":               0,
+		"ab_force_vids":             "",
+		"ab_autotest_advanced_mode": 0,
+		"show_custom_model":         true,
+		"biz_context":               map[string]any{"window_type": "Agent"},
+	})
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		GatewayBaseVar+BatchCatalogPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range buildHeaders(a) {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := doTimed(ctx, &http.Client{Transport: chatTransport()}, req, "catalog_header")
+	if err != nil {
+		return nil, fmt.Errorf("trae catalog: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("trae catalog read: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("trae catalog: HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
+	}
+	return parseCatalog(data)
+}
+
+// ParseCatalog 导出给排障探针：用**生产同一套**过滤与倍率解析规则验证真实响应。
+func ParseCatalog(data []byte) ([]CatalogModel, error) { return parseCatalog(data) }
+
+// parseCatalog 解析 batch_get_detail_param 的响应。
+//
+// 响应形状（2026-10-16 抓包确证）：
+//
+//	{"function_configs":[
+//	   {"function":"solo_agent","config_info_list":[{...},...]},
+//	   {"function":"solo_coder","config_info_list":[...]},
+//	   ...]}
+//
+// 同一模型会在多个 function 下重复出现（glm-5.3 在 solo_agent / solo_coder 下都有），
+// 按 config_name 去重：**能力字段取并集**（只要任一 function 标了 multimodal/max_mode
+// 就认），因为客户端在哪个窗口用它是运行期的事，网关不该因为查到的第一张表没标就
+// 丢掉能力。
+//
+// 兼容旧的扁平形状（config_info_list 直接在顶层）：排障探针 ParseCatalog 还会喂它。
+func parseCatalog(data []byte) ([]CatalogModel, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, fmt.Errorf("trae catalog parse: %w", err)
+	}
+	// 收集所有 function 下的条目（扁平形状就是单张表，function 名记空）。
+	type catalogEntry struct {
+		function string
+		item     map[string]any
+	}
+	var entries []catalogEntry
+	if groups, ok := parsed["function_configs"].([]any); ok {
+		for _, g := range groups {
+			group, ok := g.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, _ := group["function"].(string)
+			list, _ := group["config_info_list"].([]any)
+			for _, raw := range list {
+				if item, ok := raw.(map[string]any); ok {
+					entries = append(entries, catalogEntry{function: fn, item: item})
+				}
+			}
+		}
+	}
+	if len(entries) == 0 {
+		list, _ := parsed["config_info_list"].([]any)
+		if list == nil {
+			if nested, ok := parsed["data"].(map[string]any); ok {
+				list, _ = nested["config_info_list"].([]any)
+			}
+		}
+		for _, raw := range list {
+			if item, ok := raw.(map[string]any); ok {
+				entries = append(entries, catalogEntry{item: item})
+			}
+		}
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("trae catalog: no config_info_list in response")
+	}
+	merged := make(map[string]CatalogModel, len(entries))
+	for _, entry := range entries {
+		model, ok := catalogModelFrom(entry.item)
+		if !ok {
+			continue
+		}
+		if entry.function != "" {
+			if model.Functions == nil {
+				model.Functions = map[string]bool{}
+			}
+			model.Functions[entry.function] = true
+			// 每个 function 各自记一份出站真名：同一 config_name 在不同表里可能
+			// 对应不同的 model_name（见 CatalogModel.Profiles 的实测例）。
+			model.Profiles = map[string]CatalogFunctionProfile{
+				entry.function: {
+					DevModelName: model.DevModelName,
+					MaxModelName: model.MaxModelName,
+					DevPromptMax: model.DevPromptMax,
+					MaxPromptMax: model.MaxPromptMax,
+				},
+			}
+		}
+		if previous, seen := merged[model.ConfigName]; seen {
+			merged[model.ConfigName] = mergeCatalogModel(previous, model)
+			continue
+		}
+		merged[model.ConfigName] = model
+	}
+	models := make([]CatalogModel, 0, len(merged))
+	for _, model := range merged {
+		models = append(models, model)
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ConfigName < models[j].ConfigName })
+	return models, nil
+}
+
+// mergeCatalogModel 合并同一模型在不同 function 下的两条记录（能力取并集）。
+func mergeCatalogModel(a, b CatalogModel) CatalogModel {
+	out := a
+	if b.DisplayName != "" {
+		out.DisplayName = b.DisplayName
+	}
+	if !out.HasRate && b.HasRate {
+		out.Rate = b.Rate
+		out.HasRate = true
+	}
+	out.Multimodal = a.Multimodal || b.Multimodal
+	out.MaxMode = a.MaxMode || b.MaxMode
+	// Hidden 取**交集**：只要有一张表没标 invisible，这个模型就不是纯内部模型
+	// （kimi-k2 在 inline_chat 里没标）。
+	out.Hidden = a.Hidden && b.Hidden
+	// Functions 取并集：模型在任一 function 的表里出现过就算可用。
+	if len(b.Functions) > 0 {
+		if out.Functions == nil {
+			out.Functions = map[string]bool{}
+		}
+		for fn := range b.Functions {
+			out.Functions[fn] = true
+		}
+	}
+	// Profiles 按 function 合并（同 key 取先到的；不同 function 各存一份）。
+	if len(b.Profiles) > 0 {
+		if out.Profiles == nil {
+			out.Profiles = map[string]CatalogFunctionProfile{}
+		}
+		for fn, profile := range b.Profiles {
+			if _, seen := out.Profiles[fn]; seen {
+				continue
+			}
+			out.Profiles[fn] = profile
+		}
+	}
+	if out.DevModelName == "" {
+		out.DevModelName = b.DevModelName
+	}
+	if out.MaxModelName == "" {
+		out.MaxModelName = b.MaxModelName
+	}
+	if out.DevPromptMax == 0 {
+		out.DevPromptMax = b.DevPromptMax
+	}
+	if out.MaxPromptMax == 0 {
+		out.MaxPromptMax = b.MaxPromptMax
+	}
+	return out
+}
+
+// catalogModelFrom 把一个原始条目转成 CatalogModel；不可选时返回 false。
+func catalogModelFrom(item map[string]any) (CatalogModel, bool) {
+	// 只保留对话模型：summary 之类的辅助配置不是可选项。
+	if usage, _ := item["usage"].(string); strings.TrimSpace(usage) != "chat_completion" {
+		return CatalogModel{}, false
+	}
+	// custom_model_* 是路由配置，不是模型。
+	if _, custom := item["custom_models"]; custom {
+		return CatalogModel{}, false
+	}
+	// 内部子代理（browser_use_subagent / explore_sub_agent_v2 等）不对外公布。
+	//
+	// ⚠ 不能整条丢掉（2026-10-18 修正）：`is_invisible_to_user` 的语义是
+	// **Trae 界面不显示**，不是「不可调用」。同一个模型常在多张表里出现，
+	// 有的表标 invisible=true、另一张表没标：
+	//
+	//	kimi-k2 在 chat_v3 / builder 里 invisible=true，在 inline_chat 里没标
+	//
+	// 按旧逻辑整条丢弃会让 chat_v3 / builder 这两张**能跑**的表从目录里消失，
+	// 只剩 inline_chat（实测 3003 model service unavailable）→ 该模型永远 502。
+	//
+	// 新逻辑：仍记进目录（否则拿不到它在这些表里的出站真名），但标 Hidden；
+	// Hidden 只影响对外公布（ModelIDsFromCatalog），不影响出站选择。
+	hidden := false
+	if invisible, ok := item["is_invisible_to_user"].(bool); ok && invisible {
+		hidden = true
+	}
+	name, _ := item["config_name"].(string)
+	if name == "" {
+		name, _ = item["name"].(string)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return CatalogModel{}, false
+	}
+	display, _ := item["display_name"].(string)
+	if display == "" {
+		if dc, ok := item["display_config"].(map[string]any); ok {
+			display, _ = dc["display_name"].(string)
+		}
+	}
+	model := CatalogModel{ConfigName: name, DisplayName: strings.TrimSpace(display), Hidden: hidden}
+	if rate, ok := parseConsumptionRate(item["display_contact_config"]); ok {
+		model.Rate = rate
+		model.HasRate = true
+	}
+	model.Multimodal = truthyFlag(item["multimodal"])
+	model.MaxMode = truthyFlag(item["max_mode"])
+	if dc, ok := item["display_config"].(map[string]any); ok {
+		if truthyFlag(dc["max_mode"]) {
+			model.MaxMode = true
+		}
+		if truthyFlag(dc["multimodal"]) {
+			model.Multimodal = true
+		}
+	}
+	// model_detail_list 给出该模型各档位的**出站真名**与上下文上限。
+	// 档位后缀 `__dev` / `__max` 是上游硬要求（2026-10-16 抓包），
+	// 这里把两档记下来，出站时按请求档位选用。
+	//
+	// 有的表（chat / git_ai / multimodal）的 detail 里**没有** `__dev` 后缀，
+	// 只有一个裸名（`doubao-2.0-mini` / `multimodal_image_kimi-k2.5`）或
+	// `__v2` 变体（`kimi-k2__v2`）。这类表的普通档真名就是那个裸名——不记下来
+	// 会让该 function 的 profile 空掉，出站时回落到别的表的 `__dev` 真名，
+	// 上游回 `config item is empty` 或 4023 model unknown（2026-10-18 实测）。
+	if details, ok := item["model_detail_list"].([]any); ok {
+		for _, raw := range details {
+			detail, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := detail["model_name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			promptMax := int64(asFloatOrZero(detail["prompt_max_tokens"]))
+			switch {
+			case strings.HasSuffix(name, "__max"):
+				if model.MaxModelName == "" {
+					model.MaxModelName = name
+					model.MaxPromptMax = promptMax
+				}
+			case strings.HasSuffix(name, "__dev"):
+				if model.DevModelName == "" {
+					model.DevModelName = name
+					model.DevPromptMax = promptMax
+				}
+			default:
+				// 裸名 / `__v2` 变体：该表的普通档真名。只取第一个——
+				// 同一张表里多个裸名时上游按第一个匹配。
+				if model.DevModelName == "" {
+					model.DevModelName = name
+					model.DevPromptMax = promptMax
+				}
+			}
+		}
+	}
+	return model, true
+}
+
+// asFloatOrZero 把上游的数字字段（可能是 float64 / json.Number / 字符串）转成 float64。
+func asFloatOrZero(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case int64:
+		return float64(v)
+	case int:
+		return float64(v)
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(v), "%g", &f); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+// truthyFlag 上游布尔字段的三种拼写（bool / "true" / "1"）都认。
+func truthyFlag(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1", "yes":
+			return true
+		}
+	}
+	return false
+}
+
+// parseConsumptionRate 从 display_contact_config 里取消费倍率。
+//
+// 该字段是**JSON 字符串**（不是对象），内容形如：
+//
+//	{"consumption_rate":{"enable":true,"data":{"rate":0.78}},
+//	 "discount":{"enable":true,"data":{"original_consumption_rate":0.78,
+//	             "consumption_rate":0.39,"member_discount":50}}}
+//
+// 取值优先级：折后价（discount.consumption_rate）> 原价（consumption_rate.rate）。
+// 折扣是「会员 5 折」这类当前生效的优惠，用户看到的、计费用的是折后价。
+func parseConsumptionRate(value any) (float64, bool) {
+	raw, ok := value.(string)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return 0, false
+	}
+	var cfg map[string]any
+	if json.Unmarshal([]byte(raw), &cfg) != nil {
+		return 0, false
+	}
+	if discount, ok := cfg["discount"].(map[string]any); ok {
+		if enabled, ok := discount["enable"].(bool); !ok || enabled {
+			if data, ok := discount["data"].(map[string]any); ok {
+				if rate, ok := asFloat(data["consumption_rate"]); ok && rate > 0 {
+					return rate, true
+				}
+			}
+		}
+	}
+	if base, ok := cfg["consumption_rate"].(map[string]any); ok {
+		if data, ok := base["data"].(map[string]any); ok {
+			if rate, ok := asFloat(data["rate"]); ok && rate > 0 {
+				return rate, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func asFloat(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// ModelIDsFromCatalog 返回对外公布的模型名清单。
+//
+// 公布的是**配置名**（出站直接用的精确名）与显示名两者：客户端可能按任一种写法
+// 请求，ResolveModelName 会把它们都映射到配置名。
+func ModelIDsFromCatalog(models []CatalogModel) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(models)*2)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	for _, m := range models {
+		// Hidden 只影响公布：Trae 界面不显示的内部模型不列进 /v1/models，
+		// 但显式点名时仍能出站（见 CatalogModel.Hidden 的说明）。
+		if m.Hidden {
+			continue
+		}
+		add(m.ConfigName)
+		add(m.DisplayName)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ResolveFromCatalog 用实时目录把客户端模型名映射成配置名。
+//
+// 匹配顺序：配置名精确（含大小写）→ 配置名忽略大小写 → 显示名忽略大小写。
+// 目录里没有时回落静态别名表（离线/首帧未拉到目录时仍可用）。
+func ResolveFromCatalog(models []CatalogModel, name string) string {
+	want := strings.TrimSpace(name)
+	if want == "" {
+		return ""
+	}
+	for _, m := range models {
+		if m.ConfigName == want {
+			return m.ConfigName
+		}
+	}
+	lower := strings.ToLower(want)
+	for _, m := range models {
+		if strings.ToLower(m.ConfigName) == lower {
+			return m.ConfigName
+		}
+	}
+	for _, m := range models {
+		if m.DisplayName != "" && strings.ToLower(m.DisplayName) == lower {
+			return m.ConfigName
+		}
+	}
+	return ResolveModelName(want)
+}
+
+// OutboundModelName 返回该模型在指定档位下的**出站真名**。
+//
+// 2026-10-16 抓包确证：上游要求 model_name 带档位后缀——普通档 `__dev`、
+// 1M 档 `__max`（双下划线）。同一个 config_name 两档的上限不同
+// （glm-5.3-flash：168000 vs 936000）。网关旧实现按单横线 `-max` 猜后缀，
+// 两档都没走对。
+//
+// wantMax 为真且目录标了 max_mode 时给出 max 真名；否则给 dev 真名。
+// 目录里没有 model_detail_list（或该档缺失）时**回落成 config_name 原样**——
+// 上游对不带后缀的名字也能跑（实测 200），比凭空编一个后缀安全。
+//
+// 这是「不看 function」的旧口径，只供没有目标 function 的调用方（Remote 的
+// custom_model 绑定等）使用。出站到某个具体 function 时必须用
+// OutboundModelNameFor —— 同名模型在不同表里对应不同的 model_name。
+func (m CatalogModel) OutboundModelName(wantMax bool) string {
+	if wantMax && m.MaxMode && m.MaxModelName != "" {
+		return m.MaxModelName
+	}
+	if m.DevModelName != "" {
+		return m.DevModelName
+	}
+	return m.ConfigName
+}
+
+// OutboundModelNameFor 返回该模型在**指定 function** 目录里的出站真名。
+//
+// 必须按 function 取（2026-10-18 实测）：同一 config_name 在不同 function 的
+// 表里对应不同的 model_name——
+//
+//	code-review-judge  在 code_reviewer 表里是 deepseek-V3.1__dev
+//	Doubao-Seed-2.0-Code 在 solo_work_lite 表里是 Doubao-Seed-2.1-Turbo__dev
+//
+// 用错表的名字，上游回 `config item is empty for config opt`。
+// function 没给 / 该 function 不在目录里时回落到全局口径（不阻断出站）。
+func (m CatalogModel) OutboundModelNameFor(function string, wantMax bool) string {
+	if profile, ok := m.Profiles[function]; ok {
+		if wantMax && m.MaxMode && profile.MaxModelName != "" {
+			return profile.MaxModelName
+		}
+		if profile.DevModelName != "" {
+			return profile.DevModelName
+		}
+	}
+	return m.OutboundModelName(wantMax)
+}
+
+// PromptMaxTokensFor 返回该模型在指定 function 目录里的档位上限。
+func (m CatalogModel) PromptMaxTokensFor(function string, wantMax bool) int64 {
+	if profile, ok := m.Profiles[function]; ok {
+		if wantMax && m.MaxMode && profile.MaxPromptMax > 0 {
+			return profile.MaxPromptMax
+		}
+		if profile.DevPromptMax > 0 {
+			return profile.DevPromptMax
+		}
+	}
+	return m.PromptMaxTokens(wantMax)
+}
+
+// PromptMaxTokens 返回该档位的上下文上限（0 表示目录没给）。
+func (m CatalogModel) PromptMaxTokens(wantMax bool) int64 {
+	if wantMax && m.MaxMode && m.MaxPromptMax > 0 {
+		return m.MaxPromptMax
+	}
+	return m.DevPromptMax
+}
+
+// modelProfile 取某模型在指定 function 表里的出站参数。
+//
+// 供 Remote 路径判断「该表有没有 max 档真名」用——max 档不是每张表都有，
+// 选错表就只能拿到 `__dev` 的 168000 档（见 FunctionForModelTier）。
+func modelProfile(models []CatalogModel, name, function string) (CatalogFunctionProfile, bool) {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok {
+		return CatalogFunctionProfile{}, false
+	}
+	profile, ok := model.Profiles[function]
+	if !ok || profile.MaxModelName == "" || !model.MaxMode {
+		return CatalogFunctionProfile{}, false
+	}
+	return profile, true
+}
+
+// LookupCatalogModel 按 config_name / display_name 在目录里找模型（大小写不敏感）。
+func LookupCatalogModel(models []CatalogModel, name string) (CatalogModel, bool) {
+	want := strings.TrimSpace(name)
+	if want == "" {
+		return CatalogModel{}, false
+	}
+	for _, m := range models {
+		if m.ConfigName == want {
+			return m, true
+		}
+	}
+	lower := strings.ToLower(want)
+	for _, m := range models {
+		if strings.ToLower(m.ConfigName) == lower {
+			return m, true
+		}
+	}
+	for _, m := range models {
+		if m.DisplayName != "" && strings.ToLower(m.DisplayName) == lower {
+			return m, true
+		}
+	}
+	return CatalogModel{}, false
+}
+
+// SplitMaxSuffix 拆出「请求名里的 max 意图」。
+//
+// 网关对外公布的档位写法是 `<model>-max`（trae:glm-5.3-max），与上游的
+// `__max` 是两套写法：前者是**客户端意图**，后者是**出站真名**。这里只做前者。
+//
+// ⚠ 不能无条件剥：`qwen3.8-max` 是**真实模型名**（目录里它的档位真名是
+// `qwen3.8-max__dev` / `qwen3.8-max__max`），剥掉就成了不存在的 `qwen3.8`——
+// 上游回 `config item is empty for config opt`（2026-10-16 实测）。
+// 所以调用方必须**先查目录**：名字原样命中目录就不拆，未命中才当作档位后缀拆。
+func SplitMaxSuffix(name string) (base string, wantMax bool) {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	for _, suffix := range []string{"-max", "_max", "__max"} {
+		if strings.HasSuffix(lower, suffix) {
+			return trimmed[:len(trimmed)-len(suffix)], true
+		}
+	}
+	return trimmed, false
+}
+
+// ResolveRequestedModel 把请求名解析成 (目录里的 config_name, 是否 max 档)。
+//
+// 顺序很重要：
+//  1. 名字原样命中目录 → 它就是模型名，不带档位意图（`qwen3.8-max` 走这条）；
+//  2. 未命中 → 试剥 `-max` 后缀，剥后的名字命中目录则认作「要 max 档」；
+//  3. 都没命中 → 原样返回（让上游自己报错，比网关猜一个替代名更诚实）。
+func ResolveRequestedModel(models []CatalogModel, name string) (string, bool) {
+	if _, ok := LookupCatalogModel(models, name); ok {
+		return name, false
+	}
+	base, wantMax := SplitMaxSuffix(name)
+	if wantMax {
+		if _, ok := LookupCatalogModel(models, base); ok {
+			return base, true
+		}
+	}
+	return strings.TrimSpace(name), false
+}
+
+// splitDevSuffix 拆出「显式要求普通档」的意图（`-dev` / `_dev` / `__dev`）。
+//
+// 与 SplitMaxSuffix 对称：max 现在是**默认档**，所以必须留一个退回普通档的写法，
+// 否则排障/省额度时没有口子。同样要求调用方先查目录，避免剥掉真实模型名。
+func splitDevSuffix(name string) (string, bool) {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	// 从最长后缀开始试：`glm-5.3__dev` 同时以 `_dev` 和 `__dev` 结尾，
+	// 先试 `_dev` 会剥出 `glm-5.3_`（目录里不存在），于是整条规则失效。
+	for _, suffix := range []string{"__dev", "_dev", "-dev"} {
+		if strings.HasSuffix(lower, suffix) && len(trimmed) > len(suffix) {
+			return trimmed[:len(trimmed)-len(suffix)], true
+		}
+	}
+	return trimmed, false
+}
+
+// ResolveRequestedTier 把请求名解析成 (config_name, 是否 max 档)，**max 为默认档**。
+//
+// 为什么要默认 max（2026-10-18 用户实测要求）：Trae 目录里同一模型分两档，
+// 普通档 `__dev` 的 prompt_max 是 168000（≈200K），1M 档 `__max` 是 936000：
+//
+//	solo_work_lite   glm-5.3  max_mode=false  glm-5.3__dev  168000
+//	solo_agent       glm-5.3  max_mode=true   glm-5.3__dev/glm-5.3__max  168000/936000
+//
+// 官方客户端选中「1M」时发的是 `__max`；网关此前只有请求名带 `-max` 才发
+// `__max`，于是客户端明明声明了 1M、实际永远跑 200K 档——用户报的就是这个。
+//
+// 规则：
+//  1. 名字原样命中目录且目录标了 max_mode + 给了 `__max` 真名 → max 档；
+//  2. 名字带 `-max` 后缀且剥后命中目录 → max 档（显式意图优先）；
+//  3. 名字带 `-dev` 后缀且剥后命中目录 → 普通档（显式退回）；
+//  4. 目录没标 max_mode 或没给 `__max` 真名 → 普通档（绝不凭空造 1M）。
+func ResolveRequestedTier(models []CatalogModel, name string) (string, bool) {
+	base, wantMax := ResolveRequestedModel(models, name)
+	if wantMax {
+		return base, true
+	}
+	if devBase, ok := splitDevSuffix(base); ok {
+		if _, hit := LookupCatalogModel(models, devBase); hit {
+			return devBase, false
+		}
+	}
+	model, ok := LookupCatalogModel(models, base)
+	if !ok {
+		return base, false
+	}
+	if !model.MaxMode || model.MaxModelName == "" {
+		return model.ConfigName, false
+	}
+	return model.ConfigName, true
+}
+
+// FunctionForModel 选一个**该模型确实在表里**的 function 来出站。
+//
+// 背景（2026-10-18 实测）：llm_utils_chat 的 `function` 与 `model` 必须同属
+// 一张目录表，且表里的 model_name 各不相同：
+//
+//	deepseek-V3.1 / code-review-judge → 只在 code_reviewer 表里
+//	kimi-k2                          → 只在 chat_v3 / builder / inline_chat 表里
+//	doubao-2.0-mini                  → 只在 git_ai 表里
+//	multimodal_image_kimi-k2.5       → 只在 multimodal 表里
+//
+// 网关原来把所有请求都发到写死的 solo_work_lite，这些模型必然
+// `config item is empty for config opt`。
+//
+// 选择顺序（三级，越靠前越可靠）：
+//  1. preferred 命中且**该表有 `__dev` 真名** → 直接用；
+//  2. 任何一张表有 `__dev` 真名 → 用它（`__dev` 是 llm_utils_chat 的标准形态，
+//     实测稳定可用；`glm-5v-turbo` 只在 solo_coder 有 `__dev`，chat 表里的
+//     裸名会被上游判 4023 model unknown）；
+//  3. 按 functionPreference 挑第一个含它的表（裸名 / `__v2` 表，最后手段）。
+//
+// 都不含则回 preferred（让上游如实报错，不猜）。
+func FunctionForModel(models []CatalogModel, name, preferred string) string {
+	return FunctionForModelTier(models, name, preferred, false)
+}
+
+// FunctionForModelTier 与 FunctionForModel 相同，但按**目标档位**挑表。
+//
+// 为什么档位也影响选表（2026-10-18 实测目录）：同一个模型并非每张表都有
+// `__max` 真名，而 max_mode 也按表标注：
+//
+//	solo_work_lite   glm-5.3  max_mode=false  只有 glm-5.3__dev  168000
+//	solo_agent       glm-5.3  max_mode=true   glm-5.3__dev + glm-5.3__max  936000
+//
+// 要 1M 却发到 solo_work_lite，只能拿到 `__dev` 的 168000 档——客户端声明了
+// 1M、实际永远跑 200K，正是用户报的现象。所以 wantMax 时必须优先选**该表给了
+// `__max` 真名**的 function；一张都没有时才退回普通口径（不凭空造档位）。
+func FunctionForModelTier(models []CatalogModel, name, preferred string, wantMax bool) string {
+	model, ok := LookupCatalogModel(models, name)
+	if !ok || len(model.Functions) == 0 {
+		return preferred
+	}
+	hasDev := func(fn string) bool {
+		profile, ok := model.Profiles[fn]
+		return ok && strings.HasSuffix(profile.DevModelName, "__dev")
+	}
+	hasMax := func(fn string) bool {
+		profile, ok := model.Profiles[fn]
+		return ok && model.MaxMode && profile.MaxModelName != ""
+	}
+	hasTier := hasDev
+	if wantMax {
+		hasTier = hasMax
+	}
+	if preferred != "" && model.Functions[preferred] && hasTier(preferred) {
+		return preferred
+	}
+	// 优先找有目标档真名的表（按通用度顺序扫，结果稳定可复现）。
+	for _, fn := range functionPreference {
+		if model.Functions[fn] && hasTier(fn) {
+			return fn
+		}
+	}
+	// 目标档在这份目录里根本不存在：退回普通口径，让请求照常发出去。
+	if wantMax {
+		return FunctionForModelTier(models, name, preferred, false)
+	}
+	if preferred != "" && model.Functions[preferred] {
+		return preferred
+	}
+	for _, fn := range functionPreference {
+		if fn == preferred {
+			continue
+		}
+		if model.Functions[fn] {
+			return fn
+		}
+	}
+	return preferred
+}
+
+// functionPreference 是「模型最通用」的 function 排序。
+//
+// 只在 preferred 不含该模型时才用。顺序依据实测的通用度：solo_work_lite /
+// solo_agent 覆盖面最广，专用表（git_ai / code_reviewer / multimodal）最后。
+var functionPreference = []string{
+	"solo_work_lite", "solo_agent", "solo_agent_remote", "solo_work_remote",
+	"solo_agent_lite", "chat_v3", "builder_v3", "builder", "chat",
+	"solo_coder", "code_reviewer", "git_ai", "multimodal", "inline_chat",
+}

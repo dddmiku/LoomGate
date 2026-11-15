@@ -1,0 +1,130 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：以真实上游渠道错误锁定分类，防止安全策略展示文案覆盖主错误及回显文本误判。
+package upstream
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestClassifyExplicitChannelRejection(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"observed 400", 400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayMsg":"Blocked by security policy"}`, "channel_rejected"},
+		{"business error", 200, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, "channel_rejected"},
+		{"case and punctuation", 403, `{"msg":"  ILLEGAL API INVOCATION FROM AN UNAPPROVED CHANNEL.  "}`, "channel_rejected"},
+		{"error envelope", 400, `{"error":{"code":11128,"message":"Illegal API invocation from an unapproved channel"}}`, "channel_rejected"},
+		{"plain message", 400, `Illegal API invocation from an unapproved channel`, "channel_rejected"},
+		{"content remains content", 400, `{"code":11128,"msg":"blocked by security policy: NSFW content"}`, "content_blocked"},
+		{"code alone is not channel", 400, `{"code":11128,"msg":"unknown rejection"}`, "client"},
+		{"generic invocation is not a content finding", 400, `{"code":11128,"msg":"illegal api invocation"}`, "client"},
+		{"quoted request is not a channel finding", 400, `{"code":11128,"msg":"blocked by security policy: NSFW content","request_excerpt":"Illegal API invocation from an unapproved channel"}`, "content_blocked"},
+		{"display text is not the primary reason", 400, `{"msg":"invalid request","displayMsg":"Illegal API invocation from an unapproved channel"}`, "client"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Classify(c.status, c.body).String(); got != c.want {
+				t.Fatalf("Classify=%s want=%s for %s", got, c.want, c.body)
+			}
+		})
+	}
+}
+
+// 2026-09-26 实测：Claude Code 系统提示首行被上游按未批准渠道拒绝，断词后可通过。
+func TestNeutralizeChannelTriggerCoversClaudeCode(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"claude code sentence", `{"messages":[{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."}]}`, true},
+		{"claude code fingerprint only", `{"messages":[{"role":"system","content":"Claude Code, Anthropic's official CLI for Claude"}]}`, true},
+		{"plain claude code mention", `{"messages":[{"role":"user","content":"Claude Code 是什么？"}]}`, false},
+		{"official cli alone", `{"messages":[{"role":"system","content":"Anthropic's official CLI for Claude"}]}`, false},
+		{"codex sentence", `{"messages":[{"role":"system","content":"Codex CLI is an open source project led by OpenAI."}]}`, true},
+		{"content array", `{"messages":[{"role":"system","content":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}]}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, changed := NeutralizeChannelTrigger([]byte(tc.body))
+			if changed != tc.want {
+				t.Fatalf("changed=%v want=%v out=%s", changed, tc.want, out)
+			}
+			// 2026-10-29\uff1a\u65ad\u8bcd\uff08\u63d2\u96f6\u5bbd\uff09\u5bf9\u4e0a\u6e38\u5df2\u5931\u6548\uff0c\u4e2d\u6027\u5316\u6539\u4e3a\u5927\u5199\u5316\u5f52\u5c5e\u53e5 /
+			// \u5220\u8ba1\u8d39\u5934\u7684 "x-" \u524d\u7f00\u3002\u65ad\u8a00\u300c\u6539\u52a8\u540e\u4e0d\u518d\u542b\u539f\u6837\u89e6\u53d1\u4e32\u300d\u3002
+			if changed && strings.Contains(string(out), tc.body) {
+				t.Fatal("\u89e6\u53d1\u4e32\u539f\u6837\u5b58\u7559")
+			}
+		})
+	}
+}
+
+// 分级升级：未知客户端的归属句也能在中和后通过，且不动结构性字符串。
+func TestNeutralizeChannelTriggerEscalationLevels(t *testing.T) {
+	unknownClient := `{"model":"m","messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz. Always answer briefly."},{"role":"user","content":"hi"}]}`
+	if _, changed := NeutralizeChannelTriggerAt([]byte(unknownClient), channelLevelFingerprint); changed {
+		t.Fatal("level 0 cannot know an unlisted client")
+	}
+	out, changed := NeutralizeChannelTriggerAt([]byte(unknownClient), channelLevelAttribution)
+	if !changed {
+		t.Fatal("attribution sentence was not neutralized at level 1")
+	}
+	// 2026-10-29\uff1a\u65ad\u8bcd\uff08\u63d2\u96f6\u5bbd\uff09\u5df2\u88ab\u4e0a\u6e38\u8bc6\u522b\uff0c\u5347\u7ea7\u6863\u4e5f\u5fc5\u987b\u6539\u5199\u5b57\u6bcd\u3002
+	// \u65ad\u8a00\u300c\u89e6\u53d1\u4e32\u6d88\u5931\u300d\u4e14\u300c\u6ca1\u6709\u9000\u56de\u63d2\u96f6\u5bbd\u300d\u3002
+	if strings.Contains(string(out), "You are Foobar, the official CLI for Baz") {
+		t.Fatalf("attribution sentence survived level 1: %s", out)
+	}
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 1 must rewrite letters, not insert zero-width: %s", out)
+	}
+	if strings.Contains(string(out), "Always answer briefly.") == false {
+		t.Fatalf("unrelated sentence must stay intact: %s", out)
+	}
+	plain := `{"model":"m","messages":[{"role":"user","content":"write a function that reverses a list"}]}`
+	if _, changed := NeutralizeChannelTriggerAt([]byte(plain), channelLevelAttribution); changed {
+		t.Fatal("plain content must stay untouched at level 1")
+	}
+	structured := `{"model":"m","tool_choice":"auto","tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"mode":{"enum":["fast","safe"]}}}}}],"messages":[{"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"Read","arguments":"{\"mode\":\"fast\"}"}}]},{"role":"tool","tool_call_id":"call_abc","content":"done"}]}`
+	out, changed = NeutralizeChannelTriggerAt([]byte(structured), channelLevelAll)
+	// 2026-10-29\uff1a\u7b2c 2 \u6863\u4ece\u300c\u5168\u91cf\u63d2\u96f6\u5bbd\u300d\u6539\u4e3a\u300c\u6539\u5199\u5b57\u6bcd\u300d\u3002\u4e0a\u9762\u8fd9\u4efd body \u6ca1\u6709\u4efb\u4f55
+	// \u81ea\u79f0\u5ba2\u6237\u7aef\u7684\u53e5\u5b50\uff0c\u6240\u4ee5\u4e0d\u518d\u6709\u53ef\u6539\u5199\u7684\u5185\u5bb9\u2014\u2014**\u4e0d\u52a8\u5c31\u662f\u6b63\u786e\u884c\u4e3a**\uff08\u96f6\u8bef\u4f24\uff09\u3002
+	// \u771f\u6b63\u8981\u5b88\u7684\u662f\uff1a\u7ed3\u6784\u6027\u5b57\u7b26\u4e32\u4e00\u4e2a\u5b57\u8282\u90fd\u4e0d\u80fd\u53d8\u3002
+	if changed {
+		t.Fatalf("level 2 must not touch a body with no attribution text: %s", out)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools := parsed["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if tools["name"] != "Read" {
+		t.Fatalf("tool name was rewritten: %v", tools["name"])
+	}
+	call := parsed["messages"].([]any)[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	if call["id"] != "call_abc" {
+		t.Fatalf("tool call id was rewritten: %v", call["id"])
+	}
+	if call["function"].(map[string]any)["arguments"] != `{"mode":"fast"}` {
+		t.Fatalf("tool arguments were rewritten: %v", call["function"])
+	}
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 2 must not fall back to zero-width breaks: %s", out)
+	}
+	// \u6709\u5f52\u5c5e\u53e5\u65f6\u7b2c 2 \u6863\u5fc5\u987b\u6539\u5199\uff0c\u4e14\u4e0d\u63d2\u96f6\u5bbd\u3002
+	withAttr := `{"model":"m","messages":[{"role":"system","content":"You are Foobar, the official CLI for Baz."},{"role":"user","content":"hi"}]}`
+	out, changed = NeutralizeChannelTriggerAt([]byte(withAttr), channelLevelAll)
+	if !changed {
+		t.Fatal("level 2 must rewrite an attribution sentence")
+	}
+	if strings.Contains(string(out), "You are Foobar, the official CLI for Baz") {
+		t.Fatalf("attribution sentence survived level 2: %s", out)
+	}
+	if strings.Contains(string(out), wafBreakMarker) {
+		t.Fatalf("level 2 must rewrite letters, not insert zero-width: %s", out)
+	}
+}

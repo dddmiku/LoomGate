@@ -1,0 +1,535 @@
+// ═══ 更新日志 ═══
+// 2026-10-13：初版——桌面启动器：准备运行目录、找 Python、拉起网关、开浏览器、管生命周期。
+//
+// 桌面分发（.app / .exe）与容器/服务器部署的差别，全在这个文件里：
+//
+//	容器里                  桌面上
+//	─────────────────────   ─────────────────────────────────────────────
+//	/app 由镜像构建         用户双击，没有构建步骤，目录要自己建
+//	config.json 由挂载提供   首次运行要生成一份可用的默认配置
+//	python3 一定在          用户机器上可能只有 python.exe，或干脆没有
+//	docker 管进程           自己要当 PID 1：管信号、管退出、别留僵尸
+//	用户自己去开面板         启动后自动打开浏览器
+//
+// 关键设计：**启动器不复制网关代码**。它只做「准备环境 + exec 网关二进制」，
+// 网关本身仍然是从 cmd/server 编出来的那一个，行为与服务器版逐字一致。
+// 这样桌面版不会变成第二套实现，也不会出现「桌面能跑、服务器不能跑」的分叉。
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"workbuddy2api/internal/hotupdate"
+)
+
+// 版本由构建脚本注入（与网关同一套 ldflags 约定）。
+var (
+	version = "dev"
+	builtAt = "unknown"
+)
+
+// desktopLayout 是桌面版的数据目录布局。
+//
+// 全部数据放在**可执行文件旁边**（便携式），而不是 %APPDATA% / ~/Library：
+// 用户把整个文件夹拷到 U 盘或另一台机器就能接着用，账号与密钥跟着走；
+// 也方便「备份 = 拷贝文件夹」。macOS 的 .app 是只读包体，所以实际根目录由
+// 启动器传入（见 rootDir）。
+type desktopLayout struct {
+	Root       string // 数据根目录
+	Config     string // config/config.json
+	ConfigDir  string
+	Auths      string
+	AuthTrash  string
+	DataDir    string
+	PanelData  string
+	RuntimeDir string // 网关二进制所在目录（辅助程序也在那）
+}
+
+func layoutFor(root, runtimeDir string) desktopLayout {
+	return desktopLayout{
+		Root:       root,
+		ConfigDir:  filepath.Join(root, "config"),
+		Config:     filepath.Join(root, "config", "config.json"),
+		Auths:      filepath.Join(root, "auths"),
+		AuthTrash:  filepath.Join(root, "auths-trash"),
+		DataDir:    filepath.Join(root, "data"),
+		PanelData:  filepath.Join(root, "panel-data"),
+		RuntimeDir: runtimeDir,
+	}
+}
+
+// ensureLayout 建出运行所需的全部目录，并在首次运行时生成 config.json。
+//
+// 幂等：已存在的一律不动。用户改过的配置不会被启动器覆盖——这是硬要求，
+// 否则「重启一次配置就回默认」会让面板里的设置全部失效。
+func ensureLayout(l desktopLayout) error {
+	for _, dir := range []string{l.ConfigDir, l.Auths, l.AuthTrash, l.DataDir, l.PanelData} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("创建目录 %s: %w", dir, err)
+		}
+	}
+	if _, err := os.Stat(l.Config); err == nil {
+		return nil // 已有配置，绝不覆盖
+	}
+	if err := os.WriteFile(l.Config, []byte(defaultConfig()), 0600); err != nil {
+		return fmt.Errorf("写入默认配置: %w", err)
+	}
+	return nil
+}
+
+// defaultConfig 生成一份开箱可用的桌面配置。
+//
+// 与 config.example.json 的差别：路径全部相对数据根目录（启动器已把工作目录
+// 切到那里，所以 "./auths" 就落在用户的数据目录里），且**不开自动更新**——
+// 桌面版是便携包，更新靠用户换新版文件夹，而不是让二进制在用户机器上自我替换
+// （那在 macOS 上会破坏签名，在 Windows 上会撞正在运行的文件锁）。
+func defaultConfig() string {
+	cfg := map[string]any{
+		"listen":          "127.0.0.1:7863",
+		"api_key":         "",
+		"api_keys_file":   "./data/api_keys.json",
+		"api_keys_socket": "./data/api_keys.sock",
+		"auth_dir":        "./auths",
+		"state_file":      "./data/state.json",
+		"server": map[string]any{
+			"max_body_mb": 8,
+		},
+		"update": map[string]any{"enabled": false},
+		"schedule": map[string]any{
+			"checkin_hours": []int{9, 21}, "travel_hours": []int{9, 21},
+			"activity_hours": []int{10}, "keepalive_hours": []int{22},
+			"school_hours": []int{12}, "cat_hours": []int{1},
+			"trae_check_hours": []int{0},
+			"growth_hours":     []int{9, 21},
+			"balance_hours":    []int{9, 21},
+			"checkin_enabled": true, "travel_enabled": true,
+			"activity_enabled": true, "keepalive_enabled": true,
+			"school_enabled": true, "cat_enabled": true,
+			"trae_check_enabled": true,
+			"growth_enabled":  true,
+			"balance_enabled": true,
+		},
+	}
+	raw, _ := json.MarshalIndent(cfg, "", "  ")
+	return string(raw) + "\n"
+}
+
+// findPython 找一个**真的能执行**的 Python 3 解释器。
+//
+// 为什么要逐个试而不是直接 exec.Command("python3")：
+//   - Windows 官方安装器只给 python.exe，没有 python3；
+//   - PATH 上常有 Microsoft Store 的 python3.exe App Execution Alias **存根**，
+//     exec.Command 能找到它、但执行报 exit status 9009（仓库里已有同类教训，
+//     见 internal/scheduler/school.go 的 pythonCmd 注释）；
+//   - macOS 上 python3 通常有，但可能是 Xcode 命令行工具的一个 shim。
+//
+// 判据是「跑起来并打印出版本号」，不是「文件存在」。
+func findPython() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("WB2A_PYTHON")); v != "" {
+		if ok, _ := pythonWorks(v); ok {
+			return v, nil
+		}
+		return "", fmt.Errorf("WB2A_PYTHON=%s 无法执行", v)
+	}
+	candidates := []string{"python3", "python"}
+	if runtime.GOOS == "windows" {
+		// py -3 是 Windows 官方启动器，能绕开 Store 存根。
+		candidates = []string{"python3", "python", "py"}
+	}
+	var tried []string
+	for _, name := range candidates {
+		args := []string{"--version"}
+		if name == "py" {
+			args = []string{"-3", "--version"}
+		}
+		if ok, out := pythonRuns(name, args); ok {
+			return name, nil
+		} else {
+			tried = append(tried, name+": "+out)
+		}
+	}
+	return "", fmt.Errorf("没有找到可用的 Python 3。尝试过：\n  %s", strings.Join(tried, "\n  "))
+}
+
+func pythonWorks(name string) (bool, string) { return pythonRuns(name, []string{"--version"}) }
+
+// pythonRuns 执行解释器并确认它报的是 Python 3。
+//
+// 必须校验主版本：python 在部分系统上仍指向 Python 2，而面板用了 f-string 与
+// pathlib，Python 2 会以语法错误崩溃——那种失败发生在子进程里，报错很难懂。
+func pythonRuns(name string, args []string) (bool, string) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if text == "" {
+			text = err.Error()
+		}
+		return false, text
+	}
+	if !strings.HasPrefix(text, "Python 3") {
+		return false, "不是 Python 3: " + text
+	}
+	return true, text
+}
+
+// waitForHealth 轮询网关直到它开始服务，或超时。
+func waitForHealth(addr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	url := "http://" + addr + "/healthz"
+	client := &http.Client{Timeout: 2 * time.Second}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return true
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// freePort 在首选端口被占用时换一个。
+//
+// 桌面版最常见的启动失败是「上次没退干净，端口还占着」。与其让用户看到
+// bind: address already in use，不如换一个端口继续跑，并把实际端口告诉用户。
+func freePort(preferred string) string {
+	host, port, err := net.SplitHostPort(preferred)
+	if err != nil {
+		host, port = "127.0.0.1", "7863"
+	}
+	if canBind(host, port) {
+		return preferred
+	}
+	for candidate := 7864; candidate < 7900; candidate++ {
+		if canBind(host, fmt.Sprint(candidate)) {
+			return net.JoinHostPort(host, fmt.Sprint(candidate))
+		}
+	}
+	return preferred
+}
+
+func canBind(host, port string) bool {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// openBrowser 尽力打开默认浏览器；失败不影响网关运行（用户可手动访问）。
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	_ = cmd.Start()
+}
+
+func main() {
+	exe, err := os.Executable()
+	if err != nil {
+		fatal("无法定位程序自身: %v", err)
+	}
+	exeDir := filepath.Dir(exe)
+
+	// 数据根目录：优先环境变量（便于把数据放到别处），否则用可执行文件旁边。
+	// macOS 的 .app 里可执行文件在 Contents/MacOS/，数据要放到 .app **外面**，
+	// 由启动脚本通过 WB2A_DESKTOP_ROOT 指定，否则写进只读包体会失败。
+	root := strings.TrimSpace(os.Getenv("WB2A_DESKTOP_ROOT"))
+	if root == "" {
+		root = exeDir
+	}
+	// 运行目录（网关与辅助程序所在）：单文件分发时先把内嵌的那份解到 <root>/runtime。
+	// 必须在算出 root 之后——解压目标就在数据目录下。
+	runtimeDir, err := runtimeDirFor(root)
+	if err != nil {
+		fatal("%v", err)
+	}
+	layout := layoutFor(root, runtimeDir)
+	if err := ensureLayout(layout); err != nil {
+		fatal("%v", err)
+	}
+
+	// 面板引擎：默认 Go（不需要 Python）。要退回 Python 引擎时设 WB2A_DESKTOP_PYTHON=1
+	// 或 WB2API_PANEL_GO=0——那是给「Python 面板还在灰度」的部署留的退路，普通用户
+	// 永远走不到。桌面版默认走 Go 的理由：绝大多数用户机器上没有 python3，
+	// 而 Go 引擎与 Python 引擎功能等价（同一套前端、同一份凭据格式）。
+	panelEngine := "go"
+	python := ""
+	if usePythonPanel() {
+		resolved, err := findPython()
+		if err != nil {
+			printPythonHelp(err)
+			os.Exit(1)
+		}
+		python = resolved
+		panelEngine = "python"
+		fmt.Printf("使用解释器: %s\n", python)
+	} else {
+		// 面板不需要 Python，但**排程的脚本类任务需要**（school / cat / redeem /
+		// lottery / makeup 跑的是 scripts/*.py，由 scheduler 的 pythonCmd() 起进程）。
+		// 找不到就只是那几个任务跳过——不拦启动，但要把解释器路径传下去。
+		//
+		// 不传的后果是 pythonCmd() 回落 "python3"，而 Windows 官方安装器只给
+		// python.exe（且 PATH 上常有 Store 存根），那些任务会在每个时点各报一次
+		// WARN 然后什么都不做。用户看到的是「定时任务全都不跑」。
+		if resolved, err := findPython(); err == nil {
+			python = resolved
+			fmt.Printf("定时任务将使用解释器: %s\n", python)
+		} else {
+			fmt.Println("提示：未找到 Python 3，定时任务（签到/旅行/抽奖等）会被跳过。")
+			fmt.Println("      网关与面板的其它功能不受影响；需要时从 https://www.python.org/downloads/ 安装。")
+		}
+	}
+
+	// 网关二进制：**优先用热更新后的那份**，其次才是包内自带的。
+	//
+	// 不做这一步，热更新就是个假的：新版本会被下载、校验、交接成功，进程内
+	// 一路正常——直到用户关掉窗口再打开，启动器又从包目录里拉起旧二进制，
+	// 版本悄悄回退。用户看到的是「更新了但重启又变回旧版」。
+	gateway := filepath.Join(runtimeDir, gatewayBinaryName())
+	if updated := hotupdate.CurrentBinary(filepath.Join(layout.DataDir, "updates")); updated != "" {
+		gateway = updated
+	}
+	if _, err := os.Stat(gateway); err != nil {
+		fatal("找不到网关程序 %s：打包不完整，请重新下载。", gateway)
+	}
+
+	// 读端口：优先配置文件里的 listen，便于用户改端口。
+	addr := listenAddr(layout.Config)
+	addr = freePort(addr)
+	host, port, _ := net.SplitHostPort(addr)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	cmd := exec.Command(gateway, "-config", layout.Config)
+	cmd.Dir = layout.Root
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	env := []string{
+		"WB2API_PANEL_ENABLED=1",
+		"WB2API_RUNTIME=native",
+		"WB2API_GATEWAY_DIR=" + layout.Root,
+		"WB2API_AUTHS_DIR=" + layout.Auths,
+		"WB2API_ADMIN_DIR=" + layout.PanelData,
+		"WB2API_CONFIG_PATH=" + layout.Config,
+		"WB2API_RUNTIME_DIR=" + layout.RuntimeDir,
+		// 更新目录**显式传给网关**，而不是让两边各自推导。
+		//
+		// 启动器冷启动时看的是 <root>/data/updates（上面的 CurrentBinary），
+		// 而网关侧 updateDir() 的优先级是 WB2API_UPDATE_DIR > 配置 update.dir >
+		// 从 state_file 推导。默认情况下后两者恰好也落到同一个目录，但用户一旦
+		// 在配置里改了 update.dir，或环境里带了一个 WB2API_UPDATE_DIR（会被
+		// os.Environ() 继承下去），两边就分叉了：网关把更新下到 A、启动器去 B
+		// 找，症状是「更新成功但重启还是旧版」。
+		//
+		// 这里显式指定，让「启动器看哪里」与「网关写哪里」由同一个表达式给出。
+		"WB2API_UPDATE_DIR=" + filepath.Join(layout.DataDir, "updates"),
+		"WB2A_LISTEN=" + net.JoinHostPort(host, port),
+	}
+	if panelEngine == "python" {
+		// 显式关掉 Go 引擎；WB2A_PYTHON 让网关用它去起 app.py。
+		env = append(env, "WB2API_PANEL_GO=0", "WB2A_PYTHON="+python)
+	} else {
+		env = append(env, "WB2API_PANEL_GO=1")
+		if python != "" {
+			// 面板用不到它，但 scheduler 的 pythonCmd() 会读它去跑 scripts/*.py。
+			env = append(env, "WB2A_PYTHON="+python)
+		}
+	}
+	cmd.Env = append(os.Environ(), env...)
+	if err := cmd.Start(); err != nil {
+		fatal("启动网关失败: %v", err)
+	}
+
+	// 转发退出信号：用户 Ctrl+C 或系统要求退出时，把子进程一起带走，
+	// 否则会在任务管理器里留下一个占着端口的孤儿进程。
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		stopChild(cmd)
+		os.Exit(0)
+	}()
+
+	// 面板挂在网关的子路径下（默认 /admin），**不是根路径**。
+	//
+	// 曾经这里打印并打开的是 "http://<addr>/"，用户按它打开就是 404——面板根本不在
+	// 根上（2026-10-13 用户实测：日志只给了 ip:端口，打开后 404）。前缀与网关注册
+	// 路由用的是同一个环境变量 WB2API_ADMIN_PREFIX，所以这里读它而不是写死 "/admin"。
+	panelURL := fmt.Sprintf("http://%s%s/", addr, desktopAdminPrefix())
+	if waitForHealth(addr, 30*time.Second) {
+		fmt.Printf("\n网关已启动：http://%s\n管理面板：%s\n（关闭本窗口即停止服务）\n\n", addr, panelURL)
+		openBrowser(panelURL)
+	} else {
+		fmt.Printf("\n网关启动较慢或失败，请查看上方日志。\n管理面板（就绪后打开）：%s\n\n", panelURL)
+	}
+
+	// 等网关退出；它退了启动器也就该退了（窗口关掉 = 服务停止）。
+	if err := cmd.Wait(); err != nil {
+		fmt.Printf("网关退出: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("网关已停止。")
+}
+
+// usePythonPanel 判断是否退回 Python 面板引擎。
+//
+// 默认 Go：桌面包里已经不带 CPython 依赖，绝大多数用户机器上没有 python3，
+// 而 Go 引擎与 Python 引擎在功能上等价（同一套前端、同一份凭据格式）。
+// 这个开关是给「Python 面板还在灰度」的部署留的退路。
+func usePythonPanel() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
+	case "0", "false", "no", "off":
+		return true
+	case "1", "true", "yes", "on":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2A_DESKTOP_PYTHON"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// desktopAdminPrefix 面板的挂载前缀（默认 /admin），与网关注册路由用的是同一个
+// 环境变量 WB2API_ADMIN_PREFIX。
+//
+// 归一化规则必须与 cmd/server/panel.go 的 adminPrefix() 一致：以 "/" 开头、不以
+// "/" 结尾。两处不一致会让启动器打开的地址与网关实际挂载的位置错开一位
+// （"/admin/" 与 "/admin" 拼出 "//"），用户看到的是 404。
+func desktopAdminPrefix() string {
+	prefix := strings.TrimSpace(os.Getenv("WB2API_ADMIN_PREFIX"))
+	if prefix == "" {
+		return "/admin"
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	if trimmed := strings.TrimRight(prefix, "/"); trimmed != "" {
+		prefix = trimmed
+	}
+	return prefix
+}
+
+// runtimeDirFor 网关与辅助程序所在的目录。单文件分发时先把内嵌的那份解出来。
+//
+// 目录分发（历史形态）：exe 旁边就有网关与辅助程序，原样返回 exe 所在目录，
+// 行为与以前逐字一致。
+//
+// 单文件分发：exe 旁边什么都没有，网关与辅助程序**嵌在启动器里**，首次运行时解到
+// <root>/runtime。解到数据目录而不是 exe 旁边，是因为 exe 可能在只读位置
+// （Program Files、只读 U 盘），而数据目录一定可写；副作用是「程序 + 数据」都在
+// 同一个可写目录里，用户备份仍然是拷一个文件夹。
+//
+// 幂等：已存在且校验和一致的文件不重写，所以每次启动不会重复解压（那会让启动
+// 平白慢几百毫秒，还会天天改 mtime）。
+func runtimeDirFor(root string) (string, error) {
+	if !hasEmbeddedRuntime() {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Dir(exe), nil
+	}
+	dir := filepath.Join(root, "runtime")
+	if err := extractEmbeddedRuntime(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func gatewayBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "wb2api.exe"
+	}
+	return "wb2api"
+}
+
+// listenAddr 从配置里取监听地址；读不到就用默认。
+func listenAddr(configPath string) string {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return "127.0.0.1:7863"
+	}
+	var cfg struct {
+		Listen string `json:"listen"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil || strings.TrimSpace(cfg.Listen) == "" {
+		return "127.0.0.1:7863"
+	}
+	addr := strings.TrimSpace(cfg.Listen)
+	// 配置里可能是 ":7863"（监听所有网卡）。桌面版只服务本机，强制收回 loopback，
+	// 避免用户无意间把带账号的面板暴露到局域网。
+	if strings.HasPrefix(addr, ":") {
+		return "127.0.0.1" + addr
+	}
+	return addr
+}
+
+func stopChild(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	done := make(chan struct{})
+	go func() { _, _ = cmd.Process.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+	}
+}
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "错误: "+format+"\n", args...)
+	fmt.Fprintln(os.Stderr, "\n按回车键退出…")
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+	os.Exit(1)
+}
+
+// printPythonHelp 给出可操作的安装指引，而不是一句「缺少 Python」。
+func printPythonHelp(err error) {
+	fmt.Fprintln(os.Stderr, "错误: "+err.Error())
+	fmt.Fprintln(os.Stderr, "\n管理面板需要 Python 3（网关本体不需要）。安装方式：")
+	switch runtime.GOOS {
+	case "windows":
+		fmt.Fprintln(os.Stderr, "  1. 打开 https://www.python.org/downloads/windows/")
+		fmt.Fprintln(os.Stderr, "  2. 下载 Python 3 安装包，安装时**勾选 Add python.exe to PATH**")
+		fmt.Fprintln(os.Stderr, "  3. 重开本程序")
+	case "darwin":
+		fmt.Fprintln(os.Stderr, "  在终端执行：xcode-select --install")
+		fmt.Fprintln(os.Stderr, "  或从 https://www.python.org/downloads/macos/ 安装")
+	default:
+		fmt.Fprintln(os.Stderr, "  Debian/Ubuntu: sudo apt install python3")
+		fmt.Fprintln(os.Stderr, "  Fedora: sudo dnf install python3")
+	}
+	fmt.Fprintln(os.Stderr, "\n已装但仍报错时，可用环境变量指定解释器：WB2A_PYTHON=/path/to/python3")
+	fmt.Fprintln(os.Stderr, "\n按回车键退出…")
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "public_key": "release-signing.pub",
+  "checksums_asset": "SHA256SUMS.txt",
+  "signature_asset": "SHA256SUMS.txt.sig",
+  "targets": [
+    {
+      "id": "linux-amd64",
+      "goos": "linux",
+      "goarch": "amd64",
+      "update_asset": "wb2api-linux-amd64",
+      "runtime_asset": "wb2api-runtime-linux-amd64.tar.gz",
+      "ci_build": true
+    },
+    {
+      "id": "linux-arm64",
+      "goos": "linux",
+      "goarch": "arm64",
+      "update_asset": "wb2api-linux-arm64",
+      "runtime_asset": "wb2api-runtime-linux-arm64.tar.gz",
+      "ci_build": true
+    },
+    {
+      "id": "linux-armv7",
+      "goos": "linux",
+      "goarch": "arm",
+      "goarm": "7",
+      "update_asset": "wb2api-linux-armv7",
+      "runtime_asset": "wb2api-runtime-linux-armv7.tar.gz",
+      "ci_build": true
+    },
+    {
+      "id": "windows-amd64",
+      "goos": "windows",
+      "goarch": "amd64",
+      "update_asset": "wb2api-windows-amd64",
+      "ci_build": true
+    },
+    {
+      "id": "android-arm64",
+      "goos": "android",
+      "goarch": "arm64",
+      "update_asset": "workbuddy2api-android-arm64.apk",
+      "ci_build": false,
+      "manual_requirement": "Build with Android NDK/CGO and the existing APK signing identity; do not generate a CI debug signing key."
+    }
+  ]
+}

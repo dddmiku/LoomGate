@@ -1,0 +1,39 @@
+# ═══ 更新日志 ═══
+# 2026-10-19：默认改为拉预构建镜像，源码构建拆到 docker-compose.build.yml。
+#             此前 build: 与 image: 并存，`docker compose up -d` 会先构建，
+#             即使用户已经 docker pull 过——多一次构建，且构建出来的 tag 与
+#             镜像仓库里的不是同一个，面板版本也可能显示成 dev。
+# 2026-09-25：网关与管理台合为一个非root容器，仅发布一个回环端口，目录配置支持原子替换。
+#
+# 用法：
+#   拉镜像运行（默认）   docker compose up -d
+#   从源码构建运行       docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#   升级                 docker pull ghcr.io/dddmiku/workbuddy2api-maintenance:latest
+#                        docker compose up -d
+#
+# 固定版本：把 WB2API_TAG 写进 .env 或直接 export，例如 WB2API_TAG=v3.14.2。
+services:
+  wb2api:
+    image: ghcr.io/dddmiku/workbuddy2api-maintenance:${WB2API_TAG:-latest}
+    container_name: workbuddy2api
+    restart: unless-stopped
+    stop_grace_period: 16m
+    network_mode: bridge
+    environment:
+      TZ: Asia/Shanghai
+      WB2API_PANEL_ENABLED: "1"
+      # Trust the actual host proxy address; override for a custom Docker bridge.
+      WB2API_TRUSTED_PROXIES: ${WB2API_TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.17.0.1/32}
+    ports:
+      - "127.0.0.1:7863:7863"
+    volumes:
+      # These persistent directories must be writable by uid/gid 10001.
+      - ./auths:/app/auths
+      - ./auths-trash:/app/auths-trash
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./panel-data:/app/panel-data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

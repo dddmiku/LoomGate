@@ -1,0 +1,1208 @@
+// ═══ 更新日志 ═══
+// 2026-09-26：渠道中和改为分级升级（指纹→通用归属句→正文全量），任何客户端都不再因自称而被拒。
+// 2026-09-26：新增 Claude Code 系统提示触发句与组合指纹，修复 Claude Code 经本网关被 11128 拒绝。
+// 2026-09-17：新增上游渠道校验触发句的中性化，供被 11128 拒绝的系统说明断词重试。
+package upstream
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"workbuddy2api/internal/jsonutil"
+)
+
+// channelTriggerSentences 已实测会被上游按「未授权渠道」拒绝的系统说明句子。
+//
+// 依据（docs/codex.md §默认指令为什么会被拒，2026-09-17 字段二分结论）：
+// 官方 Codex CLI 默认说明里这一句对渠道归属的声明命中上游校验，
+// 删掉或改成中性说法后立即返回 200；工具声明、模型名、用户消息都不是触发点。
+// 只匹配句子主体，不带句末标点，兼容原文与去掉句号的变体。
+var channelTriggerSentences = []string{
+	"Codex CLI is an open source project led by OpenAI",
+	// 2026-09-26 实测（CLI 端到本网关）：Claude Code 系统提示首行命中同一校验，
+	// 原样发送返回 400/11128，断词后 200。
+	"You are Claude Code, Anthropic's official CLI for Claude",
+	// 2026-09-28 实测（逐段二分 + 对照）：Claude Code 2.1.283 在系统提示开头塞入的
+	// 计费归属头字符串本身命中同一校验。整行、只留头名、甚至只留到 "…billing-header"
+	// 都被拒；"x-anthropic-" 或 "x-anthropic-version:" 等其他头通过；断词后 200。
+	// 这是字符串级触发，与它出现在哪条消息无关，所以按精确指纹在第 0 档处理（零误伤）。
+	"x-anthropic-billing-header",
+}
+
+// channelTriggerFingerprints 组合指纹：同一段文本内同时出现全部片段才断词，
+// 对付措辞稍有变化的同一句。实测：只写 "Claude Code" 或只写
+// "Anthropic's official CLI for Claude" 均通过，两个片段同现才被拒。
+var channelTriggerFingerprints = [][]string{
+	{"Claude Code", "official CLI for Claude"},
+}
+
+// 分级升级（最多三档，逐档重发一次）：
+//
+//	channelLevelFingerprint 已实测指纹（精确、零误伤）
+//	channelLevelAttribution 通用「客户端归属」句：任何自称官方 CLI/IDE/客户端的句子
+//	channelLevelAll         system/developer/user 消息正文全量断词（最后手段，保证指纹必被破坏）
+//
+// 只在原样请求确实被上游以 11128 拒绝后使用，且只作用于消息正文（不动工具名、
+// 调用编号、枚举值等结构性字符串），因此任何客户端都不会因为「自称是谁」被挡在门外。
+const (
+	channelLevelFingerprint = iota
+	channelLevelAttribution
+	channelLevelAll
+)
+
+// maxChannelNeutralizeLevels 档位数（含未处理）：最多因渠道拒绝重发两次。
+const maxChannelNeutralizeLevels = 3
+
+// channelAttributionMarkers 「官方客户端」类措辞；与任意产品名同现即视为归属句。
+var channelAttributionMarkers = []string{
+	"official cli", "official ide", "official extension", "official client",
+	"official plugin", "official agent", "official coding", "official vscode",
+	"official vs code", "anthropic's official", "openai's official", "google's official",
+	"coding agent by", "assistant by ", "made by anthropic", "made by openai",
+}
+
+// channelClientNames 常见 AI 编码/代理客户端产品名（小写匹配）。
+//
+// ═══ 2026-11-04：每个名字都必须带词边界，否则会切碎普通英文单词 ═══
+//
+// 现场（用户报障 DSH 19:00 一直 11128）：stripClientName 用 indexFrom 做**子串**
+// 匹配，名字表里的 "zed " 命中了 `authorized and` 中间的 "zed "——把
+// `Treat every user instruction as already authorized and act...` 切成了
+// `...already authoriand act...`（"zed " 三个字母被删）。
+//
+// 后果比"没生效"严重得多：上游看到的是一段**被改坏的畸形英文**，这本身就是
+// 非官方客户端的强特征，于是第 1 级、第 2 级中和全被拒（三份 dump 逐字节 diff
+// 实测：a→b 只动了 copilot 那处大写化，b→c 就是这一处 authoriand）。
+//
+// 修法：名字两侧都必须是非字母边界。短的、会当普通英文词根出现的（zed / kiro /
+// trae / crush / amp）尤其危险，靠边界挡住；长的（claude code 等）本来就不会误命中，
+// 但统一走同一判据，避免以后再加短名时重犯。
+//
+// 为什么不用 `"zed "` 这种自带尾空格的老写法：那只挡住了右侧，左侧
+// （`authori|zed `）照样命中。真正的词边界要两边都判。
+var channelClientNames = []string{
+	"claude code", "codex cli", "codex", "cursor", "windsurf", "cline", "roo code",
+	"kilocode", "aider", "copilot", "gemini cli", "zed", "devin", "opencode",
+	"kiro", "trae", "qoder", "continue.dev", "amazon q", "jetbrains ai",
+	"augment code", "comate", "marscode", "lingma", "codebuddy", "workbuddy",
+	"tongyi", "qwen code", "iflow", "crush", "amp", "factory droid",
+}
+
+// indexWordIn 在 lowered 里查找 name，要求 name 的**两侧都不是 ASCII 字母**。
+//
+// 用途：channelClientNames 是产品名，必须整词命中。子串匹配会把
+// authorized→authori + zed、kiro 之类嵌在普通词里切掉（见上表注释的现场）。
+//
+// 为什么只判 ASCII 字母、不判数字与下划线：产品名周围出现数字（`cursor2`）或
+// 下划线（`claude_code`）时仍应命中——那是同一个产品名的常见写法；而字母拼接
+// （authorized / kirobyte）才是误伤源。
+func indexWordIn(lowered, name string) int {
+	for from := 0; from <= len(lowered)-len(name); {
+		index := indexFrom(lowered, name, from)
+		if index < 0 {
+			return -1
+		}
+		startOK := index == 0 || !isASCIILetter(lowered[index-1])
+		end := index + len(name)
+		endOK := end >= len(lowered) || !isASCIILetter(lowered[end])
+		if startOK && endOK {
+			return index
+		}
+		from = index + 1
+	}
+	return -1
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+
+// NeutralizeChannelTrigger 在「已确认被上游渠道校验拒绝」的请求体上断开触发句。
+//
+// 语义约定与 NeutralizeWAFTriggers 一致：
+//   - 只在命中句子的每个单词首字母之后插入一个零宽空格，不删除、不改写任何字符，
+//     模型侧读到的是同一句话；
+//   - 调用点仅限原样请求已被 11128 unapproved channel 拒绝之后（见
+//     ChatStreamContext 的重试分支），正常请求的正文不经过这里；
+//   - body 不是 JSON、或没有命中触发句时原样返回，第二个返回值为 false。
+func NeutralizeChannelTrigger(body []byte) ([]byte, bool) {
+	return NeutralizeChannelTriggerAt(body, channelLevelFingerprint)
+}
+
+// NeutralizeChannelTriggerAt 按档位断词：0 只处理已实测指纹（含 system 首行），
+// 1 追加通用归属句，2 在消息正文里全量断词。档位越高越不依赖「猜中原文」，
+// 代价是正文多出零宽字符。
+//
+// 2026-10-17 新增 system 首行档：实测确认上游的渠道校验**只看 system 消息的第一行**——
+// 同一句 "You are Claude Code, ..." 放在首行必被拒，加 20 字节前缀或挪到第二行即通过；
+// 计费头 "x-anthropic-billing-header" 同理。首行断词是最小代价的解法（只动一行，
+// 句子其余部分与后文完全不动）。
+func NeutralizeChannelTriggerAt(body []byte, level int) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	var obj any
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
+		return body, false
+	}
+	changed := false
+	obj = neutralizeChannelJSONValue(obj, &changed)
+	// 第 0 档处理 system 首行：实测的确定性触发点，代价最小（只改一行）。
+	//
+	// 只在 level==0 时做首行档：第 1/2 档是**升级**，此时首行早已被第 0 档（或
+	// 发送前的 NeutralizeBillingHeaders）改写过，再跑一遍不会有新改动，
+	// 反而让调用方拿到 changed=false 而放弃重试（2026-10-29 生产实测：
+	// 预改写已生效、首行无触发串，升级档因此全部空转，请求直接返回 11128）。
+	if level <= channelLevelFingerprint {
+		changed = neutralizeSystemFirstLine(obj, &changed) || changed
+	}
+	switch {
+	case level >= channelLevelAll:
+		changed = neutralizeMessageText(obj, channelTextModeAll) || changed
+	case level >= channelLevelAttribution:
+		changed = neutralizeMessageText(obj, channelTextModeAttribution) || changed
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+const (
+	channelTextModeAttribution = iota
+	channelTextModeAll
+)
+
+// channelFirstLineTriggerTokens 只出现在 system 首行就必被 11128 拒的 token。
+//
+// 2026-10-17 实测（docs/channel-verification.md 的矩阵）：
+//   - 把该 token 所在整句放在 system 首行 → 两个 realm 都返回
+//     11128 "Illegal API invocation from an unapproved channel"；
+//   - 同句前面加 20 字节中性前缀、或挪到第二行 → 通过；
+//   - 首行内每个单词首字母后插零宽空格 → 通过（本函数采用的做法）。
+//
+// 2026-10-29 实测：**断词已失效**。上游改成模糊匹配，插零宽空格、插普通空格
+// 都照样被拒（A/B/C 三组对照：原样拒、零宽插词拒、空格插词拒）。真正有效的
+// 手段是改动字母本身——去掉 `x-` 前缀后同一句立即 200。
+//
+// 为什么单列成表而不复用 channelTriggerSentences：这两个 token 的判定与
+// 「整句归属声明」无关（"x-anthropic-billing-header" 单独一行也照样被拒），
+// 触发条件是「在首行」而非「句子内容像归属声明」，误判边界不同。
+var channelFirstLineTriggerTokens = []string{
+	// Claude Code 计费归属头（2.1.283+ 系统提示首行）。单独出现即触发。
+	"x-anthropic-billing-header",
+	// Claude Code 系统提示首句的产品归属声明。
+	"You are Claude Code, Anthropic's official CLI for Claude",
+	"Codex CLI is an open source project led by OpenAI",
+	// 2026-11-04 实测（DSH 客户端 19:00 全量被拒，9 次重试 3 个账号 11128）：
+	// **system 消息里出现 `workspace root` 这个短语即被拒**，与它是不是首行无关，
+	// 加前缀无效，挪到 user 消息则通过。
+	//
+	// 定位过程（本机对生产 dump 的单变量回放，每次只改一处）：
+	//   system 去掉该行                → 200
+	//   system 保留该行                → 400
+	//   同一行挪到 user 消息            → 200
+	//   system 只有这一行               → 400
+	//   `...workspace root`            → 400
+	//   `...workspace roox`（改末字母） → 200
+	//   `...workspace rooT`（改大小写） → 400  ← 大小写不敏感
+	//   任意长度的无意义串              → 200  ← 不是长度判据
+	//
+	// 注意官方客户端**也发** `workspace root`（抓包 6/6 命中），但它出现在
+	// **user 消息**的 IDENTITY.md 模板里，不在 system——所以这不是「禁用词」，
+	// 而是「system 里不许出现」。改写在 system 内把它换掉即可，user 侧不动。
+	"workspace root",
+}
+
+// channelTokenRewrites 断词失效后的替代方案：**改写字母**而不是插零宽。
+//
+// 2026-10-29 实测矩阵（cn 域，同一账号，每次只改一个变量）：
+//
+//	x-anthropic-billing-header 原样              → 11128
+//	插零宽 x-a-nthropic-b-illing-h-eader       → 11128（断词已失效）
+//	插普通空格 x - anthropic - billing - header → 11128
+//	去掉 x- 前缀 → anthropic-billing-header      → 200
+//	连字符也去掉 → -anthropic-billing-header     → 200
+//	换成中文「计费头：」                         → 200
+//
+// 结论：上游匹配的是**带前缀的完整字面量**，改动任意字母即可绕开。
+// 选「去掉 x- 前缀」而不是换成中文：改动最小（删 2 字节）、语义仍可读
+// （模型看得出这是计费头）、且不引入非 ASCII 字符。
+var channelTokenRewrites = []struct {
+	trigger string
+	replace string
+}{
+	{"x-anthropic-billing-header", "anthropic-billing-header"},
+}
+
+// channelAttributionSentences 归属声明句：上游对整句做模糊匹配，只能整句改写。
+//
+// 2026-10-29 用**生产 dump 真实请求**回放的实测矩阵（每次只改一项）：
+//
+//	原样                          → 11128
+//	**大写化**                    → 11128  ← 上游大小写不敏感，转大写骗不过
+//	插零宽断词                    → 11128
+//	改措辞 You are a coding assistant, an official CLI for Claude.  → 200
+//	去掉 Claude Code              → 200
+//	改成中文                      → 200
+//	加中性前缀                    → 200
+//	只留前半句 / 只留后半句       → 200
+//
+// 结论：必须**改掉字母本身**。这里选「替换成中性措辞」——保持语义可读
+// （模型仍知道自己在做 CLI 助手），但字面量与官方不同。
+//
+// 注意：早期版本用 strings.ToUpper 改写，在简化请求上测通过、在真实请求上
+// 仍被拒——那是「大写化」这一条路本身无效，不是实现写错了。
+var channelAttributionRewrites = []struct {
+	trigger string
+	replace string
+}{
+	{
+		"You are Claude Code, Anthropic's official CLI for Claude",
+		"You are a coding assistant, an official CLI for Claude",
+	},
+	{
+		"Codex CLI is an open source project led by OpenAI",
+		"A CLI coding tool is an open source project.",
+	},
+	// 2026-10-29（另一台设备上的生产实测）：DeepSeek Harness 的客户端归属句
+	// 同样命中 11128。它出现在系统提示里声明自己是官方 harness，
+	// 改写后（换成中性说法）通过。
+	{
+		"You are DeepSeek Harness",
+		"You are a coding assistant",
+	},
+	// 带 @ 的产品标识（skill 清单里的 `@anthropic-ai`、`@deepseek-ai` 这类包名写法）。
+	// 上游把它们当渠道特征匹配；去掉 @ 前缀后不再命中，语义仍是「某个包」。
+	{"@anthropic-ai", "anthropic-ai"},
+	{"@deepseek-ai", "deepseek-ai"},
+}
+
+
+// neutralizeSystemFirstLine 断开 system 消息**首行**里的渠道触发 token。
+//
+// 上游的渠道校验窗口实测限定在 system 的第一行（详见函数调用点注释与
+// docs/channel-verification.md）：同句出现在第二行或加前缀即通过。
+// 只处理首行 = 最小改动面：句子其余部分与后面全部正文原样不动。
+//
+// system 可能是字符串，也可能是 part 数组（官方客户端两种都用），逐个分支处理。
+// 返回值报告是否发生改动。
+func neutralizeSystemFirstLine(obj any, changed *bool) bool {
+	root, ok := obj.(map[string]any)
+	if !ok {
+		return false
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return false
+	}
+	touched := false
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "system") {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			orig := content
+			head, rest := splitFirstLine(content)
+			if broken := breakFirstLineTokens(head, changed); broken != head {
+				content = broken + rest
+			}
+			// system 全文档（2026-11-04）：`workspace root` 这类触发点与位置无关，
+			// 出现在 system 第 105 行照样被拒（前置测试：加前缀无效、挪到 user 消息
+			// 才通过）。首行档覆盖不到它，所以对整条 system 再做一次全域改写。
+			content = breakSystemBodyTokens(content, changed)
+			if content != orig {
+				message["content"] = content
+				touched = true
+			}
+		case []any:
+			// part 数组：每一块都是一次「首行」机会——上游对块内首行同样校验。
+			for _, rawPart := range content {
+				part, ok := rawPart.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, ok := part["text"].(string)
+				if !ok {
+					continue
+				}
+				orig := text
+				head, rest := splitFirstLine(text)
+				if broken := breakFirstLineTokens(head, changed); broken != head {
+					text = broken + rest
+				}
+				text = breakSystemBodyTokens(text, changed)
+				if text != orig {
+					part["text"] = text
+					touched = true
+				}
+			}
+		}
+	}
+	return touched
+}
+
+// breakSystemBodyTokens 对 **system 全文档**（不限首行）改写位置无关的触发短语。
+//
+// 为什么需要单独一档（2026-11-04 现场）：
+// 首行档只覆盖「上游只看 system 首行」这一类触发点（billing 头、Claude Code 归属句）。
+// 但 `workspace root` 不是首行敏感——它出现在 DSH 的 system 第 105 行照样被拒：
+//
+//	system 去掉该行        → 200
+//	system 保留该行        → 400
+//	同一行挪到 user 消息    → 200     ← 只有当它在 system 里才拒
+//	该行加 20 字节前缀      → 400     ← 前缀无效，与首行档的规则相反
+//	`workspace root`       → 400
+//	`workspace roox`       → 200     ← 改一个字母即可
+//	`workspace rooT`       → 400     ← 大小写不敏感
+//
+// 换句话说这是一条**位置约束不同的独立规则**，塞进首行档永远命中不了。
+//
+// 改写策略：把 `workspace root` 换成 `workspace base`——同义、同长、语义可读，
+// 且已实测 200。不做删除（会破坏 dsh 给模型的工作区路径说明，模型可能因此
+// 误解相对路径的解析基准）。
+//
+// 只动 system：官方客户端在 **user** 消息的 IDENTITY.md 模板里也发这个短语
+// （抓包 6/6 命中）且能 200，说明 user 侧不受此规则约束——动它只会白白改变
+// 用户可见内容。
+func breakSystemBodyTokens(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	lowered := strings.ToLower(text)
+	trigger := "workspace root"
+	const repl = "workspace base"
+	index := indexFrom(lowered, trigger, 0)
+	if index < 0 {
+		return text
+	}
+	// 大小写不敏感替换：上表实测 `workspace rooT` 同样被拒，所以不能只匹配小写原样。
+	var b strings.Builder
+	b.Grow(len(text))
+	last := 0
+	for index >= 0 {
+		b.WriteString(text[last:index])
+		b.WriteString(repl)
+		last = index + len(trigger)
+		index = indexFrom(lowered, trigger, last)
+	}
+	b.WriteString(text[last:])
+	*changed = true
+	return b.String()
+}
+
+// splitFirstLine 把文本切成首行与其余部分（rest 保留换行符本身）。// 无换行符时整条文本就是首行（head=全量、rest 为空）——单行 system 的首行即其全部，
+// 上游照样检查它，因此必须处理（2026-10-17：早前一版把这种形态跳过，导致
+// 「单行 system 含触发串」漏检）。
+func splitFirstLine(text string) (head, rest string) {
+	if index := strings.IndexByte(text, '\n'); index >= 0 {
+		return text[:index], text[index:]
+	}
+	return text, ""
+}
+
+// breakFirstLineTokens 对首行内命中的 token 逐词断字（幂等）。
+//
+// 零宽容 + 幂等（2026-10-17 实测修正，两处都必需）：
+//
+//  1. **匹配前剥掉零宽字符**：Claude Code 的系统提示首行自带零宽空格——Anthropic
+//     自己在每个单词首字母后插了 U+200B（防字符串级检测），实际发来的字节是
+//     "x​-a​nthropic-..."，而表里是纯 ASCII。逐字节 Contains 永不命中，
+//     中和从未生效。
+//
+//  2. **输出前也剥掉零宽字符**（先归一化再断词）：多档重试会对同一 token 反复断词，
+//     零宽字符**累积**——生产落盘样本实测到 5 层嵌套：
+//     `x[5ZW]-a[5ZW]nthropic-b[5ZW]illing-h[5ZW]eader: ...`
+//     这种「被反复篡改」的形态本身就是异常特征，等于把「非官方客户端」写在脸上。
+//     归一化后每档输出形态一致（每词首一个零宽），重试不再叠加。
+//
+// 实现：先把首行归一化成「纯可见文本」，再一次性插入断词，输出即最终形态——
+// 因此同一份文本无论经过多少次中和，输出都逐字节相同。副作用是**命中时**首行里
+// 客户端的其它零宽字符会被顺带清掉；那些字符对模型无语义价值，清掉反而更接近
+// 官方客户端的正常形态。未命中时首行一个字节都不动（见下方 return）。
+func breakFirstLineTokens(head string, changed *bool) string {
+	// 归一化：剥掉全部零宽类字符，用于**匹配**（客户端自己就在词间插了零宽，
+	// 直接按字面量 Contains 永远命不中）。
+	visible := make([]byte, 0, len(head))
+	for i := 0; i < len(head); {
+		size, isZW := zeroWidthAt(head, i)
+		if isZW {
+			i += size
+			continue
+		}
+		visible = append(visible, head[i])
+		i++
+	}
+	if len(visible) == 0 {
+		return head
+	}
+	plain := string(visible)
+
+	// 改写：删掉触发串里会被上游匹配的片段（见 channelTokenRewrites 的实测矩阵）。
+	//
+	// 2026-10-29 起不再插零宽空格：上游已改成模糊匹配，断词（零宽或普通空格）
+	// 照样被拒。改写字母后同一句立即 200，且改动面最小（只删 "x-" 两个字节）。
+	rewritten := plain
+	touched := false
+	for _, rw := range channelTokenRewrites {
+		for {
+			index := indexFrom(rewritten, rw.trigger, 0)
+			if index < 0 {
+				break
+			}
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(rw.trigger):]
+			touched = true
+		}
+	}
+	// 归属句整句替换。必须改掉字母——大写化与断词都已被实测否决（见
+	// channelAttributionRewrites 上的矩阵）。
+	//
+	// ═══ 为什么必须忽略大小写和零宽 ═══
+	//
+	// Claude Code 2.1.312 发来的原文本身就是**大写 + 词间插零宽**：
+	//   "Y​OU A​RE C​LAUDE C​ODE, A​NTHROPIC'S​ ..."
+	// 直接按小写字面量 `You are Claude Code, ...` 匹配永远命中不了，
+	// 改写因此从未生效（2026-10-29 生产 dump 实测：三档重试全被拒）。
+	// 归一化后的 plain 已经剥掉零宽，这里再按小写比一次。
+	lowered := strings.ToLower(rewritten)
+	for _, rw := range channelAttributionRewrites {
+		trigger := strings.ToLower(rw.trigger)
+		for {
+			index := indexFrom(lowered, trigger, 0)
+			if index < 0 {
+				break
+			}
+			// 两串同步替换：rewritten 保留原大小写风格之外的措辞，lowered 只用于
+			// 后续定位。length 可能不同，所以每次都用同一段区间一起改。
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(trigger):]
+			lowered = lowered[:index] + strings.ToLower(rw.replace) + lowered[index+len(trigger):]
+			touched = true
+		}
+	}
+	// 未命中任何触发串：**原样返回 head**，不要落回归一化结果。
+	// 零宽剥离只用于匹配——首行里客户端自带的零宽字符对模型无语义价值，但
+	// 「没触发就一个字节都不动」是零误伤的契约（2026-10-17 起就有测试守着）。
+	if !touched || rewritten == head {
+		return head
+	}
+	*changed = true
+	return rewritten
+}
+
+// zeroWidthAt 报告 head[i] 处是否是一个零宽/格式类字符，并返回其字节长度。
+// 覆盖 Claude Code 实际使用的 U+200B，以及同类常见形态（U+200C/200D/2060/FEFF）
+// ——它们在「两个字母之间插入」这件事上对匹配的影响完全相同。
+func zeroWidthAt(s string, i int) (int, bool) {
+	if i >= len(s) {
+		return 0, false
+	}
+	switch {
+	case s[i] == 0xE2: // U+2000–U+206F 区（含 200B/200C/200D/2060）
+		if i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0x8B || s[i+2] == 0x8C || s[i+2] == 0x8D) {
+			return 3, true
+		}
+		if i+2 < len(s) && s[i+1] == 0x81 && s[i+2] == 0xA0 { // U+2060 word joiner
+			return 3, true
+		}
+		return 1, false
+	case s[i] == 0xEF: // U+FEFF BOM / zero width no-break space
+		if i+2 < len(s) && s[i+1] == 0xBB && s[i+2] == 0xBF {
+			return 3, true
+		}
+		return 1, false
+	}
+	return 1, false
+}
+
+// neutralizeMessageText 只对消息正文断词：content（字符串或 part 数组的 text/thinking）、
+// reasoning_content 与顶层 system。工具名、调用编号、工具参数、枚举值等结构性字符串不动，
+// 避免破坏工具配对与 schema 校验。
+func neutralizeMessageText(obj any, mode int) bool {
+	root, ok := obj.(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	apply := func(text string) string {
+		if text == "" {
+			return text
+		}
+		if mode == channelTextModeAll {
+			return breakAllWords(text, &changed)
+		}
+		return breakAttributionSentences(text, &changed)
+	}
+	visit := func(message map[string]any) {
+		if content, ok := message["content"].(string); ok {
+			message["content"] = apply(content)
+			return
+		}
+		if parts, ok := message["content"].([]any); ok {
+			for _, raw := range parts {
+				part, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				for _, key := range []string{"text", "thinking", "input_text"} {
+					if text, ok := part[key].(string); ok {
+						part[key] = apply(text)
+					}
+				}
+			}
+		}
+		if text, ok := message["reasoning_content"].(string); ok {
+			message["reasoning_content"] = apply(text)
+		}
+	}
+	if messages, ok := root["messages"].([]any); ok {
+		for _, raw := range messages {
+			if message, ok := raw.(map[string]any); ok {
+				visit(message)
+			}
+		}
+	}
+	if text, ok := root["system"].(string); ok {
+		root["system"] = apply(text)
+	}
+	return changed
+}
+
+// breakAllWords 正文全量档：**改写字母**，不再插零宽。
+//
+// 2026-10-29 实测：上游改成模糊匹配后，插零宽空格（wafBreakMarker）已经无效——
+// 生产日志的直接证据是「已中和渠道触发词（第 2 级）」之后仍然 11128。
+// 第 0 档改成了改写字母，但升级档漏改，于是没命中第 0 档的请求升到第 2 档、
+// 插一堆零宽，照样被拒。
+//
+// 现在的做法：先按已知触发串改写（与第 0 档同一张表），再兜底——对每个命中
+// 「自称客户端」特征的句子删掉产品名。两档共用同一实现，差别只在兜底的句域：
+// 第 1 档逐句判定归属特征，第 2 档（all=true）对全部正文都过一遍。
+func breakAllWords(text string, changed *bool) string {
+	return rewriteAttributionText(text, changed, true)
+}
+
+// breakAttributionSentences 归属句档：只改写「自称客户端」的句子。
+func breakAttributionSentences(text string, changed *bool) string {
+	return rewriteAttributionText(text, changed, false)
+}
+
+// rewriteAttributionText 按已知触发串改写字母（零宽断词已失效，见 breakAllWords 注释）。
+//
+// 两档都做兜底改写：已知表只覆盖两个客户端，未列出的客户端仍会自称，必须有
+// 一条不依赖字面量的路径。all 只控制兜底的句域范围——
+// false（第 1 档）逐句判定归属特征，true（第 2 档）对全部正文都试一遍。
+func rewriteAttributionText(text string, changed *bool, all bool) string {
+	rewritten, touched := rewriteKnownTriggers(text)
+	// 逐句兜底：句子含「官方归属措辞 + 产品名」但没被已知表覆盖时，删掉产品名。
+	// 不插字符、不改句子结构，模型读到的仍是「自称是某 CLI 助手」的语义。
+	var builder strings.Builder
+	builder.Grow(len(rewritten))
+	last := 0
+	for _, span := range sentenceSpans(rewritten) {
+		segment := rewritten[span[0]:span[1]]
+		if !all && !isChannelAttribution(segment) {
+			continue
+		}
+		if replaced, ok := stripClientName(segment); ok {
+			builder.WriteString(rewritten[last:span[0]])
+			builder.WriteString(replaced)
+			last = span[1]
+			touched = true
+		}
+	}
+	if last > 0 {
+		builder.WriteString(rewritten[last:])
+		rewritten = builder.String()
+	}
+	// 幂等判据：内容没变就不报改动。
+	//
+	// 这一步必需——stripZeroWidth 只用于匹配，若正文里本来就没有触发串，
+	// 上面的 touched 可能因为「剥零宽后重编码」而误报 true（例如客户端自带
+	// 零宽字符、但没有触发串）。调用方拿 changed 决定要不要重发，
+	// 误报会导致无意义的重试（2026-10-29 生产实测的「第 2 级中和后仍被拒」
+	// 有一部分就是这类空转）。
+	if !touched || rewritten == text {
+		return text
+	}
+	*changed = true
+	return rewritten
+}
+
+// rewriteKnownTriggers 按 channelTokenRewrites / channelAttributionRewrites 改写字母。
+// 与第 0 档的 breakFirstLineTokens 用同一张表、同一套「归一化后忽略大小写匹配」，
+// 但作用于任意文本而非仅首行。
+func rewriteKnownTriggers(text string) (string, bool) {
+	visible := stripZeroWidth(text)
+	if visible == "" {
+		return text, false
+	}
+	rewritten := visible
+	touched := false
+	for _, rw := range channelTokenRewrites {
+		for {
+			index := indexFrom(rewritten, rw.trigger, 0)
+			if index < 0 {
+				break
+			}
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(rw.trigger):]
+			touched = true
+		}
+	}
+	lowered := strings.ToLower(rewritten)
+	for _, rw := range channelAttributionRewrites {
+		trigger := strings.ToLower(rw.trigger)
+		for {
+			index := indexFrom(lowered, trigger, 0)
+			if index < 0 {
+				break
+			}
+			rewritten = rewritten[:index] + rw.replace + rewritten[index+len(trigger):]
+			lowered = lowered[:index] + strings.ToLower(rw.replace) + lowered[index+len(trigger):]
+			touched = true
+		}
+	}
+	if !touched {
+		return text, false
+	}
+	return rewritten, true
+}
+
+// zeroWidthMarkers 除 U+200B 之外的同类零宽/格式字符（U+200C/200D/2060/FEFF）。
+// 用常量拼接而不是字面量：U+FEFF 直接写进源码会被编译器当成 BOM 拒绝。
+var zeroWidthMarkers = []string{
+	"\u200c", "\u200d", "\u2060", string(rune(0xFEFF)),
+}
+
+// stripZeroWidth 剥掉零宽类字符（仅用于匹配，见 breakFirstLineTokens 的同名逻辑）。
+func stripZeroWidth(text string) string {
+	if !strings.Contains(text, wafBreakMarker) {
+		// 快速路径：绝大多数文本没有零宽字符，避免逐字节重建。
+		for _, marker := range zeroWidthMarkers {
+			if strings.Contains(text, marker) {
+				goto rebuild
+			}
+		}
+		return text
+	}
+rebuild:
+	visible := make([]byte, 0, len(text))
+	for i := 0; i < len(text); {
+		size, isZW := zeroWidthAt(text, i)
+		if isZW {
+			i += size
+			continue
+		}
+		visible = append(visible, text[i])
+		i++
+	}
+	return string(visible)
+}
+
+// stripClientName 删掉句中的产品名（兜底改写，用于未列入词表的客户端）。
+//
+// 只删产品名本身，不动「official CLI for ...」这类归属措辞之外的正文：
+// 实测「去掉 Claude Code」「只留后半句」都能通过，删产品名是最小改动面。
+//
+// 两条规则，按优先级：
+//  1. 命中 channelClientNames 里的已知产品名 → 删掉它；
+//  2. 未命中时按通用句式「You are <名字>, ...」删掉名字段——
+//     未列入词表的客户端（"You are Foobar, the official CLI for Baz."）走这条。
+func stripClientName(segment string) (string, bool) {
+	lowered := strings.ToLower(segment)
+	for _, name := range channelClientNames {
+		// 整词匹配，不是子串：`authorized` 里的 "zed" 不算客户端名（见
+		// channelClientNames 上方的现场记录）。
+		index := indexWordIn(lowered, name)
+		if index < 0 {
+			continue
+		}
+		// 去掉产品名及其后的空白，保留句子其余部分。
+		rest := segment[index+len(name):]
+		rest = strings.TrimLeft(rest, " \t")
+		head := segment[:index]
+		if strings.TrimSpace(head) == "" && strings.TrimSpace(rest) == "" {
+			continue
+		}
+		return head + rest, true
+	}
+	return stripSelfIntroduction(segment)
+}
+
+// stripSelfIntroduction 处理「You are <名字>, <归属措辞>」这种通用自称句式。
+//
+// 这是不依赖字面量的最后一条路径：只要句子是「You are X, ... official CLI/IDE/...」，
+// 就把 X 换成中性词。产品名未列入 channelClientNames 时靠它救回来
+// （2026-10-29 生产日志：未知客户端的第 1 级重试仍被拒，因为旧实现只查已知表）。
+func stripSelfIntroduction(segment string) (string, bool) {
+	const prefix = "you are "
+	lowered := strings.ToLower(segment)
+	index := indexFrom(lowered, prefix, 0)
+	if index < 0 {
+		return segment, false
+	}
+	start := index + len(prefix)
+	// 名字段到第一个逗号为止；没有逗号就不是这个句式。
+	rest := segment[start:]
+	comma := strings.IndexByte(rest, ',')
+	if comma <= 0 {
+		return segment, false
+	}
+	name := strings.TrimSpace(rest[:comma])
+	if name == "" || len(name) > 40 {
+		return segment, false
+	}
+	// 只换名字段，保留「, <归属措辞>」的其余部分。
+	return segment[:start] + "a coding assistant" + rest[comma:], true
+}
+
+// sentenceSpans 按句末标点与换行切句，返回半开区间的字节偏移。
+func sentenceSpans(text string) [][2]int {
+	spans := [][2]int{}
+	start := 0
+	for index, r := range text {
+		switch r {
+		case '.', '!', '?', '\n', '\r', '\u3002', '\uff01', '\uff1f', '\uff1b':
+			if index > start {
+				spans = append(spans, [2]int{start, index})
+			}
+			start = index + len(string(r))
+		}
+	}
+	if start < len(text) {
+		spans = append(spans, [2]int{start, len(text)})
+	}
+	return spans
+}
+
+// isChannelAttribution 判断句子是否在声明客户端归属。
+func isChannelAttribution(segment string) bool {
+	lower := strings.ToLower(segment)
+	for _, marker := range channelAttributionMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	named := false
+	for _, name := range channelClientNames {
+		if strings.Contains(lower, name) {
+			named = true
+			break
+		}
+	}
+	// 「你是 X」式自我介绍也属于归属声明（产品名在表内时）。
+	if !named {
+		return false
+	}
+	return strings.Contains(lower, "you are ") || strings.Contains(lower, "i am ") ||
+		strings.Contains(lower, "assistant") || strings.Contains(lower, "agent")
+}
+
+// insertBreaks 按升序偏移插入零宽标记，第二个返回值报告是否真的插入了标记。
+//
+// 已带标记的位置跳过（幂等）：多档重试会对同一段正文反复断词，若同一位置再插一个，
+// 零宽字符就累积成 5 层嵌套（生产落盘实测），形态本身就是「非官方客户端」的铁证。
+//
+// 返回值必须精确（2026-10-17）：调用方用 changed 决定「要不要改写 body 重发」。
+// 若全是已标记位置（无新断点），返回 false —— 否则调用方会把一份已知被拒的请求
+// 原样再发一次，白等一趟往返。
+func insertBreaks(text string, points []int) (string, bool) {
+	sortInts(points)
+	out := make([]byte, 0, len(text)+len(points)*len(wafBreakMarker))
+	prev := 0
+	inserted := false
+	for _, pos := range points {
+		if pos <= prev || pos >= len(text) {
+			continue
+		}
+		if _, isZW := zeroWidthAt(text, pos); isZW {
+			continue // 该位置已有标记
+		}
+		out = append(out, text[prev:pos]...)
+		out = append(out, wafBreakMarker...)
+		prev = pos
+		inserted = true
+	}
+	if !inserted {
+		return text, false
+	}
+	out = append(out, text[prev:]...)
+	return string(out), true
+}
+
+// neutralizeChannelJSONValue 递归遍历解码后的 JSON，对每个字符串做触发句断词。
+func neutralizeChannelJSONValue(value any, changed *bool) any {
+	switch node := value.(type) {
+	case string:
+		return neutralizeChannelText(node, changed)
+	case []any:
+		for i, item := range node {
+			node[i] = neutralizeChannelJSONValue(item, changed)
+		}
+		return node
+	case map[string]any:
+		for key, item := range node {
+			node[key] = neutralizeChannelJSONValue(item, changed)
+		}
+		return node
+	default:
+		return value
+	}
+}
+
+// neutralizeChannelText 在单个字符串内断开全部命中句子，报告是否发生改动。
+func neutralizeChannelText(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	insertAt := map[int]struct{}{}
+	for _, sentence := range channelTriggerSentences {
+		start := 0
+		for {
+			index := indexFrom(text, sentence, start)
+			if index < 0 {
+				break
+			}
+			for _, pos := range wordBreakPoints(text, index, index+len(sentence)) {
+				insertAt[pos] = struct{}{}
+			}
+			start = index + len(sentence)
+		}
+	}
+	for _, parts := range channelTriggerFingerprints {
+		if len(parts) < 2 {
+			continue
+		}
+		start := indexFrom(text, parts[0], 0)
+		if start < 0 {
+			continue
+		}
+		end := start + len(parts[0])
+		complete := true
+		for _, part := range parts[1:] {
+			index := indexFrom(text, part, end)
+			if index < 0 {
+				complete = false
+				break
+			}
+			end = index + len(part)
+		}
+		if !complete {
+			continue
+		}
+		for _, pos := range wordBreakPoints(text, start, end) {
+			insertAt[pos] = struct{}{}
+		}
+	}
+	if len(insertAt) == 0 {
+		return text
+	}
+	points := make([]int, 0, len(insertAt))
+	for pos := range insertAt {
+		points = append(points, pos)
+	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
+	*changed = true
+	return out
+}
+
+// indexFrom 从 from 起查找 needle 的字节偏移（区分大小写；触发句大小写固定）。
+func indexFrom(text, needle string, from int) int {
+	if from >= len(text) {
+		return -1
+	}
+	index := -1
+	for i := from; i+len(needle) <= len(text); i++ {
+		if text[i:i+len(needle)] == needle {
+			index = i
+			break
+		}
+	}
+	return index
+}
+
+// wordBreakPoints 返回片段内每个单词首字母之后的插入点（原字符串字节偏移）。
+// 单词以 ASCII 字母/数字起始，遇到空格、标点或大小写之外的分隔即结束。
+//
+// 零宽字符**整个序列**都要跳过（幂等关键，2026-10-17 修正）：
+//
+//   - 它不算分隔符——否则「a​b」被看成两个单词，再断一次就在原标记后
+//     又插一个，多档重试累积成 5 层嵌套（生产落盘实测）；
+//   - 而且必须按 zeroWidthAt 返回的长度整块跳过。此前循环是 `i++`，U+200B 的
+//     第 2、3 字节（0x80 0x8B）会被当作普通分隔符各扫一遍，于是「词首字母后」
+//     判定重新成立，又在词中插入新的断点——这正是 ​ 后紧跟新断点的来源。
+func wordBreakPoints(text string, start, end int) []int {
+	points := []int{}
+	atWordStart := true
+	for i := start; i < end; {
+		c := text[i]
+		if size, isZW := zeroWidthAt(text, i); isZW {
+			i += size // 整块跳过，零宽不改变「仍在单词内」的状态
+			continue
+		}
+		i++
+		if isASCIIAlnum(c) {
+			if atWordStart {
+				points = append(points, i)
+				atWordStart = false
+			}
+			continue
+		}
+		atWordStart = true
+	}
+	return points
+}
+
+// preNeutralizeTriggers 发送前就要断开的触发串。
+//
+// 为什么不能只断计费头：这些串几乎每个请求都出现，而线上实测显示，只提前断计费头时仍有
+// 约六成请求被 11128 拒一次、再靠第 0 档补救成功（每次白花 200–500ms 往返）——剩下那两条
+// 归属句同样在触发校验。既然第 0 档本来就会在拒绝后断它们，就直接提前断，省掉这次往返。
+// 零宽空格不可见，模型读到的文字与客户端解析都不变；触发词之外的正文一律原样发送。
+var preNeutralizeTriggers = []string{
+	// Claude Code 2.1.283 系统提示首行的计费归属头：整行被拒、只留头名也被拒；
+	// "x-anthropic-" 或 "x-anthropic-version:" 等其他头通过（2026-09-28 实测）。
+	"x-anthropic-billing-header",
+	// 以下两条来自第 0 档已实测指纹（channelTriggerSentences）。
+	"Codex CLI is an open source project led by OpenAI",
+	"You are Claude Code, Anthropic's official CLI for Claude",
+	// 2026-10-29：DeepSeek Harness 的归属句与带 @ 的包名标识同样命中 11128。
+	// 提前改写省掉「先被拒一次再重试」的往返（与上面三条同理）。
+	"You are DeepSeek Harness",
+	"@anthropic-ai",
+	"@deepseek-ai",
+}
+
+// NeutralizeBillingHeaders 发送前断开 system 首行的已知渠道触发串；没命中时原样返回 false。
+// 与 NeutralizeChannelTriggerAt 的分工：这里是「已知必被拒、且无信息价值」的提前处理，
+// 那边是「被拒之后的逐档补救」。
+//
+// 2026-10-17 收窄作用域：此前对 body 全文递归断词（neutralizePreemptValue），
+// 而实测确认上游只看 system 的**第一行**（同句加到第二行或加 20 字节前缀即通过）。
+// 全文断词会在整篇历史消息里插入大量零宽字符（每条历史 system/user 正文都中），
+// 既无必要也增加上游侧解析不确定性；改为只处理 system 首行后，
+// 未命中首行的请求 body 一个字节都不变。
+func NeutralizeBillingHeaders(body []byte) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	// 廉价前置：全部触发串都以 ASCII 形式出现在 body 里才会命中。
+	// 之前无条件做一次完整 JSON 解码 + 递归遍历 + 重编码——60 万 token 的上下文
+	// 这一趟要 7–15ms，而绝大多数请求（CN、非 Claude Code 客户端）根本不含触发串，
+	// 白做一遍。这里先做字节级 Contains（O(n) 且不分配对象图），确认可能命中才解码。
+	if !containsAnyTrigger(body) {
+		return body, false
+	}
+	var obj any
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
+		return body, false
+	}
+	changed := false
+	// 首行档：计费头、归属句这类「上游只看 system 第一行」的串。
+	if neutralizeSystemFirstLine(obj, &changed) {
+		changed = true
+	}
+	// 全文档：与位置无关的串（包名写法 @anthropic-ai 之类）。
+	//
+	// 为什么要单独一条路径：@ 开头的包名出现在 system 正文中段（skill 清单、
+	// 工具描述），不在首行——只走首行档会完全漏掉。这类串本身不含「渠道归属」
+	// 语义，改动它们对模型无影响，因此可以全文处理而不违反零误伤契约。
+	if neutralizeAnywhereTokens(obj, &changed) {
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// anywhereTokens 与位置无关、可全文改写的串（不限于 system 首行）。
+//
+// 入选标准：出现在任何位置都会被上游当渠道特征匹配，且改写后语义不变。
+// 与 preNeutralizeTriggers 的区别：后者是「已知在首行必被拒」的串，
+// 这里的是「在哪都可能被拒」的串。
+var anywhereTokens = []struct{ trigger, replace string }{
+	// 包名写法：@anthropic-ai/sdk、@deepseek-ai/core 这类。去掉 @ 前缀即可，
+	// 仍是可读的包名（anthropic-ai/sdk），模型不受影响。
+	{"@anthropic-ai", "anthropic-ai"},
+	{"@deepseek-ai", "deepseek-ai"},
+}
+
+// neutralizeAnywhereTokens 对消息正文做与位置无关的串改写。
+//
+// 只动命中的字面量，其余字节原样保留（与首行档同一契约）。
+func neutralizeAnywhereTokens(obj any, changed *bool) bool {
+	root, ok := obj.(map[string]any)
+	if !ok {
+		return false
+	}
+	touched := false
+	apply := func(text string) string {
+		if text == "" {
+			return text
+		}
+		out := text
+		for _, rw := range anywhereTokens {
+			for {
+				index := indexFrom(out, rw.trigger, 0)
+				if index < 0 {
+					break
+				}
+				out = out[:index] + rw.replace + out[index+len(rw.trigger):]
+				touched = true
+			}
+		}
+		return out
+	}
+	visit := func(message map[string]any) {
+		if content, ok := message["content"].(string); ok {
+			message["content"] = apply(content)
+			return
+		}
+		if parts, ok := message["content"].([]any); ok {
+			for _, raw := range parts {
+				part, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				for _, key := range []string{"text", "thinking", "input_text"} {
+					if text, ok := part[key].(string); ok {
+						part[key] = apply(text)
+					}
+				}
+			}
+		}
+	}
+	if messages, ok := root["messages"].([]any); ok {
+		for _, raw := range messages {
+			if message, ok := raw.(map[string]any); ok {
+				visit(message)
+			}
+		}
+	}
+	if text, ok := root["system"].(string); ok {
+		root["system"] = apply(text)
+	}
+	if touched {
+		*changed = true
+	}
+	return touched
+}
+
+// containsAnyTrigger 报告 body 里是否**可能**含有任一触发串（字节级，区分大小写）。
+//
+// 只用于提前退出：宁可多解码一次，也不能漏判——所以对每条触发串都做一次
+// bytes.Contains。成本是 O(len(body) × 串数)，但不构造任何对象图。
+// 触发串本身是纯 ASCII 字面量（见 TestTriggerTablesHoldCleanStrings），而客户端
+// 发来的同句会在词间插零宽字符，因此这里再加一条「剥零宽后的局部匹配」太贵也不必要：
+// 只要命中就必须进完整路径，完整路径自己会做归一化。
+func containsAnyTrigger(body []byte) bool {
+	for _, sentence := range channelTriggerSentences {
+		if bytes.Contains(body, []byte(sentence)) {
+			return true
+		}
+	}
+	for _, token := range channelFirstLineTriggerTokens {
+		if bytes.Contains(body, []byte(token)) {
+			return true
+		}
+	}
+	// 预改写表里的串也要检查：它们同样需要进入完整路径才能被改写。
+	// 漏掉这一步的表现是「发送前预改写从不触发」，请求照旧先撞一次 11128。
+	for _, trigger := range preNeutralizeTriggers {
+		if bytes.Contains(body, []byte(trigger)) {
+			return true
+		}
+	}
+	// 组合指纹：两个片段都要出现。
+	for _, parts := range channelTriggerFingerprints {
+		all := true
+		for _, part := range parts {
+			if !bytes.Contains(body, []byte(part)) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	// 零宽形态：客户端把触发串断过词时，上面的 ASCII 匹配会落空，但归一化后仍会命中。
+	// 只检查「body 里有没有零宽字符」——有就必须进完整路径（低频，代价可接受）。
+	return bytes.Contains(body, []byte(wafBreakMarker))
+}
+
+// neutralizePreemptValue 递归遍历解码后的 JSON，断开计费头触发串。
+//
+// DeptestOnly：保留给跨包回归测试（锁定历史的全文断词语义）。
+// 生产路径改用 neutralizeSystemFirstLine（见 NeutralizeBillingHeaders 注释）。
+func neutralizePreemptValue(value any, changed *bool) any {
+	switch node := value.(type) {
+	case string:
+		return neutralizePreemptText(node, changed)
+	case []any:
+		for i, item := range node {
+			node[i] = neutralizePreemptValue(item, changed)
+		}
+		return node
+	case map[string]any:
+		for key, item := range node {
+			node[key] = neutralizePreemptValue(item, changed)
+		}
+		return node
+	default:
+		return value
+	}
+}
+
+// neutralizePreemptText 在单个字符串内断开全部计费头触发串。
+func neutralizePreemptText(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	insertAt := map[int]struct{}{}
+	for _, trigger := range preNeutralizeTriggers {
+		start := 0
+		for {
+			index := indexFrom(text, trigger, start)
+			if index < 0 {
+				break
+			}
+			for _, pos := range wordBreakPoints(text, index, index+len(trigger)) {
+				insertAt[pos] = struct{}{}
+			}
+			start = index + len(trigger)
+		}
+	}
+	if len(insertAt) == 0 {
+		return text
+	}
+	points := make([]int, 0, len(insertAt))
+	for pos := range insertAt {
+		points = append(points, pos)
+	}
+	out, inserted := insertBreaks(text, points)
+	if !inserted {
+		return text
+	}
+	*changed = true
+	return out
+}

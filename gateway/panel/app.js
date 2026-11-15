@@ -1,0 +1,2554 @@
+"use strict";
+// ═══ 更新日志 ═══
+// 2026-10-10：新增积分有效期页；停用口径改为「文件级 ∪ 池级」并补池级复活按钮。
+// 2026-09-25：接入请求消费明细导航与刷新，保持筛选和历史分页状态。
+// 2026-09-24：忽略过时刷新响应，日志按完整行检测更新并补取改变后的条数；修正空成功时间、凭证到期判断和当前页刷新。
+// 2026-09-24：冷却截止时间随数据快照固定，搜索或切页不再重新开始倒计时；同一到期快照仅补取一次。
+// 2026-09-22：系统页新增「重复推理保护」热切换开关（命中后重发 / 命中即停止），
+//             进入页面即拉取当前运行期值，改完立即生效、不需要重启网关。
+// 2026-09-20：按 new-api 面板规范重做外观：顶栏横跨整宽并承载品牌与全局操作，
+//             页标题移入内容区，主题按钮从侧栏底部移到顶栏（不再需要 themeLabel）。
+// 2026-09-20：渲染按当前页收敛——刷新只重绘可见页（此前每次 30 秒刷新都重建全部
+//             页面的 DOM，长表格页在刷新瞬间会明显卡顿）；搜索输入加防抖。
+// 2026-09-20：2.1.2 冷却状态带实时倒计时（data-cool-end + 每秒就地刷新，归零自动补取
+//             一次数据），并把分钟级冷却显示成 mm:ss。
+// 2026-09-20：2.1.2 账号表状态列改显示冷却剩余与原因，最近活动区分「无成功记录」与
+//             「无记录」——此前冷却中的号把凭证有效期（剩 363 天）显示在「冷却中」旁，
+//             且只有错误记录时整列显示「从未」，两处都误导排查。
+// 2026-09-20：侧栏显示管理台实际版本，避免发布 2.1.1 后仍标为 v1。
+// 2026-09-19：积分查询失败时显示错误和缓存状态，避免把尚未取到的余额显示为零。
+// 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
+// 2026-09-18：退出失败时保留页面并显示错误，不再跳转伪装成功；重启提示与后台收尾行为保持一致。
+// 2026-09-16：接入密钥管理导航与本页刷新，侧栏不再下发或复制完整配置密钥。
+
+var $  = function(s, r){ return (r || document).querySelector(s); };
+var $$ = function(s, r){ return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+function esc(t){ return String(t == null ? '' : t).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function pad(n){ return n < 10 ? '0' + n : '' + n; }
+function num(n){ return (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US'); }
+// compactNum：日志表里的输入/缓存列。非数字（"-" 等缺失标记）原样返回，
+// 数字按 k/M 缩写，鼠标悬浮看原值（title 由调用方给出）。
+function compactNum(v){
+  if (v == null || v === '') return '-';
+  var n = Number(String(v).replace(/[, ]/g, ''));
+  if (isNaN(n)) return String(v);
+  if (n >= 1000000000) return (n / 1000000000).toFixed(2) + 'B';
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+// cacheLabel / cacheHint 渲染网关请求行的 cache= 列（v2.6.19）。
+// 这一列回答「这次该不该命中」：hit= 只说命中了多少，不说该不该有命中。
+//   cold       本会话首次请求，hit=0 属正常（前缀本来就没写过）
+//   prev=N     该会话上一轮输入 N token，与 hit= 直接比较即可判定是否丢失
+//   -          输入未知（上游没报 usage），无法判断
+function cacheLabel(it){
+  var c = (it && it.cache) || '-';
+  if (c === 'cold') return '冷启动';
+  if (c === '-') return '-';
+  var m = /^prev=(\d+)$/.exec(c);
+  if (m) return '上轮 ' + compactNum(m[1]);
+  return c;
+}
+function cacheHint(it){
+  var c = (it && it.cache) || '-';
+  if (c === 'cold') return '本会话首次请求：前缀还没写过，hit=0 属正常';
+  var m = /^prev=(\d+)$/.exec(c);
+  if (m) {
+    var prev = Number(m[1]);
+    var hit = Number(String((it && it.hit) || '').replace(/[, ]/g, ''));
+    if (!isNaN(hit) && hit > 0 && hit < prev * 0.5) {
+      return '上一轮输入 ' + prev + ' tokens，本轮只命中 ' + hit + ' —— 同会话内前缀丢失（异常）';
+    }
+    return '上一轮输入 ' + prev + ' tokens，与本轮「缓存命中」对比即可判断是否丢失';
+  }
+  return '输入未知（上游未返回 usage），无法判断是否该命中';
+}
+// debounce 让高频输入（搜索框）只在停顿后触发一次渲染。
+function debounce(fn, wait){
+  var t = null;
+  return function(){
+    var self = this, args = arguments;
+    if (t) clearTimeout(t);
+    t = setTimeout(function(){ t = null; fn.apply(self, args); }, wait);
+  };
+}
+function shortUid(u){ return (u && u.length > 18) ? u.slice(0, 8) + '…' + u.slice(-6) : (u || '—'); }
+function fmtTime(iso){
+  if (!iso) return '—';
+  var s = String(iso);
+  if (s.indexOf('0001-01-01') === 0) return '—';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return '—';
+  return pad(d.getMonth()+1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+function relTime(iso){
+  if (!iso) return '从未';
+  var s = String(iso);
+  if (s.indexOf('0001-01-01') === 0) return '从未';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return '从未';
+  var diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 0) return '即将';
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  if (diff < 2592000) return Math.floor(diff / 86400) + ' 天前';
+  return fmtTime(iso);
+}
+function daysLeft(sec){
+  if (!sec || !isFinite(Number(sec))) return null;
+  return Math.ceil((Number(sec) * 1000 - Date.now()) / 86400000);
+}
+function activityTime(iso){
+  if (!iso) return '';
+  var s = String(iso);
+  return s.indexOf('0001-01-01') === 0 || isNaN(new Date(s).getTime()) ? '' : s;
+}
+// coolLeft 把冷却剩余秒数格式化成人读文案。冷却与凭证有效期是两回事，状态列在冷却中
+// 必须显示冷却剩余，否则「冷却中 + 剩 363 天」会被读成冷却要等一年（用户实测反馈）。
+function coolLeft(sec){
+  var s = Number(sec) || 0;
+  if (s <= 0) return '即将恢复';
+  if (s < 60) return '剩 ' + s + ' 秒';
+  if (s < 3600) {
+    var mm = Math.floor(s / 60), ss = s % 60;
+    return '剩 ' + mm + ':' + (ss < 10 ? '0' : '') + ss;
+  }
+  if (s < 86400) {
+    var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return '剩 ' + h + ' 小时' + (m ? ' ' + m + ' 分' : '');
+  }
+  return '剩 ' + Math.round(s / 86400) + ' 天';
+}
+
+// 冷却倒计时：状态列只在下一次拉取数据时才重算，用户盯着页面看不到秒数变化。
+// 渲染时把截止时刻写进 data-cool-end，这里每秒就地更新文本；有账号归零时补一次
+// 刷新，让「冷却中」及时翻成可用状态。
+var COOL_TICK = null, COOL_RELOAD_PENDING = false;
+function startCoolTicker(){
+  if (COOL_TICK) return;
+  COOL_TICK = setInterval(tickCooldowns, 1000);
+}
+function tickCooldowns(){
+  var nodes = document.querySelectorAll('[data-cool-end]');
+  if (!nodes.length) return;
+  var now = Date.now(), expired = [];
+  for (var i = 0; i < nodes.length; i++){
+    var node = nodes[i];
+    var end = Number(node.getAttribute('data-cool-end')) || 0;
+    var left = Math.max(0, Math.round((end - now) / 1000));
+    var reason = node.getAttribute('data-cool-reason') || '';
+    if (left <= 0 && node.getAttribute('data-cool-refreshed') !== '1') expired.push(node);
+    node.textContent = coolLeft(left) + (reason ? ' · ' + reason : '');
+  }
+  if (!expired.length || COOL_RELOAD_PENDING) return;
+  // 归零后只补取一次：等后端把这号从冷却里摘掉再渲染，避免每秒重拉。
+  // 页面在后台时不补取——用户看不到，等切回来时 30s 定时器自然会拉新数据。
+  if (document.hidden) return;
+  expired.forEach(function(node){ node.setAttribute('data-cool-refreshed', '1'); });
+  COOL_RELOAD_PENDING = true;
+  setTimeout(async function(){
+    try { await loadAll(); } finally { COOL_RELOAD_PENDING = false; }
+  }, 1500);
+}
+// coolReason 冷却原因转可读文案。上游原始 reason 已是运维可读串（如 "429 rate limit"），
+// 只做英文短语到中文的映射，未知值原样透出，不编造。
+function coolReason(p){
+  var r = String((p && p.reason) || '');
+  if (!r) return '';
+  if (r.indexOf('429') >= 0) return '上游限流';
+  if (r.indexOf('14017') >= 0) return 'trial 未激活';
+  if (r.indexOf('6004') >= 0) return '模型限流';
+  if (r.indexOf('11140') >= 0) return '账号被上游封禁';
+  if (r.indexOf('404') >= 0) return '上游 404';
+  if (r.indexOf('余额') >= 0) return '余额不足';
+  return r;
+}
+// modelLimitTitle 模型级限流行的悬停说明：把 reason 翻译成中文，并透出上游原始的
+// 重置墙钟（reset_at 可能晚于 until——网关把冷却截到 soft_rate_max 封顶，真实
+// 恢复时刻以 reset_at 为准；两者相同则只显示一个）。
+function modelLimitTitle(m){
+  var why = String(m.reason || '');
+  var until = String(m.until).replace('T', ' ').replace(/Z$/, '').replace(/\+08:00$/, '');
+  // 11102 与限流是两种事，提示语不能共用「恢复时刻」这个说法（见 rlmKind 注释）。
+  if (rlmKind(m) === 'unavailable'){
+    return '上游答复该后端无此模型（11102 service info not found）。这是模型在当前上游' +
+      '不存在（下线或改名），不是限流——等到退避结束重试仍会失败。' +
+      '网关将在 ' + until + ' 后自动重试一次；也可以点「检测」立即验证。';
+  }
+  if (why.indexOf('6004') >= 0) why = '该模型用量已达上限（6004），其他模型不受影响';
+  else if (why.indexOf('11102') >= 0) why = '上游确认该模型不可用（11102）';
+  var reset = m.resetAt ? String(m.resetAt).replace('T', ' ').replace(/Z$/, '').replace(/\+08:00$/, '') : '';
+  var when = (reset && reset !== until) ? ('上游重置 ' + reset + '，网关先避让到 ' + until) : ('恢复时刻 ' + until);
+  return why + '；' + when;
+}
+// rlmOf 取账号的模型级台账（已过滤掉无 until 的残缺条目）。
+//
+// 台账形状来自网关 /status 的 accounts[].rate_limited_models[]：
+// {model, until, reset_at?, reason, kind?}。until 是网关避让截止，resetAt 是上游
+// 权威重置墙钟（截断场景下 until 更早）。排序/筛选统一用 until——它是「网关什么
+// 时候会再试这个模型」的真实时刻；resetAt 只用于展示补充。
+//
+// kind 区分两类语义完全不同的条目（后端 modelLimitKind 给出）：
+//   'rate'        —— 上游限流（6004/429），until 是「到点可能恢复」；
+//   'unavailable' —— 11102「该后端无此模型」，until 只是本地退避窗口，
+//                    到点重试仍然不通。二者不能用同一句「解除 X」表述。
+// 老后端不带 kind 时按 reason 前缀兜底推断，保证前后端可独立升级。
+function rlmKind(m){
+  var k = String((m && m.kind) || '');
+  if (k) return k;
+  return String((m && m.reason) || '').indexOf('11102') === 0 ? 'unavailable' : 'rate';
+}
+function rlmOf(a){
+  var p = (a && a.pool) || {};
+  return (p.rateLimitedModels || []).filter(function(m){ return m && m.until; });
+}
+// modelLimitEnd 取该账号在指定模型下的**限流**解除时刻（毫秒）。
+//
+// model 为空时取最早解除的那个——「这个号最快多久能恢复某个模型」正是运维排序时
+// 想要的语义。没有匹配 → Infinity（排最后，等价于「不受此约束」）。
+//
+// 11102（kind='unavailable'）不参与：它没有「解除」可言，把它算进排序会让一个
+// 「有个模型下线了」的号排到「正在限流 5 小时」的号前面，误导运维。
+// 指定 model 时同理——若该模型只有 11102 记录，视为不受限流约束。
+function modelLimitEnd(a, model){
+  var list = rlmOf(a);
+  var best = Infinity;
+  for (var i = 0; i < list.length; i++){
+    var m = list[i];
+    if (rlmKind(m) === 'unavailable') continue;
+    if (model && String(m.model || '') !== model) continue;
+    var t = new Date(m.until).getTime();
+    if (!isNaN(t) && t < best) best = t;
+  }
+  return best;
+}
+// limitedModels 汇总当前池子里所有被避让的模型名（去重、按名排序）。
+// 供模型筛选下拉框的选项来源——不写死模型表，模型名是客户端自选字段，池子里
+// 出现过哪些才列哪些。
+//
+// 2026-10-18：默认只收**限流**类（kind='rate'）。11102「该后端无此模型」不是
+// 限流，把它混进「按解除时间排序」的下拉里会让人以为「等到那个时刻就能用」，
+// 而实测那批模型对所有 CN 账号都返回 11102（是模型下线/改名，不是等待）。
+function limitedModels(accounts, includeUnavailable){
+  var seen = Object.create(null), out = [];
+  (accounts || []).forEach(function(a){
+    rlmOf(a).forEach(function(m){
+      if (!includeUnavailable && rlmKind(m) === 'unavailable') return;
+      var name = String(m.model || '');
+      if (name && !seen[name]){ seen[name] = 1; out.push(name); }
+    });
+  });
+  out.sort();
+  return out;
+}
+// fmtLimitWhen 把限流解除时刻格式化成本地「HH:MM」（跨天才带日期）。// 时间串来自后端（RFC3339）；浏览器按本地时区解释，面板用户看的就是本机时间。
+function fmtLimitWhen(raw){
+  var t = new Date(raw);
+  if (isNaN(t.getTime())) return String(raw || '');
+  function two(n){ return (n < 10 ? '0' : '') + n; }
+  var today = new Date(); today.setHours(0,0,0,0);
+  var day = new Date(t); day.setHours(0,0,0,0);
+  var clock = two(t.getHours()) + ':' + two(t.getMinutes());
+  var days = Math.round((day - today) / 86400000);
+  if (days === 0) return clock;
+  if (days === 1) return '明天 ' + clock;
+  return (t.getMonth() + 1) + '/' + t.getDate() + ' ' + clock;
+}
+function svg(inner, size){
+  return '<svg width="' + (size||16) + '" height="' + (size||16) + '" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+}
+var IC = {
+  users: '<path d="M15 20.5v-1.6a3.4 3.4 0 0 0-3.4-3.4H6.4A3.4 3.4 0 0 0 3 18.9v1.6"/><circle cx="9" cy="7.6" r="3.6"/><path d="M21 20.5v-1.6a3.4 3.4 0 0 0-2.6-3.3"/>',
+  check: '<circle cx="12" cy="12" r="8.6"/><path d="m8.4 12.2 2.5 2.5 4.7-5.2"/>',
+  clock: '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3 1.8"/>',
+  warn:  '<path d="M12 9.5v4M12 17h.01"/><path d="M10.3 4.4 2.9 17.2A1.9 1.9 0 0 0 4.6 20h14.8a1.9 1.9 0 0 0 1.7-2.8L13.7 4.4a1.9 1.9 0 0 0-3.4 0Z"/>',
+  box:   '<path d="M20.5 7.5 12 3 3.5 7.5v9L12 21l8.5-4.5v-9Z"/><path d="m3.5 7.5 8.5 4.5 8.5-4.5"/>',
+  coins: '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4v9.2M9.4 10h5.2M9.4 14h5.2"/>',
+  eye:   '<path d="M2.2 12S5.8 5.4 12 5.4 21.8 12 21.8 12 18.2 18.6 12 18.6 2.2 12 2.2 12Z"/><circle cx="12" cy="12" r="2.7"/>',
+  play:  '<path d="M8 5.4v13.2L19 12 8 5.4Z"/>',
+  stop:  '<rect x="6.4" y="6.4" width="11.2" height="11.2" rx="1.6"/>',
+  trash: '<path d="M4 7h16M9.6 7V4.8h4.8V7M6.6 7l.9 13.2h9l.9-13.2"/>',
+  pulse: '<path d="M3 12h3.6l2.4-6 3.9 12 2.6-6H21"/>',
+  moon:  '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
+  sun:   '<circle cx="12" cy="12" r="4"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/>'
+};
+
+/* ── 状态 ─────────────────────────────────────────── */
+// acctSort：账号页排序键。'' = 保持后端顺序（最近活动优先，后端已排好）。
+//   'limit'  → 按「解除模型限流的时间」升序：最快解除的排最前，没有限流的排最后。
+//   'credit' → 按可用积分降序：找「该用哪个号跑大活」时最常看的维度。
+// acctModel：模型筛选。空 = 不限；非空时只显示「该模型当前被限流」的账号
+//   （仅在 acctSort='limit' 时有意义——其它排序下筛模型会得到一张看不出顺序的表）。
+var S = { data:null, tasks:null, filter:'all', realm:'', creditRealm:'', taskRealm:'', q:'',
+          acctSort:'', acctModel:'', logLines:120, loadRevision:0, loadedAt:0 };
+var DT = { realm:'cn', url:'', loginId:'', timer:null, tries:0, polling:false, trae:false };
+
+// REALM_ORDER / REALM_LABEL 是**全域的单一来源**。
+//
+// 接入 trae 后有三处要列域（账号池、积分分域、任务分组），此前各写各的：
+// 账号池用「国内/国际/trae」，积分用「国际/国内」且顺序相反，trae 干脆被漏掉
+// （2026-10-11 用户实测：积分合计 63,125，但分域只列了 33,501 + 10,673，
+// 差额就是没显示的 trae）。顺序与文案集中在这里，新增域只改一处。
+var REALM_ORDER = ['cn', 'global', 'trae'];
+var REALM_LABEL = { cn: '国内版 CN', global: '国际版 Global', trae: 'Trae CN' };
+// REALM_SHORT 用于「XX 可用 / XX 剩余」这类紧凑行。
+var REALM_SHORT = { cn: '国内', global: '国际', trae: 'Trae' };
+// REALM_NO_SCHEDULE：没有「逐笔到期日程」的域。
+//
+// WorkBuddy 两域的积分按套餐分批到期，cmd/credit 能逐包取出到期时刻；Trae 的
+// pay API 只给一个总额（total_amount），没有分批到期时间，所以它的账号永远
+// 不会有 schedule。用于「到期日程」的参与账号口径——不排除的话，空态会显示成
+// 「取到的账号都没有带到期时间的积分」，让人以为数据缺失，实际是这个域没这项。
+var REALM_NO_SCHEDULE = { trae: true };
+
+function realmName(realm){ return REALM_LABEL[realm] || realm; }
+function realmShort(realm){ return REALM_SHORT[realm] || realm; }
+// realmOf 归一化一个账号的域：缺省/空值按 cn 处理，与后端一致
+// （app.py 的账号解析就是 `or "cn"`）。不归一化的话，空域的号会在分组时
+// 掉进「其它」桶里，而 realmTag 又把它画成 CN——同一行自相矛盾。
+function realmOf(account){
+  return String((account && account.realm) || '').toLowerCase() || 'cn';
+}
+
+var modalCb = null;
+var logKey = null, logName = '';
+
+/* ── 主题 ─────────────────────────────────────────── */
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  $('#icTheme').innerHTML = (t === 'dark') ? IC.moon : IC.sun;
+  $('#btnTheme').setAttribute('title', (t === 'dark') ? '切换到亮色' : '切换到暗色');
+  try { localStorage.setItem('loomgate-theme', t); } catch(e){}
+}
+$('#btnTheme').addEventListener('click', function(){
+  setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+(function(){
+  var t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  try { var v = localStorage.getItem('loomgate-theme') || localStorage.getItem('wb2a-theme'); if (v) t = v; } catch(e){}
+  setTheme(t);
+})();
+
+/* ── 通讯 ─────────────────────────────────────────── */
+async function api(path, body, method){
+  var opt = { headers:{ 'Content-Type':'application/json' }, cache:'no-store' };
+  // 所有写操作统一携带同源管理标记。
+  if (body !== undefined){
+    opt.headers['X-Admin-Request'] = '1';
+  }
+  if (body !== undefined){ opt.method = method || 'POST'; opt.body = JSON.stringify(body || {}); }
+  var r = await fetch(path, opt);
+  if (r.status === 401){ location.replace('login'); throw new Error('登录已失效'); }
+  var data = null;
+  try{ data = await r.json(); }catch(e){ data = null; }
+  if (!r.ok){
+    var msg = (data && (data.message || (data.error && data.error.message))) ||
+      ('HTTP ' + r.status);
+    var err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+function toast(msg, kind){
+  var d = document.createElement('div');
+  d.className = 'toast ' + (kind || '');
+  var icon = kind === 'ok' ? IC.check : (kind === 'err' ? IC.warn : IC.clock);
+  d.innerHTML = svg(icon, 15) + '<div>' + esc(msg) + '</div>';
+  $('#toasts').appendChild(d);
+  setTimeout(function(){ d.style.transition = 'opacity .25s'; d.style.opacity = '0';
+    setTimeout(function(){ d.remove(); }, 260); }, 4200);
+}
+
+/* ── 视图 ─────────────────────────────────────────── */
+var PAGE = {
+  overview:{ t:'运行总览', d:'服务、账号与任务的当前状态' },
+  providers:{t:'服务接入',d:'连接服务与管理授权方式'},
+  models:{t:'模型目录',d:'来自上游的动态模型与能力目录'},
+  schedules:{t:'调度计划',d:'明确时区、执行时间和账号范围'},
+  executions:{t:'执行记录',d:'追踪真实执行、阶段与最终结果'},
+  migration:{t:'迁移状态',d:'旧版数据的兼容与迁移结果'},
+  accounts:{ t:'账号', d:'凭证、积分与启停' },
+  credits: { t:'积分有效期', d:'积分到期分布与即将作废的余额' },
+  keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
+  usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
+  requests:{ t:'请求明细', d:'核对每次调用、重试消费与账号调度' },
+  tasks:   { t:'任务', d:'按账号区域分组的定时任务' },
+  logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
+  system:  { t:'系统设置', d:'运行服务、安全访问与版本更新' }
+};
+var sysLoaded = false;
+// CURRENT_VIEW 当前页标识：刷新时只重绘这一页（见 render）。
+var CURRENT_VIEW = 'overview';
+function go(v){
+  if (!PAGE[v]) v = 'overview';
+  CURRENT_VIEW = v;
+  $$('.view[data-view]').forEach(function(p){
+    p.classList.toggle('hide', p.getAttribute('data-view') !== v);
+  });
+  $$('#tabs button, #tabs2 button').forEach(function(b){
+    b.classList.toggle('on', b.getAttribute('data-view') === v);
+  });
+  $('#pgTitle').textContent = PAGE[v].t;
+  $('#pgDesc').textContent = PAGE[v].d;
+  document.title = PAGE[v].t + ' · LoomGate 织枢';
+  try { localStorage.setItem('loomgate-view', v); } catch(e){}
+  history.replaceState(null, '', '#' + v);
+  if (typeof loomRoute === 'function') loomRoute(v);
+  closeNav();
+  // 进入页面立即用已有数据渲染一次：否则从别的页切回来会先看到上一次的旧内容。
+  renderView(v);
+  // 积分实时刷新（2026-10-14 用户要求）：概览 / 账号 / 积分有效期三页都显示积分，
+  // 每次切进去都拉一次实时值，而不是只显示首屏那份最多 60 秒前的缓存。
+  // 走 refresh_credit=1 让网关等一次真查询（冷查约 8 秒，有缓存则很快返回）。
+  if (v === 'overview' || v === 'accounts' || v === 'credits') refreshCreditView();
+  if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
+  if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (v === 'requests' && typeof loadRequests === 'function') loadRequests();
+  // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
+  if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
+  // 重复推理保护开关同样不依赖 /api/state，进入系统页就拉当前运行期值。
+  if (v === 'system' && typeof loadReasoningLoop === 'function') loadReasoningLoop();
+  if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
+  if (v !== 'system' && typeof stopUpdatePoll === 'function') stopUpdatePoll();
+  // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
+  if (v === 'logs'){ loadLogs(); startLogAuto(); } else { stopLogAuto(); }
+}
+document.addEventListener('click', function(e){
+  var b = e.target.closest('button[data-view]');
+  if (b) go(b.getAttribute('data-view'));
+});
+$('#btnHome').addEventListener('click', function(){ go('overview'); });
+
+/* ── 窄屏导航 ─────────────────────────────────────── */
+function openNav(){ $('#side').classList.add('open'); $('#scrimNav').classList.add('on'); }
+function closeNav(){ $('#side').classList.remove('open'); $('#scrimNav').classList.remove('on'); }
+$('#btnMenu').addEventListener('click', openNav);
+$('#scrimNav').addEventListener('click', closeNav);
+
+/* ── 忙碌 ─────────────────────────────────────────── */
+var busyDepth = 0;
+function busy(on){
+  busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
+  var b = busyDepth > 0;
+  ['#btnRefresh','#btnRestart','#btnAdd','#btnTaskReload','#btnLogs','#btnReviveAll'].forEach(function(s){
+    var el = $(s); if (el) el.disabled = b;
+  });
+}
+
+/* ── 加载 ─────────────────────────────────────────── */
+// CREDIT_RETRY 首次加载时积分还在后台查（后端返回 creditPending）的补取定时器。
+var CREDIT_RETRY = null;
+
+async function loadAll(forceCredit){
+  var revision = ++S.loadRevision;
+  var loadedAt = 0;
+  busy(true);
+  try{
+    var res = await Promise.all([
+      api('api/state' + (forceCredit ? '?refresh_credit=1' : '')).then(function(data){
+        loadedAt = Date.now();
+        return data;
+      }),
+      api('api/tasks').catch(function(){ return null; })
+    ]);
+    if (revision !== S.loadRevision) return;
+    S.data = res[0];
+    S.loadedAt = loadedAt;
+    S.tasks = res[1];
+    render();
+    svc(true);
+    scheduleCreditRetry(res[0]);
+  }catch(err){
+    if (revision !== S.loadRevision) return;
+    svc(false, String(err && err.message || err));
+    toast('加载失败：' + (err && err.message || err), 'err');
+  }finally{ busy(false); }
+}
+
+// scheduleCreditRetry 后端说积分还在后台查时，过几秒自动补取一次；
+// 这样首屏立刻可用，积分数字稍后自己出现，不必让页面干等（冷查约 8 秒）。
+function scheduleCreditRetry(data){
+  if (CREDIT_RETRY){ clearTimeout(CREDIT_RETRY); CREDIT_RETRY = null; }
+  if (!data || !data.creditPending) return;
+  CREDIT_RETRY = setTimeout(function(){
+    CREDIT_RETRY = null;
+    // 不传 force：走后端缓存优先路径，拿到后台线程写好的结果就渲染。
+    loadAll();
+  }, 3000);
+}
+
+// CREDIT_VIEW_MIN_INTERVAL 两次「进入积分页触发的实时刷新」之间的最小间隔。
+//
+// 为什么需要节流：概览 / 账号 / 积分有效期三页共用同一份积分数据，用户在这三页之间
+// 来回切是常见操作；不节流的话每次点击都强制一次上游查询（冷查 8 秒、打全账号），
+// 既拖慢界面又会被上游当异常流量。30 秒覆盖「切过去看一眼再切回来」的典型间隔，
+// 而真正的数据新鲜度由网关侧 60 秒缓存兜底——两边叠加后最坏滞后约 30 秒。
+var CREDIT_VIEW_MIN_INTERVAL = 30000;
+var creditViewAt = 0;
+
+// refreshCreditView 进入积分相关页面时拉一次实时积分。
+//
+// 复用 loadAll(forceCredit=true)：它已经处理了并发去重（S.loadRevision）、
+// 失败提示与 creditPending 的后续补取，不必另写一条加载路径。
+function refreshCreditView(){
+  var now = Date.now();
+  if (now - creditViewAt < CREDIT_VIEW_MIN_INTERVAL) return;  // 节流窗口内：用现有数据渲染
+  creditViewAt = now;
+  loadAll(true);
+}
+function svc(up){
+  var b = $('#svcBadge'), t = $('#svcText');
+  var running = S.data && S.data.containerRunning;
+  if (!up){ b.className = 'chip e'; t.textContent = '面板不可达'; return; }
+  if (running){ b.className = 'chip ok'; t.textContent = '网关运行中'; }
+  else { b.className = 'chip e'; t.textContent = '容器未运行'; }
+}
+function taskList(){
+  return (S.tasks && S.tasks.available && Array.isArray(S.tasks.tasks)) ? S.tasks.tasks : [];
+}
+function badge(st){ return '<span class="bdg ' + st.cls + '"><i></i>' + st.text + '</span>'; }
+function mrow(k, v, cls){
+  return '<div class="mrow"><span class="k">' + esc(k) + '</span>' +
+    '<span class="v ' + (cls || '') + '">' + esc(v) + '</span></div>';
+}
+// mgroup 概览卡里的子分组：一条带标题的分隔线 + 组内若干行。
+//
+// 「账号池」「积分」两卡各含「整体汇总」与「分域明细」两块。此前平铺成一串
+// 同样的 mrow，分域行和总量行长得一样，扫读时分不出分组。标题与右侧备注
+// 走 esc()，行由调用方拼好（内部是 mrow，已各自转义）。
+function mgroup(title, note, body){
+  if (!body) return '';
+  return '<div class="mgroup">' +
+    '<div class="mgroup-h"><span>' + esc(title) + '</span><span class="sp"></span>' +
+    (note ? '<span class="n">' + esc(note) + '</span>' : '') + '</div>' +
+    body + '</div>';
+}
+// mcell 汇总小格（.mcells 的两列格）：短标签 + 大数字。值为空/为零时返回 ''，
+// 由调用方决定「0 是否值得占一格」。
+function mcell(k, v, cls){
+  if (v === '' || v == null) return '';
+  return '<div class="mcell"><div class="k">' + esc(k) + '</div>' +
+    '<div class="v ' + (cls || '') + '">' + v + '</div></div>';
+}
+// mtile 分域瓷片：域名胶囊 + 主数字 + 比例条 + 小注。sub 带 .w 时整块上警示
+// （该域有快过期积分），条与文字一起变色，一眼看出「哪个域吃紧」。
+function mtile(realm, value, unit, pct, sub, subWarn){
+  var r = String(realm || '').toLowerCase();
+  var label = r === 'trae' ? 'TRAE' : (r === 'global' ? 'GLOBAL' : 'CN');
+  return '<div class="mtile ' + (subWarn ? 'w' : '') + '">' +
+    '<div class="mtile-h"><span class="rtag ' + esc(r) + '">' + label + '</span>' +
+    '<span class="n">' + esc(sub && sub.count ? sub.count : '') + '</span></div>' +
+    '<div class="mtile-v">' + value + (unit ? '<small>' + esc(unit) + '</small>' : '') + '</div>' +
+    '<div class="mtile-bar"><i style="width:' + Math.max(2, Math.min(100, pct || 0)) + '%"></i></div>' +
+    (sub && sub.text ? '<div class="mtile-s' + (subWarn ? ' w' : '') + '">' + esc(sub.text) + '</div>' : '') +
+    '</div>';
+}
+function emptyBox(icon, title, sub){
+  return '<div class="empty">' + svg(icon, 30) + '<div class="empty-t">' + esc(title) + '</div>' +
+    (sub ? '<div class="empty-s">' + esc(sub) + '</div>' : '') + '</div>';
+}
+
+/* ── 渲染 ─────────────────────────────────────────── */
+// render(view) 只重绘指定页；不传时重绘当前页。刷新（30 秒定时或手动）不该重建
+// 用户没在看的页面：账号页最多几十行、日志页可达数百行，全部重建会让刷新瞬间掉帧。
+// 侧栏计数与提示条是全局信息，每次刷新都更新。
+function render(){
+  var d = S.data; if (!d) return;
+  // 网关版本号**自带** "v" 前缀（VERSION 文件是 "v2.6.26"，/healthz 原样透出），
+  // 这里再补一个就渲染成 "wv2.6.26"（2026-10-11 用户实测看到）。补前缀前先看有没有。
+  if (d.service){
+    var ver = String(d.version || '');
+    if (ver && ver.charAt(0) !== 'v') ver = 'v' + ver;
+    $('#brandVer').textContent = '控制台' + (ver ? ' · ' + ver : '');
+  }
+  var a = d.accounts || [], tasks = taskList();
+  $('#tabAcct').textContent = a.length;
+  $('#tabTask').textContent = tasks.length ? tasks.length : '—';
+  renderCreditsTab();
+  renderNotes();
+  renderStrip();
+  renderView(CURRENT_VIEW);
+}
+
+// renderView 按页面分派；未列出渲染函数的页面保持原样（其数据由各自的 load 函数负责）。
+function renderView(v){
+  if (!S.data) return;
+  if (v === 'overview'){ renderMetrics(); renderPool(); renderCredit(); }
+  else if (v === 'accounts'){ renderAccounts(); }
+  else if (v === 'credits'){ renderCreditsPage(); }
+  else if (v === 'tasks'){ renderTasks(); }
+  else if (v === 'system'){ renderSystem(); }
+}
+
+// 兼容旧调用点：仍可显式要求渲染全部页面（例如首次拿到数据后）。
+function renderAll(){
+  var d = S.data; if (!d) return;
+  renderMetrics();
+  renderPool();
+  renderCredit();
+  renderAccounts();
+  renderCreditsPage();
+  renderCreditsTab();
+  renderTasks();
+  renderSystem();
+}
+
+function metric(k, value, unit, sub, cls, pct, icon){
+  return '<div class="metric">' +
+    '<div class="k">' + esc(k) + '</div>' +
+    '<div class="v">' + svg(icon, 15) + '<b>' + value + '</b>' +
+    (unit ? '<small>' + esc(unit) + '</small>' : '') + '</div>' +
+    (typeof pct === 'number'
+      ? '<div class="bar"><i class="' + (cls || '') + '" style="width:' +
+        Math.max(0, Math.min(100, pct)) + '%"></i></div>'
+      : '') +
+    (sub ? '<div class="s ' + (cls || '') + '">' + esc(sub) + '</div>' : '') +
+    '</div>';
+}
+
+// acctOff 报告账号是否处于「停用」状态——两个来源取并集：
+//   · 文件级：面板把 workbuddy-X.json 改名成 .disabled，网关下次加载时不再读它
+//     （重启后生效，见 renderNotes 的 pendingRestart）；
+//   · 池级：网关自己停用的号（被上游封禁/内容审核标记等），仍在池内但不可选。
+//
+// 为什么要并集（2026-10-10 用户反馈「卡片数字打架」）：总览的「账号」卡原先只看
+// 文件级（线上 28 个文件都没 .disabled → 恒显示「0 个停用」），而「账号池」卡读
+// 网关 /status（7 个池级停用）。两张卡并排却各说各话。运维关心的是「有几个号现在
+// 用不了」，那就是并集。
+function acctOff(a){
+  return !!a.disabled || !!((a.pool || {}).disabled);
+}
+// acctOffKind 区分停用来源，供提示文案说明处置方式（文件级要重启，池级要重登）。
+function acctOffKind(a){
+  var file = !!a.disabled, pool = !!((a.pool || {}).disabled);
+  if (file && pool) return 'both';
+  if (file) return 'file';
+  if (pool) return 'pool';
+  return '';
+}
+
+// acctRank 账号页默认排序的档位（小的在前）：
+//
+//	0 健康：能正常服务付费与免费模型
+//	1 余额不足：只是没积分，免费模型照常可用（CreditsExhausted 而非 Cooling）
+//	2 账号级约束：熔断（连续 5xx）或真正的账号级限流
+//	3 模型级限流：只有个别模型在倒计时，其余模型可用
+//	4 停用
+//
+// 为什么余额不足排在模型限流前面：前者对「用免费模型」的调用方毫无影响，
+// 后者会让指定模型直接不可用；反过来排会把一批其实健康的号压到后面。
+// 停用排最后——它需要人工介入，不属于「现在能不能用」的答案。
+//
+// 同档内不比较其他字段：调用方用 Array.prototype.sort（V8 上是稳定排序），
+// 保持后端返回的活跃度顺序，避免每次刷新顺序抖动。
+function acctRank(a){
+  if (acctOff(a)) return 4;
+  var p = a.pool || {};
+  if (p.cooling) return 2;
+  if (p.creditsExhausted) return 1;
+  var hasLimit = rlmOf(a).some(function(m){
+    return rlmKind(m) !== 'unavailable' && m.until;
+  });
+  if (hasLimit) return 3;
+  return 0;
+}
+
+function renderMetrics(){
+  var d = S.data, a = d.accounts || [], p = d.pool || {};
+  var on = a.filter(function(x){ return !acctOff(x); }).length;
+  var off = a.length - on;
+  var total = Number(p.total) || 0, healthy = Number(p.healthy) || 0;
+  var cooling = Number(p.cooling) || 0, dis = Number(p.disabled) || 0;
+  // 余额不足（CoolHard）不是冷却——上游没限流这个号，只是没积分，免费模型照常可用。
+  // 单独计数并单独显示，避免「冷却中 N」把这两类完全不同的情况混在一起
+  // （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的」）。
+  var exhausted = Number(p.creditsExhausted) || 0;
+  var runs = taskList().filter(function(t){ return t.running; }).length;
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
+  var size = have.reduce(function(s, x){
+    return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
+  var pct = size ? Math.round(remain / size * 100) : 0;
+  var hpct = total ? Math.round(healthy / total * 100) : 0;
+  // 快过期积分合计：到期即作废，总览页给一个汇总，免得逐行去找。
+  var expiring = have.reduce(function(s, x){
+    return s + expiringSoon(x.credits, 7); }, 0);
+
+  // 「账号池」卡的副文案与配色。
+  //
+  // ═══ 为什么不能写成 healthy === total ? '全部可用' ═══
+  //
+  // 只要池里有**任何**一个号在冷却或停用，healthy 就不可能等于 total——线上实测
+  // 24/34（3 冷却 + 7 停用），于是那句「全部可用」永远不会出现。真正该说的是
+  // 「不可用的有几个」，与进度条（它把 cooling 与 disabled+off 都算成占用）同一口径。
+  //
+  // 反过来，healthy === total 且 total > 0 时才是真的全可用；那时说是好消息，
+  // 用 ok 绿。
+  var poolSub, poolCls;
+  if (!total){
+    // 池数据缺失（网关未就绪，或首屏还没拿到 /status）。
+    // **绝不能**显示成「0 / 0 · 全部可用」并涂成绿色——那读起来像「一切正常」，
+    // 而实际是「还不知道」（2026-10-13 用户截图反馈：卡片显示 0/0 全部可用，
+    // 而池里明明有 34 个号）。如实说明「未就绪」，用中性色。
+    poolSub = S.data && S.data.ok === false ? '网关未就绪' : '正在读取…';
+    poolCls = '';
+  } else if (healthy === total){
+    poolSub = '全部可用';
+    poolCls = 'ok';
+  } else {
+    // 不可用 = 账号级不可用（熔断 + 停用 + 未入池），**不含余额不足**。
+    // 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+    // 此前把余额不足算进不可用，global 域 19 个号里 11 个积分不足就被显示成
+    // 「11 个不可用」（用户截图指出）——它们其实都在正常服务免费模型。
+    var unusable = total - healthy;
+    var bits = [];
+    if (unusable) {
+      if (cooling) bits.push(cooling + ' 熔断中');
+      var offCnt = Math.max(0, unusable - cooling);
+      if (offCnt) bits.push(offCnt + ' 停用');
+    }
+    if (unusable) {
+      poolSub = unusable + ' 个不可用' + (bits.length ? '（' + bits.join('、') + '）' : '');
+    } else if (exhausted) {
+      // 账号全部可用，只是有号缺积分——这是模型层面的提示，不算「不可用」。
+      poolSub = '全部可用（' + exhausted + ' 个余额不足，仅影响付费模型）';
+    } else {
+      poolSub = '全部可用';
+    }
+    poolCls = unusable ? (healthy ? 'w' : 'e') : 'ok';
+  }
+
+  $('#metrics').innerHTML = [
+    metric('账号', S.data ? String(a.length) : '—', S.data ? (on + ' 启用') : '',
+      // 数据还没到（S.data === null）时不能报「0 个停用」——那是把「未知」说成
+      // 「好消息」，而用户会据此以为账号一切正常（同「账号池」卡的判据）。
+      S.data ? (off + ' 个停用') : '正在读取…',
+      S.data ? (off ? 'w' : 'ok') : '', null, IC.users),
+    metric('账号池', total ? (healthy + ' / ' + total) : '—', total ? '健康' : '',
+      poolSub, poolCls, total ? hpct : null, IC.pulse),
+    metric('可用积分', num(remain), '剩余',
+      expiring > 0 ? (num(expiring) + ' 即将过期') : (have.length + ' / ' + a.length + ' 个账号取到'),
+      expiring > 0 ? 'w' : (pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok')), pct, IC.coins),
+    metric('任务', taskList().length ? String(taskList().length) : '—', '个任务',
+      runs ? (runs + ' 个执行中') : '全部空闲', runs ? 'w' : '', null, IC.clock)
+  ].join('');
+
+  renderCoolSummary(a, p);
+}
+
+// renderCoolSummary 冷却台账：把「有多少号在冷却、多少没有」单独列一行。
+//
+// 为什么单独列：总览卡片里的「账号池」只说 `healthy / total`，用户看不出
+// 「剩下的到底是熔断、余额不足，还是被停用」。2026-10-22 用户要求
+// 「账号有冷却和没有被冷却的加个统计」，于是按四种互斥状态各给一个数：
+//
+//	可用       — 没冷却、没停用、没余额不足
+//	冷却中     — 账号级熔断/软冷却（上游限流这个号）
+//	余额不足   — CoolHard，只影响付费模型，免费模型照常可用
+//	已停用     — 网关停用
+//
+// 口径与 pool/state.go 的 countsDetailedForRealm 一致：total = 可用 + 冷却 + 停用，
+// 余额不足是「可用」的子集，所以单独标注而不是从可用里扣。
+function renderCoolSummary(accounts, p){
+  var el = $('#coolSummary');
+  if (!el) return;
+  var total = Number(p.total) || 0;
+  if (!total){
+    el.innerHTML = '';
+    return;
+  }
+  var cooling = Number(p.cooling) || 0;
+  var disabled = Number(p.disabled) || 0;
+  var exhausted = Number(p.creditsExhausted) || 0;
+  var healthy = Number(p.healthy) || 0;
+  // 未冷却 = 可用 - 余额不足（余额不足不算冷却，但要单独说明）
+  var noCool = Math.max(0, healthy - exhausted);
+  var items = [
+    { k:'ok',   label:'未冷却',   n:noCool,   hint:'正常参与选号' },
+    { k:'w',    label:'冷却中',   n:cooling,  hint:'上游限流或熔断，到期自动恢复' },
+    { k:'a',    label:'余额不足', n:exhausted, hint:'仅影响付费模型，免费模型可用' },
+    { k:'',     label:'已停用',   n:disabled, hint:'网关停用，需手动启用' }
+  ];
+  el.innerHTML = '<div class="coolsum">' + items.map(function(it){
+    return '<span class="cs ' + it.k + '" title="' + esc(it.hint) + '">' +
+      '<b>' + it.n + '</b> ' + esc(it.label) + '</span>';
+  }).join('') + '</div>';
+}
+
+function renderNotes(){
+  var d = S.data, out = [];
+  var off = (d.accounts || []).filter(function(a){ return a.disabled; });
+  if (d.pendingRestart){
+    out.push(note('w', '账号变更待生效',
+      '有 ' + off.length + ' 个账号已停用但仍在池中，重启网关后生效。',
+      { label:'立即重启', act:'restart' }));
+  }
+  if (!d.containerRunning){
+    out.push(note('e', '网关容器未运行', '服务当前不可用，账号操作与积分查询都会失败。', null));
+  }
+  if (d.creditError){
+    out.push(note('w', '积分数据不可用', String(d.creditError), null));
+  }
+  if (S.tasks && S.tasks.available === false){
+    out.push(note('a', '任务未接入', '当前网关进程没有加载排程器。', null));
+  }
+  $('#notes').innerHTML = out.join('');
+}
+function note(kind, title, body, btn){
+  var cls = kind === 'e' ? 'e' : (kind === 'w' ? 'w' : 'a');
+  var icon = kind === 'a' ? IC.clock : IC.warn;
+  return '<div class="note ' + cls + '">' + svg(icon, 16) +
+    '<div class="g"><b>' + esc(title) + '</b> ' + esc(body) + '</div>' +
+    (btn ? '<button class="btn sm" data-note-act="' + esc(btn.act) + '">' + esc(btn.label) + '</button>' : '') +
+    '</div>';
+}
+$('#notes').addEventListener('click', function(e){
+  var b = e.target.closest('[data-note-act]');
+  if (b && b.getAttribute('data-note-act') === 'restart') actRestart();
+});
+
+function setCell(sel, text, copy){
+  var el = $(sel), code = el.querySelector('code'), btn = el.querySelector('.mini');
+  code.textContent = text;
+  code.title = text;
+  if (copy){ btn.disabled = false; btn.setAttribute('data-copy', copy); }
+  else { btn.disabled = true; btn.removeAttribute('data-copy'); }
+}
+function renderStrip(){
+  var base = location.origin + '/v1';
+  var health = location.origin + '/healthz';
+  setCell('#cellBase', base, base);
+  setCell('#cellKey', '在密钥页管理', '');
+  $('#cellKey .mini').disabled = false;
+  setCell('#cellHealth', health, health);
+}
+
+function renderPool(){
+  var p = S.data.pool || {};
+  var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
+  var exhausted = p.creditsExhausted || 0;
+  // 2026-10-18：余额不足**不再**从 healthy 里扣——它属于模型维度，账号本身可用。
+  // 进度条只反映账号级状态：可用 / 熔断 / 停用。
+  var off = Math.max(0, total - healthy - cooling - dis);
+  function w(n){ return total ? (n / total * 100) : 0; }
+  // 池数据缺失（网关未就绪 / 首屏还没拿到 /status）时给一个明确的空态，
+  // 而不是渲染「0 / 0 健康」加一条全空的进度条——那看起来像「池子空了」，
+  // 与「还不知道」是两件事（见 renderMetrics 里同一条判据）。
+  if (!total){
+    $('#poolPanel').innerHTML = '<div class="empty">' + svg(IC.pulse, 30) +
+      '<div class="empty-t">' +
+      (S.data && S.data.ok === false ? '网关未就绪' : '正在读取账号池…') + '</div>' +
+      '<div class="empty-s">' +
+      (S.data && S.data.ok === false
+        ? '网关还没有响应状态接口；启动完成后这里会显示各域的健康账号数。'
+        : '稍候会自动刷新。') + '</div></div>';
+    return;
+  }
+  // 汇总块：大字 + 进度条 + 两列小格。格子里只放「0 有意义」的项
+  // （停用 0 是好消息但值得看到；并发占满/粘性会话为 0 时不占格）。
+  var html = '<div class="big"><span class="v">' + healthy + '</span><span class="u">/ ' + total + ' 健康</span></div>' +
+    '<div class="comp">' +
+      '<i class="a" style="width:' + w(healthy) + '%"></i>' +
+      '<i class="b" style="width:' + w(cooling) + '%"></i>' +
+      '<i class="c" style="width:' + w(dis + off) + '%"></i>' +
+    '</div>' +
+    '<div class="mcells">' +
+      mcell('池内总数', String(total)) +
+      mcell('熔断中', cooling ? String(cooling) : '0', cooling ? 'w' : 'ok') +
+      mcell('已停用', dis ? String(dis) : '0', dis ? 'e' : '') +
+      // 余额不足是**模型维度**的提示：账号可用，只是付费模型扣不动积分。
+      // 仍然显示（运维要看到），但不计入「不可用」。
+      mcell('余额不足', exhausted ? String(exhausted) : '0', exhausted ? 'w' : '') +
+      mcell('并发占满', p.inFlightFull ? String(p.inFlightFull) : '0', p.inFlightFull ? 'w' : '') +
+      mcell('粘性会话', p.stickySessions ? String(p.stickySessions) : '0') +
+    '</div>';
+  var rt = p.realmTotals || {};
+  // 分域瓷片：固定顺序（cn → global → trae），不跟对象键的插入顺序走。
+  // 条的长度 = 该域健康占比；全绿 = 全健康，红 = 一个可用都没有。
+  var tiles = '', realms = 0;
+  REALM_ORDER.forEach(function(k){
+    var v = rt[k];
+    if (v === undefined) return;
+    var tot, ok, cls;
+    if (v && typeof v === 'object'){
+      tot = Number(v.total) || 0; ok = Number(v.healthy) || 0;
+      if (!tot) return;
+      cls = (tot && ok === tot) ? 'ok' : (ok ? '' : 'e');
+    } else {
+      tot = Number(v) || 0; ok = tot; cls = tot ? 'ok' : 'e';
+      if (!tot) return;
+    }
+    // 2026-10-18：瓷片只反映账号级可用性（余额不足的号也算可用）。
+    // 该域的余额不足数在下面一行单独提示，避免和「不可用」混为一谈。
+    var rq = Number(v && v.credits_exhausted) || 0;
+    var sub = ok === tot
+      ? (rq ? ('全部可用（' + rq + ' 个余额不足）') : '全部可用')
+      : (ok ? ((tot - ok) + ' 个不可用' + (rq ? '（另 ' + rq + ' 个余额不足）' : '')) : '全部不可用');
+    tiles += mtile(k, String(ok), '/ ' + tot, ok / tot * 100, { text: sub });
+    realms++;
+  });
+  if (realms) html += mgroup('按区域', realms + ' 个域', '<div class="mtiles">' + tiles + '</div>');
+  $('#poolPanel').innerHTML = html;
+}
+
+function renderCredit(){
+  var d = S.data, a = d.accounts || [];
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  // 积分在后台查询中（首屏不等 8 秒的冷查）：给出明确提示，稍后自动刷新。
+  if (d.creditPending && !have.length){
+    $('#creditPanel').innerHTML =
+      '<div class="big"><span class="v">…</span><span class="u">查询中</span></div>' +
+      mrow('状态', '正在后台统计积分') +
+      mrow('取到积分', '0 / ' + a.length);
+    return;
+  }
+  if (d.creditError && !have.length){
+    $('#creditPanel').innerHTML =
+      '<div class="big"><span class="v">—</span><span class="u">查询失败</span></div>' +
+      mrow('原因', d.creditError);
+    return;
+  }
+  // 按域汇总：国际与国内的积分是两套账（不同上游、不同计费），混在一起看不出
+  // 哪边快用完。合计保留在最上面，下面分列，与「账号池」的 realmTotals 同一惯例。
+  function sumOf(list){
+    var remain = list.reduce(function(s, x){ return s + x.credits.remain; }, 0);
+    var size = list.reduce(function(s, x){
+      return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
+    var expiring = list.reduce(function(s, x){ return s + expiringSoon(x.credits, 7); }, 0);
+    return {remain: remain, size: size, used: Math.max(0, size - remain),
+            count: list.length, expiring: expiring};
+  }
+  // 汇总块：大字 + 进度条 + 两列小格（与「账号池」同一模块语言）。
+  var total = sumOf(have);
+  var remain = total.remain, size = total.size, used = total.used;
+  var pct = size ? Math.round(remain / size * 100) : 0;
+  var html = '<div class="big"><span class="v">' + num(remain) + '</span><span class="u">剩余</span></div>' +
+    '<div class="comp">' +
+      '<i class="a" style="width:' + pct + '%"></i>' +
+      '<i class="c" style="width:' + Math.max(0, 100 - pct) + '%"></i>' +
+    '</div>' +
+    '<div class="mcells">' +
+      mcell('已用', num(used)) +
+      mcell('总额度', num(size)) +
+      mcell('取到积分', have.length + '<small>/ ' + a.length + '</small>') +
+      // 快过期积分：到期即作废，有才显示（mrow 时代就是条件行，格子里同理）。
+      (total.expiring > 0
+        ? mcell('快过期', num(total.expiring) + '<small>' +
+            Math.round(total.expiring / Math.max(1, remain) * 100) + '% 即将作废</small>', 'w')
+        : '') +
+    '</div>';
+  // 分域瓷片：按 REALM_ORDER 固定顺序，**包含全部域**（含 trae）。
+  // 只列该域确实取到积分的账号；某域一个都没有时不显示，避免堆空块。
+  // 条的长度 = 该域占全部剩余的份额；该域有快过期积分时整块上警示色。
+  var tiles = '', realms = 0;
+  REALM_ORDER.forEach(function(realm){
+    var subset = have.filter(function(x){ return realmOf(x) === realm; });
+    if (!subset.length) return;
+    var part = sumOf(subset);
+    var share = remain ? Math.round(part.remain / remain * 100) : 0;
+    var sub = { count: part.count + ' 个号',
+                text: '占 ' + share + '%' + (part.expiring > 0 ? ' · ' + num(part.expiring) + ' 快过期' : '') };
+    tiles += mtile(realm, num(part.remain), '', share, sub, part.expiring > 0);
+    realms++;
+  });
+  if (realms) html += mgroup('按区域', realms + ' 个域', '<div class="mtiles">' + tiles + '</div>');
+  if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
+  else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
+  $('#creditPanel').innerHTML = html;
+}
+
+function taskState(t){
+  if (!t) return { cls:'n', text:'未知' };
+  if (t.running) return { cls:'a', text:'执行中' };
+  // 一次性任务（无排程小时）没有「启用/停用」的概念——它的执行由上游活动是否
+  // 过期决定。显示「已启用」会让人以为它会定时跑，所以单独给一个说法。
+  if (!(t.hours && t.hours.length)) return { cls:'n', text:'手动' };
+  if (!t.enabled) return { cls:'n', text:'已停用' };
+  return { cls:'ok', text:'已启用' };
+}
+function sortTasks(list){
+  return list.slice().sort(function(a, b){
+    var ha = (a.hours && a.hours[0]) || 99, hb = (b.hours && b.hours[0]) || 99;
+    return ha - hb;
+  });
+}
+// realmTag 渲染域标签。
+//
+// 接入 trae 后池子里有三种来源（CN / Global / Trae），纯大写文字（CN/GLOBAL/TRAE）
+// 在几十行里扫不出来。用带色的胶囊标签区分：一眼能看出「哪个域的号出问题了」。
+function realmTag(realm){
+  var r = String(realm || '').toLowerCase();
+  var label = r === 'trae' ? 'TRAE' : (r === 'global' ? 'GLOBAL' : 'CN');
+  return '<span class="rtag ' + esc(r) + '">' + esc(label) + '</span>';
+}
+
+function acctState(a){
+  var p = a.pool || {};
+  // 池级停用（网关自己停的，多为被上游封禁/标记）优先展示——这是真正"用不了"
+  // 且需要重登的原因；文件级停用（面板改名）在它之后。两者都用 acctOff 口径，
+  // 保证与总览卡片一致（见 acctOff 注释）。
+  if (p.disabled) return { cls:'n', text:'已停用' };
+  if (a.disabled) return { cls:'n', text:'已停用' };
+  if (!p.inPool) return { cls:'w', text:'不在池中' };
+  // 冷却（熔断）与余额不足都**不是账号不可用**：
+  //   - cooling 只表示熔断器打开（连续 5xx），账号本身没被停用；
+  //   - creditsExhausted 只表示积分花完，付费模型扣不动、免费模型照常。
+  // 2026-10-18 用户口径：「可不可用是针对账号的，冷却和积分余额是模型使用方面的」。
+  // 所以这里先给出账号级结论（正常），把余额不足/冷却作为**附注**放在状态格下方
+  // 的独立一行（见 renderAccounts 的 exhaustedSub/coolSub），不再冒充「不可用」。
+  if (p.cooling) return { cls:'w', text:'熔断中' };
+  if (!p.healthy) return { cls:'e', text:'异常' };
+  return { cls:'ok', text:'正常' };
+}
+// syncAcctSortControls 同步账号页排序组与模型下拉的 UI 状态。
+//
+// 单独抽出来是因为它同时被两处驱动：renderAccounts（数据刷新后重绘）与
+// 排序按钮的点击处理。模型选项必须来自**当前池子**——模型名是客户端自选字段，
+// 写死一份模型清单必然与上游脱节；只列正被限流的模型，才让下拉框的长度有意义。
+//
+// 2026-10-18：只收「限流」类（kind='rate'）。11102「该后端无此模型」不进这个下拉——
+// 它没有「解除时刻」可言，混进来会让人以为等到那个时刻就能用（实测那批模型对全部
+// CN 账号都是 11102，是模型下线/改名）。
+function syncAcctSortControls(all){
+  $$('#acctSort button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x.getAttribute('data-s') === S.acctSort));
+  });
+  var sel = $('#acctModel');
+  if (!sel) return;
+  var models = limitedModels(all);
+  // 重新填充前记住当前选项：数据刷新后仍要保持用户的选择。
+  // 之前选的模型已经没号被限流了 → 回落到「全部模型」，否则下拉框会显示一个
+  // 不存在的选项（浏览器默认选第一项，看起来像筛了却什么都没筛）。
+  var keep = S.acctModel;
+  if (keep && models.indexOf(keep) < 0){ keep = ''; S.acctModel = ''; }
+  sel.innerHTML = '<option value="">全部模型</option>' + models.map(function(m){
+    return '<option value="' + esc(m) + '">' + esc(m) + '</option>';
+  }).join('');
+  sel.value = keep;
+  // 「限流解除」排序才有模型筛选的意义：其它排序下禁用，并给出原因（title）。
+  var usable = S.acctSort === 'limit';
+  sel.disabled = !usable || models.length === 0;
+  sel.title = !models.length
+    ? '当前没有模型处于限流状态'
+    : (usable ? '只显示该模型被限流的账号' : '先选择「限流解除」排序');
+}
+function renderAccounts(){
+  var all = S.data.accounts || [];
+  var list = all.slice();
+  // 排序控件的选中态与模型下拉在这里刷新（重绘会重建表格，控件是同一批 DOM，
+  // 不随 innerHTML 变化，所以必须显式同步，否则点了排序按钮看不出选中的是哪个）。
+  syncAcctSortControls(all);
+  // 域级共同的 11102 每轮只算一次：行渲染要按它做过滤，逐行重算会 O(n²)。
+  var q = S.q.trim().toLowerCase();
+  if (S.filter === 'on') list = list.filter(function(a){ return !acctOff(a); });
+  if (S.filter === 'off') list = list.filter(function(a){ return acctOff(a); });
+  // 按域筛选：接入 trae 后池子里有三种来源，全混在一张表里看不出「哪个域的号出问题了」。
+  if (S.realm) list = list.filter(function(a){ return realmOf(a) === S.realm; });
+  // 模型筛选：只在「按解除限流时间排序」下生效。选中某模型时只留该模型正被**限流**
+  // 的号——这正是「哪些号还要等多久才能用这个模型」的答案。
+  // 11102（上游无此模型）不算：那类条目没有解除时刻，等下去也不会好。
+  // 其它排序下不筛：一张按积分排、却只剩被限流账号的表读不出任何意义。
+  if (S.acctSort === 'limit' && S.acctModel){
+    list = list.filter(function(a){
+      return rlmOf(a).some(function(m){
+        return rlmKind(m) !== 'unavailable' && String(m.model || '') === S.acctModel;
+      });
+    });
+  }
+  if (q) list = list.filter(function(a){
+    return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
+           (a.uid || '').toLowerCase().indexOf(q) >= 0;
+  });
+  // 排序。默认（''）按「可用性」分档，健康的号在最前：
+  //
+  // 2026-10-18 用户反馈「没有被限流的号不应该在最前面吗」。此前 '' 走的是后端
+  // 返回顺序（= 账号文件名顺序），碰巧被限流的号排在前面看起来就像「限流优先」。
+  // 现在显式分档：健康 → 只用得起免费模型（余额不足）→ 熔断/账号级限流 →
+  // 模型限流 → 停用。同档内保持后端顺序（它是最近的活跃度顺序，不该被重排）。
+  //
+  // 'limit'：按解除时刻升序（最快解除的在前）。没有模型限流的号用 Infinity 排最后。
+  //          同刻到期的按昵称稳定排序，避免每次刷新顺序抖动。
+  // 'credit'：按可用积分降序；查不到积分的（undefined）排最后而不是当 0 ——
+  //          「查不到」与「确实是 0」是两件事，混在一起会让 0 分号被埋掉。
+  if (S.acctSort === '') {
+    list.sort(function(x, y){ return acctRank(x) - acctRank(y); });
+  } else if (S.acctSort === 'limit'){
+    var lim = Object.create(null);
+    list.forEach(function(a){ lim[a.uid] = modelLimitEnd(a, S.acctModel); });
+    list.sort(function(x, y){
+      var dx = lim[x.uid], dy = lim[y.uid];
+      if (dx !== dy) return dx - dy;
+      return String(x.nickname || '').localeCompare(String(y.nickname || ''));
+    });
+  } else if (S.acctSort === 'credit'){
+    list.sort(function(x, y){
+      var cx = (x.credits || {}).remain, cy = (y.credits || {}).remain;
+      var hasX = typeof cx === 'number', hasY = typeof cy === 'number';
+      if (hasX !== hasY) return hasX ? -1 : 1;   // 能查到分的排前面
+      if (hasX && cx !== cy) return cy - cx;      // 分多的在前
+      return String(x.nickname || '').localeCompare(String(y.nickname || ''));
+    });
+  }
+  // 计数按当前域口径给出：筛选到 CN 时，「共 N 个」应当指 CN 的号，不是全池。
+  var scoped = S.realm ? all.filter(function(a){ return realmOf(a) === S.realm; }) : all;
+  var countEl = $('#acctCount');
+  if (countEl){
+    countEl.textContent = (list.length === scoped.length)
+      ? ('共 ' + scoped.length + ' 个账号')
+      : ('显示 ' + list.length + ' / ' + scoped.length + ' 个账号');
+  }
+  if (!list.length){
+    $('#acctRows').innerHTML = '<tr><td colspan="5" data-l="">' +
+      emptyBox(IC.users, '没有匹配的账号', scoped.length ? '换个关键词或筛选条件' : '用右上角添加账号') +
+      '</td></tr>';
+      return;
+  }
+  $('#acctRows').innerHTML = list.map(function(a){
+    var st = acctState(a), c = a.credits || {}, p = Object.assign({}, a.pool || {});
+    var coolEnd = (S.loadedAt || Date.now()) + (Number(p.coolRemaining) || 0) * 1000;
+    p.coolRemaining = Math.max(0, Math.ceil((coolEnd - Date.now()) / 1000));
+    var left = daysLeft(a.expiresAt);
+    // 每个域都有自己的积分接口（WorkBuddy billing/meter、Trae pay API），都能查。
+    // trae 的额度单位与 WorkBuddy 的积分不同，用悬停说明区分，不做跨域合计。
+    var isTrae = realmOf(a) === 'trae';
+    // 快过期积分：网关按 expiring_soon 窗口（默认 7 天）判定，是 remain 的一部分。
+    // 有值时单独提示——积分到期就作废，运维需要知道「这些得赶紧用掉」。
+    // 无值/为 0 时整行不出现（大多数时候没有快过期积分，不该占位）。
+    var expiring = expiringSoon(c, 7);
+    // 兜底：即将过期的量不可能超过当前余额（它是 remain 的子集）。上游各字段若
+    // 不同步（例如逐包 remaining 合计与汇总 remain 口径不一致），宁可整行不显示，
+    // 也不能让界面出现「余额 2,670，其中 5,000 即将过期」这种自相矛盾的数。
+    // 2026-11-09 实测踩过：Trae 侧逐包金额用了包总额做兜底，档位合计达 size。
+    if (typeof c.remain === 'number' && expiring > c.remain) expiring = 0;
+    var expiringLine = (expiring > 0 && typeof c.remain === 'number')
+      ? '<span class="sub expiring" title="到期即作废，网关选号已优先消耗这批积分">其中 ' +
+        num(expiring) + ' 即将过期</span>'
+      : '';
+    // 非 WorkBuddy 域（trae）没有这套积分接口：显示「不适用」而不是「—」或错误，
+    // 否则运维会以为是查询失败。
+    var creditCell;
+    if (typeof c.remain === 'number'){
+      var creditTitle = isTrae ? 'Trae 额度（与 WorkBuddy 积分口径不同，不参与跨域合计）' : '';
+      creditCell = '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
+        '<span class="m">已用 ' + num(c.used) + ' / ' + num(c.size) + '</span>' +
+        (typeof c.size === 'number' && c.size > 0
+          ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
+          : '') + expiringLine + '</div>';
+      if (creditTitle) creditCell = '<span title="' + esc(creditTitle) + '" style="display:block">' + creditCell + '</span>';
+    } else if (c.error){
+      creditCell = '<span class="na err" title="' + esc(String(c.error)) + '">查询失败</span>';
+    } else {
+      creditCell = '<span style="color:var(--ink-3)">—</span>';
+    }
+    // 最近活动：成功优先，只有错误记录时明说「无成功」，避免与「无记录」混淆
+    // （冷却中的号往往只有错误时间，此前两个时间戳都不写，整列显示「从未」）。
+    // trae 号从没成功过也属正常（刚加进来还没用过），不该显示成「无成功记录」
+    // 那种像是出过错的措辞。
+    var errAt = activityTime(p.lastErr), successAt = activityTime(p.lastSuccess);
+    var lastTxt, lastSub;
+    if (isTrae && !successAt && !errAt){
+      lastTxt = '尚未使用';
+      lastSub = '';
+    } else {
+      lastTxt = successAt ? relTime(successAt) : (errAt ? '无成功记录' : '无记录');
+      lastSub = errAt ? ('最近错误 ' + relTime(errAt))
+        : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
+    }
+    // 状态列：冷却中显示冷却剩余与原因；正常号才显示凭证有效期（两者混在一起会把
+    // 「冷却中」误读成要等 363 天，见 coolLeft 注释）。
+    // 冷却中的行带 data-cool-end（截止毫秒时间戳），交给 tickCooldowns 每秒就地刷新，
+    // 不必等下一次整页数据拉取。
+    var coolReasonTxt = coolReason(p);
+    // 余额不足（CoolHard）的号：只挡住扣积分的模型，**免费模型照常可用**（网关选号
+    // 侧对它豁免，见 pool.hardCreditBlocksModel）。旧文案只写「冷却中 · 余额不足」，
+    // 用户会以为整个号废了、白占着名额——2026-10-15 反馈：「这种积分不足的账号，
+    // 是可以用免费模型的，但是你直接冷却了，后续怎么进来这个号呢」。
+    //
+    // 2026-10-18：余额不足现在**不算冷却**（后端 creditsExhausted 单独表达），
+    // 这一行改由余额分支渲染，措辞里不再出现「冷却」二字——用户指出
+    // 「账号级冷却其实没有存在的必要，都是针对模型的，只是没有积分余额而已」。
+    var freeUsable = p.freeModelsUsable === true;
+    if (freeUsable) coolReasonTxt = (coolReasonTxt || '余额不足') + '（免费模型仍可用）';
+    var exhaustedSub = p.creditsExhausted
+      ? '<span class="sub" data-cool-end="' + coolEnd +
+        '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
+        esc('余额不足 · 免费模型仍可用' +
+            (p.coolRemaining ? '（' + coolLeft(p.coolRemaining) + '后重新查积分）' : '')) + '</span>'
+      : '';
+    var coolSub = p.cooling
+      ? '<span class="sub" data-cool-end="' + coolEnd +
+        '" data-cool-reason="' + esc(coolReasonTxt) + '">' +
+        esc(coolLeft(p.coolRemaining) + (coolReasonTxt ? ' · ' + coolReasonTxt : '')) + '</span>'
+      : '';
+    // 模型级台账：只显示**上游明确告知的限流**（2026-10-18 用户要求：
+    // 「只有被使用的模型，被明确告知冷却，才在账号里显示模型级的冷却」）。
+    //
+    //   rate（6004/429 等）→ 「模型限流 m · 解除 22:53（剩 5 小时）」：
+    //                        until 是上游给的恢复时刻，到点确实可能能用。
+    //
+    // 11102「该后端无此模型」整类不渲染（用户：「甚至连这句话都不需要显示出来」）：
+    // 它表示模型本身不存在/已改名，与账号无关，上游也没给恢复时刻；列出来只会让
+    // 每个账号挂 3~4 行「模型不可用」，把真正在倒计时的限流淹没。后端已不再下发
+    // 这类条目（见 pool.rateLimitedModelsLocked 的 11102 排除），这里再挡一层，
+    // 避免旧版 state.json 恢复的存量条目漏出来。
+    var rlm = rlmOf(a).filter(function(m){ return rlmKind(m) !== 'unavailable'; });
+    var rlmSub = (rlm.length)
+      ? rlm.map(function(m){
+          var sec = Math.max(0, Math.ceil((new Date(m.until).getTime() - Date.now()) / 1000));
+          var untilTxt = fmtLimitWhen(m.until);
+          var resetTxt = m.resetAt ? fmtLimitWhen(m.resetAt) : '';
+          var when = (resetTxt && resetTxt !== untilTxt)
+            ? (resetTxt + '（先避让到 ' + untilTxt + '）')
+            : untilTxt;
+          var label = '模型限流 ' + (m.model || '?') + ' · 解除 ' + when + '（' + coolLeft(sec) + '）';
+          return '<span class="sub rlm" title="' +
+            esc(modelLimitTitle(m)) + '">' + esc(label) +
+            '<button class="btn sm probe" data-probe="' + esc(a.uid) + '" data-probe-model="' +
+            esc(m.model || '') + '" title="发一次极小请求，确认该模型是否已恢复">检测</button>' +
+            '</span>';
+        }).join('')
+      : '';
+    var credSub = (!p.cooling && !p.creditsExhausted && !rlm.length && left != null)
+      ? '<span class="sub">' + esc(left > 0 ? ('凭证剩 ' + left + ' 天') : '凭证已过期') + '</span>'
+      : '';
+    // 账号行第二行：优先显示手机号（Trae 账号由 GetUserInfo 写入 account.mobile，
+    // 形如 138******00）。没有手机号时回落到 uid——WorkBuddy 账号本来就没有。
+    //
+    // 为什么换掉 uid：Trae 的 uid 是一串内部数字（411685466945619），运维看不出
+    // 哪个号是哪个；手机号（哪怕掩码）能直接对上人。
+    var idLine = a.mobile ? a.mobile : shortUid(a.uid);
+    return '<tr>' +
+      '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
+      '<div class="sub mono">' + esc(idLine) + ' · ' + realmTag(a.realm) + '</div></td>' +
+      '<td data-l="状态"><span class="cell-in">' + badge(st) +
+      exhaustedSub + coolSub + rlmSub + credSub +
+      '</span></td>' +
+      '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
+      '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +
+      (lastSub ? '<span class="sub">' + esc(lastSub) + '</span>' : '') + '</span></td>' +
+      // 操作列：td 保持 table-cell（`class="r"` 与其它列一致地拿到 border-collapse
+      // 的底边），flex 交给内层 div——td 自己 flex 化会让折叠边框不再绘制它。
+      //
+      // 池级停用（p.disabled）的号给「复活」而不是「启用」：文件级改名对它们无效
+      // （文件本来就在池里），只有 POST /accounts/revive 能清网关侧的 disabled+reason。
+      // 两类停用都可能同时存在，故两个按钮按需分别出现。
+      '<td class="r" data-l="操作"><div class="row-acts">' +
+      (p.disabled
+        ? '<button class="btn sm" data-revive="' + esc(a.uid) + '" title="' +
+          esc(p.disabledReason || '清除网关侧的停用标记') + '">复活</button>'
+        : '') +
+      // 补发邀请奖励：只有 Trae 域有 code fission 活动（WorkBuddy 两域没有这套端点）。
+      // 放在账号行上而不是任务页：邀请关系是账号级事实，补发也是按 uid 一次性动作，
+      // 不是可排程的周期任务。
+      //
+      // 判域用 realmOf(a) 而不是裸 a.realm：后端对「account 段没有 realm」的账号
+      // 只下发 auth.realm（实测 trae 账号 account.realm 为 None、auth.realm 为
+      // 'trae'），全文件其余判域处一律走 realmOf() 兜底。裸比较是脆的。
+      (realmOf(a) === 'trae'
+        ? '<button class="btn sm" data-fission="' + esc(a.uid) + '" title="' +
+          '补发邀请奖励（服务端代客户端登录时的那次发奖调用）">补发邀请</button>'
+        : '') +
+      '<button class="btn sm" data-toggle="' + esc(a.uid) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' +
+      (a.disabled ? '启用' : '停用') + '</button>' +
+      '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
+      '" title="删除">' + svg(IC.trash, 13) + '</button></div></td></tr>';
+  }).join('');
+}
+
+
+/* ── 积分有效期页 ─────────────────────────────────────
+ * 数据来源：账号的 credits.expiry（cmd/credit 直查上游 billing/meter 得到的分档）。
+ * 为什么不在总览卡上只做一行提示：积分按套餐分批到期，运维需要看到「哪天、哪个号、
+ * 多少分要作废」才能决定是否优先跑掉——一行汇总数看不出这些。
+ * 分档是固定的 1/3/7/30 天，面板不再按窗口重复查上游。
+ */
+// EXPIRY_BUCKETS 与后端 upstream.ExpiryBreakdown 的档位一一对应。
+var EXPIRY_BUCKETS = [
+  { key:'within_1d',  label:'1 天内',  cls:'e' },
+  { key:'within_3d',  label:'3 天内',  cls:'e' },
+  { key:'within_7d',  label:'7 天内',  cls:'w' },
+  { key:'within_30d', label:'30 天内', cls:'a' },
+  { key:'later',      label:'30 天后', cls:'' },
+  { key:'unlimited',  label:'不会过期', cls:'ok' }
+];
+function expiryOf(c){
+  var e = (c && c.expiry) || {};
+  var out = {}, sum = 0;
+  EXPIRY_BUCKETS.forEach(function(b){
+    var v = Number(e[b.key]) || 0;
+    out[b.key] = v; sum += v;
+  });
+  out.next_end = e.next_end || '';
+  out.sum = sum;
+  return out;
+}
+// expiringSoon 返回「N 天内」的累计快过期积分（含更紧迫档位，不含不会过期的部分）。
+//
+// 两个数据来源，优先用更细的分档：
+//   · credits.expiry（分档，积分有效期页用）——存在且有任何一档非零时按天累计；
+//   · credits.expiring（标量，网关/credit 直接给的窗口内合计）——分档缺失时回落到它。
+// 回落是必要的：旧面板数据/旧网关只给标量，硬走分档会把「有积分要作废」显示成 0。
+function expiringSoon(c, days){
+  if (!c) return 0;
+  var e = c.expiry;
+  if (e && typeof e === 'object'){
+    var hasBucket = EXPIRY_BUCKETS.some(function(b){ return (Number(e[b.key]) || 0) > 0; });
+    if (hasBucket){
+      var s = 0;
+      EXPIRY_BUCKETS.forEach(function(b){
+        if (b.key === 'later' || b.key === 'unlimited') return;
+        var d = parseInt(b.label, 10);           // "1 天内" → 1
+        if (d <= days) s += Number(e[b.key]) || 0;
+      });
+      return s;
+    }
+  }
+  return Number(c.expiring) || 0;
+}
+function fmtEnd(iso){
+  if (!iso) return '—';
+  var t = new Date(iso);
+  if (isNaN(t.getTime())) return '—';
+  var days = Math.ceil((t.getTime() - Date.now()) / 86400000);
+  var rel = days <= 0 ? '已到期' : (days === 1 ? '明天' : days + ' 天后');
+  var md = (t.getMonth() + 1) + '/' + t.getDate() + ' ' +
+    ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2);
+  return md + '（' + rel + '）';
+}
+function renderCreditsPage(){
+  var d = S.data || {}, a = d.accounts || [];
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  if (!have.length){
+    $('#creditsHead').innerHTML = '';
+    $('#creditsBars').innerHTML = '';
+    $('#creditsThead').innerHTML = '';
+    $('#creditsRows').innerHTML = '<tr><td colspan="8" data-l="">' +
+      emptyBox(IC.coins, d.creditPending ? '正在统计积分' : '暂无积分数据',
+        d.creditError ? String(d.creditError) : '稍后自动刷新') + '</td></tr>';
+    $('#creditsMeta').textContent = '';
+    return;
+  }
+  // 域筛选：与账号页同一套（S.creditRealm 只作用于本页，不动账号页的 S.realm）。
+  var scoped = have;
+  if (S.creditRealm) scoped = have.filter(function(x){ return realmOf(x) === S.creditRealm; });
+  var total = { within_1d:0, within_3d:0, within_7d:0, within_30d:0, later:0, unlimited:0, sum:0 };
+  var remain = 0, soon7 = 0, nextEnd = '';
+  scoped.forEach(function(x){
+    var e = expiryOf(x.credits);
+    EXPIRY_BUCKETS.forEach(function(b){ total[b.key] += e[b.key]; });
+    total.sum += e.sum;
+    remain += x.credits.remain;
+    soon7 += expiringSoon(x.credits, 7);
+    if (e.next_end && (!nextEnd || new Date(e.next_end) < new Date(nextEnd))) nextEnd = e.next_end;
+  });
+  var windowHours = Number((d.creditTotals || {}).expiring_window_hours) || 0;
+  var windowDays = windowHours ? Math.round(windowHours / 24) : 0;
+  var pctSoon = remain ? Math.round(soon7 / remain * 100) : 0;
+  $('#creditsHead').innerHTML =
+    '<div class="metric"><div class="k">' + (windowDays ? windowDays + ' 天内到期' : '7 天内到期') + '</div>' +
+      '<div class="v">' + svg(IC.clock, 15) + '<b>' + num(soon7) + '</b><small>积分</small></div>' +
+      '<div class="s ' + (soon7 > 0 ? 'w' : 'ok') + '">' +
+      (soon7 > 0 ? '占剩余 ' + pctSoon + '%，到期即作废' : '暂无即将作废的积分') + '</div></div>' +
+    '<div class="metric"><div class="k">剩余合计</div>' +
+      '<div class="v">' + svg(IC.coins, 15) + '<b>' + num(remain) + '</b><small>积分</small></div>' +
+      '<div class="s">' + scoped.length + ' / ' + a.length + ' 个账号取到' +
+      (S.creditRealm ? '（' + realmShort(S.creditRealm) + '）' : '') + '</div></div>' +
+    '<div class="metric"><div class="k">最近一次到期</div>' +
+      '<div class="v">' + svg(IC.clock, 15) + '<b>' + (nextEnd ? fmtEnd(nextEnd).replace(/（.*$/, '') : '—') + '</b></div>' +
+      '<div class="s">' + (nextEnd ? fmtEnd(nextEnd).replace(/^.*（|）$/g, '') : '无到期积分') + '</div></div>';
+  // 分档条：把 remain 按到期紧迫度铺成一条，一眼看出「多少要作废」。
+  $('#creditsBars').innerHTML = EXPIRY_BUCKETS.map(function(b){
+    var v = total[b.key];
+    if (!v) return '';
+    var pct = remain ? (v / remain * 100) : 0;
+    return '<div class="exp-bar ' + b.cls + '">' +
+      '<div class="exp-bar-h"><span>' + esc(b.label) + '</span><b>' + num(v) + '</b></div>' +
+      '<div class="exp-bar-t"><i style="width:' + Math.max(1, Math.round(pct)) + '%"></i></div>' +
+      '<div class="exp-bar-s">' + pct.toFixed(pct < 10 ? 1 : 0) + '%</div></div>';
+  }).join('');
+  // 列自适应：1/3/7/30 天四档里，多数时候只有一两档非零，其余整列都是「—」。
+  // 全列铺出来是一堵 8 列的灰墙，真正有数字的那格反而被淹没。所以只保留
+  // **本次筛选下确有余额**的档位（「不会过期」同理），列头跟着数据走。
+  var cols = EXPIRY_BUCKETS.filter(function(b){ return total[b.key] > 0; });
+  // 「最近到期」只在真有到期时间时才有意义；全是不会过期的余额时整列无意义。
+  var showNext = cols.some(function(b){ return b.key !== 'unlimited'; });
+  // 账号表：按域分组（cn → global → trae），组内按「7 天内到期」降序，
+  // 有作废风险的在最上面。分组让「哪个域的积分要浪费了」一眼可辨。
+  var rows = scoped.slice().sort(function(x, y){
+    return expiringSoon(y.credits, 7) - expiringSoon(x.credits, 7);
+  });
+  var groups = REALM_ORDER.filter(function(r){
+    return rows.some(function(x){ return realmOf(x) === r; });
+  });
+  // 池里出现但不在 REALM_ORDER 里的域（未来新增）：兜底追加，不静默丢行。
+  var extra = {};
+  rows.forEach(function(x){
+    var r = realmOf(x);
+    if (REALM_ORDER.indexOf(r) < 0) extra[r] = true;
+  });
+  groups = groups.concat(Object.keys(extra));
+  var span = 2 + cols.length + (showNext ? 1 : 0);
+  $('#creditsThead').innerHTML = '<tr><th>账号</th><th class="r">剩余</th>' +
+    cols.map(function(b){ return '<th class="r">' + esc(b.label) + '</th>'; }).join('') +
+    (showNext ? '<th>最近到期</th>' : '') + '</tr>';
+  $('#creditsRows').innerHTML = groups.map(function(realm){
+    var mine = rows.filter(function(x){ return realmOf(x) === realm; });
+    if (!mine.length) return '';
+    var part = mine.reduce(function(s, x){ return s + expiringSoon(x.credits, 7); }, 0);
+    // 备注用 float:right（见 credits.css）：td 必须保持 table-cell，
+    // 否则折叠边框不再绘制它。
+    var head = '<tr class="tbl-grp"><td colspan="' + span + '">' +
+      '<span class="g-sub">' + mine.length + ' 个号' +
+      (part > 0 ? ' · ' + num(part) + ' 快过期' : '') + '</span>' +
+      realmTag(realm) +
+      '<span class="g-nm">' + esc(realmName(realm)) + '</span></td></tr>';
+    return head + mine.map(function(x){
+      var e = expiryOf(x.credits);
+      return '<tr>' +
+        '<td data-l="账号"><div class="who">' + esc(x.nickname || '') + '</div>' +
+          '<div class="sub mono">' + esc(shortUid(x.uid)) + '</div></td>' +
+        '<td class="r" data-l="剩余"><b>' + num(x.credits.remain) + '</b></td>' +
+        cols.map(function(b){
+          var v = e[b.key];
+          var urgent = (b.key === 'within_1d' || b.key === 'within_3d') ? ' exp-urgent' : '';
+          return '<td class="r" data-l="' + esc(b.label) + '">' +
+            (v ? '<span class="' + urgent.trim() + '">' + num(v) + '</span>'
+               : '<span class="exp-zero">—</span>') + '</td>';
+        }).join('') +
+        (showNext ? '<td data-l="最近到期"><span class="sub">' + esc(fmtEnd(e.next_end)) + '</span></td>' : '') +
+        '</tr>';
+    }).join('');
+  }).join('');
+  if (!groups.length){
+    $('#creditsRows').innerHTML = '<tr><td colspan="' + span + '" data-l="">' +
+      emptyBox(IC.coins, '该区域没有积分数据', '换个区域或选「全区域」') + '</td></tr>';
+  }
+  $('#creditsMeta').textContent = scoped.length + ' 个账号 · 分档互斥，合计 = 剩余';
+  renderSchedule();
+}
+
+/* ── 到期日程 ─────────────────────────────────────────
+ * 分档回答「有多少快过期」，日程回答「具体几号几点过期多少」。
+ * 把各账号的 schedule 按到期时刻聚合：同一时刻多个号一起作废的合成一行，
+ * 这样运维能一眼看到"下一波什么时候来、一共多少"。
+ */
+// SCHED_STATE 日程视图状态（范围 + 选中账号）。放在模块级而不是 S 里：
+// 它只影响这一个区块，且切换筛选不该触发整页重绘。
+var SCHED_STATE = { scope:'all', account:'' };
+// schedEntries 把账号列表的 schedule 聚合成「时刻 → {amount, accounts[], realms[]}」。
+function schedEntries(list){
+  var byTime = {}, order = [];
+  list.forEach(function(x){
+    var sch = ((x.credits || {}).expiry || {}).schedule || [];
+    var realm = realmOf(x);
+    sch.forEach(function(e){
+      var t = e.end; if (!t) return;
+      if (!byTime[t]){ byTime[t] = { end:t, amount:0, accounts:[], realms:[] }; order.push(t); }
+      byTime[t].amount += Number(e.amount) || 0;
+      byTime[t].accounts.push(x.nickname || shortUid(x.uid));
+      // 同一时刻可能跨域一起到期（各域的积分是两套账），记下来供行内标注。
+      if (byTime[t].realms.indexOf(realm) < 0) byTime[t].realms.push(realm);
+    });
+  });
+  return order.sort(function(p, q){ return new Date(p) - new Date(q); })
+    .map(function(t){ return byTime[t]; });
+}
+// schedRel 把到期时刻写成「N 天后 / 明天 / 今天 HH:MM / 已到期」。
+function schedRel(iso){
+  var t = new Date(iso); if (isNaN(t.getTime())) return '';
+  var ms = t.getTime() - Date.now();
+  var days = Math.floor(ms / 86400000);
+  if (ms < 0) return '已到期';
+  if (days === 0) return '今天';
+  if (days === 1) return '明天';
+  if (days < 30) return days + ' 天后';
+  return Math.floor(days / 30) + ' 个月后';
+}
+// schedCls 按紧迫度给行上色：3 天内 err、7 天内 warn、30 天内 info、更远中性。
+function schedCls(iso){
+  var ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 3 * 86400000) return 'e';
+  if (ms <= 7 * 86400000) return 'w';
+  if (ms <= 30 * 86400000) return 'a';
+  return '';
+}
+function renderSchedule(){
+  var rowsEl = $('#schedRows'); if (!rowsEl) return;
+  var d = S.data || {}, a = d.accounts || [];
+  // 积分到期日程是 WorkBuddy 端点族的概念（cmd/credit 查 billing/meter 得到）。
+  // 非 WorkBuddy 域（trae）的 pay API 只给总额、没有逐笔到期时间，永远不会有
+  // schedule。不排除的话，它们会被算进「取到的账号」，让「没有到期日程」的空态
+  // 读起来像数据缺失，实际是这个域压根没这项。口径见 REALM_NO_SCHEDULE。
+  var billable = a.filter(function(x){ return !REALM_NO_SCHEDULE[realmOf(x)]; });
+  var have = billable.filter(function(x){
+    return x.credits && typeof x.credits.remain === 'number' &&
+           ((x.credits.expiry || {}).schedule || []).length;
+  });
+  // 账号选择器：只列真的有日程的号（几十个号全列出来没人用）。带上域标签，
+  // 免得重名昵称分不出是哪个域的号。
+  var picker = $('#schedAccount');
+  if (picker){
+    picker.innerHTML = '<button data-a="" aria-pressed="' + (!SCHED_STATE.account) + '">全部</button>' +
+      have.map(function(x){
+        return '<button data-a="' + esc(x.uid) + '" aria-pressed="' +
+          (SCHED_STATE.account === x.uid) + '" title="' + esc(realmName(x.realm)) + '">' +
+          esc(x.nickname || shortUid(x.uid)) + '</button>';
+      }).join('');
+  }
+  var scope = have;
+  if (SCHED_STATE.account){
+    scope = have.filter(function(x){ return x.uid === SCHED_STATE.account; });
+  }
+  var entries = schedEntries(scope);
+  if (SCHED_STATE.scope === 'soon'){
+    // 「窗口内」= 与分档同口径：7 天内（窗口由 pool.expiring_soon 决定，
+    // 面板拿到的小时数在这里换算，避免两处各写死一个天数）。
+    var wh = Number((d.creditTotals || {}).expiring_window_hours) || 168;
+    var cutoff = Date.now() + wh * 3600000;
+    entries = entries.filter(function(e){ return new Date(e.end).getTime() <= cutoff; });
+  }
+  // 顶部计数：让「有日程的号 / 参与统计的号」可见，而不是只给一张表。
+  var countEl = $('#schedCount');
+  if (countEl){
+    var skipped = a.length - billable.length;
+    countEl.textContent = have.length
+      ? ('共 ' + entries.length + ' 笔 · 涉及 ' + scope.length + ' 个账号' +
+         (skipped ? '（' + skipped + ' 个无到期概念的账号已排除）' : ''))
+      : '';
+  }
+  if (!entries.length){
+    var why = have.length ? '换个筛选条件'
+      : (billable.length ? '取到的账号都没有带到期时间的积分'
+        : '没有适用积分到期的账号');
+    rowsEl.innerHTML = '<tr><td colspan="4" data-l="">' +
+      emptyBox(IC.clock, '没有到期日程', why) + '</td></tr>';
+    return;
+  }
+  // 截断说明：任一账号标了 truncated 就提示一次（余额已聚进最后一笔，不是丢了）。
+  var truncated = scope.some(function(x){
+    return ((x.credits.expiry || {}).schedule_truncated);
+  });
+  var html = entries.map(function(e){
+    var cls = schedCls(e.end);
+    var names = e.accounts;
+    var label = names.length <= 3 ? names.join('、')
+      : (names.slice(0, 3).join('、') + ' 等 ' + names.length + ' 个号');
+    // 涉及多个域时标出来：不同域的积分是两套账，混在一笔里容易误读成「同一个池子」。
+    var realms = e.realms || [];
+    var realmCell = realms.length > 1
+      ? '<span class="sub">' + realms.map(function(r){ return realmTag(r); }).join(' ') + '</span>'
+      : '';
+    return '<tr>' +
+      '<td data-l="到期时间"><span class="sched-t ' + cls + '">' + esc(fmtStamp(e.end)) + '</span></td>' +
+      '<td data-l="距今"><span class="sub">' + esc(schedRel(e.end)) + '</span>' + realmCell + '</td>' +
+      '<td class="r" data-l="作废积分"><b class="' + (cls === 'e' ? 'exp-urgent' : '') + '">' +
+        num(e.amount) + '</b></td>' +
+      '<td data-l="涉及账号"><span class="sub">' + esc(label) + '</span></td></tr>';
+  }).join('');
+  if (truncated){
+    html += '<tr><td colspan="4" data-l=""><div class="sub sched-trunc">' +
+      '部分账号的日程超过 40 笔，更远的余额已合并到最后一笔——合计仍等于剩余积分。</div></td></tr>';
+  }
+  rowsEl.innerHTML = html;
+}
+// fmtStamp 绝对时刻：M/D HH:MM（跨年时补年份，避免"1/5"看不出是哪年）。
+function fmtStamp(iso){
+  var t = new Date(iso); if (isNaN(t.getTime())) return '—';
+  var now = new Date();
+  var s = (t.getMonth() + 1) + '/' + t.getDate() + ' ' +
+    ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2);
+  if (t.getFullYear() !== now.getFullYear()) s = t.getFullYear() + '/' + s;
+  return s;
+}
+// 侧栏计数：有积分将在窗口内到期的账号数（0 时显示 —，避免长期占一个数字）。
+function renderCreditsTab(){
+  var el = $('#tabCredits'); if (!el) return;
+  var a = (S.data && S.data.accounts) || [];
+  var n = a.filter(function(x){
+    return x.credits && typeof x.credits.remain === 'number' && expiringSoon(x.credits, 7) > 0;
+  }).length;
+  el.textContent = n ? String(n) : '—';
+}
+// 搜索输入防抖：账号表在输入过程中每敲一个字都重建 DOM，几十行时能感到迟滞。
+$('#acctSearch').addEventListener('input', debounce(function(e){ S.q = e.target.value; renderAccounts(); }, 120));
+$('#acctFilter').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-f]'); if (!b) return;
+  S.filter = b.getAttribute('data-f');
+  $$('#acctFilter button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderAccounts();
+});
+// 域筛选：与状态筛选相互独立（两个维度同时生效），只重绘表格不动整页。
+// 排序与模型筛选。两者是一组：只有「限流解除」排序下模型筛选才启用——
+// 其它排序里按模型过滤会得到一张顺序毫无意义的表（见 renderAccounts 注释）。
+$('#acctSort').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-s]'); if (!b) return;
+  S.acctSort = b.getAttribute('data-s');
+  // 切走「限流解除」时清掉模型筛选：留着会让下次切回来时莫名其妙只剩几行，
+  // 而用户以为自己选的是「全部模型」。
+  if (S.acctSort !== 'limit' && S.acctModel) S.acctModel = '';
+  renderAccounts();
+});
+$('#acctModel').addEventListener('change', function(e){
+  S.acctModel = e.target.value || '';
+  renderAccounts();
+});
+$('#acctRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.realm = b.getAttribute('data-r');
+  $$('#acctRealm button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderAccounts();
+});
+// 任务页的域筛选：只作用于本页（S.taskRealm）。与账号页 S.realm、积分页
+// S.creditRealm 三者各自独立——它们是三个不同的使用场景，联动会让「在账号页
+// 筛了 CN，切到任务页只剩一半」这种意外发生。
+$('#taskRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.taskRealm = b.getAttribute('data-r');
+  renderTasks();  // 重绘会顺带刷新按钮的 aria-pressed
+});
+// 积分有效期页的域筛选：只作用于本页（S.creditRealm），与账号页的 S.realm 互不影响
+// ——两页的筛选是各自的使用场景，联动的结果是「在账号页筛了 CN，切到积分页只剩一半」。
+$('#creditsRealm').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-r]'); if (!b) return;
+  S.creditRealm = b.getAttribute('data-r');
+  $$('#creditsRealm button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderCreditsPage();
+});
+// 到期日程的两个筛选：范围（全部/窗口内）与账号。只重绘日程表，不动整页。
+$('#schedScope').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-s]'); if (!b) return;
+  SCHED_STATE.scope = b.getAttribute('data-s');
+  $$('#schedScope button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderSchedule();
+});
+// 账号选择器是动态重建的（只列有日程的号），用事件委托挂在容器上。
+$('#schedAccount').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-a]'); if (!b) return;
+  SCHED_STATE.account = b.getAttribute('data-a');
+  renderSchedule();  // 重绘会顺带刷新选择器的 aria-pressed
+});
+$('#acctRows').addEventListener('click', function(e){
+  var rv = e.target.closest('[data-revive]');
+  if (rv) return actRevive(rv.getAttribute('data-revive'));
+  var fs = e.target.closest('[data-fission]');
+  if (fs) return actFission(fs.getAttribute('data-fission'));
+  var pb = e.target.closest('[data-probe]');
+  if (pb) return actProbeModel(pb.getAttribute('data-probe'), pb.getAttribute('data-probe-model'));
+  var t = e.target.closest('[data-toggle]');
+  if (t) return actToggle(t.getAttribute('data-toggle'), t.getAttribute('data-disabled') === '0');
+  var d = e.target.closest('[data-del]');
+  if (d) return actDelete(d.getAttribute('data-del'), d.getAttribute('data-name'));
+});
+
+// renderTasks 按**账号区域**分组渲染任务。
+//
+// 分组的依据是后端给的 t.realms（任务实际作用的域），不是按名字猜——签到同时覆盖
+// cn/global/trae 三个域，其余任务只服务 WorkBuddy 两域，猜一定会猜错。
+//
+// 只渲染池里**真有账号**的域：没有 trae 号时列出「Trae」分组只会让人以为漏了配置。
+// taskRealms 返回任务页该展示哪些域（按 REALM_ORDER 固定顺序，避免分组跳动）。
+//
+// 依据是**池里出现的域**（与分组同一口径）；池子数据还没到时退回任务自己声明的域，
+// 至少不显示空白。返回的这份同时用于顶部切换按钮与分组渲染。
+function taskRealms(list){
+  var present = {};
+  ((S.data && S.data.accounts) || []).forEach(function(a){ present[realmOf(a)] = true; });
+  var groups = REALM_ORDER.filter(function(r){ return present[r]; });
+  if (!groups.length){
+    var seen = {};
+    list.forEach(function(t){
+      (t.realms || ['cn']).forEach(function(r){ seen[r] = true; });
+    });
+    groups = REALM_ORDER.filter(function(r){ return seen[r]; });
+  }
+  return groups;
+}
+
+// renderTaskRealmSeg 生成顶部区域切换按钮。
+//
+// 选项是**动态**的：哪些域有任务随池子变化（今天只有 cn/global，明天加了 trae），
+// 写死会让新域无法筛选。域多了以后整页要滚很久才能看到后面的域，所以只渲染
+// 选中的那一个域（「全部」则全渲染）。
+function renderTaskRealmSeg(groups){
+  var host = $('#taskRealm');
+  if (!host) return;
+  // 选中的域已经从池里消失（账号被删）时回落到「全部」，否则会卡在一个空页上。
+  if (S.taskRealm && groups.indexOf(S.taskRealm) < 0) S.taskRealm = '';
+  var btns = [['', '全部']].concat(groups.map(function(r){ return [r, realmShort(r)]; }));
+  host.innerHTML = btns.map(function(pair){
+    return '<button data-r="' + esc(pair[0]) + '" aria-pressed="' +
+      (S.taskRealm === pair[0]) + '">' + esc(pair[1]) + '</button>';
+  }).join('');
+}
+
+function renderTasks(){
+  var list = taskList();
+  var host = $('#taskList');
+  if (!host) return;
+  if (!list.length){
+    renderTaskRealmSeg([]);
+    host.innerHTML = emptyBox(IC.clock, '暂无定时任务',
+      (S.tasks && S.tasks.error) || '网关进程没有加载排程器');
+    return;
+  }
+  var groups = taskRealms(list);
+  renderTaskRealmSeg(groups);
+  // 只渲染选中的域；「全部」时渲染全部域。
+  var shown = S.taskRealm ? groups.filter(function(r){ return r === S.taskRealm; }) : groups;
+  var html = shown.map(function(realm){
+    var mine = list.filter(function(t){
+      return (t.realms || ['cn']).indexOf(realm) >= 0;
+    });
+    if (!mine.length) return '';
+    return '<div class="vhead sec" style="margin-top:18px">' +
+        '<h2 style="font-size:14px">' + realmTag(realm) +
+        '<span style="margin-left:8px">' + esc(realmName(realm)) + '</span></h2>' +
+        '<span class="sp"></span>' +
+        '<span class="sub">' + mine.length + ' 个任务</span>' +
+      '</div>' +
+      '<div class="tiles">' + sortTasks(mine).map(taskTile).join('') + '</div>';
+  }).join('');
+  // 没有任何域匹配（理论上不会）：退回平铺，宁可丑也不要空白。
+  host.innerHTML = html || ('<div class="tiles">' + sortTasks(list).map(taskTile).join('') + '</div>');
+}
+
+// taskTile 单个任务卡片。
+function taskTile(t){
+  var st = taskState(t);
+  // Trae 签到不是整点触发：后端 nextTraeFire 把它排在整点后第 5 分钟（避开
+  // CST 日切边界，见 scheduler.traeFireMinute）。小时标签必须显示真实时刻，
+  // 否则面板写 00:00、实际 00:05 才跑，排查时会误判成任务没触发。
+  // 分钟值由后端下发的 fire_minute 决定，前端不硬编码——两处各写一份必然漂移。
+  var fireMin = (typeof t.fire_minute === 'number') ? t.fire_minute : 0;
+  var hours = (t.hours || []).map(function(h){
+    return '<span class="hour">' + pad(h) + ':' + pad(fireMin) + '</span>'; }).join('');
+  // 一次性任务（无 hours）没有开关：它的执行与否由上游活动是否过期决定，
+  // 不由配置决定。面板隐藏开关（服务端也会拒绝对它的 toggle，见
+  // panel.SetTaskEnabled 的空字段保护），只留「跑一次」与「停止」。
+  var oneShot = !(t.hours && t.hours.length);
+  var toggle = oneShot ? '<span class="pill">一次性</span>' :
+    '<button class="sw" role="switch" data-task="' + esc(t.key) + '" aria-checked="' +
+    (t.enabled ? 'true' : 'false') + '"' + (t.running ? ' disabled' : '') +
+    ' aria-label="' + esc(t.name) + ' 开关"></button>';
+  // 运行中时「跑一次」换成「停止」：同一个位置、同一个按钮样式，避免用户
+  // 在「已经在跑」的状态下还能再点一次触发（服务端会回 409，但那是错误提示，
+  // 不如直接把可用的动作摆出来）。
+  var action = t.running
+    ? '<button class="btn sm dgr solid" data-stop="' + esc(t.key) + '">' + svg(IC.stop, 11) + '停止</button>'
+    : '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>';
+  return '<div class="tile">' +
+    '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' + toggle + '</div>' +
+    '<div><div class="tl-nm">' + esc(t.name) + '</div>' +
+    '<div class="detail">' + esc(t.detail || '') + '</div></div>' +
+    '<div class="hours">' + hours + '</div>' +
+    '<div class="tile-f">' +
+    action +
+    '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) +
+    '" title="日志">' + svg(IC.eye, 13) + '</button>' +
+    '<span class="sp"></span><span class="meta">' + esc(fmtTime(t.next_run)) + '</span>' +
+    '</div></div>';
+}
+
+function renderSystem(){
+  var d = S.data; if (!d) return;   // 直接打开 /#system（刷新或深链）时数据还没到，等 render() 再补
+  var accounts = d.accounts || [];
+  var cool = accounts.filter(function(a){ return a.pool && a.pool.cooling; }).length;
+  var bad = accounts.filter(function(a){ return a.pool && a.pool.inPool && !a.pool.healthy; }).length;
+  $('#sysCards').innerHTML =
+    mrow('运行状态', d.containerRunning ? '运行中' : '已停止', d.containerRunning ? 'ok' : 'e') +
+    mrow('服务', 'LoomGate') +
+    mrow('冷却账号', String(cool), cool ? 'w' : '') +
+    mrow('异常账号', String(bad), bad ? 'e' : 'ok') +
+    mrow('账号总数', String(accounts.length)) +
+    mrow('定时任务', taskList().length ? String(taskList().length) : '—');
+  renderLan();
+}
+
+/* ── 局域网访问（2026-10-15）────────────────────────────
+   开关 + 可选来源网段白名单；写 config.json 的 listen / admin_allow_cidrs。
+   面板与 API 在同一个监听上，开启即一起暴露——这是安全敏感操作：
+   后端拒绝在无调用密钥时开启（SetLANAccess 闸门）。 */
+function renderLan(){
+  var el = document.getElementById('lanRows'); if (!el) return;
+  var d = S.data && S.data.lan || {};
+  $('#lanState').textContent = d.enabled ? '已开启' : '已关闭';
+  el.innerHTML =
+    mrow('当前监听', d.listen || '—') +
+    mrow('来源白名单', d.allow_cidrs ? d.allow_cidrs : '不限（仅回环与局域网可达）') +
+    mrow('调用密钥', d.has_key ? '已配置' : '未配置（开启前需先创建）', d.has_key ? 'ok' : 'e');
+  if (document.activeElement !== $('#lanCIDRs')) $('#lanCIDRs').value = d.allow_cidrs || '';
+  var b = $('#btnLanApply');
+  b.setAttribute('data-enable', d.enabled ? 'off' : 'on');
+  b.textContent = d.enabled ? '关闭局域网访问' : '开启局域网访问';
+}
+async function actLanApply(cidrs){
+  var d = S.data && S.data.lan || {};
+  var enable = d.enabled ? false : true;   // 按当前状态取反
+  busy(true);
+  try{
+    var r = await api('api/lan', { enabled: enable, allow_cidrs: cidrs || '' });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) setTimeout(function(){ loadAll(); }, 1200);
+  }catch(err){ toast('保存失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+document.addEventListener('click', function(e){
+  var b = e.target.closest('#btnLanApply');
+  if (b){ actLanApply($('#lanCIDRs').value); return; }
+});
+
+/* ── 交互委托 ─────────────────────────────────────── */
+document.addEventListener('click', function(e){
+  var r = e.target.closest('[data-run]');
+  if (r){ actTaskRun(r.getAttribute('data-run')); return; }
+  // 停止排在 data-run 之后：两者互斥（运行中渲染 stop、空闲渲染 run），
+  // 不会同时命中，但保持「先 run 后 stop」的顺序便于阅读。
+  var p = e.target.closest('[data-stop]');
+  if (p){ actTaskStop(p.getAttribute('data-stop')); return; }
+  var g = e.target.closest('[data-log]');
+  if (g){ openTaskLog(g.getAttribute('data-log'), g.getAttribute('data-name')); return; }
+  var s = e.target.closest('[data-task]');
+  if (s){ actTaskToggle(s.getAttribute('data-task'), s.getAttribute('aria-checked') !== 'true'); return; }
+  var c = e.target.closest('[data-copy]');
+  if (c) copyText(c.getAttribute('data-copy'));
+});
+
+function copyText(t){
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(function(){ toast('已复制', 'ok'); },
+      function(){ toast('复制失败', 'err'); });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast('已复制', 'ok'); }
+    catch(err){ toast('复制失败', 'err'); }
+    ta.remove();
+  }
+}
+
+/* ── 确认弹窗 ─────────────────────────────────────── */
+function ask(title, text, okLabel, danger, cb){
+  $('#mdTitle').textContent = title;
+  $('#mdText').textContent = text;
+  $('#mdIcon').className = 'mic ' + (danger ? 'e' : 'w');
+  var yes = $('#mdYes');
+  yes.textContent = okLabel;
+  modalCb = cb;
+  $('#scrimM').classList.add('on');
+  $('#modal').classList.add('on');
+  setTimeout(function(){ yes.focus(); }, 60);
+}
+function closeModal(){
+  $('#scrimM').classList.remove('on');
+  $('#modal').classList.remove('on');
+  modalCb = null;
+}
+$('#mdNo').addEventListener('click', closeModal);
+$('#scrimM').addEventListener('click', closeModal);
+$('#mdYes').addEventListener('click', function(){
+  var cb = modalCb; closeModal(); if (cb) cb();
+});
+document.addEventListener('keydown', function(e){
+  if (e.key !== 'Escape') return;
+  if ($('#modal').classList.contains('on')) closeModal();
+  else if ($('#logModal').classList.contains('on')) closeLogModal();
+  else if ($('#drawer').classList.contains('on')) closeDrawer();
+});
+
+/* ── 操作 ─────────────────────────────────────────── */
+async function actToggle(uid, nextDisabled){
+  busy(true);
+  try{
+    var r = await api('api/account/toggle', { uid:uid, disabled:nextDisabled });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) await loadAll();
+  }catch(err){ toast('操作失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+function actRevive(uid){
+  ask('复活账号',
+    '将清除网关侧对该号的停用标记，让它重新参与调度。\n\n' +
+    '注意：如果该号是被上游标记（内容审核/封禁）的，复活后第一次请求会被再次拒绝并重新停用——' +
+    '这类号需要先用官方客户端重新登录一次。',
+    '复活', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/revive', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+// actProbeModel 手动检测某账号在某模型上的冷却是否已解除。
+//
+// 模型级限流没有权威到期前的自查手段：上游给的「将在 … 重置」只是它的预期，
+// 是否真放行只能发一次极小真实请求验证。成功即清掉该模型的限流记录
+// （网关侧 ClearModelLimit 的同一证伪口径），失败则如实给出新的解除时刻。
+function actProbeModel(uid, model){
+  if (!model) return;
+  busy(true);
+  api('api/account/probe-model', { uid:uid, model:model }).then(function(r){
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) loadAll();
+  }, function(err){
+    toast('检测失败：' + (err && err.message || err), 'err');
+  }).then(function(){ busy(false); });
+}
+function actFission(uid){
+  ask('补发邀请奖励',
+    '将代替 TRAE 桌面端，向该账号补发一次「邀请新用户」奖励（500 积分）。\n\n' +
+    '为什么需要它：邀请记录停在「邀请中」不是服务端没发，而是发奖动作在桌面端本地——' +
+    '被邀请人没登过客户端，记录就永远挂着。\n\n' +
+    '重复执行是安全的：上游对已发放的账号返回「已发放」，不会重复加积分。',
+    '补发', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/fission', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('补发失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+function actDelete(uid, name){
+  ask('删除账号', '将把「' + (name || shortUid(uid)) + '」移入 auths-trash 并重启网关，可手动从回收目录恢复。',
+    '删除', true, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/delete', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('删除失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+function actRestart(){
+  ask('重启网关', '重启期间服务会暂时中断，后台任务可能需要等待结束；账号与配置改动将在重新启动后生效。', '重启', false, async function(){
+    busy(true);
+    try{
+      var r = await api('api/service/restart', {});
+      toast(r.message, r.ok ? 'ok' : 'err');
+      await loadAll(true);
+    }catch(err){ toast('重启失败：' + (err && err.message || err), 'err'); }
+    finally{ busy(false); }
+  });
+}
+async function actTaskRun(key){
+  busy(true);
+  try{
+    var r = await api('api/task/run', { key:key });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok){
+      // 触发成功就直接打开这个任务的日志窗口：用户点「跑一次」要看的正是
+      // 「现在跑成什么样」，让他再去找小眼睛按钮是多余一跳（2026-10-15 用户
+      // 反馈「手动执行的任务看不到实时日志」——日志机制本身是好的，缺的就是
+      // 这一步引导）。弹窗自带 2s 轮询，任务结束后回落到 5s。
+      var t = taskList().filter(function(x){ return x.key === key; })[0] || {};
+      openTaskLog(key, t.name || key);
+      setTimeout(function(){ loadAll(); }, 1200);
+    }
+  }catch(err){ toast('触发失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+async function actTaskStop(key){
+  busy(true);
+  try{
+    var r = await api('api/task/stop', { key:key });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok){
+      // 停止是协作式的：信号发出后任务在下一个检查点退出，因此不能立刻断言
+      // 「已停止」。刷新几次让面板自己把状态翻成「空闲」——第一次 1.2s 覆盖
+      // 快速退出的任务，第二次 4s 兜住还在收尾的（脚本子进程要等它退出）。
+      setTimeout(function(){ loadAll(); }, 1200);
+      setTimeout(function(){ loadAll(); }, 4000);
+    }
+  }catch(err){ toast('停止失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+function actTaskToggle(key, nextEnabled){
+  var t = taskList().filter(function(x){ return x.key === key; })[0] || {};
+  // 文案不再写「重启网关生效」：2026-10-15 起网关会原地改运行期开关并叫醒排程器
+  // （见 panel.actions.applyTaskToggle），保存后立刻生效，不必重启。
+  ask((nextEnabled ? '启用' : '停用') + '任务',
+    '「' + (t.name || key) + '」' + (nextEnabled ? '将恢复按点执行' : '将不再自动执行') + '，保存后立即生效。',
+    nextEnabled ? '启用' : '停用', !nextEnabled, async function(){
+      busy(true);
+      try{
+        var r = await api('api/task/toggle', { key:key, enabled:nextEnabled });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('操作失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+
+/* ── 任务日志 ───────────────────────────────────────
+ * 弹窗打开期间**自动刷新**：任务日志是有时效的（刚点完「跑一次」就想看它跑成什么样），
+ * 手动点刷新会错过整个执行过程。轮询间隔按状态分档——任务在跑时日志还在长，2 秒一次；
+ * 跑完（或本来就没在跑）降到 5 秒，只等下一次触发。关掉弹窗即停表。
+ *
+ * 后端会区分「当前这一轮」与「上一次那一轮」：任务空闲时给的是**最近一次**的完整日志，
+ * 所以打开弹窗立刻就能看到上次跑了什么，不必先自己触发一遍。
+ */
+var LG = { timer:null, running:false, endedAt:'', lastSig:'' };
+
+// lgStatusText 顶栏右侧的状态文案：运行中 / 最近一次完成时刻。
+function lgStatusText(){
+  if (LG.running) return '运行中…';
+  if (LG.endedAt) return '最近一次 ' + fmtTime(LG.endedAt);
+  return '';
+}
+function lgRenderStatus(){
+  var el = $('#lgStatus');
+  if (el) el.textContent = lgStatusText();
+}
+function lgStopTimer(){
+  if (LG.timer){ clearTimeout(LG.timer); LG.timer = null; }
+}
+// lgSchedule 按当前状态安排下一次拉取：运行中 2s（日志还在长），否则 5s。
+function lgSchedule(){
+  lgStopTimer();
+  if (!logKey) return;
+  LG.timer = setTimeout(async function(){
+    if (!logKey) return;
+    await loadTaskLog();
+    lgSchedule();
+  }, LG.running ? 2000 : 5000);
+}
+
+function openLogModal(title){
+  $('#lgTitle').textContent = title;
+  $('#scrimL').classList.add('on');
+  $('#logModal').classList.add('on');
+}
+function closeLogModal(){
+  $('#scrimL').classList.remove('on');
+  $('#logModal').classList.remove('on');
+  lgStopTimer();
+  logKey = null;
+}
+$('#lgClose').addEventListener('click', closeLogModal);
+$('#scrimL').addEventListener('click', closeLogModal);
+$('#lgRefresh').addEventListener('click', function(){ if (logKey) loadTaskLog(); });
+async function openTaskLog(key, name){
+  logKey = key; logName = name || key;
+  LG.running = false; LG.endedAt = ''; LG.lastSig = '';
+  openLogModal('任务日志 · ' + logName);
+  $('#lgBody').textContent = '加载中…';
+  lgRenderStatus();
+  await loadTaskLog();
+  lgSchedule();
+}
+async function loadTaskLog(){
+  try{
+    var r = await api('api/task/log?key=' + encodeURIComponent(logKey));
+    var lines = r.lines || [];
+    LG.running = !!r.running;
+    LG.endedAt = r.endedAt || '';
+    lgRenderStatus();
+    // 内容没变就不重写 DOM（自动刷新每 2 秒一次，重写会打断选中与滚动位置）。
+    var sig = lines.length + '|' + (lines[lines.length - 1] || '') + '|' + LG.running;
+    if (sig === LG.lastSig) return;
+    LG.lastSig = sig;
+    var body = $('#lgBody');
+    var atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
+    body.textContent = lines.length ? lines.join('\n') : (r.message || '这个任务还没有跑过，点「跑一次」后回来看。');
+    // 跟着日志走：用户本来就在底部（或本来就没滚动）时自动贴底，否则别抢滚动位置。
+    if (atBottom) body.scrollTop = body.scrollHeight;
+  }catch(err){
+    lgStopTimer();
+    $('#lgBody').textContent = '拉取失败：' + (err && err.message || err);
+  }
+}
+
+/* ── 请求日志（独立页，表格 + 自动刷新） ───────────── */
+// sig 上一次渲染的内容指纹：自动刷新每 5 秒一次，几百行表格在内容没变时重建 DOM
+// 纯属浪费，指纹一致就跳过重绘（只更新时间戳）。
+var LOG = { loading:false, timer:null, auto:false, sig:'' };
+
+function logAutoText(){
+  var b = $('#btnLogAuto');
+  if (!b) return;
+  b.textContent = '自动刷新：' + (LOG.auto ? '开' : '关');
+  b.setAttribute('aria-pressed', String(LOG.auto));
+}
+
+function startLogAuto(){
+  if (!LOG.auto || LOG.timer) return;
+  LOG.timer = setInterval(function(){
+    if (document.visibilityState === 'visible') loadLogs();
+  }, 5000);
+}
+
+function stopLogAuto(){
+  if (LOG.timer){ clearInterval(LOG.timer); LOG.timer = null; }
+}
+
+function statusClass(code){
+  var n = parseInt(code, 10);
+  if (!n || n >= 500) return 'st-err';
+  if (n >= 400) return 'st-warn';
+  return 'st-ok';
+}
+
+async function loadLogs(){
+  if (LOG.loading) return;
+  var requestedLines = S.logLines;
+  LOG.loading = true;
+  var btn = $('#btnLogs');
+  if (btn) btn.disabled = true;
+  try{
+    var r = await api('api/logs?lines=' + requestedLines);
+    if (requestedLines !== S.logLines) return;
+    var rows = r.rows || [];
+    // 内容指纹一致时跳过重绘：自动刷新每 5 秒跑一次，没新请求就没必要重建几百行 DOM。
+    var sig = requestedLines + '|' + JSON.stringify(rows);
+    if (sig !== LOG.sig){
+      LOG.sig = sig;
+      if (!rows.length){
+        $('#logRows').innerHTML = '<tr><td colspan="14"><div class="empty">还没有请求记录。</div></td></tr>';
+      } else {
+        $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
+          var cls = statusClass(it.status);
+          return '<tr>' +
+          '<td class="mono">#' + esc(it.seq) + '</td>' +
+          '<td class="mono">' + esc(it.time) + '</td>' +
+          '<td class="mono">' + esc(it.model) + '</td>' +
+          '<td>' + esc(it.mode === 'stream' ? '流式' : '非流式') + '</td>' +
+          '<td class="' + cls + '">' + esc(it.status) + '</td>' +
+          '<td>' + esc(it.key) + '</td>' +
+          '<td class="mono">' + esc(it.uid) + '</td>' +
+          '<td class="mono num">' + esc(it.ttfb) + '</td>' +
+          '<td class="mono num" title="输入 tokens（每轮重发整段上下文）">' + esc(compactNum(it.in)) + '</td>' +
+          '<td class="mono num" title="输入里命中提示缓存的 tokens">' + esc(compactNum(it.hit)) + '</td>' +
+          '<td class="mono" title="' + esc(cacheHint(it)) + '">' + esc(cacheLabel(it)) + '</td>' +
+          '<td class="mono num">' + esc(it.tok) + '</td>' +
+          '<td class="mono num">' + esc(it.rate) + '</td>' +
+          '<td class="mono num">' + esc(it.total) + '</td>' +
+          '</tr>';
+        }).join('');
+      }
+    }
+    var count = $('#logCount'); if (count) count.textContent = String(rows.length);
+    var updated = $('#logUpdated');
+    if (updated){
+      var now = new Date();
+      function p(x){ return x < 10 ? '0' + x : '' + x; }
+      updated.textContent = '更新于 ' + p(now.getHours()) + ':' + p(now.getMinutes()) + ':' + p(now.getSeconds());
+    }
+    $('#logBox').textContent = (r.other && r.other.length) ? r.other.join('\n') : '（无警告与错误）';
+    var note = $('#logError');
+    if (note){
+      if (r.ok){ note.classList.add('hide'); }
+      else { note.textContent = '读取容器日志失败，请检查面板是否有 docker 权限。'; note.classList.remove('hide'); }
+    }
+  }catch(err){
+    if (requestedLines !== S.logLines) return;
+    var note = $('#logError');
+    if (note){ note.textContent = '拉取失败：' + (err && err.message || err); note.classList.remove('hide'); }
+  }finally{
+    LOG.loading = false;
+    if (btn) btn.disabled = false;
+    if (requestedLines !== S.logLines && CURRENT_VIEW === 'logs') await loadLogs();
+  }
+}
+
+$('#logLines').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-n]'); if (!b) return;
+  S.logLines = parseInt(b.getAttribute('data-n'), 10) || 120;
+  $$('#logLines button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  loadLogs();
+});
+$('#btnLogAuto').addEventListener('click', function(){
+  LOG.auto = !LOG.auto;
+  logAutoText();
+  if (LOG.auto){ startLogAuto(); loadLogs(); } else { stopLogAuto(); }
+});
+logAutoText();
+
+/* ── 添加账号 ─────────────────────────────────────── */
+function openDrawer(){
+  $('#scrimD').classList.add('on');
+  $('#drawer').classList.add('on');
+  renderPick();
+}
+function closeDrawer(){
+  stopPoll();
+  $('#scrimD').classList.remove('on');
+  $('#drawer').classList.remove('on');
+  DT.url = '';
+}
+$('#drClose').addEventListener('click', closeDrawer);
+$('#scrimD').addEventListener('click', closeDrawer);
+$('#btnAdd').addEventListener('click', openDrawer);
+
+// 一键复活全部被停用账号。
+// 使用场景：上游误判是**系统性**的——一次风控窗口会把同一批号连续判错
+// （2026-10-16/17 实测 9 个健康号因 11128 被误标 11140 停用）。逐个点太慢，这里批量处理。
+$('#btnReviveAll').addEventListener('click', function(){
+  var a = (S.data && S.data.accounts) || [];
+  var n = a.filter(function(x){ return x.disabled; }).length;
+  if (!n){ toast('没有被停用的账号', 'ok'); return; }
+  ask('全部复活',
+    '将清除 ' + n + ' 个被停用账号的停用标记，让它们重新参与调度。\n\n' +
+    '注意：如果某个号是真的被上游封禁，复活后第一次请求会被再次拒绝并重新停用——' +
+    '这类号需要先用官方客户端重新登录一次。',
+    '全部复活', false, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/revive-all', {});
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('复活失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+});
+
+function renderPick(){
+  DT.url = '';
+  DT.trae = false;
+  $('#drTitle').textContent = '添加账号';
+  $('#drBody').innerHTML =
+    '<div class="mtext">扫码完成授权后，凭证会写入 auths 并重启网关。</div>' +
+    '<div style="margin-top:16px"><div class="sub" style="margin-bottom:7px">区域</div>' +
+    '<div class="seg grow" id="segRealm">' +
+    '<button data-r="cn" aria-pressed="' + (DT.realm === 'cn' ? 'true' : 'false') + '">国内版 CN</button>' +
+    '<button data-r="global" aria-pressed="' + (DT.realm === 'global' ? 'true' : 'false') + '">国际版 Global</button>' +
+    '<button data-r="trae" aria-pressed="' + (DT.realm === 'trae' ? 'true' : 'false') + '">Trae CN</button>' +
+    '</div></div>' +
+    '<div class="sub" id="realmHint" style="margin-top:10px;line-height:1.6"></div>';
+  updateRealmHint();
+  $('#drFoot').innerHTML = '<button class="btn pri" id="drGo">生成授权链接</button>';
+  $('#segRealm').addEventListener('click', function(e){
+    var b = e.target.closest('button[data-r]'); if (!b) return;
+    DT.realm = b.getAttribute('data-r');
+    $$('#segRealm button').forEach(function(x){
+      x.setAttribute('aria-pressed', String(x === b));
+    });
+    updateRealmHint();
+    $('#drGo').textContent = DT.realm === 'trae' ? '生成 Trae 授权链接' : '生成授权链接';
+  });
+  $('#drGo').addEventListener('click', startLogin);
+}
+
+// Trae 的授权页强制回调到本机 127.0.0.1，浏览器打不开那个地址——所以流程与扫码
+// 不同：完成授权后要把地址栏整条粘回来。这里把差异直接写在界面上，免得用户以为卡住。
+function updateRealmHint(){
+  var hint = $('#realmHint'); if (!hint) return;
+  if (DT.realm === 'trae'){
+    hint.innerHTML = 'Trae 授权完成后浏览器会停在一个打不开的 127.0.0.1 地址上，' +
+      '这是正常的——把<b>地址栏里的整条链接</b>复制回来粘贴即可。';
+  } else {
+    hint.textContent = '';
+  }
+}
+
+async function startLogin(){
+  var go = $('#drGo'); go.disabled = true; go.textContent = '正在获取…';
+  try{
+    if (DT.realm === 'trae'){
+      var t = await api('api/trae/login/start', {});
+      if (!t.ok){ toast(t.message || '获取 Trae 授权链接失败', 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
+      DT.url = t.url; DT.loginId = t.login_id || '';
+      renderTraeAuth();
+      return;
+    }
+    var r = await api('api/login/start', { realm:DT.realm });
+    DT.loginId = r.login_id || '';
+    if (!r.ok){ toast(r.message, 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
+    DT.url = r.url;
+    renderWait();
+    startPoll();
+  }catch(err){
+    toast('获取链接失败：' + (err && err.message || err), 'err');
+    go.disabled = false; go.textContent = '重新生成';
+  }
+}
+
+// renderTraeAuth 是 Trae 授权页 —— **纯手工路**。
+//
+// 为什么不做自动回调：Trae 授权页由字节 Passport SDK 驱动，我们用的是官方客户端的
+// client_id，其注册的回调白名单只认 localhost。实测把 auth_callback_url 指向本服务
+// 公网地址时，Trae 侧一律报「网络错误」，服务器上**一条回调请求都收不到**
+// （nginx 访问日志可证）。用户实测反馈「你的自动全是网络错误」——这条路对本部署
+// 不可用，所以界面上不再提供它，避免再让人白试一次。
+//
+// 要支持自动回调，需要自建 client_id 并在 Trae 侧登记本服务的回调地址；在那之前
+// 手工粘贴（本机回调 + 复制地址栏）是唯一走得通的路径。
+function renderTraeAuth(){
+  $('#drTitle').textContent = 'Trae 授权';
+  // 第 1 步用**真正的 <a> 链接**，不用 button + window.open。
+  //
+  // 为什么：手机 App 的 WebView 没有地址栏，而 Trae 授权流程要求用户在最后一步
+  // 复制地址栏里的回调链接。所以这一步必须把授权页甩到**系统浏览器**里去——
+  // App 侧靠 shouldOverrideUrlLoading 接住外链并 startActivity(ACTION_VIEW)。
+  // 真实链接的导航一定会经过那个回调；而 window.open 在 WebView 里的行为取决于
+  // 多窗口设置，不如链接确定。顺带桌面用户也能右键复制这个链接。
+  var authURL = DT.url || '';
+  $('#drBody').innerHTML =
+    '<div class="mtext"><b>第 1 步</b>：点下面的按钮打开 Trae 授权页并完成登录。</div>' +
+    '<div style="margin-top:8px">' +
+      '<a class="btn pri" id="drReopen" href="' + esc(authURL) + '" target="_blank" ' +
+      'rel="noopener" style="width:100%;box-sizing:border-box;text-align:center;' +
+      'text-decoration:none;display:block;line-height:1.9">打开 Trae 授权页</a>' +
+    '</div>' +
+    '<div class="note w" style="margin-top:14px;line-height:1.65">' +
+      svg(IC.warn, 16) +
+      '<div class="g"><b>第 2 步</b>：授权后浏览器会跳到 <code>127.0.0.1</code> 并显示' +
+      '「无法访问此网站」。<b>这是正常的，别关那个标签页</b>——凭据就在它的地址栏里。' +
+      '在那个报错页按 <code>Ctrl+L</code>、<code>Ctrl+C</code> 复制地址，然后回来点下面：</div>' +
+    '</div>' +
+    '<div style="margin-top:10px"><button class="btn pri" id="drPaste" style="width:100%">' +
+      '从剪贴板读取并添加</button></div>' +
+    '<textarea id="traeCallback" rows="3" spellcheck="false" ' +
+      'style="width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid #3a3f54;' +
+      'background:#141722;color:#e8eaed;font:12px ui-monospace,Consolas,monospace;resize:vertical" ' +
+      'placeholder="也可以直接在这里 Ctrl+V：http://127.0.0.1:8765/authorize?refreshToken=..."></textarea>' +
+    '<div class="sub" id="traeMsg" style="margin-top:8px;line-height:1.6"></div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
+    '<button class="btn pri" id="drSubmit2">完成添加</button>';
+  $('#drCancel').addEventListener('click', renderPick);
+  // 链接本身负责导航；这里只在拿不到链接时给出可读提示，不让用户点一个空链接。
+  $('#drReopen').addEventListener('click', function(e){
+    if (!authURL){
+      e.preventDefault();
+      var msg = $('#traeMsg');
+      if (msg) msg.textContent = '授权链接还没生成好，请点「重新选择区域」再试一次。';
+    }
+  });
+  $('#drPaste').addEventListener('click', readClipboardIntoCallback);
+  $('#drSubmit2').addEventListener('click', submitTraeCallback);
+}
+
+// readClipboardIntoCallback 读剪贴板并直接提交。
+//
+// 点按钮属于用户手势，浏览器允许 clipboard.readText，于是回传动作从
+// 「全选→复制→切回来→粘贴」变成一次点击。不支持或拒绝时退回手动粘贴，
+// 不把「读不到剪贴板」变成死路。
+async function readClipboardIntoCallback(){
+  var msg = $('#traeMsg');
+  try{
+    if (!navigator.clipboard || !navigator.clipboard.readText){
+      if (msg) msg.textContent = '这个浏览器不支持读取剪贴板，请在下面手动 Ctrl+V';
+      return;
+    }
+    var text = await navigator.clipboard.readText();
+    if (!text || !text.trim()){
+      if (msg) msg.textContent = '剪贴板是空的，请先在报错页按 Ctrl+L、Ctrl+C';
+      return;
+    }
+    var box = $('#traeCallback');
+    if (box) box.value = text.trim();
+    submitTraeCallback();
+  }catch(err){
+    if (msg) msg.textContent = '读剪贴板被拒绝，请在下面手动 Ctrl+V';
+  }
+}
+
+async function submitTraeCallback(){
+  var box = $('#traeCallback'); if (!box) return;
+  var value = (box.value || '').trim();
+  var msg = $('#traeMsg');
+  if (!value){ if (msg) msg.textContent = '请先把报错页地址栏里的链接粘贴进来'; return; }
+  // 早失败：用户很可能贴回来的是我们自己生成的那条授权链接（还没走完授权），
+  // 或贴了别的网页。这两种都换不出凭据，不如在这里直接说清楚。
+  if (value.indexOf('trae.cn/authorization') >= 0){
+    if (msg) msg.textContent = '这是授权页的链接，不是回调链接。请在 Trae 完成登录后，复制跳转到的 127.0.0.1 那条地址。';
+    return;
+  }
+  // 按钮 id 是 drSubmit2（drSubmit 是扫码流程用的，两者不能混）。
+  // 取不到时不能直接解引用：$() 返回 null 会在这里抛异常，整个函数静默失败，
+  // 用户看到的就是「点了没反应」（2026-10-11 实测踩到）。
+  var btn = $('#drSubmit2');
+  if (btn){ btn.disabled = true; btn.textContent = '正在添加…'; }
+  try{
+    var r = await api('api/trae/login/finish', { callback: value });
+    if (!r.ok){
+      if (msg) msg.textContent = r.message || '添加失败';
+      if (btn){ btn.disabled = false; btn.textContent = '完成添加'; }
+      return;
+    }
+    renderDone(r);
+  }catch(err){
+    if (msg) msg.textContent = '添加失败：' + (err && err.message || err);
+    if (btn){ btn.disabled = false; btn.textContent = '完成添加'; }
+  }
+}
+
+function renderWait(){
+  $('#drTitle').textContent = '扫码登录';
+  $('#drBody').innerHTML =
+    '<div class="qr-box"><canvas id="qr"></canvas></div>' +
+    '<div class="url-box" id="urlText">' + esc(DT.url) + '</div>' +
+    '<div class="wait"><span class="spin"></span><span id="waitMsg">等待扫码…</span></div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
+    '<button class="btn" id="drCopy">复制链接</button>';
+  $('#drCancel').addEventListener('click', renderPick);
+  $('#drCopy').addEventListener('click', function(){ copyText(DT.url); });
+  drawQR(DT.url);
+}
+
+function drawQR(text){
+  var cv = $('#qr'); if (!cv) return;
+  try{
+    var q = qrcode(0, 'M');
+    q.addData(text); q.make();
+    var n = q.getModuleCount(), pad2 = 2;
+    var cell = Math.max(2, Math.floor(176 / (n + pad2 * 2)));
+    var side = cell * (n + pad2 * 2);
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = side * dpr; cv.height = side * dpr;
+    cv.style.width = side + 'px'; cv.style.height = side + 'px';
+    var ctx = cv.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, side, side);
+    ctx.fillStyle = '#111214';
+    for (var r = 0; r < n; r++)
+      for (var c = 0; c < n; c++)
+        if (q.isDark(r, c)) ctx.fillRect((c + pad2) * cell, (r + pad2) * cell, cell, cell);
+  }catch(err){
+    cv.parentNode.innerHTML = '<div class="sub" style="padding:56px 0">二维码生成失败，请用下方链接打开</div>';
+  }
+}
+function setWait(msg){ var w = $('#waitMsg'); if (w) w.textContent = msg; }
+function stopPoll(){ if (DT.timer){ clearInterval(DT.timer); DT.timer = null; } }
+function startPoll(){
+  stopPoll(); DT.tries = 0;
+  DT.timer = setInterval(async function(){
+    if (DT.polling) return;
+    if (DT.tries++ > 100){ stopPoll(); setWait('等待超时，请重新生成链接。'); return; }
+    try{
+      DT.polling = true;
+      var r = await api('api/login/poll', { realm:DT.realm, login_id:DT.loginId });
+      if (r.ok){ stopPoll(); renderDone(r); return; }
+      if (r.pending && DT.tries % 3 === 0) setWait('等待扫码…');
+      // 非 pending 的失败是**终态**（凭证已保存但重载失败、state 过期等），
+      // 必须停下来报给用户。
+      //
+      // 曾经这里只处理 pending、其余一律忽略，于是「凭证已保存但重启失败」这类
+      // 错误被静默吞掉：界面永远停在「等待扫码…」，而用户看到上游明明提示
+      // 「登录成功」——2026-10-13 Windows 版实测（reload 在 Windows 上必然失败，
+      // 见 cmd/server/panel.go 的 reloadHandler 注释）。
+      if (!r.pending){
+        stopPoll();
+        setWait('添加失败：' + (r.message || '未知错误'));
+        return;
+      }
+    }catch(err){
+      // 网络抖动继续等；但连续失败也要给个说法，否则同样表现为「卡住」。
+      if (DT.tries > 3 && DT.tries % 5 === 0) setWait('连接异常，重试中…（' + (err.message || err) + '）');
+    }
+    finally { DT.polling = false; }
+  }, 3000);
+}
+function renderDone(r){
+  var a = r.account || {};
+  $('#drTitle').textContent = '添加成功';
+  $('#drBody').innerHTML =
+    '<div class="note ok">' + svg(IC.check, 16) +
+    '<div class="g"><b>' + esc(a.nickname || '账号') + '</b> 已写入并加载</div></div>' +
+    '<div style="margin-top:14px">' +
+    mrow('UID', a.uid || '—') +
+    mrow('区域', realmName(realmOf(a))) +
+    mrow('有效期', a.expiresInDays ? (a.expiresInDays + ' 天') : '—') +
+    '</div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drMore">再加一个</button>' +
+    '<button class="btn pri" id="drDone">完成</button>';
+  $('#drDone').addEventListener('click', async function(){ closeDrawer(); await loadAll(true); });
+  $('#drMore').addEventListener('click', renderPick);
+  loadAll(true);
+}
+
+/* ── 顶栏动作 ─────────────────────────────────────── */
+$('#btnRefresh').addEventListener('click', function(){
+  loadAll(true);
+  if (CURRENT_VIEW === 'keys' && typeof loadKeys === 'function') loadKeys();
+  if (CURRENT_VIEW === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (CURRENT_VIEW === 'requests' && typeof loadRequests === 'function') loadRequests(true);
+  if (CURRENT_VIEW === 'logs') loadLogs();
+});
+$('#btnRestart').addEventListener('click', actRestart);
+$('#btnTaskReload').addEventListener('click', async function(){
+  await loadAll(); toast('已刷新', 'ok');
+});
+$('#btnLogs').addEventListener('click', loadLogs);
+$('#btnLogout').addEventListener('click', function(){
+  ask('退出登录', '将结束本机的登录会话，需要重新输入用户名和密码。', '退出', false, async function(){
+    try{ await api('api/auth/logout', {}); }
+    catch(e){ toast(e.message || '退出失败，请稍后重试', 'err'); return; }
+    location.replace('login');
+  });
+});
+
+/* ── 登录账号 ─────────────────────────────────────── */
+async function loadIdentity(){
+  try{
+    var r = await api('api/session');
+    $('#whoami').textContent = r.username || '';
+    $('#pwUser').value = r.username || '';
+    $('#pwHint').textContent = r.inherited
+      ? '沿用 nginx 时期的密码，保存一次即切换成本面板自管'
+      : '保存后所有设备都需要重新登录';
+  }catch(err){ /* 401 已由 api() 跳转登录页 */ }
+}
+$('#btnPwSave').addEventListener('click', async function(){
+  var cur = $('#pwCur').value, user = $('#pwUser').value.trim();
+  var pw = $('#pwNew').value, cfm = $('#pwCfm').value;
+  if (!cur){ toast('请输入当前密码', 'err'); $('#pwCur').focus(); return; }
+  if (!user){ toast('请输入新用户名', 'err'); $('#pwUser').focus(); return; }
+  if (pw.length < 8){ toast('新密码至少 8 位', 'err'); $('#pwNew').focus(); return; }
+  if (pw !== cfm){ toast('两次输入的新密码不一致', 'err'); $('#pwCfm').focus(); return; }
+  var btn = $('#btnPwSave');
+  btn.disabled = true;
+  try{
+    var r = await api('api/auth/password',
+      { current:cur, username:user, password:pw, confirm:cfm });
+    toast(r.message || '已保存', 'ok');
+    $('#pwCur').value = ''; $('#pwNew').value = ''; $('#pwCfm').value = '';
+    $('#whoami').textContent = r.username || user;
+  }catch(err){
+    toast('保存失败：' + (err && err.message || err), 'err');
+  }finally{ btn.disabled = false; }
+});
+
+/* ── 启动 ─────────────────────────────────────────── */
+function init(){
+  var v = 'overview';
+  try { var s = localStorage.getItem('loomgate-view') || localStorage.getItem('wb2a-view'); if (s && PAGE[s]) v = s; } catch(e){}
+  var hashView = location.hash.slice(1); if (PAGE[hashView]) v = hashView;
+  go(v);
+  loadAll();
+  loadIdentity();
+  if (typeof loomInit === 'function') loomInit();
+  // 冷却倒计时按秒走；页面隐藏时 tick 仍在跑但没有任何可见成本，切回来即可对齐。
+  startCoolTicker();
+  setInterval(function(){
+    if (!document.hidden && !DT.timer) loadAll();
+  }, 30000);
+}
+
+// app.js 与 keys.js / usage.js 拼在同一个脚本里，后者的顶层状态（KS / US / LOG）
+// 要等各自那一段执行完才赋值。init() 里的 go() 会直接调用这些页面的加载函数，
+// 所以必须等整个脚本跑完再启动——否则从 #usage 进入时 US 还是 undefined，
+// 页面会永远停在「正在加载用量…」。
+if (document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

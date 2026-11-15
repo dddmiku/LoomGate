@@ -1,0 +1,517 @@
+// ═══ 更新日志 ═══
+// 2026-10-13：初版——账号与服务的写操作（与 panel/app.py 的同名方法同口径）。
+//
+// ═══ 两条「重启」路径，别混 ═══
+//
+//   - **文件层启停**（account_toggle）：改 auth 文件名，网关扫目录时看不到它。
+//   - **池层停用**（account_revive）：网关自己记的状态（被上游封禁/内容审核标记），
+//     存在 state.json 里，与文件无关。
+//
+// 两者独立：一个账号可能文件是启用的、却在池里被停用（上游封禁），也可能文件被
+// 停用了、池里还留着记录。面板把两种状态并排显示，运维可能两个都要用。
+//
+// 另外，**每个改动账号的操作都要重启网关**：auth 文件在网关启动时一次性加载，
+// 容器里 config.json 还是只读挂载，改完不重启不会生效。重启失败不是「操作失败」——
+// 文件已经改对了，所以提示必须写成「已禁用 xxx，但重启失败：…」，让运维知道
+// 重试重启即可，而不是以为白改了。
+package panel
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// reloadAccounts 让网关**原地**重读 auths 目录，不重启进程。
+//
+// 为什么改文件层之后不该重启（2026-10-15 用户反馈「账号启停、删除都要重启网关，
+// 这合理吗」）：auth 文件是网关每次请求选号时按池里的索引用的，而池的索引可以
+// 原地换掉——`/runtime/reload` 就是干这个的（重读目录 + SyncToDir）。重启一次
+// 要几十秒、打断在途请求、容器里还会重建整个进程，代价远大于收益。
+//
+// 返回 (是否已生效, 失败原因)。失败原因只用于文案，**不**把整个操作判失败：
+// 文件已经改对了，那才是真值；原地重载失败时提示用户手动重启即可。
+//
+// 与 restartContainer 的分工：**只有改监听地址这类进程级配置**（局域网开关）才
+// 必须真重启，因为 reload 不重绑 listener（见 exec.go 的 native restart 映射）。
+func (s *Server) reloadAccounts(ctx context.Context) (bool, string) {
+	if s.gateway == nil || s.gateway.Management == nil || !s.gateway.Management.ManagementEnabled() {
+		return false, "管理通道不可用"
+	}
+	code, payload := s.gateway.Management.Request(ctx, "POST", "/runtime/reload", map[string]any{})
+	if code == http.StatusOK && jsonBool(payload["ok"], false) {
+		return true, ""
+	}
+	return false, firstNonEmpty(gatewayEnvelopeError(payload), "网关未接受重载")
+}
+
+// restartTimeout 是重启网关的超时。要覆盖容器停止宽限期（默认 10s）加上启动时间，
+// 所以给到 210 秒；健康检查另有一段自己的预算。
+const restartTimeout = 210 * time.Second
+
+// healthTimeout 是重启后等待网关健康的总时长。
+const healthTimeout = 45 * time.Second
+
+// restartContainer 重启网关并确认它真的起来了。
+//
+// 返回 (ok, message, 秒数)。**必须用真实健康响应确认成功**：只看 `docker restart`
+// 的退出码是不够的——容器起来了但网关可能因为账号文件坏掉而启动失败，那时报「已重启」
+// 会让运维以为账号已加载（2026-09-18 修的就是这个）。
+func (s *Server) restartContainer(ctx context.Context) (bool, string, float64) {
+	started := s.now()
+	result := s.runner.Run(ctx, []string{"restart", s.containerName()}, restartTimeout, nil)
+	if result.Code != 0 {
+		return false, "重启失败: " + firstNonEmpty(result.Stderr, result.Stdout), 0
+	}
+	// 原生模式（桌面/安卓）下 restart 就是一次运行时重载，网关自己会确认完成，
+	// 没有容器可轮询。
+	if s.opts.Runtime == "native" {
+		return true, "配置与账号已重新加载", s.elapsed(started)
+	}
+	deadline := s.now().Add(healthTimeout)
+	for s.now().Before(deadline) {
+		remaining := deadline.Sub(s.now())
+		if remaining <= 0 {
+			break
+		}
+		probeCtx, cancel := contextWithTimeout(ctx, minDuration(5*time.Second, remaining))
+		health := s.gateway.Get(probeCtx, "/healthz")
+		cancel()
+		// 判据是「网关在服务」而不是「网关健康」：/healthz 在**一个账号都没有**时
+		// 返回 503（ServableNow 为假），而那种部署（刚装好、还没加号）重启后必然
+		// 拿不到 200。只看 200 会把它报成「重启已执行但健康检查未通过」——用户看到
+		// 一条永远无法满足的失败提示。service 字段与 X-Service 头是网关的身份标识，
+		// 有它、且没有 error 键，就说明进程起来了、能响应了。
+		if jsonString(health["service"]) == "workbuddy2api" && health["error"] == nil {
+			return true, "已重启并加载账号", s.elapsed(started)
+		}
+		select {
+		case <-ctx.Done():
+			return false, "容器重启已执行，但网关健康检查未通过，请查看日志后刷新", s.elapsed(started)
+		case <-time.After(time.Second):
+		}
+	}
+	return false, "容器重启已执行，但网关健康检查未通过，请查看日志后刷新", s.elapsed(started)
+}
+
+func (s *Server) elapsed(started time.Time) float64 {
+	return float64(s.now().Sub(started).Milliseconds()) / 1000
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// accountToggle 启用/停用账号（改文件名后缀）。
+func (s *Server) accountToggle(ctx context.Context, body map[string]any) map[string]any {
+	uid := jsonString(body["uid"])
+	wantDisabled := jsonBool(body["disabled"], false)
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	entry := s.store.Find(uid)
+	if entry == nil {
+		return map[string]any{"ok": false, "message": formatMessage("找不到账号 %s", uid)}
+	}
+	if entry.Disabled == wantDisabled {
+		// 状态本来就对：不重启（重启一次要几十秒，白重启很扰民）。
+		return map[string]any{"ok": true, "message": "状态未变化", "restart": nil}
+	}
+	src := entry.Path
+	dst := src + ".disabled"
+	if !wantDisabled {
+		dst = strings.TrimSuffix(src, ".disabled")
+	}
+	if _, err := os.Stat(dst); err == nil {
+		// 同时存在启用与禁用两份：保留两份文件让人核对，不擅自覆盖。
+		return map[string]any{"ok": false,
+			"message": "存在同名的启用与禁用凭据，已保留两份文件，请先核对重复账号"}
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return map[string]any{"ok": false, "message": "重命名失败：" + err.Error()}
+	}
+	chownApp(dst)
+	action := "禁用"
+	if !wantDisabled {
+		action = "启用"
+	}
+	// 原地重载：auth 文件改名后网关必须重扫目录才生效，但那不需要重启进程。
+	if ok, detail := s.reloadAccounts(ctx); ok {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s %s，立即生效", action, uidPrefix(entry.UID))}
+	} else if detail != "" {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s %s（%s），重启网关后生效", action, uidPrefix(entry.UID), detail)}
+	}
+	return map[string]any{"ok": true, "restart": nil,
+		"message": formatMessage("已%s %s，重启网关后生效", action, uidPrefix(entry.UID))}
+}
+
+// accountDelete 把账号移入回收目录（可手动恢复），不直接删除。
+func (s *Server) accountDelete(ctx context.Context, body map[string]any) map[string]any {
+	uid := jsonString(body["uid"])
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	entry := s.store.Find(uid)
+	if entry == nil {
+		return map[string]any{"ok": false, "message": formatMessage("找不到账号 %s", uid)}
+	}
+	trashed, err := s.store.Delete(uid)
+	if err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	// 与 accountToggle 同理：删号是文件层改动，原地重载即可，不必重启进程。
+	if ok, detail := s.reloadAccounts(ctx); ok {
+		return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+			"message": formatMessage("已删除 %s（回收件 %s），立即生效", uidPrefix(entry.UID), trashed)}
+	} else if detail != "" {
+		return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+			"message": formatMessage("已删除 %s（回收件 %s），%s；重启网关后生效", uidPrefix(entry.UID), trashed, detail)}
+	}
+	return map[string]any{"ok": true, "restart": nil, "trashed": trashed,
+		"message": formatMessage("已删除 %s（回收件 %s），重启网关后生效", uidPrefix(entry.UID), trashed)}
+}
+
+// accountRevive 复活被网关停用的账号（清 disabled + reason，账号回到可选池）。
+//
+// 只走网关的管理通道 POST /accounts/revive；**不改 auth 文件**——池级停用是网关自己
+// 记的状态，文件层面的启停是另一回事（见 accountToggle）。
+func (s *Server) accountRevive(ctx context.Context, body map[string]any) map[string]any {
+	uid := jsonString(body["uid"])
+	ok, payload := s.gateway.PostJSON(ctx, "/accounts/revive", map[string]any{"uid": uid})
+	if !ok {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(payload)}
+	}
+	if !jsonBool(payload["ok"], false) {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "复活失败")}
+	}
+	if !jsonBool(payload["was_disabled"], false) {
+		return map[string]any{"ok": true, "message": "该账号未被停用，无需复活"}
+	}
+	return map[string]any{"ok": true, "message": formatMessage("已复活 %s", uidPrefix(uid))}
+}
+
+// accountReviveAll 一键复活全部被停用账号（面板「全部复活」按钮）。
+//
+// 与 accountRevive 同一条管理通道，只是不带 uid——网关侧遍历池里 disabled 的号。
+// 返回处理数量，便于面板直接展示结果。
+func (s *Server) accountReviveAll(ctx context.Context, body map[string]any) map[string]any {
+	ok, payload := s.gateway.PostJSON(ctx, "/accounts/revive-all", map[string]any{})
+	if !ok {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(payload)}
+	}
+	if !jsonBool(payload["ok"], false) {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "复活失败")}
+	}
+	revived := int(jsonInt64(payload["revived"]))
+	total := int(jsonInt64(payload["total"]))
+	if revived == 0 {
+		return map[string]any{"ok": true, "message": formatMessage("没有需要复活的账号（共 %d 个账号全部正常）", total)}
+	}
+	return map[string]any{"ok": true, "message": formatMessage("已复活 %d 个账号（共 %d 个）", revived, total)}
+}
+
+// accountProbeModel 手动检测某账号在某模型上的冷却是否已经解除（面板「检测模型」按钮）。
+//
+// 模型级限流没有「上游说恢复就一定会恢复」的保证，冷却期间唯一能被证伪的方式
+// 是发一次真实请求。这里把网关的 POST /accounts/probe-model 结果翻成一句人话：
+// 探测成功且确有记录被清 → 已恢复；仍限流 → 给出新的解除时刻。
+func (s *Server) accountProbeModel(ctx context.Context, body map[string]any) map[string]any {
+	uid := jsonString(body["uid"])
+	model := jsonString(body["model"])
+	if uid == "" || model == "" {
+		return map[string]any{"ok": false, "message": "需要账号与模型"}
+	}
+	ok, payload := s.gateway.PostJSON(ctx, "/accounts/probe-model", map[string]any{"uid": uid, "model": model})
+	if !ok {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(payload)}
+	}
+	if !jsonBool(payload["ok"], false) {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "检测失败")}
+	}
+	if jsonBool(payload["limited"], false) {
+		until := jsonString(payload["until"])
+		reason := jsonString(payload["reason"])
+		msg := "探测确认该模型仍被限流"
+		if until != "" {
+			msg += "，解除 " + until
+		}
+		if reason != "" {
+			msg += "（" + reason + "）"
+		}
+		return map[string]any{"ok": true, "limited": true, "message": formatMessage("%s", msg)}
+	}
+	if jsonBool(payload["cleared"], false) {
+		return map[string]any{"ok": true, "limited": false, "cleared": true,
+			"message": formatMessage("探测成功：%s 的模型冷却已解除", model)}
+	}
+	if jsonBool(payload["probe_ok"], false) {
+		return map[string]any{"ok": true, "limited": false,
+			"message": formatMessage("探测成功：%s 本来就可用，无需解除", model)}
+	}
+	// 走到这里 = 探测没成功、且台账里也没有该模型的限流条目。
+	//
+	// 2026-10-18 起，没有精确恢复时刻的 429（14003 Model busy / 来源限流）只记
+	// 观测时间、不产生冷却条目——上游没给恢复时刻，任何本地推算的「解除时刻」
+	// 都是臆造。这种情形不能说「冷却保持不变」（本来就没有冷却），如实说明原因。
+	return map[string]any{"ok": true, "limited": false,
+		"message": formatMessage("探测未成功（上游返回 %d）：上游未给出精确恢复时刻，不记冷却",
+			jsonInt64(payload["status"]))}
+}
+
+// accountFission 补发 Trae 邀请奖励（面板「补发邀请奖励」按钮）。
+//
+// 背景：面板上的邀请记录停在「邀请中」，不是服务端没发，而是**发奖动作在 TRAE 桌面端
+// 本地**——客户端登录时自己调一次 code_fission/grant。被邀请人没登过桌面端，记录就
+// 永远挂着。这里把那一次调用搬到服务端补发。
+//
+// 走 ./fission_bin（与 ./credit 同一条受限运行通道），只传 -uid，设备号用账号默认代数；
+// 重复调用是幂等的（上游返回 1028「已发放」）。
+func (s *Server) accountFission(ctx context.Context, body map[string]any) map[string]any {
+	uid := strings.TrimSpace(jsonString(body["uid"]))
+	if !uidRe.MatchString(uid) {
+		return map[string]any{"ok": false, "message": "账号标识不正确"}
+	}
+	if !s.containerRunning(ctx) {
+		return map[string]any{"ok": false, "message": "容器未运行"}
+	}
+	result := s.runner.Run(ctx, []string{"exec", s.containerName(), "./fission_bin", "-uid", uid}, 120*time.Second, nil)
+	if result.Code != 0 && strings.TrimSpace(result.Stdout) == "" {
+		return map[string]any{"ok": false, "message": firstNonEmpty(result.Stderr, "补发执行失败")}
+	}
+	data, raw := DecodeExecJSON(result.Stdout)
+	if data == nil {
+		return map[string]any{"ok": false, "message": "补发输出无法解析", "raw": raw}
+	}
+	rows, _ := data["accounts"].([]any)
+	if len(rows) == 0 {
+		return map[string]any{"ok": false, "message": "没有匹配的 Trae 账号（该 uid 可能不是 Trae 域）"}
+	}
+	row, _ := rows[0].(map[string]any)
+	outcome := jsonString(row["result"])
+	return map[string]any{"ok": outcome != "failed", "result": outcome, "message": fissionMessage(row)}
+}
+
+// fissionMessage 把补发结果翻译成一句给运维看的中文。
+//
+// 上游的业务码在 CLI 里已经翻成 result 三态（granted/already/failed），这里只负责补上
+// 「发生了什么」和「下一步」。失败时保留上游原文——排障要看它。
+func fissionMessage(row map[string]any) string {
+	result := jsonString(row["result"])
+	before, _ := jsonNumber(row["before"])
+	after, _ := jsonNumber(row["after"])
+	switch result {
+	case "granted":
+		delta, _ := jsonNumber(row["delta"])
+		if delta != 0 {
+			return formatMessage("已发放邀请奖励 %.0f → %.0f（+%.0f）", before, after, delta)
+		}
+		// 上游说 success 但积分没动：通常是奖励已入账、本次是重复触发。
+		return formatMessage("上游返回成功，但积分未变化（当前 %.0f）；可能此前已发放", firstNonZero(after, before))
+	case "already":
+		return formatMessage("此前已发放过，无需重复补发（当前 %.0f）", before)
+	}
+	return "补发失败：" + firstNonEmpty(jsonString(row["error"]), "上游未返回结果")
+}
+
+func firstNonZero(values ...float64) float64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// containerRunning 判断网关是否在跑。
+//
+// ═══ 为什么与 state.go 共用同一个判据 ═══
+//
+// 这里原本走 runner 的 `inspect` 分支，而 state.go 走 /healthz —— **同一件事两套
+// 实现**。两者会不一致：2026-10-13 真机实测，安卓上面板状态显示「网关运行中」、
+// /api/state 里 containerRunning=true，但点「添加账号」却报「容器未运行，先启动
+// 服务」（登录、任务、积分这些操作都走这个判据），功能直接不可用。
+//
+// 现在两边都走同一个函数：**看网关自己回的 service 字段**。这是唯一能同时回答
+// 「进程活着吗」与「服务可用吗」的判据——面板本身就是被网关托管的，管理通道通了
+// 只说明网关进程在，不代表它在服务。
+//
+// 注意**不能要求 HTTP 200**：一个账号都没有时 /healthz 返回 503，而那正是刚装好、
+// 还没加号时的正常状态；只认 200 会让首次使用被卡死。
+func (s *Server) containerRunning(ctx context.Context) bool {
+	return gatewayServing(ctx, s.gateway)
+}
+
+// taskRun 手动触发一个排程任务。
+func (s *Server) taskRun(ctx context.Context, body map[string]any) map[string]any {
+	key := strings.TrimSpace(jsonString(body["key"]))
+	if !KnownTask(key) {
+		return map[string]any{"ok": false, "message": formatMessage("未知任务：%s", key)}
+	}
+	ok, payload := s.gateway.Post(ctx, "/tasks/"+key+"/run")
+	if !ok {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "触发失败")}
+	}
+	// 前端收到 ok 会直接打开该任务的日志窗口（2026-10-15 起），不再指引
+	// 「下方日志」——任务页没有内嵌日志区，那句话让人找不到入口。
+	return map[string]any{"ok": true, "message": "已触发"}
+}
+
+// taskStop 停止正在跑的某个任务（面板「停止」按钮）。
+//
+// 与 taskRun 对称：转发到网关的 /tasks/{key}/stop。网关返回 stopped 字段表示
+// 是否确实发出了取消信号；任务没在跑时 stopped=false，那不是错误（面板可能连点，
+// 或任务刚好自己结束了）——对用户来说「任务不在跑」这个意图已经满足。
+func (s *Server) taskStop(ctx context.Context, body map[string]any) map[string]any {
+	key := strings.TrimSpace(jsonString(body["key"]))
+	if !KnownTask(key) {
+		return map[string]any{"ok": false, "message": formatMessage("未知任务：%s", key)}
+	}
+	ok, payload := s.gateway.Post(ctx, "/tasks/"+key+"/stop")
+	if !ok {
+		return map[string]any{"ok": false, "message": firstNonEmpty(errorMessage(payload), "停止失败")}
+	}
+	if stopped, _ := payload["stopped"].(bool); stopped {
+		return map[string]any{"ok": true, "message": "已发出停止信号，任务将在当前步骤结束后退出"}
+	}
+	return map[string]any{"ok": true, "message": "该任务当前没有在运行"}
+}
+
+// taskToggle 改任务开关（写 config.json，必须重启才生效）。
+func (s *Server) taskToggle(ctx context.Context, body map[string]any) map[string]any {
+	key := strings.TrimSpace(jsonString(body["key"]))
+	enabled := jsonBool(body["enabled"], false)
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	ok, message := SetTaskEnabled(s.opts.ConfigPath, key, enabled)
+	if !ok {
+		return map[string]any{"ok": false, "message": message}
+	}
+	if message == "状态未变化" {
+		return map[string]any{"ok": true, "message": message}
+	}
+	// 文件写好了，还要让**运行中的**排程器跟上：它启动时把开关抄进了自己的 Config，
+	// 不告诉它的话新开关要等重启才生效（2026-10-15 用户反馈「任务启停都要重启」）。
+	//
+	// 走网关的 /tasks/toggle（原地改运行期覆盖 + 叫醒主循环重算下次时点），
+	// **不再重启容器**：任务开关是纯排程状态，重启一次几十秒还打断在途请求，
+	// 代价与收益完全不成比例。
+	if applied, detail := s.applyTaskToggle(ctx, key, enabled); applied {
+		return map[string]any{"ok": true, "message": formatMessage("已%s「%s」，立即生效", enabledLabel(enabled), key)}
+	} else if detail != "" {
+		// 原地生效失败（旧版网关没有这个端点、或管理通道不可用）：如实说明，并指出
+		// 文件已改对——重启后同样会生效，不让用户以为白改了。
+		return map[string]any{"ok": true,
+			"message": formatMessage("已%s「%s」的设置（%s），重启网关后生效", enabledLabel(enabled), key, detail)}
+	}
+	return map[string]any{"ok": true,
+		"message": formatMessage("已%s「%s」的设置，重启网关后生效", enabledLabel(enabled), key)}
+}
+
+// applyTaskToggle 让运行中的排程器原地接受新开关。
+//
+// 返回 (是否已生效, 失败原因)。失败原因只用于文案，**不**把整个操作判失败——
+// config.json 已经写对了，那才是真值；原地生效是「让它立刻起作用」的加速器。
+func (s *Server) applyTaskToggle(ctx context.Context, key string, enabled bool) (bool, string) {
+	if s.gateway == nil || s.gateway.Management == nil || !s.gateway.Management.ManagementEnabled() {
+		return false, "管理通道不可用"
+	}
+	code, payload := s.gateway.Management.Request(ctx, "POST", "/tasks/toggle",
+		map[string]any{"key": key, "enabled": enabled})
+	if code == http.StatusOK && jsonBool(payload["ok"], false) {
+		return true, ""
+	}
+	return false, firstNonEmpty(gatewayEnvelopeError(payload), "网关未接受该开关")
+}
+
+func enabledLabel(enabled bool) string {
+	if enabled {
+		return "启用"
+	}
+	return "停用"
+}
+
+// serviceRestart 手动重启网关。
+func (s *Server) serviceRestart(ctx context.Context) map[string]any {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	ok, message, seconds := s.restartContainer(ctx)
+	out := map[string]any{"ok": ok, "restart": nil, "message": message}
+	if ok {
+		out["restart"] = seconds
+	}
+	return out
+}
+
+// reasoningLoopToggle 热切换重复推理保护的「命中后怎么办」。
+//
+// 与 config.json 里的 features.reasoning_loop_stop_only 是同一个语义：false（默认）
+// 命中后同账号重发一次，true 命中即停止并如实报错。运行期值优先，不需要重启。
+func (s *Server) reasoningLoopToggle(ctx context.Context, body map[string]any) map[string]any {
+	stopOnly := jsonBool(body["stop_only"], false)
+	if s.gateway.Management == nil || !s.gateway.Management.ManagementEnabled() {
+		return map[string]any{"ok": false, "message": "无法读取网关配置"}
+	}
+	code, result := s.gateway.Management.Request(ctx, "POST", "/features/reasoning-loop",
+		map[string]any{"stop_only": stopOnly})
+	if code != 200 || !jsonBool(result["ok"], false) {
+		return map[string]any{"ok": false, "message": gatewayEnvelopeError(result)}
+	}
+	applied := jsonBool(result["stop_only"], false)
+	message := "已切换为「命中后自动重发」"
+	if applied {
+		message = "已切换为「命中即停止」"
+	}
+	return map[string]any{"ok": true, "stop_only": applied, "message": message}
+}
+
+// uidPrefix 取 uid 前 8 位（与网关日志的 uidPrefix 口径一致）。
+//
+// 面板的提示文案里只露前 8 位：完整 uid 是账号标识，显示在屏幕上没有额外价值，
+// 而截图/工单里带上完整 uid 反而是一次不必要的泄露。
+func uidPrefix(uid string) string {
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
+}
+
+// lanToggle 开/关局域网访问（写 config.json 的 listen 与 admin_allow_cidrs）。
+//
+// 与 taskToggle 的差别在生效路径：任务开关经 restartContainer——容器形态是
+// docker restart（真的重启），**native 形态（桌面/安卓/裸机 systemd）却是
+// POST /runtime/reload（进程内重载，只重读账号，不会重绑监听套接字）**。
+// 所以 native 下不调 restartContainer（它返回的「配置与账号已重新加载」对
+// listen 是假的），如实提示手动重启。
+func (s *Server) lanToggle(ctx context.Context, body map[string]any) map[string]any {
+	enabled := jsonBool(body["enabled"], false)
+	allowCIDRs := strings.TrimSpace(jsonString(body["allow_cidrs"]))
+	s.lock.Lock()
+	ok, message := SetLANAccess(s.opts.ConfigPath, enabled, allowCIDRs)
+	s.lock.Unlock()
+	if !ok {
+		return map[string]any{"ok": false, "message": message}
+	}
+	if message == "状态未变化" {
+		return map[string]any{"ok": true, "message": message}
+	}
+	// native 形态无法经面板真正重启（reload 不重绑监听），只能提示手动重启。
+	// 容器形态走 docker restart，真实生效。
+	if s.opts.Runtime == "native" {
+		return map[string]any{"ok": true, "restart": nil,
+			"message": formatMessage("已%s局域网访问；监听地址在重启服务后生效（桌面版关闭窗口重开 / 安卓重启 App / 服务器 systemctl restart）", enabledLabel(enabled))}
+	}
+	restartOK, restartMessage, seconds := s.restartContainer(ctx)
+	out := map[string]any{"ok": restartOK, "restart": nil, "message": restartMessage}
+	if restartOK {
+		out["restart"] = seconds
+		out["message"] = formatMessage("已%s局域网访问，%s", enabledLabel(enabled), restartMessage)
+	} else {
+		out["message"] = formatMessage("已%s局域网访问的设置，但%s", enabledLabel(enabled), restartMessage)
+	}
+	return out
+}

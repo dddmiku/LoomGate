@@ -1,0 +1,138 @@
+/* 2026-09-20：对齐 new-api 规范——标签改软色药丸、弹窗 14px 圆角、输入框 34px。
+ * 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
+/* 2026-09-20：列表复制入口和逐密钥重复推理保护开关，兼容移动端卡片。 */
+/* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
+/* 2026-09-25：增加限流表单、占用摘要与固定表头，窄屏保持独立字段对应。 */
+.key-limits{line-height:1.7}.key-limit-state{margin-top:3px;white-space:normal}.key-limit-content{min-width:0}
+/* 2026-10-09：8 列（有效期与创建时间合并）。此前 9 列按「1920 视口、1396px 内容区」
+ *   定的 min-width:1330px，但 1440 视口下内容区只有 1186px，表格恒溢出 113px，
+ *   右侧操作列被切在滚动区外（用户实测截图）。合并两列时间戳后自然宽度降到约 1210px，
+ *   再把内边距收到 14px，1440 视口下刚好放得下且不局促。窄屏（≤900px）走卡片态，
+ *   不受这些下限约束。 */
+@media(min-width:901px){.key-table{min-width:0}.key-table td:first-child{min-width:140px}.key-table td:nth-child(3){min-width:160px}.key-limits{min-width:170px}.key-actions{min-width:132px}.key-model-tag{overflow-wrap:normal}
+  .key-table td,.key-table th{padding-left:12px;padding-right:12px}}
+/* 有效期与创建时间：竖排，主行是有效期状态，次行是创建时间。 */
+.key-when{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.key-when .sub{white-space:nowrap}
+/* 状态列：主徽章 + 两个次级开关竖排（并入后此列内容变多，给足换行空间）。 */
+.key-state{min-width:118px}
+.key-state .bdg{display:inline-flex}
+.key-state-toggles{display:flex;flex-direction:column;align-items:flex-start;gap:2px;margin-top:3px}
+.key-limit-fields{border:1px solid var(--line);border-radius:var(--r2);padding:14px;margin:6px 0 0;min-width:0}
+.key-limit-fields legend{padding:0 6px;font-weight:500}.key-limit-fields p{margin:0 0 12px;line-height:1.7}
+.key-limit-fields p:last-child{margin-bottom:0}.key-limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.key-limit-grid .fld:last-child{grid-column:1/-1}.key-limit-grid .fld{min-width:0}
+.key-dialog-head,.key-dialog-foot{position:sticky;background:var(--surface);z-index:1}.key-dialog-head{top:0}.key-dialog-foot{bottom:0}
+@media(max-width:420px){.key-limit-grid{grid-template-columns:1fr}}
+.key-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 16px}
+.key-summary p{margin:0}.key-count{font:600 26px/1 var(--mono);letter-spacing:-.02em;color:var(--ink)}
+.key-name{font-weight:500;display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}
+.key-note{margin-top:4px;max-width:320px;white-space:normal;overflow-wrap:anywhere}
+.key-legacy{font-size:11px;font-weight:500;padding:1px 8px;border-radius:999px;color:var(--ink-2);
+  background:var(--sunken);white-space:nowrap}
+.key-mask{white-space:nowrap;font-size:12.5px}.key-date{font-size:12px;color:var(--ink-2);white-space:nowrap}
+.key-tokens{font-size:12.5px;white-space:nowrap}.key-expiry{white-space:nowrap;font-size:12.5px}
+/* 「总用量与积分」列：token 为主、积分作副行。竖排而不是并排——并排会把这一列
+   撑宽，而密钥表的横向余量本来就紧（见 test_layout 的列宽约束）。 */
+.key-usage{display:flex;flex-direction:column;gap:2px;align-items:flex-start}
+.key-usage .key-credit{white-space:nowrap}
+.key-expiry-expired{color:var(--err);font-weight:500}
+.key-dialog .fld select{width:100%;height:36px;border:1px solid var(--line-2);border-radius:var(--r2);
+  padding:0 11px;background:var(--surface);color:var(--ink)}
+.key-dialog .fld select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.key-value{display:flex;align-items:center;gap:8px;min-width:0}
+.key-guard-toggle{white-space:nowrap;color:var(--ink-3)}
+.key-guard-toggle[aria-checked=true]{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+.key-guard-field{display:flex;align-items:flex-start;gap:9px;margin:12px 0 4px;cursor:pointer}
+.key-guard-field input{width:16px;height:16px;margin-top:3px;accent-color:var(--accent);flex:none}
+.key-guard-field b{font-size:13px;font-weight:500}
+.key-guard-field small{display:block;margin-top:4px;font-size:12px;color:var(--ink-3);line-height:1.7}
+.key-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap}.key-table th:last-child{width:178px}
+.key-footnote{line-height:1.7;margin:14px 1px}
+.key-dialog{margin:auto;padding:0;border:1px solid var(--line);border-radius:var(--r);
+  width:min(520px,calc(100% - 28px));max-height:calc(100dvh - 40px);overflow:auto;color:var(--ink);
+  background:var(--surface);box-shadow:var(--shadow-2)}
+.key-dialog::backdrop{background:rgba(10,10,10,.45)}
+.key-dialog-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--line)}
+.key-dialog-head h3{font-size:16px}.key-dialog-head .vbtn{font-size:22px;width:28px;height:28px}
+.key-dialog-body{padding:20px}
+.key-dialog .fld{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}
+.key-dialog .fld input{width:100%;height:36px;border:1px solid var(--line-2);border-radius:var(--r2);
+  padding:0 11px;background:var(--surface);color:var(--ink);
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.key-dialog .fld input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.key-dialog-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--line)}
+.key-secret{width:100%;padding:12px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--sunken);
+  color:var(--ink);font:13px/1.8 var(--mono);resize:none;overflow-wrap:anywhere;word-break:break-all}
+.key-secret-hint{margin:15px 0;color:var(--ink-2);line-height:1.7}
+.key-form-error{margin:15px 0 0;color:var(--err);line-height:1.65}
+.key-model-tags{display:flex;flex-wrap:wrap;gap:5px;max-width:240px}
+.key-model-tag{font:11.5px/1.7 var(--mono);padding:1px 8px;border-radius:999px;color:var(--ink-2);
+  background:var(--sunken);overflow-wrap:anywhere}
+/* 模型绑定折叠（2026-10-16）：绑定几十个模型时全部平铺会把行高撑到上千像素。
+   默认隐藏超出的标签，点「还有 N 个」原地展开。 */
+.key-model-more{display:none;flex-wrap:wrap;gap:5px}
+.key-model-more.on{display:contents}
+.key-model-toggle{margin-top:6px}
+
+/* ── 绑定模型：自绘选择器 ────────────────────────────────────────────────
+ * 2026-10-08：替换原来的原生 <select>。原生控件无法显示倍率、也跟不上面板的
+ * 主题令牌（系统深色下拉在暗色面板里非常突兀）。现在每一行显示
+ * 「模型名 + 倍率徽标 + 能力标记」，倍率来自 /api/models 的 credits 字段。
+ * 倍率配色按档位分三档（免费/低/高），一眼能看出哪个贵。 */
+.mfield{display:flex;flex-direction:column;gap:9px}
+.mtags{display:flex;flex-wrap:wrap;gap:6px;min-height:0}
+.mtags:empty{display:none}
+.mtag{display:inline-flex;align-items:center;gap:7px;padding:4px 6px 4px 10px;border-radius:var(--r3);
+  background:var(--sunken);border:1px solid var(--line);font:12px/1.4 var(--mono);color:var(--ink)}
+.mtag .mtag-x{display:grid;place-items:center;width:16px;height:16px;border:0;padding:0;cursor:pointer;
+  border-radius:50%;background:transparent;color:var(--ink-3);font-size:13px;line-height:1}
+.mtag .mtag-x:hover{background:var(--err-soft);color:var(--err)}
+.mpick{position:relative;display:flex;align-items:center;gap:8px}
+/* 可输入的触发框：整条是搜索框，点哪都能打字，面板随输入实时过滤。 */
+.mtrigger{flex:1;min-width:0;display:flex;align-items:center;gap:8px;
+  height:36px;padding:0 11px;border:1px solid var(--line-2);border-radius:var(--r2);
+  background:var(--surface);color:var(--ink-3);cursor:text;
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease)}
+.mtrigger:hover{border-color:var(--accent)}
+.mtrigger.on,.mtrigger:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.mtrigger-ic,.mtrigger-c{flex:none;color:var(--ink-3)}
+.mtrigger-i{flex:1;min-width:0;font-size:13px;color:var(--ink);outline:none}
+/* 搜索框本体必须把通用输入框样式整个重置掉。
+ * 选择器写成 .key-dialog .fld .mtrigger-i 是为了压过 .key-dialog .fld input
+ * （0,2,1）：那条通用规则会给输入框再加一层 border/height/padding，于是外层容器
+ * 和内层 input 各画一个圆角框，视觉上就是「重叠」（2026-10-09 用户实测）。
+ * :focus 同理——聚焦环画在外层 .mtrigger 上，内层不能自己再画一个。 */
+.key-dialog .fld .mtrigger-i{width:auto;height:100%;padding:0;border:0;border-radius:0;
+  background:none;box-shadow:none}
+.key-dialog .fld .mtrigger-i:focus{border:0;box-shadow:none}
+.mtrigger-i::placeholder{color:var(--ink-3)}
+.mtrigger-n{flex:none;font:11.5px/1 var(--mono);color:var(--ink-3);padding:3px 6px;border-radius:999px;
+  background:var(--sunken)}
+.mtrigger-n:empty{display:none}
+.mtrigger.on .mtrigger-c{transform:rotate(180deg)}
+.mtrigger-c{transition:transform .15s var(--ease)}
+.mpanel{position:absolute;z-index:80;top:calc(100% + 6px);left:0;right:0;max-height:290px;overflow:auto;
+  padding:5px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface);
+  box-shadow:var(--shadow-2)}
+.mpanel[hidden]{display:none}
+.mopt{display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:var(--r3);cursor:pointer;
+  transition:background .1s var(--ease)}
+.mopt:hover,.mopt.on{background:var(--sunken)}
+.mopt.dis{opacity:.45;cursor:default}
+.mopt.dis:hover{background:transparent}
+.mopt-main{flex:1;min-width:0}
+.mopt-id{font:12.5px/1.5 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.mopt-sub{font-size:11.5px;color:var(--ink-3);margin-top:2px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.mopt-check{flex:none;width:16px;color:var(--accent);font-size:13px}
+/* 倍率徽标：免费 / 低 / 高 三档配色，让「哪个贵」一眼可见 */
+.mrate{flex:none;font:11.5px/1 var(--mono);padding:3px 7px;border-radius:999px;
+  background:var(--sunken);color:var(--ink-2);white-space:nowrap}
+.mrate.free{background:var(--ok-soft);color:var(--ok)}
+.mrate.low{background:var(--info-soft);color:var(--info)}
+.mrate.high{background:var(--warn-soft);color:var(--warn)}
+.mcap{flex:none;font-size:11px;color:var(--ink-3)}
+.mempty{padding:14px 10px;text-align:center;color:var(--ink-3);font-size:12.5px}
+@media(max-width:700px){.mpanel{max-height:230px}}
+@media(max-width:900px){.key-table td:first-child{display:block}.key-table td:first-child::before{display:none}.key-table td:first-child .key-name{margin-bottom:3px}.key-note{max-width:100%}.key-actions{justify-content:flex-start}}
+@media(max-width:700px){.key-summary{display:block}.key-summary p{margin-top:10px;line-height:1.65}.key-dialog-body{padding:17px}.key-table td:last-child{padding-top:10px}}

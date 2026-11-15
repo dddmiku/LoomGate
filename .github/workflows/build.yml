@@ -1,0 +1,104 @@
+name: Manual build acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly -p=1
+  GOMAXPROCS: '2'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: gateway/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+      - name: Prepare isolated build workspace
+        run: |
+          work_root="$(dirname "$GITHUB_WORKSPACE")/loomgate-build"
+          mkdir -p "$work_root/tmp"
+          echo "LOOMGATE_WORK_ROOT=$work_root" >> "$GITHUB_ENV"
+          echo "LOOMGATE_TEST_TMP=$work_root/tmp" >> "$GITHUB_ENV"
+          echo "TMPDIR=$work_root/tmp" >> "$GITHUB_ENV"
+      - name: Validate asset contract and derive build matrix
+        id: targets
+        run: python gateway/scripts/build_acceptance.py validate --github-output "$GITHUB_OUTPUT"
+      - name: Verify Go dependencies and source
+        working-directory: gateway
+        run: |
+          go mod verify
+          go test ./... -count=1
+          go vet ./...
+      - name: Verify embedded UI and build guard regressions
+        run: |
+          python gateway/panel/build.py
+          git diff --exit-code -- gateway/panel/index.html
+          python -m unittest discover -s tools/buildtests -p 'test_*.py' -v
+      - name: Test legacy panel and runtime scripts
+        working-directory: gateway
+        run: |
+          python -m unittest discover -s panel -p 'test_*.py'
+          python -m unittest discover -s scripts -p 'test_*.py'
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.verify.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: gateway/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated build workspace
+        run: |
+          work_root="$(dirname "$GITHUB_WORKSPACE")/loomgate-build"
+          mkdir -p "$work_root/tmp"
+          echo "LOOMGATE_WORK_ROOT=$work_root" >> "$GITHUB_ENV"
+          echo "TMPDIR=$work_root/tmp" >> "$GITHUB_ENV"
+      - name: Build and inspect declared target
+        env:
+          TARGET_ID: ${{ matrix.id }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python gateway/scripts/build_acceptance.py build --target "$TARGET_ID" --work-root "$LOOMGATE_WORK_ROOT" --commit "$SOURCE_COMMIT"
+      - name: Retain unsigned CI verification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-acceptance-${{ matrix.id }}-${{ github.sha }}
+          path: ${{ env.LOOMGATE_WORK_ROOT }}/artifacts/${{ matrix.id }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false

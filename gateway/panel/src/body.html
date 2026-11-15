@@ -1,0 +1,536 @@
+<a class="skip-link" href="#workspaceMain">跳到主要内容</a>
+<div class="shell">
+<aside class="side" id="side" aria-label="主导航">
+ <button class="brand" id="btnHome" title="LoomGate 织枢 · 运行总览"><span class="mark" aria-hidden="true">L<span>G</span></span><span class="wm"><b>LoomGate <em>织枢</em></b><span id="brandVer">多服务 AI 网关</span></span></button>
+ <nav class="nav" id="tabs"><div class="nav-lb">工作空间</div><div class="nav-group"><button type="button" data-view="overview"><span class="nav-icon" aria-hidden="true">◈</span><span>运行总览</span></button><button type="button" data-view="providers"><span class="nav-icon" aria-hidden="true">◉</span><span>服务接入</span></button><button type="button" data-view="accounts"><span class="nav-icon" aria-hidden="true">◎</span><span>账号池</span><i id="tabAcct">—</i></button><button type="button" data-view="models"><span class="nav-icon" aria-hidden="true">◇</span><span>模型目录</span></button><button type="button" data-view="keys"><span class="nav-icon" aria-hidden="true">⌘</span><span>访问密钥</span><i id="tabKeys">—</i></button></div><div class="nav-lb">任务编排</div><div class="nav-group"><button type="button" data-view="tasks"><span class="nav-icon" aria-hidden="true">▤</span><span>任务中心</span><i id="tabTask">—</i></button><button type="button" data-view="schedules"><span class="nav-icon" aria-hidden="true">◷</span><span>调度计划</span></button><button type="button" data-view="executions"><span class="nav-icon" aria-hidden="true">↗</span><span>执行记录</span></button></div><div class="nav-lb">观测与管理</div><div class="nav-group"><button type="button" data-view="usage"><span class="nav-icon" aria-hidden="true">▥</span><span>用量分析</span></button><button type="button" data-view="requests"><span class="nav-icon" aria-hidden="true">≡</span><span>请求明细</span></button><button type="button" data-view="logs"><span class="nav-icon" aria-hidden="true">⌁</span><span>运行日志</span></button><button type="button" data-view="credits"><span class="nav-icon" aria-hidden="true">◴</span><span>积分到期</span><i id="tabCredits">—</i></button><button type="button" data-view="system"><span class="nav-icon" aria-hidden="true">⚙</span><span>系统设置</span></button><button type="button" data-view="migration"><span class="nav-icon" aria-hidden="true">⇄</span><span>迁移状态</span></button></div></nav><div id="tabs2"></div>
+ <div class="side-conn"><div class="side-label">客户端连接</div>
+  <div class="cell" id="cellBase"><span class="k">API</span><code>—</code><button class="mini" disabled title="复制 Base URL" aria-label="复制 Base URL">⧉</button></div>
+  <div class="cell" id="cellKey"><span class="k">KEY</span><code>—</code><button class="mini" data-view="keys" title="管理密钥" aria-label="管理密钥">↗</button></div>
+  <div class="cell" id="cellHealth"><span class="k">状态</span><code>—</code><button class="mini" disabled title="复制健康检查地址" aria-label="复制健康检查地址">⧉</button></div>
+ </div>
+</aside>
+<div class="scrim-m" id="scrimNav"></div>
+<main class="main" id="workspaceMain" tabindex="-1">
+ <header class="top"><button class="vbtn menu" id="btnMenu" title="打开导航" aria-label="打开导航">☰</button><span class="workspace-label">WORKSPACE <span>/</span> 控制台</span><span class="sp"></span>
+  <span class="chip" id="svcBadge"><i></i><span id="svcText">连接中</span></span>
+  <button class="vbtn" id="btnRefresh" title="刷新当前数据" aria-label="刷新当前数据">↻</button>
+  <button class="vbtn" id="btnTheme" title="切换主题" aria-label="切换主题"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" id="icTheme"></svg></button>
+  <button class="vbtn danger" id="btnRestart" title="重载网关" aria-label="重载网关">⏻</button>
+  <button class="vbtn" id="btnLogout" title="退出登录" aria-label="退出登录">⇥</button>
+ </header>
+ <div class="body"><div class="inner">
+  <div class="vhead page-heading"><div><div class="eyebrow" id="pageEyebrow">LOOMGATE CONSOLE</div><h1 id="pgTitle">运行总览</h1><p class="d" id="pgDesc">服务、账号与任务的当前状态</p></div><span class="sp"></span><div class="heading-actions"><button class="btn" data-view="models">查看模型</button><button class="btn pri" data-view="providers">接入服务 <span aria-hidden="true">↗</span></button></div></div>
+  <div class="notes" id="notes" aria-live="polite"></div>
+      <section class="view" data-view="overview">
+        <div class="overview-intro"><div><span class="eyebrow">CONTROL PLANE</span><h2>所有连接，尽在一处。</h2><p>从服务接入到模型调用，从定时任务到每次执行。</p></div><div class="overview-links"><button class="btn" data-view="executions">执行记录 ↗</button><button class="btn pri" data-view="providers">管理服务</button></div></div><div class="metrics" id="metrics"></div>
+        <!-- 冷却台账：按「未冷却 / 冷却中 / 余额不足 / 已停用」各给一个数。
+             总览卡片只说 healthy/total，看不出剩下的到底是熔断还是停用。 -->
+        <div class="coolsum" id="coolSummary"></div>
+        <div class="vhead sec">
+          <h1>账号池与积分</h1>
+          <div class="d">运行时状态</div>
+        </div>
+        <div class="pairs">
+          <section class="panel">
+            <div class="ph"><h2>账号池</h2><span class="sp"></span><span class="sub">按区域</span></div>
+            <div class="pb" id="poolPanel"></div>
+          </section>
+          <section class="panel">
+            <div class="ph"><h2>积分</h2><span class="sp"></span><span class="sub">全部账号合计</span></div>
+            <div class="pb" id="creditPanel"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view hide" data-view="accounts">
+        <div class="panel">
+          <div class="ph">
+            <div class="search">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+              <input id="acctSearch" placeholder="搜索昵称或 UID" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="seg" id="acctFilter">
+              <button data-f="all" aria-pressed="true">全部</button>
+              <button data-f="on">启用</button>
+              <button data-f="off">停用</button>
+            </div>
+            <div class="seg" id="acctRealm" title="按域筛选">
+              <button data-r="" aria-pressed="true">全区域</button>
+              <button data-r="cn">CN</button>
+              <button data-r="global">Global</button>
+              <button data-r="trae">Trae</button>
+            </div>
+            <div class="seg" id="acctSort" title="排序方式">
+              <button data-s="" aria-pressed="true">默认</button>
+              <button data-s="limit" title="按「解除模型限流」的时刻升序：最快恢复的排最前；未限流的排最后">限流解除</button>
+              <button data-s="credit" title="按可用积分从多到少；查不到积分的排最后">积分</button>
+            </div>
+            <select id="acctModel" class="sel" title="只显示该模型被限流的账号（需先选「限流解除」排序）" disabled>
+              <option value="">全部模型</option>
+            </select>
+            <span class="sp"></span>
+            <span class="sub" id="acctCount"></span>
+            <button class="btn sm" id="btnReviveAll" title="清除所有被停用账号的停用标记，让它们重新参与调度">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11.5A8.5 8.5 0 1 1 17 4.9"/><path d="M20.5 4.5v5h-5"/></svg>
+              全部复活
+            </button>
+            <button class="btn sm pri" id="btnAdd">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
+              添加账号
+            </button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr><th>账号</th><th>状态</th><th class="r">积分</th><th>最近活动</th><th></th></tr></thead>
+              <tbody id="acctRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hide" data-view="credits">
+        <div class="exp-hd" id="creditsHead"></div>
+        <div class="exp-bars" id="creditsBars"></div>
+        <div class="panel">
+          <div class="ph">
+            <h2>按账号</h2>
+            <span class="sp"></span>
+            <div class="seg" id="creditsRealm">
+              <button data-r="" aria-pressed="true">全区域</button>
+              <button data-r="cn">CN</button>
+              <button data-r="global">Global</button>
+              <button data-r="trae">Trae</button>
+            </div>
+            <span class="sub" id="creditsMeta"></span>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl credits-table">
+              <thead id="creditsThead"></thead>
+              <tbody id="creditsRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">积分按套餐分批到期，到期即作废且不可恢复。网关在选号时对快过期积分额外加权，优先消耗这批余额；下表用于确认「哪些号有积分要浪费了」。窗口口径由网关 <code>pool.expiring_soon</code> 决定（当前见上表说明），「不会过期」为无到期时间的套餐余额。没有积分的档位列不会出现——只显示真有余额要作废的那几档。</p>
+
+        <div class="panel" style="margin-top:18px">
+          <div class="ph">
+            <h2>到期日程</h2>
+            <span class="sp"></span>
+            <div class="seg" id="schedScope">
+              <button data-s="all" aria-pressed="true">全部账号</button>
+              <button data-s="soon">窗口内</button>
+            </div>
+            <div class="seg" id="schedAccount" style="margin-left:8px"></div>
+          </div>
+          <div class="sub" id="schedCount" style="padding:0 2px 10px"></div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr>
+                <th>到期时间</th>
+                <th>距今</th>
+                <th class="r">作废积分</th>
+                <th>涉及账号</th>
+              </tr></thead>
+              <tbody id="schedRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">每一行是「某个时刻会作废的积分」。同一时刻的多个赠送包已合并；单账号最多列 40 笔，更远的余额聚在最后一笔里（末尾会标注）。</p>
+      </section>
+
+      <section class="view hide" data-view="keys">
+        <div class="key-summary">
+          <div><span class="key-count" id="keyEnabledCount">—</span><span class="sub"> 把密钥正在启用</span></div>
+          <p class="sub">停用或删除会立即阻止后续请求，已开始的请求不受影响。</p>
+        </div>
+        <div id="keyError" class="note err hide" role="alert"></div>
+        <div id="keyLimitsError" class="note warn hide" role="status"></div>
+        <div class="panel">
+          <div class="ph">
+            <div class="search"><input id="keySearch" placeholder="搜索名称或备注" autocomplete="off" spellcheck="false" aria-label="搜索密钥"></div>
+            <span class="sp"></span>
+            <button class="btn sm" id="btnKeysReload">刷新</button>
+            <button class="btn sm pri" id="btnCreateKey">＋ 创建密钥</button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl key-table" data-sticky-head="keys">
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>总用量与积分</th><th>限流与占用</th><th>状态与保护</th><th>有效期与创建</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="8"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">新密钥可随时从列表复制；旧密钥正常使用一次后也可复制。重复推理保护按密钥独立设置，开启时会结束持续重复输出（推理或正文）的请求，对后续请求生效。有效期留空表示无限制，到期后该密钥立即失效，重新设置即可继续使用。</p>
+        <p class="sub key-footnote">限流由此密钥的各协议共同计数；频率统计网关接纳的请求，内部重试不重复占用额度。限流修改对后续请求及正在排队的请求生效，已经开始的请求继续完成。占用为最近一次刷新的快照。</p>
+      </section>
+
+      <!--__REQUESTS_VIEW__-->
+
+      <section class="view hide" data-view="usage">
+        <div class="usage-filter" id="usageFilter"></div>
+        <div class="usage-range">
+          <label class="fld">
+            <span class="k">起</span>
+            <input type="date" id="usageFrom" aria-label="筛选起始日期">
+          </label>
+          <label class="fld">
+            <span class="k">止</span>
+            <input type="date" id="usageTo" aria-label="筛选结束日期">
+          </label>
+          <label class="fld">
+            <span class="k">单日</span>
+            <select id="usageDayPick" aria-label="按天筛选"></select>
+          </label>
+        </div>
+        <div class="usage-tiles" id="usageTiles"></div>
+        <p class="sub usage-note hide" id="usageCoverage" role="status"></p>
+        <p class="sub usage-note">按服务返回的原始用量累计，失败或中断也保留已返回的数据。缓存命中已包含在输入中；客户端的上下文估算倍率不影响这里。</p>
+        <div id="usageError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <b>按密钥</b>
+            <span class="sp"></span>
+            <span class="sub" id="usageSince"></span>
+            <button class="btn sm" id="btnUsageReload">刷新</button>
+          </div>
+          <div class="tblwrap table-scroll">
+            <table class="tbl usage-table" data-sticky-head="usage">
+              <thead><tr>
+                <th>密钥</th><th class="r">请求</th><th class="r">输入 tokens</th>
+                <th class="r">缓存命中</th><th class="r">输出 tokens</th><th class="r">合计 tokens</th>
+                <th class="r">已用积分</th>
+                <th>最近使用</th><th class="r">模型拆分</th>
+              </tr></thead>
+              <tbody id="usageRows"><tr><td colspan="9"><div class="empty">正在加载用量…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub usage-note">按日期筛选使用已有的每日记录；按模型明细请切换到“全部”。失败与用量缺失状态从新版开始记录，旧版未保存的信息无法自动补算。</p>
+        <p class="sub usage-note" id="usageFile"></p>
+      </section>
+
+      <section class="view hide" data-view="tasks">
+        <div class="panel">
+          <div class="ph">
+            <b>任务</b>
+            <span class="sp"></span>
+            <!-- 区域切换：域多了以后整页要滚很久才能看到 Trae。
+                 选项由 JS 按「当前真有任务的域」动态生成（含「全部」）。 -->
+            <div class="seg" id="taskRealm" title="按账号区域筛选"></div>
+            <span class="sub">按账号区域分组，按点执行，可手动触发一次</span>
+            <button class="btn sm" id="btnTaskReload">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+              刷新
+            </button>
+          </div>
+          <div id="taskList"></div><div class="task-definitions"><div class="section-intro"><div><h2>任务定义</h2><p>服务声明的任务能力与执行步骤。</p></div><button class="btn" id="definitionsReload">刷新定义</button></div><div id="definitionsNotice" role="status"></div><div id="definitionGrid" class="definition-grid"></div></div>
+        </div>
+      </section>
+
+      <section class="view hide" data-view="logs">
+        <div id="logError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <b>最近 <span id="logCount">—</span> 条请求</b>
+            <span class="sp"></span>
+            <span class="sub" id="logUpdated">—</span>
+            <div class="seg" id="logLines">
+              <button data-n="60">60</button>
+              <button data-n="120" aria-pressed="true">120</button>
+              <button data-n="300">300</button>
+              <button data-n="600">600</button>
+            </div>
+            <button class="btn sm" id="btnLogAuto" aria-pressed="false">自动刷新：关</button>
+            <button class="btn sm ico" id="btnLogs" title="立即刷新" aria-label="立即刷新">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+            </button>
+          </div>
+          <div class="tblwrap table-scroll">
+            <table class="tbl log-table" data-sticky-head="logs">
+              <thead><tr>
+                <th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>调用密钥</th>
+                <th>账号</th><th class="r">TTFB</th><th class="r">输入</th><th class="r">缓存命中</th>
+                <th>缓存参照</th>
+                <th class="r">输出</th><th class="r">tok/s</th><th class="r">total</th>
+              </tr></thead>
+              <tbody id="logRows"><tr><td colspan="14"><div class="empty">正在加载日志…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <details class="panel log-raw">
+          <summary>非请求行（启动信息、警告与错误）</summary>
+          <pre class="term" id="logBox">—</pre>
+        </details>
+      </section>
+
+      <section class="view hide" data-view="system"><div class="settings-tabs"><button class="btn" data-settings="service">运行服务</button><button class="btn" data-settings="security">登录与访问</button><button class="btn" data-settings="updates">版本与更新</button></div>
+        <div class="pairs wide">
+          <div>
+            <section class="panel">
+              <div class="ph"><h2>服务</h2></div>
+              <div class="pb" id="sysCards"></div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph"><h2>登录账号</h2><span class="sp"></span><span class="sub" id="whoami">—</span></div>
+              <div class="pb">
+                <div class="cred-form">
+                  <label class="fld">
+                    <span class="k">当前密码</span>
+                    <input id="pwCur" type="password" autocomplete="current-password" placeholder="用于确认身份">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新用户名</span>
+                    <input id="pwUser" autocomplete="username" spellcheck="false">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新密码</span>
+                    <input id="pwNew" type="password" autocomplete="new-password" placeholder="至少 8 位">
+                  </label>
+                  <label class="fld">
+                    <span class="k">重复新密码</span>
+                    <input id="pwCfm" type="password" autocomplete="new-password">
+                  </label>
+                </div>
+                <div class="frow">
+                  <button class="btn pri" id="btnPwSave">保存账号信息</button>
+                </div>
+                <div class="sub" id="pwHint" style="margin-top:10px;line-height:1.6">保存后所有设备都需要重新登录</div>
+              </div>
+            </section>
+          </div>
+          <div>
+            <section class="panel">
+              <div class="ph">
+                <h2>版本与热更新</h2>
+                <span class="sp"></span>
+                <span class="sub" id="updState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="updRows"></div>
+                <div class="frow" style="margin-top:12px">
+                  <button class="btn sm" id="btnUpdCheck">检查更新</button>
+                  <button class="btn pri sm" id="btnUpdApply" disabled>立即更新</button>
+                  <span class="sp"></span>
+                  <span class="sub" id="updHint">—</span>
+                </div>
+                <p class="sub" style="margin:10px 0 0;line-height:1.6">
+                  升级时新进程先接手监听套接字，旧进程把正在进行的请求（包含流式对话）跑完再退出，
+                  所以调用中的客户端不需要重连，容器也不会重建。
+                </p>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
+                <h2>局域网访问</h2>
+                <span class="sp"></span>
+                <span class="sub" id="lanState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="lanRows"></div>
+                <div class="cred-form" style="margin-top:10px">
+                  <label class="fld">
+                    <span class="k">允许来源网段</span>
+                    <input id="lanCIDRs" spellcheck="false" placeholder="192.168.5.0/24（留空 = 不限网段）">
+                  </label>
+                </div>
+                <div class="frow" style="margin-top:10px">
+                  <button class="btn pri sm" id="btnLanApply">保存</button>
+                  <span class="sub" id="lanHint" style="line-height:1.6">开启后同网络的人都能访问面板登录页与 API；调用密钥是唯一门槛，请先在「密钥」页创建一把。</span>
+                </div>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
+                <h2>重复推理保护</h2>
+                <span class="sp"></span>
+                <span class="sub" id="rlState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="rlRows"></div>
+                <label class="key-guard-field" style="margin-top:12px">
+                  <input type="checkbox" id="rlStopOnly">
+                  <span>
+                    <b>命中即停止，不自动重发</b>
+                    <small>关闭（默认）：模型持续重复短行时，网关在同一账号上重发一次，用户无感；
+                      重发仍循环才回报错误。开启：命中即停止该次请求并如实报错，把是否重试交回调用方。
+                      改完立即作用于后续请求，已经在跑的对话不受影响，不需要重启网关。</small>
+                  </span>
+                </label>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
+                <h2>容器状态</h2>
+                <span class="sp"></span>
+                <button class="btn sm" data-view="logs">查看请求日志</button>
+              </div>
+              <div class="pb">
+                <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+<section class="view hide" data-view="providers" aria-label="服务接入">
+ <div class="section-intro"><div><h2>连接你的 AI 服务</h2><p>账号、模型与任务按服务独立管理。可用能力以当前网关返回为准。</p></div><button class="btn" id="providersReload">刷新目录</button></div>
+ <div id="providersNotice" role="status"></div><div class="provider-grid" id="providerGrid"></div>
+</section>
+<section class="view hide" data-view="models" aria-label="模型目录">
+ <div class="workspace-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="modelSearch" aria-label="搜索模型" placeholder="搜索名称、标识或厂商"></label><select id="modelProvider" aria-label="筛选模型服务"><option value="">全部服务</option></select><select id="modelCapability" aria-label="筛选模型能力"><option value="">全部能力</option><option value="supports_images">图像输入</option><option value="supports_reasoning">推理</option><option value="supports_tool_call">工具调用</option></select><span class="sp"></span><span class="sub" id="modelCount"></span><button class="btn pri" id="modelsReload">同步模型目录</button></div>
+ <div id="modelsNotice" role="status"></div><div class="model-grid" id="modelGrid"></div>
+</section>
+<section class="view hide" data-view="schedules" aria-label="调度计划">
+ <div class="workspace-toolbar"><p class="sub">按任务、时区和账号范围安排执行。</p><span class="sp"></span><button class="btn" id="schedulesReload">刷新</button><button class="btn pri" id="scheduleNew">新建计划</button></div><div id="schedulesNotice" role="status"></div><div class="schedule-grid" id="scheduleGrid"></div>
+</section>
+<section class="view hide" data-view="executions" aria-label="执行记录">
+ <form class="workspace-toolbar" id="executionFilters"><select id="executionTask" aria-label="筛选任务"><option value="">全部任务</option></select><select id="executionStatus" aria-label="筛选执行状态"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">执行中</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="canceled">已取消</option><option value="uncertain">结果待核实</option><option value="skipped">已跳过</option></select><span class="sp"></span><button class="btn pri" type="submit">查询记录</button></form>
+ <div id="executionsNotice" role="status"></div><div class="panel"><div class="tblwrap"><table class="tbl execution-table"><thead><tr><th>任务 / 执行标识</th><th>触发与服务</th><th>状态</th><th>开始时间</th><th>执行阶段</th><th>结果</th><th></th></tr></thead><tbody id="executionRows"></tbody></table></div></div>
+ <div class="workspace-toolbar pagination"><span class="sub" id="executionRange"></span><span class="sp"></span><button class="btn" id="executionsPrev">上一页</button><button class="btn" id="executionsNext">下一页</button></div>
+</section>
+<section class="view hide" data-view="migration" aria-label="迁移状态">
+ <div class="section-intro"><div><h2>数据迁移与兼容性</h2><p>确认旧版账号、配置和历史数据在当前版本中的迁移结果。</p></div><button class="btn" id="migrationReload">检查状态</button></div><div id="migrationNotice" role="status"></div><div id="migrationContent"></div>
+</section>
+
+</div></div></main></div>
+
+<div class="scrim" id="scrimD"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drTitle">
+  <div class="dh">
+    <h3 id="drTitle">添加账号</h3>
+    <button class="vbtn" id="drClose" aria-label="关闭">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <div class="dbody" id="drBody"></div>
+  <div class="dfoot" id="drFoot"></div>
+</aside>
+
+<div class="scrim" id="scrimM"></div>
+<div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mdTitle">
+  <div class="mh">
+    <div class="mic w" id="mdIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9.5v4M12 17h.01"/><path d="M10.3 4.4 2.9 17.2A1.9 1.9 0 0 0 4.6 20h14.8a1.9 1.9 0 0 0 1.7-2.8L13.7 4.4a1.9 1.9 0 0 0-3.4 0Z"/></svg>
+    </div>
+    <h3 id="mdTitle">确认操作</h3>
+  </div>
+  <div class="mbody"><div class="mtext" id="mdText"></div></div>
+  <div class="mfoot">
+    <button class="btn" id="mdNo">取消</button>
+    <button class="btn pri" id="mdYes">确认</button>
+  </div>
+</div>
+
+<!-- 更新进度对话框：点「立即更新」之后弹出，全程显示下载/校验/切换的进度。
+     与上面的通用 modal 分开：那个是「问一句就关」，这个是**常驻进度面板**，
+     按钮的语义（取消/关闭）和内容（进度条 + 字节数 + 阶段）都不一样，
+     塞进通用 modal 会让两边的逻辑互相牵制。
+
+     为什么要有它：下载包十几 MB，慢网络下要等几十秒。此前只在卡片里给一行静止的
+     「下载中…」，用户分不清是在下载、卡住了、还是已经失败（2026-10-13 用户要求
+     「下载改为弹窗加进度条」）。 -->
+<div class="scrim" id="scrimU"></div>
+<div class="modal" id="updModal" role="dialog" aria-modal="true" aria-labelledby="updModalTitle">
+  <div class="mh">
+    <div class="mic w" id="updModalIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4.5 20.5h15"/></svg>
+    </div>
+    <h3 id="updModalTitle">正在更新</h3>
+  </div>
+  <div class="mbody">
+    <div class="mtext" id="updModalText">正在准备…</div>
+    <div class="upd-progress" id="updModalBar"><i style="width:0%"></i></div>
+    <div class="upd-progress-note" id="updModalNote"></div>
+  </div>
+  <div class="mfoot">
+    <button class="btn" id="updModalClose">后台运行</button>
+  </div>
+</div>
+
+<div class="scrim" id="scrimL"></div>
+<div class="modal wide" id="logModal" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
+  <div class="mh">
+    <h3 id="lgTitle">任务日志</h3>
+    <span class="sub" id="lgStatus"></span>
+    <button class="btn sm ico" id="lgRefresh" title="刷新" aria-label="刷新日志">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+    </button>
+    <button class="btn sm ico ghost" id="lgClose" title="关闭" aria-label="关闭">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <pre class="term" id="lgBody">—</pre>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<dialog class="key-dialog" id="keyDialog" aria-labelledby="keyDialogTitle">
+  <form id="keyForm" autocomplete="off">
+    <div class="key-dialog-head"><h3 id="keyDialogTitle">创建密钥</h3><button type="button" class="vbtn" id="keyDialogClose" aria-label="关闭密钥窗口">×</button></div>
+    <div class="key-dialog-body">
+      <div id="keyFields">
+        <label class="fld"><span class="k">名称</span><input id="keyName" name="name" maxlength="64" required placeholder="例如：工作电脑 codex" autocomplete="off"></label>
+        <label class="fld"><span class="k">备注 <span class="sub">（可选）</span></span><input id="keyNote" name="note" maxlength="256" placeholder="记录用途，方便日后管理" autocomplete="off"></label>
+        <!-- 用 div 而不是 label 包住模型选择区：label 内含 #keyModels 输入框时，
+             点 label 内任意位置都会触发一次「激活该输入框」的额外点击，冒泡到
+             document 后被「点面板外面就关闭」的判定捕获，导致刚打开的下拉被立刻关掉
+             （2026-10-08 实测踩到）。标题用 span 呈现，样式不变。 -->
+        <div class="fld">
+          <span class="k">绑定模型 <span class="sub">（留空表示不限制）</span></span>
+          <div class="mfield">
+            <div class="mtags" id="keyModelTags" role="list" aria-label="已绑定的模型"></div>
+            <div class="mpick">
+              <div class="mtrigger" id="keyModelPick">
+                <svg class="mtrigger-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+                <input type="text" id="keyModelQuery" class="mtrigger-i" placeholder="输入关键词筛选"
+                       autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false"
+                       aria-controls="keyModelPanel" aria-autocomplete="list" aria-label="筛选并选择模型">
+                <span class="mtrigger-n" id="keyModelCount"></span>
+                <svg class="mtrigger-c" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+              <button type="button" class="btn sm" id="btnClearModels">清空</button>
+              <button type="button" class="btn sm" id="btnRefreshModels" title="模型倍率缓存 1 小时，点此立即回源刷新">刷新</button>
+              <div class="mpanel" id="keyModelPanel" role="listbox" hidden></div>
+            </div>
+          </div>
+          <input type="hidden" id="keyModels" name="models" value="">
+        </div>
+        <label class="key-guard-field"><input type="checkbox" id="keyGuard" checked><span><b>重复推理保护</b><small>检测到持续重复输出（推理或正文）时结束该次请求。关闭后让模型继续，对此密钥的后续请求生效。</small></span></label>
+        <label class="key-guard-field"><input type="checkbox" id="keyGlobalFallback"><span><b>global 全部限流时回落同名 CN 模型</b><small>仅当此密钥的 global: 请求在对应模型上、所有 global 号都被限流时，改用同名 CN 模型继续。存在其它不可用原因（熔断、在途占满）时不回落。</small></span></label>
+        <label class="fld"><span class="k">有效期 <span class="sub">（默认无限制）</span></span>
+          <select id="keyExpiry" aria-label="选择密钥有效期">
+            <option value="none">无限制</option>
+            <option value="7">7 天后到期</option>
+            <option value="30">30 天后到期</option>
+            <option value="90">90 天后到期</option>
+            <option value="365">1 年后到期</option>
+            <option value="custom">自定义时间…</option>
+          </select>
+        </label>
+        <label class="fld hide" id="keyExpiryCustomField"><span class="k">到期时间</span><input type="datetime-local" id="keyExpiryCustom" aria-label="自定义到期时间"></label>
+        <fieldset class="key-limit-fields">
+          <legend>此密钥的请求限流</legend>
+          <p class="sub">三个设置对全部协议共用。默认不限制，填 0 可关闭对应限制。</p>
+          <div class="key-limit-grid">
+            <label class="fld"><span class="k">每分钟请求数</span><input type="number" id="keyRPM" min="0" max="60000" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">同时进行的请求数</span><input type="number" id="keyConcurrency" min="0" max="256" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+            <label class="fld"><span class="k">并发满时最多等待（秒）</span><input type="number" id="keyQueueSeconds" min="0" max="30" step="1" value="0" inputmode="numeric" aria-describedby="keyLimitHint"></label>
+          </div>
+          <p class="sub" id="keyLimitHint">请求频率按滚动 60 秒计数，边界最多延迟 1 秒释放。并发满时可等待 1–30 秒；0 表示直接返回限流提示。只有设置并发上限后才能排队，每把密钥最多排队 32 个请求。</p>
+        </fieldset>
+      </div>
+      <div id="keyCreated" class="hide">
+        <div class="note ok" id="keySecretStatus" role="status">密钥已创建，可以用于连接网关。</div>
+        <p class="key-secret-hint" id="keySecretHint">可以现在复制，也可以关闭后从密钥列表再次复制。</p>
+        <label class="fld"><span class="k">完整密钥</span><textarea id="keySecret" class="key-secret" rows="3" readonly spellcheck="false" aria-label="完整密钥"></textarea></label>
+        <button type="button" class="btn pri" id="btnCopyKey">复制密钥</button>
+      </div>
+      <p id="keyFormError" class="key-form-error hide" role="alert"></p>
+    </div>
+    <div class="key-dialog-foot"><button type="button" class="btn" id="keyDialogCancel">取消</button><button type="submit" class="btn pri" id="keyDialogSave">创建密钥</button></div>
+  </form>
+</dialog>
+<script src="vendor/qrcode.js"></script>
+<script>
+"use strict";
+/*__APP_JS__*/
+</script>
+</body>
+</html>

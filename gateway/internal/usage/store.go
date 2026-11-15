@@ -1,0 +1,1120 @@
+// ═══ 更新日志 ═══
+// 2026-09-17：新增按调用密钥累计的 token 用量账本：进程内累加、周期落盘，
+//
+//	供请求日志（key= 列）与管理台「用量统计」页读取。
+//
+// 2026-09-17：落盘前先与磁盘账本按字段取最大值合并。热更新时新旧进程会短暂同时
+//
+//	持有账本，合并保证两边记的请求都不丢，也不会把同一笔重复计两次。
+//
+// 2026-09-17：改为「基线 + 本方增量」并在文件锁内读改写。取最大值只在两侧看到同一批
+//
+//	记录时才对；两个进程各自服务不同请求时取大会丢掉一方记的请求，改增量后可累加。
+//
+// 2026-09-18：新增缓存命中输入维度（CachedTokens）。思考模式下每轮重发整段上下文，
+// 输入里绝大部分是缓存命中；不单列出来，看总数会误以为「用了很多却只记了这么点」。
+// 2026-09-18：文件锁覆盖整个读改写，隔离快照与在途增量，串行关闭/清零，拒绝覆盖损坏账本并支持合法大账本。
+// 2026-09-19：已调用上游的失败与取消请求保留已知用量，累计失败/未完整上报计数并穿过全部持久化维度。
+// 2026-09-24：跨实例合并只携带真实增量，以磁盘起算时间为准，防止清零后旧密钥和日期复活。
+// 2026-09-24：启动和跨实例快照读取也取得账本锁，避免 Windows 读句柄使原子替换失败。
+// 2026-09-30：单密钥模型桶设上限并淘汰消耗最小的桶，防止客户端自选模型名把账本撑过体积上限而永久停写。
+// 2026-09-30：rename 后补父目录 fsync，与 requestlog/apikeys 口径一致（2026-09-30 深度体检发现）。
+package usage
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Version 账本文件格式版本。
+const Version = 1
+
+const maxLedgerBytes = 64 << 20
+
+// defaultFlushInterval 落盘间隔：
+// 账本是累计计数，进程崩溃最多丢一个窗口的数据，换来的是写盘次数与请求量解耦。
+const defaultFlushInterval = 5 * time.Second
+
+// maxDayBuckets 账本保留的天桶数量（约 4 个月）。超过后裁掉最旧的天，账本不会无限增长。
+const maxDayBuckets = 120
+
+// maxModelsPerKey 单密钥保留的模型桶数量上限。模型名是客户端自选字段（handler 只限
+// 长度 256 字节，不限取值），只增不减会让账本内存与每次落盘的序列化体积无上限增长，
+// 一旦序列化超过 maxLedgerBytes 所有用量都不再落盘。超限时淘汰总量最小的模型桶，
+// 面板仍能看到消耗最大的那些模型（2026-09-30 深度体检发现）。
+const maxModelsPerKey = 128
+
+// dayKeyLayout 天桶键格式（服务端本地时区的日历日）。
+const dayKeyLayout = "2006-01-02"
+
+// dayKeyOf 把一次请求的时间折算成天桶键。
+//
+// 用本地时区而不是 UTC：面板按调用方所在时区显示日期，容器 TZ 与用户一致
+// （compose 里 TZ=Asia/Shanghai）。按 UTC 分桶会把本地 00:00–08:00 的请求记到前一天。
+func dayKeyOf(at time.Time) string {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return at.In(time.Local).Format(dayKeyLayout)
+}
+
+// Totals 一个维度的累计量。Credit 只在上游 usage 显式带 credit 时累加
+// （缺失 ≠ 0，见 upstream 侧 Credit() 注释）。
+type Totals struct {
+	Requests           int64   `json:"requests"`
+	FailedRequests     int64   `json:"failed_requests"`
+	UnreportedRequests int64   `json:"unreported_requests"`
+	PromptTokens       int64   `json:"prompt_tokens"`
+	CachedTokens       int64   `json:"cached_tokens"`
+	CompletionTokens   int64   `json:"completion_tokens"`
+	TotalTokens        int64   `json:"total_tokens"`
+	Credit             float64 `json:"credit"`
+}
+
+// Outcome describes the final client-request result independently of usage.
+// Unreported also covers a failed retry whose consumption was not observed;
+// a later successful attempt cannot establish that earlier attempt cost zero.
+type Outcome struct {
+	Failed     bool
+	Unreported bool
+}
+
+// add 把一次请求计入累计量。prompt/completion/cached 为负表示上游没有该项观测（缺失≠0）。
+func (t *Totals) add(prompt, completion, cached int, credit float64, hasCredit bool, outcome Outcome) {
+	if outcome.Failed {
+		t.FailedRequests++
+	}
+	if outcome.Unreported || prompt < 0 || completion < 0 {
+		t.UnreportedRequests++
+	}
+	if prompt < 0 {
+		prompt = 0
+	}
+	if completion < 0 {
+		completion = 0
+	}
+	if cached < 0 {
+		cached = 0
+	}
+	t.Requests++
+	t.PromptTokens += int64(prompt)
+	t.CachedTokens += int64(cached)
+	t.CompletionTokens += int64(completion)
+	t.TotalTokens += int64(prompt) + int64(completion)
+	if hasCredit {
+		t.Credit += credit
+	}
+}
+
+// ModelUsage 单模型维度。
+type ModelUsage struct {
+	Model  string `json:"model"`
+	Totals Totals `json:"totals"`
+}
+
+// KeyUsage 单密钥维度（对外快照）。
+type KeyUsage struct {
+	KeyID     string       `json:"key_id"`
+	Name      string       `json:"name"`
+	MaskedKey string       `json:"masked_key"`
+	Totals    Totals       `json:"totals"`
+	Models    []ModelUsage `json:"models"`
+	// Days 是该密钥的按天累计量（新到旧排序），面板按密钥筛日期时读它。
+	Days []DayUsage `json:"days"`
+	// DayModels 是该密钥「每天 × 每个模型」的累计量（新到旧排序）。
+	//
+	// 为什么需要这一维：Models 只有全时段口径，Days 只有总量口径。面板一旦按日期
+	// 筛选，就既不能拿全时段的模型明细冒充（那是假数据，2026-09-18 已明确禁止），
+	// 也没有按天的模型明细可用——于是「按模型」按钮在筛选态直接消失。
+	//
+	// 后果是具体的（2026-10-13 用户实测截图）：勾选「今天」后「模型拆分」列整列变成
+	// 「—」，点不动；而这个按钮恰恰是判断「哪条流量贵」的唯一入口，筛选态下最需要它。
+	DayModels   []DayModels `json:"day_models"`
+	FirstUsedAt time.Time   `json:"first_used_at"`
+	LastUsedAt  time.Time   `json:"last_used_at"`
+}
+
+// Snapshot 一次读取结果：总量 + 按密钥明细（按总 token 降序）。
+type Snapshot struct {
+	Since     time.Time  `json:"since"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	Totals    Totals     `json:"totals"`
+	Keys      []KeyUsage `json:"keys"`
+	// Days 是按天分桶的累计量（键为本地日历日 YYYY-MM-DD，新到旧排序），
+	// 面板的日期筛选读它。
+	Days []DayUsage `json:"days"`
+}
+
+// DayUsage 单日累计量。
+type DayUsage struct {
+	Day    string `json:"day"`
+	Totals Totals `json:"totals"`
+}
+
+// DayModels 单日 × 单模型的累计量。
+type DayModels struct {
+	Day    string       `json:"day"`
+	Models []ModelUsage `json:"models"`
+}
+
+// keyRecord 落盘用的单密钥记录。
+type keyRecord struct {
+	Name      string             `json:"name"`
+	MaskedKey string             `json:"masked_key"`
+	Totals    Totals             `json:"totals"`
+	Models    map[string]*Totals `json:"models"`
+	Days      map[string]*Totals `json:"days,omitempty"`
+	// DayModels 是「天 → 模型 → 累计量」两维桶，供面板在日期筛选下仍能给出模型拆分
+	// （见 KeyUsage.DayModels）。用 omitempty：老账本没有这一维，读入后为空、照常工作，
+	// 新请求到达时自然补上。
+	DayModels   map[string]map[string]*Totals `json:"day_models,omitempty"`
+	FirstUsedAt time.Time                     `json:"first_used_at"`
+	LastUsedAt  time.Time                     `json:"last_used_at"`
+}
+
+// document 账本文件结构。
+type document struct {
+	Version   int                   `json:"version"`
+	Since     time.Time             `json:"since"`
+	UpdatedAt time.Time             `json:"updated_at"`
+	Totals    Totals                `json:"totals"`
+	Keys      map[string]*keyRecord `json:"keys"`
+	Days      map[string]*Totals    `json:"days,omitempty"`
+}
+
+// Store 用量账本。零值不可用，必须经 Open 构造。
+type Store struct {
+	mu        sync.Mutex
+	flushMu   sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+	path      string
+	interval  time.Duration
+	doc       document
+	// written 本进程上一次提交的累计值。落盘时用「当前 - written」算出本方新增量，
+	// 热更新期间新旧进程各自只往盘上加自己那部分，既不覆盖对方也不重复计数。
+	written document
+	dirty   bool
+	closed  bool
+	stop    chan struct{}
+	done    chan struct{}
+	persist func(document) error
+}
+
+// Open 打开（或新建）账本文件。path 为空返回错误——调用方据此跳过用量统计。
+func Open(path string, interval time.Duration) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("usage file path is empty")
+	}
+	if interval <= 0 {
+		interval = defaultFlushInterval
+	}
+	s := &Store{
+		path:     path,
+		interval: interval,
+		doc:      document{Version: Version, Since: time.Now().UTC(), Keys: map[string]*keyRecord{}},
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	s.persist = s.write
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	go s.loop()
+	return s, nil
+}
+
+// load 读取已有账本；文件不存在时保持空账本并落一次盘，保证目录里有可见文件。
+func (s *Store) load() error {
+	doc, err := readLedgerSnapshot(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.dirty = true
+		return s.Flush()
+	}
+	if err != nil {
+		return err
+	}
+	if doc.Since.IsZero() {
+		doc.Since = time.Now().UTC()
+	}
+	doc.Version = Version
+	// 读入时同样裁剪：旧文件可能是在没有上限的版本里写下的（2026-09-30 深度体检发现）。
+	for _, record := range doc.Keys {
+		if record != nil {
+			trimModelBuckets(record.Models)
+			for _, models := range record.DayModels {
+				trimModelBuckets(models)
+			}
+			trimDayModels(record.DayModels)
+		}
+	}
+	s.doc = doc
+	s.written = cloneDocument(doc)
+	return nil
+}
+
+// Record 保留已有成功请求调用接口；新增失败/取消记账使用 RecordOutcome。
+// model 为空时只计入密钥与总量维度。
+func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion, cached int, credit float64, hasCredit bool, at time.Time) {
+	s.RecordOutcome(keyID, name, maskedKey, model, prompt, completion, cached, credit, hasCredit, Outcome{}, at)
+}
+
+// RecordOutcome records one finished client request that reached the upstream.
+// Known values are retained even when it failed; absent fields remain unknown.
+// keyID 为空时归到 "legacy"（单密钥模式/内置密钥）。
+func (s *Store) RecordOutcome(keyID, name, maskedKey, model string, prompt, completion, cached int, credit float64, hasCredit bool, outcome Outcome, at time.Time) {
+	if s == nil {
+		return
+	}
+	if strings.TrimSpace(keyID) == "" {
+		keyID = "legacy"
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	} else {
+		at = at.UTC()
+	}
+	day := dayKeyOf(at)
+	if name == "" {
+		name = "未命名密钥"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	record := s.doc.Keys[keyID]
+	if record == nil {
+		record = &keyRecord{Models: map[string]*Totals{}, FirstUsedAt: at}
+		s.doc.Keys[keyID] = record
+	}
+	// 名称/掩码以最近一次为准：管理台改名后页面要看到新名字。
+	if name != "" {
+		record.Name = name
+	}
+	if maskedKey != "" {
+		record.MaskedKey = maskedKey
+	}
+	if record.FirstUsedAt.IsZero() {
+		record.FirstUsedAt = at
+	}
+	record.LastUsedAt = at
+	record.Totals.add(prompt, completion, cached, credit, hasCredit, outcome)
+	s.doc.Totals.add(prompt, completion, cached, credit, hasCredit, outcome)
+	s.doc.UpdatedAt = at
+	// 天桶：总量与按密钥各记一份（面板按密钥筛选日期时要能对上）。
+	if s.doc.Days == nil {
+		s.doc.Days = map[string]*Totals{}
+	}
+	if dayTotals := s.doc.Days[day]; dayTotals != nil {
+		dayTotals.add(prompt, completion, cached, credit, hasCredit, outcome)
+	} else {
+		created := &Totals{}
+		created.add(prompt, completion, cached, credit, hasCredit, outcome)
+		s.doc.Days[day] = created
+	}
+	if record.Days == nil {
+		record.Days = map[string]*Totals{}
+	}
+	if keyDay := record.Days[day]; keyDay != nil {
+		keyDay.add(prompt, completion, cached, credit, hasCredit, outcome)
+	} else {
+		created := &Totals{}
+		created.add(prompt, completion, cached, credit, hasCredit, outcome)
+		record.Days[day] = created
+	}
+	trimDayBuckets(s.doc.Days)
+	trimDayBuckets(record.Days)
+	if strings.TrimSpace(model) != "" {
+		if record.Models == nil {
+			record.Models = map[string]*Totals{}
+		}
+		counter := record.Models[model]
+		if counter == nil {
+			counter = &Totals{}
+			record.Models[model] = counter
+		}
+		counter.add(prompt, completion, cached, credit, hasCredit, outcome)
+		trimModelBuckets(record.Models)
+		// 天 × 模型两维桶：面板按日期筛选时要能看到该范围内的模型拆分（见 DayModels）。
+		if record.DayModels == nil {
+			record.DayModels = map[string]map[string]*Totals{}
+		}
+		byModel := record.DayModels[day]
+		if byModel == nil {
+			byModel = map[string]*Totals{}
+			record.DayModels[day] = byModel
+		}
+		dayModel := byModel[model]
+		if dayModel == nil {
+			dayModel = &Totals{}
+			byModel[model] = dayModel
+		}
+		dayModel.add(prompt, completion, cached, credit, hasCredit, outcome)
+		trimModelBuckets(byModel)
+		trimDayModels(record.DayModels)
+	}
+	s.dirty = true
+}
+
+// trimDayBuckets 只保留最近 maxDayBuckets 个天桶（键按字典序即时间序）。
+func trimDayBuckets(buckets map[string]*Totals) {
+	if len(buckets) <= maxDayBuckets {
+		return
+	}
+	keys := make([]string, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys[:len(keys)-maxDayBuckets] {
+		delete(buckets, key)
+	}
+}
+
+// syncLedgerDir 在 rename 之后同步父目录，让「目录项替换」本身落盘。
+// 只刷 tmp 文件内容不够：崩溃发生在 rename 返回后、目录元数据落盘前时，
+// 重启看到的仍是旧账本（2026-09-30 深度体检发现，与 requestlog/apikeys 同口径）。
+// 抽成变量便于测试断言这一步确实发生（崩溃窗口本身无法在用例里复现）。
+var ledgerDirSync = syncLedgerDir
+
+// trimModelBuckets 把单密钥的模型桶裁到 maxModelsPerKey。模型名由客户端自选，
+// 与天桶不同它没有自然上限，必须显式裁剪（2026-09-30 深度体检发现）。
+// 按总 token 升序淘汰，消耗最大的模型保留在面板上；总量相同时按名称序，保证
+// 裁剪结果稳定可复现（同一输入无论 map 遍历顺序如何都裁掉同一批）。
+func trimModelBuckets(models map[string]*Totals) {
+	if len(models) <= maxModelsPerKey {
+		return
+	}
+	keys := make([]string, 0, len(models))
+	for key := range models {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := models[keys[i]], models[keys[j]]
+		if left == nil || right == nil {
+			return keys[i] < keys[j]
+		}
+		if left.TotalTokens != right.TotalTokens {
+			return left.TotalTokens < right.TotalTokens
+		}
+		return keys[i] < keys[j]
+	})
+	for _, key := range keys[:len(keys)-maxModelsPerKey] {
+		delete(models, key)
+	}
+}
+
+// trimDayModels 把「天 × 模型」两维桶裁到最近 maxDayBuckets 天。
+// 每天内部的模型桶由 trimModelBuckets 各自裁剪（与单密钥全时段模型桶同一上限）。
+func trimDayModels(days map[string]map[string]*Totals) {
+	if len(days) <= maxDayBuckets {
+		return
+	}
+	keys := make([]string, 0, len(days))
+	for key := range days {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys[:len(keys)-maxDayBuckets] {
+		delete(days, key)
+	}
+}
+
+// Snapshot 返回当前累计值的深拷贝快照。
+//
+// 视图 = 盘上账本 + 本进程尚未落盘的新增量。为什么不能只看内存：热更新期间旧进程
+// 收尾时会把在途请求记进同一个文件，新进程如果没有流量就不会再落盘，只看内存会让
+// 面板一直少算那几条（实测 v1.3.4→v1.3.5 少算了 8256 token）。读盘失败时退回内存视图。
+func (s *Store) Snapshot() Snapshot {
+	if s == nil {
+		return Snapshot{}
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	s.mu.Lock()
+	mine := cloneDocument(s.doc)
+	written := cloneDocument(s.written)
+	s.mu.Unlock()
+
+	view := mine
+	if disk, ok := s.readDisk(); ok {
+		view = addDocument(disk, deltaDocument(mine, written))
+	}
+
+	out := Snapshot{Since: view.Since, UpdatedAt: view.UpdatedAt, Totals: view.Totals}
+	out.Keys = make([]KeyUsage, 0, len(view.Keys))
+	for id, record := range view.Keys {
+		if record == nil {
+			continue
+		}
+		entry := KeyUsage{
+			KeyID:       id,
+			Name:        record.Name,
+			MaskedKey:   record.MaskedKey,
+			Totals:      record.Totals,
+			Days:        sortDays(record.Days),
+			DayModels:   sortDayModels(record.DayModels),
+			FirstUsedAt: record.FirstUsedAt,
+			LastUsedAt:  record.LastUsedAt,
+		}
+		models := make([]ModelUsage, 0, len(record.Models))
+		for model, totals := range record.Models {
+			if totals == nil {
+				continue
+			}
+			models = append(models, ModelUsage{Model: model, Totals: *totals})
+		}
+		sort.Slice(models, func(i, j int) bool {
+			if models[i].Totals.TotalTokens != models[j].Totals.TotalTokens {
+				return models[i].Totals.TotalTokens > models[j].Totals.TotalTokens
+			}
+			return models[i].Model < models[j].Model
+		})
+		entry.Models = models
+		out.Keys = append(out.Keys, entry)
+	}
+	sort.Slice(out.Keys, func(i, j int) bool {
+		if out.Keys[i].Totals.TotalTokens != out.Keys[j].Totals.TotalTokens {
+			return out.Keys[i].Totals.TotalTokens > out.Keys[j].Totals.TotalTokens
+		}
+		return out.Keys[i].KeyID < out.Keys[j].KeyID
+	})
+	out.Days = sortDays(view.Days)
+	return out
+}
+
+// sortDays 把天桶摊平成按日期倒序的切片（最新的一天在最前）。
+func sortDays(buckets map[string]*Totals) []DayUsage {
+	if len(buckets) == 0 {
+		return []DayUsage{}
+	}
+	days := make([]DayUsage, 0, len(buckets))
+	for day, totals := range buckets {
+		if totals == nil {
+			continue
+		}
+		days = append(days, DayUsage{Day: day, Totals: *totals})
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+	return days
+}
+
+// sortDayModels 把「天 × 模型」桶摊平成按日期倒序的切片；同一天内模型按 token 降序。
+// 排序与 sortDays、models 的既有口径一致，面板无需为两维桶写第二套排序。
+func sortDayModels(buckets map[string]map[string]*Totals) []DayModels {
+	if len(buckets) == 0 {
+		return []DayModels{}
+	}
+	days := make([]DayModels, 0, len(buckets))
+	for day, models := range buckets {
+		entry := DayModels{Day: day, Models: make([]ModelUsage, 0, len(models))}
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			entry.Models = append(entry.Models, ModelUsage{Model: model, Totals: *totals})
+		}
+		sort.Slice(entry.Models, func(i, j int) bool {
+			if entry.Models[i].Totals.TotalTokens != entry.Models[j].Totals.TotalTokens {
+				return entry.Models[i].Totals.TotalTokens > entry.Models[j].Totals.TotalTokens
+			}
+			return entry.Models[i].Model < entry.Models[j].Model
+		})
+		days = append(days, entry)
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+	return days
+}
+
+// Path 返回账本文件路径（页面展示用）。
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+// Flush 把当前累计值原子落盘（tmp + rename）。
+func (s *Store) Flush() error {
+	if s == nil {
+		return nil
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	s.mu.Lock()
+	if !s.dirty {
+		s.mu.Unlock()
+		return nil
+	}
+	snapshot := cloneDocument(s.doc)
+	s.dirty = false
+	s.mu.Unlock()
+
+	snapshot.Version = Version
+	if snapshot.UpdatedAt.IsZero() {
+		snapshot.UpdatedAt = time.Now().UTC()
+	}
+	if err := s.persist(snapshot); err != nil {
+		// 落盘失败：把脏标记放回去，下一轮重试（不覆盖已有文件）。
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// write 原子写：先在文件锁内把本进程的新增量并入盘上账本，再 tmp + rename。
+func (s *Store) write(doc document) error {
+	return s.persistDocument(doc, true)
+}
+
+// writeDirect 不做增量合并，直接覆盖（Reset 专用：清零必须真的清零）。
+func (s *Store) writeDirect(doc document) error {
+	return s.persistDocument(doc, false)
+}
+
+func (s *Store) persistDocument(doc document, merge bool) error {
+	if dir := filepath.Dir(s.path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	unlock, err := lockLedger(s.path)
+	if err != nil {
+		return fmt.Errorf("lock usage ledger: %w", err)
+	}
+	defer unlock()
+	snapshot := doc
+	if merge {
+		base, err := readLedger(s.path)
+		if errors.Is(err, os.ErrNotExist) {
+			base = s.writtenSnapshot()
+		} else if err != nil {
+			return fmt.Errorf("read usage ledger before merge: %w", err)
+		}
+		doc = addDocument(base, deltaDocument(snapshot, s.writtenSnapshot()))
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if len(raw) > maxLedgerBytes {
+		return errors.New("usage file exceeds size limit")
+	}
+	file, err := os.CreateTemp(filepath.Dir(s.path), ".usage-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if err = file.Chmod(0600); err == nil {
+		_, err = file.Write(raw)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := replaceLedger(tmp, s.path); err != nil {
+		return err
+	}
+	// 目录 fsync：rename 只保证目录项替换对已刷盘的内容生效，崩溃时若不刷目录，
+	// 重命名可能丢失（旧账本回来）。tmp.Sync() 只覆盖文件内容（2026-09-30 深度体检发现）。
+	if err := ledgerDirSync(filepath.Dir(s.path)); err != nil {
+		return err
+	}
+	s.commit(doc, snapshot, merge)
+	return nil
+}
+
+// mergeDelta 把「本进程自上次落盘以来的新增量」加到盘上的账本里。
+//
+// 为什么不是简单覆盖：热更新期间新旧两个进程会同时存活（新实例已接管监听，旧实例
+// 还在把在途请求跑完），谁后落盘谁就会用自己内存里的快照覆盖对方刚写的记录。
+//
+// 为什么也不是"逐字段取最大值"：取大只对"两侧看到的是同一批记录"成立。两个进程
+// 各自服务不同请求时，取大会**丢掉**只被一方记到的那部分（旧进程 100 笔 + 新进程
+// 5 笔 → 仍是 100 笔）。改成"基线 + 本方增量"后，两边记录的都会累加，且由于增量
+// 是本方累计值减去本方上次已提交的累计值，重复落盘也不会重复计数。
+//
+// persistDocument 在持有文件锁时完成全部读改写，读取失败保留原文件与待写增量。
+func readLedger(path string) (document, error) {
+	empty := document{Version: Version, Keys: map[string]*keyRecord{}}
+	// #nosec G304 -- 账本路径来自管理员配置，非请求输入
+	file, err := os.Open(path)
+	if err != nil {
+		return empty, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxLedgerBytes+1))
+	if err != nil {
+		return empty, err
+	}
+	if len(raw) > maxLedgerBytes {
+		return empty, errors.New("usage file exceeds size limit")
+	}
+	var disk document
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		return empty, err
+	}
+	if disk.Version != Version {
+		return empty, errors.New("unsupported usage file version")
+	}
+	if disk.Keys == nil {
+		disk.Keys = map[string]*keyRecord{}
+	}
+	return disk, nil
+}
+
+// readDisk 用于只读视图；读盘失败时 Snapshot 保留内存中的已知记录。
+func (s *Store) readDisk() (document, bool) {
+	doc, err := readLedgerSnapshot(s.path)
+	return doc, err == nil
+}
+
+func readLedgerSnapshot(path string) (document, error) {
+	unlock, err := lockLedger(path)
+	if err != nil {
+		return document{}, err
+	}
+	defer unlock()
+	return readLedger(path)
+}
+
+// writtenSnapshot 本进程上次提交的累计值（深拷贝，防止后续写入改到它）。
+func (s *Store) writtenSnapshot() document {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneDocument(s.written)
+}
+
+// commit 记录本次落盘后的账本基线。
+//
+// adoptDisk 为真（增量合并路径）说明盘上可能还有别的进程的贡献：把这些贡献加进内存视图，
+// 面板才能立刻看到合并后的真实数字；同时把基线提到合并结果，下一次的新增量只算本方
+// 新记录，不会重复计入别人的部分。
+func (s *Store) commit(mine, snapshot document, adoptDisk bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !adoptDisk {
+		s.written = cloneDocument(mine)
+		return
+	}
+	// Records accepted after the flush snapshot were not persisted by this
+	// write. Carry them forward separately from other processes' contributions.
+	pending := deltaDocument(s.doc, snapshot)
+	s.doc = addDocument(cloneDocument(mine), pending)
+	s.written = cloneDocument(mine)
+}
+
+// deltaDocument 本进程自上次提交以来的新增量（累计量单调不减，负数按 0 处理）。
+func deltaDocument(mine, prev document) document {
+	out := document{
+		Version:   Version,
+		Since:     mine.Since,
+		UpdatedAt: mine.UpdatedAt,
+		Totals:    deltaTotals(mine.Totals, prev.Totals),
+		Keys:      make(map[string]*keyRecord, len(mine.Keys)),
+		Days:      deltaDays(mine.Days, prev.Days),
+	}
+	for id, current := range mine.Keys {
+		if current == nil {
+			continue
+		}
+		var before keyRecord
+		if old := prev.Keys[id]; old != nil {
+			before = *old
+		}
+		totalsDelta := deltaTotals(current.Totals, before.Totals)
+		if totalsDelta == (Totals{}) {
+			continue
+		}
+		item := &keyRecord{
+			Name:        current.Name,
+			MaskedKey:   current.MaskedKey,
+			Totals:      totalsDelta,
+			Models:      make(map[string]*Totals, len(current.Models)),
+			Days:        deltaDays(current.Days, before.Days),
+			DayModels:   deltaDayModels(current.DayModels, before.DayModels),
+			FirstUsedAt: current.FirstUsedAt,
+			LastUsedAt:  current.LastUsedAt,
+		}
+		for model, totals := range current.Models {
+			if totals == nil {
+				continue
+			}
+			var beforeModel Totals
+			if before.Models != nil {
+				if old := before.Models[model]; old != nil {
+					beforeModel = *old
+				}
+			}
+			delta := deltaTotals(*totals, beforeModel)
+			if delta != (Totals{}) {
+				item.Models[model] = &delta
+			}
+		}
+		out.Keys[id] = item
+	}
+	return out
+}
+
+// deltaDays 逐天算增量；对方没有的天（本进程新记录）整体作为增量保留。
+func deltaDays(mine, prev map[string]*Totals) map[string]*Totals {
+	out := make(map[string]*Totals, len(mine))
+	for day, totals := range mine {
+		if totals == nil {
+			continue
+		}
+		var before Totals
+		if old := prev[day]; old != nil {
+			before = *old
+		}
+		delta := deltaTotals(*totals, before)
+		if delta != (Totals{}) {
+			out[day] = &delta
+		}
+	}
+	return out
+}
+
+// deltaDayModels 逐天、逐模型算增量，与 deltaDays / deltaModels 同一口径。
+// 整层都为空时返回 nil，让 omitempty 生效、不把空壳写进账本。
+func deltaDayModels(mine, prev map[string]map[string]*Totals) map[string]map[string]*Totals {
+	out := map[string]map[string]*Totals{}
+	for day, models := range mine {
+		beforeModels := prev[day]
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			var before Totals
+			if beforeModels != nil {
+				if old := beforeModels[model]; old != nil {
+					before = *old
+				}
+			}
+			delta := deltaTotals(*totals, before)
+			if delta == (Totals{}) {
+				continue
+			}
+			byModel := out[day]
+			if byModel == nil {
+				byModel = map[string]*Totals{}
+				out[day] = byModel
+			}
+			copied := delta
+			byModel[model] = &copied
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// addDocument 把增量并进基线账本（总量、按密钥、按模型逐层累加）。
+func addDocument(base, delta document) document {
+	base.Version = Version
+	base.Totals = addTotals(base.Totals, delta.Totals)
+	// The persisted start belongs to the current reset period. An overlapping
+	// process may still carry the previous period in its in-memory baseline.
+	if base.Since.IsZero() {
+		base.Since = delta.Since
+	}
+	if delta.UpdatedAt.After(base.UpdatedAt) {
+		base.UpdatedAt = delta.UpdatedAt
+	}
+	if base.Keys == nil {
+		base.Keys = map[string]*keyRecord{}
+	}
+	base.Days = addDays(base.Days, delta.Days)
+	for id, add := range delta.Keys {
+		if add == nil {
+			continue
+		}
+		current := base.Keys[id]
+		if current == nil {
+			copied := *add
+			copied.Models = cloneModels(add.Models)
+			copied.Days = cloneModels(add.Days)
+			copied.DayModels = cloneDayModels(add.DayModels)
+			base.Keys[id] = &copied
+			continue
+		}
+		current.Totals = addTotals(current.Totals, add.Totals)
+		if add.Name != "" && (current.Name == "" || !add.LastUsedAt.Before(current.LastUsedAt)) {
+			current.Name = add.Name
+		}
+		if add.MaskedKey != "" && (current.MaskedKey == "" || !add.LastUsedAt.Before(current.LastUsedAt)) {
+			current.MaskedKey = add.MaskedKey
+		}
+		if !add.FirstUsedAt.IsZero() && (current.FirstUsedAt.IsZero() || add.FirstUsedAt.Before(current.FirstUsedAt)) {
+			current.FirstUsedAt = add.FirstUsedAt
+		}
+		if add.LastUsedAt.After(current.LastUsedAt) {
+			current.LastUsedAt = add.LastUsedAt
+		}
+		if current.Models == nil {
+			current.Models = map[string]*Totals{}
+		}
+		for model, totals := range add.Models {
+			if totals == nil {
+				continue
+			}
+			if existing := current.Models[model]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				current.Models[model] = &merged
+			} else {
+				copied := *totals
+				current.Models[model] = &copied
+			}
+		}
+		if current.Days == nil {
+			current.Days = map[string]*Totals{}
+		}
+		for day, totals := range add.Days {
+			if totals == nil {
+				continue
+			}
+			if existing := current.Days[day]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				current.Days[day] = &merged
+			} else {
+				copied := *totals
+				current.Days[day] = &copied
+			}
+		}
+		trimDayBuckets(current.Days)
+		current.DayModels = addDayModels(current.DayModels, add.DayModels)
+	}
+	trimDayBuckets(base.Days)
+	return base
+}
+
+// addDayModels 把「天 × 模型」增量并进基线。
+func addDayModels(base, delta map[string]map[string]*Totals) map[string]map[string]*Totals {
+	if len(delta) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]map[string]*Totals{}
+	}
+	for day, models := range delta {
+		byModel := base[day]
+		if byModel == nil {
+			byModel = map[string]*Totals{}
+			base[day] = byModel
+		}
+		for model, totals := range models {
+			if totals == nil {
+				continue
+			}
+			if existing := byModel[model]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				byModel[model] = &merged
+			} else {
+				copied := *totals
+				byModel[model] = &copied
+			}
+		}
+		trimModelBuckets(byModel)
+	}
+	trimDayModels(base)
+	return base
+}
+
+// addDays 逐天累加两个天桶表。
+func addDays(base, delta map[string]*Totals) map[string]*Totals {
+	if len(base) == 0 && len(delta) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]*Totals{}
+	}
+	for day, totals := range delta {
+		if totals == nil {
+			continue
+		}
+		if existing := base[day]; existing != nil {
+			merged := addTotals(*existing, *totals)
+			base[day] = &merged
+		} else {
+			copied := *totals
+			base[day] = &copied
+		}
+	}
+	return base
+}
+
+// cloneDocument 深拷贝账本，避免共享 map / 指针。
+func cloneDocument(doc document) document {
+	out := doc
+	out.Keys = make(map[string]*keyRecord, len(doc.Keys))
+	out.Days = cloneModels(doc.Days)
+	for id, record := range doc.Keys {
+		if record == nil {
+			continue
+		}
+		copied := *record
+		copied.Models = cloneModels(record.Models)
+		copied.Days = cloneModels(record.Days)
+		copied.DayModels = cloneDayModels(record.DayModels)
+		out.Keys[id] = &copied
+	}
+	return out
+}
+
+// cloneDayModels 深拷贝「天 × 模型」两维桶。
+func cloneDayModels(source map[string]map[string]*Totals) map[string]map[string]*Totals {
+	if source == nil {
+		return nil
+	}
+	out := make(map[string]map[string]*Totals, len(source))
+	for day, models := range source {
+		out[day] = cloneModels(models)
+	}
+	return out
+}
+
+// deltaTotals 逐字段算增量，负数（清零或跨进程读到的更大值）按 0 处理。
+func deltaTotals(now, prev Totals) Totals {
+	return Totals{
+		Requests:           positive(now.Requests - prev.Requests),
+		FailedRequests:     positive(now.FailedRequests - prev.FailedRequests),
+		UnreportedRequests: positive(now.UnreportedRequests - prev.UnreportedRequests),
+		PromptTokens:       positive(now.PromptTokens - prev.PromptTokens),
+		CachedTokens:       positive(now.CachedTokens - prev.CachedTokens),
+		CompletionTokens:   positive(now.CompletionTokens - prev.CompletionTokens),
+		TotalTokens:        positive(now.TotalTokens - prev.TotalTokens),
+		Credit:             positiveFloat(now.Credit - prev.Credit),
+	}
+}
+
+// addTotals 逐字段相加。
+func addTotals(base, delta Totals) Totals {
+	return Totals{
+		Requests:           base.Requests + delta.Requests,
+		FailedRequests:     base.FailedRequests + delta.FailedRequests,
+		UnreportedRequests: base.UnreportedRequests + delta.UnreportedRequests,
+		PromptTokens:       base.PromptTokens + delta.PromptTokens,
+		CachedTokens:       base.CachedTokens + delta.CachedTokens,
+		CompletionTokens:   base.CompletionTokens + delta.CompletionTokens,
+		TotalTokens:        base.TotalTokens + delta.TotalTokens,
+		Credit:             base.Credit + delta.Credit,
+	}
+}
+
+func positive(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func positiveFloat(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+// cloneModels 深拷贝按模型维度的累计量。
+func cloneModels(source map[string]*Totals) map[string]*Totals {
+	if source == nil {
+		return map[string]*Totals{}
+	}
+	out := make(map[string]*Totals, len(source))
+	for model, totals := range source {
+		if totals == nil {
+			continue
+		}
+		copied := *totals
+		out[model] = &copied
+	}
+	return out
+}
+
+// loop 周期落盘，直到 Close。
+func (s *Store) loop() {
+	defer close(s.done)
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			if err := s.Flush(); err != nil {
+				log.Printf("WARN: [用量] 账本落盘失败：%v", err)
+			}
+		}
+	}
+}
+
+// Close 停后台落盘并做最后一次落盘。
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.stop)
+		s.mu.Unlock()
+		<-s.done
+		s.closeErr = s.Flush()
+	})
+	return s.closeErr
+}
+
+// Reset 清空账本（管理台「清零」入口；保留文件与 Since 之外的结构）。
+func (s *Store) Reset(at time.Time) error {
+	if s == nil {
+		return nil
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	previous, written, dirty := s.doc, s.written, s.dirty
+	s.doc = document{Version: Version, Since: at.UTC(), UpdatedAt: at.UTC(), Keys: map[string]*keyRecord{}}
+	s.written = cloneDocument(s.doc)
+	s.dirty = false
+	snapshot := cloneDocument(s.doc)
+	s.mu.Unlock()
+	// 清零必须直接覆盖：走增量合并的话，盘上旧数据会被当成"别人的贡献"保留下来。
+	// 清零之后各进程的新增量照旧累加（它们只减自己上次提交的基线）。
+	if err := s.writeDirect(snapshot); err != nil {
+		s.mu.Lock()
+		s.doc = addDocument(previous, s.doc)
+		s.written = written
+		s.dirty = dirty || s.dirty
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}

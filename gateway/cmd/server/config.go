@@ -1,0 +1,693 @@
+// ═══ 更新日志 ═══
+// 2026-09-28：pool 新增 rotate_on_client_error。
+// 2026-09-28：pool 新增 max_soft_rotations。
+// 2026-09-26：pool 新增 max_rotate 与 source_rate_gate。
+// 2026-09-22：密钥管理默认启用：api_keys_file 留空（含历史示例里的空串）都走
+//
+//	./data/api_keys.json，修掉新装用户照抄 config.example.json 时管理台报
+//	「密钥管理尚未启用」而建不了密钥。启动时库里 0 把是正常起点；只有显式
+//	api_keys_enabled=false 才关闭。
+//
+// 2026-09-22：新增 features.reasoning_loop_stop_only（命中循环只停不重发），缺省 false；
+//
+//	非法类型或 null 直接拒绝，避免静默改变重发语义。
+//
+// 2026-09-19：重复推理保护默认开启，可由features.reasoning_loop_guard显式关闭；不修改模型或思考档位。
+// 2026-09-19：退役输入倍率配置，合法旧值仅告警并忽略，Responses 恢复上游原始用量。
+// 2026-09-19：校验输入估计倍率的格式与有限范围，防止非法环境变量静默关闭估计或产生负用量。
+// 2026-09-18：更新目录优先采用监督进程显式传入的值，避免下载位置与容器重启指针分离。
+// 2026-09-16：废弃正文清洗并保留配置兼容，避免默认设置篡改业务数据。
+// config.go 加载 JSON 配置 + 环境变量覆盖。
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"workbuddy2api/internal/config"
+	"workbuddy2api/internal/prompt"
+)
+
+// DefaultAPIKeysFile 是密钥库的默认位置（相对容器工作目录 /app，即挂载出来的 data 卷）。
+//
+// 密钥管理默认启用：新装用户照抄 config.example.json、或干脆不写这一项，都能直接
+// 在管理台里建密钥，不会再看到「密钥管理尚未启用」。显式写 `"api_keys_file": ""`
+// 仍然表示关闭多密钥管理，回到单密钥（或免鉴权）模式。
+//
+// 管理台面板侧有一份等价常量（panel/key_management.py 的 DEFAULT_API_KEYS_FILE），
+// 两边必须一致：面板读的是原始 config.json，网关读的是归一化后的配置，默认值一旦
+// 分叉，就会出现「网关已启用、面板说未启用」的分裂。
+// #nosec G101 -- 这是密钥库的文件路径常量，不是凭据
+const DefaultAPIKeysFile = "./data/api_keys.json"
+
+// Config 顶层配置。
+type Config struct {
+	Listen        string `json:"listen"`          // ":7863"
+	APIKey        string `json:"api_key"`         // 空 = 不鉴权
+	APIKeysFile   string `json:"api_keys_file"`   // 密钥库路径；留空即用 DefaultAPIKeysFile（密钥管理默认启用）。
+	APIKeysSocket string `json:"api_keys_socket"` // 本机管理 socket，默认位于密钥文件同目录。
+	// APIKeysEnabled 是否启用持久化密钥库。缺省（未写）为 true——库里可以一把密钥
+	// 都没有，那是正常起点，用户随后在管理台创建即可；「没有密钥」不等于「关掉功能」。
+	// 显式 false 才回到单密钥 / 免鉴权模式。
+	APIKeysEnabled *bool `json:"api_keys_enabled"`
+	// UsageFile 按调用密钥累计的 token 用量账本；留空且启用了密钥库时默认落在
+	// 密钥文件同目录的 usage.json。空 + 无密钥库 = 不记账（/usage 报未启用）。
+	UsageFile string `json:"usage_file"`
+	AuthDir   string `json:"auth_dir"`   // ./auths
+	StateFile string `json:"state_file"` // ./data/state.json
+
+	Server struct {
+		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
+		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
+		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
+		// 0/负数视为非法 → normalize 回落默认并记录。
+		MaxBodyMB int `json:"max_body_mb"`
+		// OutboundImageBudgetMB 出站请求体字节预算（单位 MB，默认 7）。
+		// 与 MaxBodyMB 是两件事：MaxBodyMB 决定网关「接不接收」，本项决定
+		// 「往上游发多大」。入站放宽到能收下大请求后，出站仍须守住上游能接受的
+		// 体积，否则上游拒绝且网关可能误罚账号。
+		// 超预算时从最旧的图片开始替换为文本占位（见 upstream/image_budget.go）。
+		// 0 或负数 = 关闭裁剪（不推荐）。
+		OutboundImageBudgetMB int `json:"outbound_image_budget_mb"`
+		// InputTokenScale 已退役，仅用于兼容和校验旧配置，不再传入 HTTP handler。
+		// 合法旧值 [1,5] 会被忽略并告警；所有 usage 始终保留上游原值。
+		InputTokenScale float64 `json:"input_token_scale"`
+	} `json:"server"`
+
+	Cooldown struct {
+		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
+		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
+		// 旧 config 中的这些键因 JSON 未知字段而自然忽略，不报错。
+		SoftRate string `json:"soft_rate"` // "600s"，软限流冷却基数
+		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
+		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
+		SoftRateMax string `json:"soft_rate_max"` // "2h"
+	} `json:"cooldown"`
+
+	Schedule config.Schedule `json:"schedule"`
+
+	Global struct {
+		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
+		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
+		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
+		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
+		Enabled bool `json:"enabled"`
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.ai（D5，internal/upstream.defaultGlobalBase）。
+		ChatBase    string `json:"chat_base"`
+		BillingBase string `json:"billing_base"`
+	} `json:"global"`
+
+	Upstream struct {
+		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
+		TimeoutSeconds int `json:"timeout_seconds"`
+		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
+		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
+		// issue #42 深挖：官网「使用端」列基于出站请求 UA 的服务端归因，官方 WorkBuddy
+		// 桌面 UA 为 `WorkBuddy/<version>`。默认值已对齐官方（A 段变更），用户仍可配完全
+		// 自定义值改写。
+		UserAgent string `json:"user_agent"`
+		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与白名单
+		// 头组 X-IDE-Version 的取值）。空 = 内置默认（对齐官方 5.7.6 分发包）；
+		// 显式配置（如升级后的桌面包版本）则随配置走。
+		ClientVersion string `json:"client_version"`
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（对齐官方内置 CLI
+		// 2.156.0）；显式配置则随配置走。
+		CliVersion string `json:"cli_version"`
+
+		// ChannelDumpDir 渠道拒绝（11128）时的**完整出站报文**落盘目录。
+		//
+		// 为什么需要：11128 的判定依据不在任何单一字段里——2026-10-17 排障时用逐项
+		// 排除法（头/字段/体积/图片/工具/账号/压缩）几十组实验都无法复现生产的拒绝，
+		// 差异只能在整个报文里。开这个开关后，每次渠道拒绝都写一份完整 JSON
+		// （出站请求头 + 完整请求体 + 完整上游响应），供事后逐字节对照。
+		//
+		// 空 = 关闭（默认）。排查期设成 /app/data/channel-dumps 即可。
+		ChannelDumpDir string `json:"channel_dump_dir"`
+
+		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底。
+		// 容器内无桌面端 Turing SDK，这是把外部生成的 token 注入的入口；空 = 不注入。
+		// 每号覆盖优先级：auths 文件 device_token > 本全局值 > DeviceTokenFile（文件兜底）。
+		DeviceToken string `json:"device_token"`
+		// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
+		// 读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略（优雅降级不注入）。
+		DeviceTokenFile string `json:"device_token_file"`
+		// ClientName 用量归属头 X-Product/X-IDE-Name/X-IDE-Type 的取值。
+		// 空（缺省）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，
+		// 上游用量归因不再出现 client/agentPurpose 为空的网关特征）。
+		// 显式配 "SaaS" 还原旧行为（仅 X-Product="SaaS"，不设 X-IDE-*）。
+		ClientName string `json:"client_name"`
+		// PassthroughIP 是否透传客户端 IP（X-Forwarded-For/X-Real-IP 首段）给上游。
+		// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）；true 才透传。
+		PassthroughIP bool `json:"passthrough_ip"`
+	} `json:"upstream"`
+
+	Features struct {
+		// SanitizeBlacklistFingerprints 兼容旧配置；已废弃，不再改写任何业务内容。
+		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		ReasoningLoopGuard            bool `json:"reasoning_loop_guard"`
+		// ReasoningLoopStopOnly 命中重复短行时只停止该次请求，不做同账号重发。
+		// 缺省 false = 命中后先在同一账号上重发一次（用户侧无感，重发仍循环才回报错误）。
+		// 显式 true = 命中即停止并如实回报，把是否重试交回调用方。
+		// 只影响「命中之后怎么办」，不影响检测本身。
+		ReasoningLoopStopOnly bool `json:"reasoning_loop_stop_only"`
+	} `json:"features"`
+
+	Prompt struct {
+		// Mode passthrough（默认）= 保留客户端原始 system；上游拒绝时不自动替换。
+		// custom = 网关用自有系统提示词替换客户端 system/developer（显式配置仍可覆盖回替换）。
+		Mode string `json:"mode"` // "custom" / "passthrough"
+		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
+		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
+		File string `json:"file"`
+		// ActNote 运行约定：追加在「带工具的 Responses 请求」system 末尾，抑制上游
+		// 模型「一句话一个命令」的叙述式输出（原生 DeepSeek 不会这样，反代链路实测会）。
+		// 空 = 内置默认（prompt.ActNote）；"off" = 关闭；其他值 = 自定义文本。
+		// 原 system 内容一字不改，只在末尾追加；不带工具的纯对话不受影响。
+		ActNote string `json:"act_note"`
+	} `json:"prompt"`
+
+	// Update 热更新：从 GitHub Release 取新二进制，在容器内完成监听套接字交接。
+	// 交接期间新实例已接管监听，旧实例把在途请求（含长 SSE 对话）跑完才退出，
+	// 因此版本切换不会打断正在进行的对话。
+	Update struct {
+		// Enabled 是否允许通过管理台触发热更新。缺省 true。
+		// 显式 false 时 /update/* 返回未启用，只能手工重新部署。
+		Enabled bool `json:"enabled"`
+		// Repo 发布仓库（owner/name）。空 = 内置默认 dddmiku/workbuddy2api。
+		Repo string `json:"repo"`
+		// Token 私有仓库读取用；公开仓库留空。
+		Token string `json:"token"`
+		// Proxy 下载加速代理前缀（默认 https://gh-proxy.com）。国内直连
+		// GitHub releases 经常超时或极慢，热更新因此形同虚设。
+		// 设成 "-" 表示直连（不用代理）。
+		Proxy string `json:"proxy"`
+		// Dir 下载与 current 指针目录；空 = 数据目录下的 updates（与 state_file 同盘）。
+		Dir string `json:"dir"`
+	} `json:"update"`
+
+	// PromptText 解析后的系统提示词文本（custom 模式使用）。
+	PromptText string `json:"-"`
+
+	Upstash struct {
+		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
+		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
+	} `json:"upstash"`
+
+	Pool struct {
+		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
+		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
+		ExpiringSoon string `json:"expiring_soon"`
+		// MaxRotate 单请求最多换号次数（0 = 默认 3）。号多时调大能提高成功率，
+		// 代价是上游持续限流时客户端等得更久。
+		MaxRotate int `json:"max_rotate"`
+		// SourceRateGate 是否启用「来源级限流闸门」（默认 true）。上游短时间内让多个
+		// 不同账号都回「无重置时间的 429」时，闸门会暂停该 realm 的选号并直接回 429；
+		// 关掉后改为继续换号（号多时更实用）。
+		SourceRateGate *bool `json:"source_rate_gate"`
+		// MaxSoftRotations 「内容审核 / 未知 4xx」在回给调用方前的换号次数上限。
+		// 0（默认）= 保持既有契约：这两类错误直接回给调用方，不换号。
+		MaxSoftRotations int `json:"max_soft_rotations"`
+		// RotateOnClientError 未知 4xx 是否也换号再试（默认 false）。开启后，
+		// 换号成本只是一个多出来的上游请求；关掉可避免用轮转掩盖真实请求错误。
+		RotateOnClientError *bool `json:"rotate_on_client_error"`
+		// FreezeOnAccountFault 收到 11140（账号级授权封禁）时不换号，直接把上游原文
+		// 回给调用方（默认 false = 保持既有轮转）。开启后当次请求会失败，换来的是
+		// 完整的事故现场：哪个号、什么形态、上游原文都在响应里，便于抓包对照修复。
+		FreezeOnAccountFault *bool `json:"freeze_on_account_fault"`
+		// SlotWait 「健康账号全被在途名额占满」时，单个请求等待名额释放的上限
+		// （如 "10s"，默认 10s）。这类账号可用、只是并发名额暂时用尽，名额会在
+		// 既有请求结束时释放，等等就能正常服务。显式 "0s" = 不等待，立即回 503。
+		// 池里根本没有健康账号（全禁用 / 全冷却）时不适用——那种情况等不来结果。
+		SlotWait string `json:"slot_wait"`
+	} `json:"pool"`
+
+	SessionSticky struct {
+		Enabled    bool   `json:"enabled"`     // 默认 true
+		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+	} `json:"session_sticky"`
+
+	// 解析后
+	SoftRateDur         time.Duration `json:"-"`
+	SoftRateMaxDur      time.Duration `json:"-"`
+	PoolSlotWaitDur     time.Duration `json:"-"`
+	BreakerCooldownDur  time.Duration `json:"-"`
+	BreakerCooldownMaxD time.Duration `json:"-"`
+	SessionTTL          time.Duration `json:"-"`
+	SessionGCInterval   time.Duration `json:"-"`
+	ExpiringSoonDur     time.Duration `json:"-"`
+}
+
+// Default 默认配置。
+func Default() *Config {
+	c := &Config{
+		Listen: ":7863",
+		APIKey: "",
+		// 密钥管理默认启用：新装用户照抄 config.example.json、或自己写一份最小配置
+		// 漏掉这一项，都能直接在管理台里建密钥。显式写 "" 仍然表示关闭。
+		APIKeysFile: DefaultAPIKeysFile,
+		AuthDir:     "./auths",
+		StateFile:   "./data/state.json",
+	}
+	c.Cooldown.SoftRate = "600s"
+	c.Cooldown.SoftRateMax = "2h"
+	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	// 出站预算默认 7MB：留在网关 8MB 入站边界之内；调整入站上限时须同步复核本值。
+	c.Server.OutboundImageBudgetMB = 7
+	// 仅供已退役字段的兼容校验，不参与运行时用量处理。
+	c.Server.InputTokenScale = 1
+	c.Features.ReasoningLoopGuard = true
+	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
+	// 消除 issue #49 的默认值漂移）。
+	c.Schedule = config.DefaultSchedule()
+	c.Upstream.TimeoutSeconds = 120
+	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
+	c.Upstream.HeaderTimeoutSeconds = 0
+	c.Upstream.IdleTimeoutSeconds = 0
+	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+	// ChatBase/BillingBase 缺省空（回落内置默认）。
+	c.Global.Enabled = true
+	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 三段式 + X-IDE-* 头组
+	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
+	// 显式 client_name="SaaS" 还原旧行为。
+	c.Upstream.ClientName = "WorkBuddy"
+	c.Features.SanitizeBlacklistFingerprints = false
+	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
+	c.Pool.MaxInFlight = 3
+	c.Pool.BreakerThreshold = 3
+	c.Pool.BreakerCooldown = "30m"
+	c.Pool.BreakerCooldownMax = "6h"
+	c.Pool.IdleWeightPerHour = 0.5
+	c.Pool.IdleWeightMax = 5.0
+	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	c.Pool.SlotWait = "10s"      // 在途名额等满时的等待上限（0s = 不等待，立即 503）
+	c.SessionSticky.Enabled = true
+	c.SessionSticky.TTL = "30m"
+	c.SessionSticky.GCInterval = "5m"
+	// 热更新缺省开启：管理台可一键切版本，在途对话不受影响。
+	c.Update.Enabled = true
+	return c
+}
+
+// updateDir 热更新目录：监督进程明确指定的目录优先，其次配置，最后 state.json 同目录的 updates/
+// （容器里就是挂载出来的 data 卷，重启后 current 指针仍在）。
+func updateDir(c *Config) string {
+	if dir := strings.TrimSpace(os.Getenv("WB2API_UPDATE_DIR")); dir != "" {
+		return dir
+	}
+	if dir := strings.TrimSpace(c.Update.Dir); dir != "" {
+		return dir
+	}
+	// 安卓：更新目录与 App 侧有一份显式约定（AppPaths.dataRoot()/updates），
+	// 必须用它而不是从 state_file 推导——两侧各自推导过一次，分叉成了
+	// files/data/data/updates 与 files/data/updates，安装器因此永远找不到标记文件。
+	if dir := strings.TrimSpace(os.Getenv("WB2API_UPDATE_DIR")); dir == "" {
+		if base := strings.TrimSpace(os.Getenv("WB2API_ADMIN_DIR")); base != "" &&
+			strings.TrimSpace(os.Getenv("WB2API_ANDROID")) == "1" {
+			// adminDir 是 <root>/panel-data，<root> 就是 App 的数据根
+			// （AppPaths.dataRoot() 返回 <files>/data）。更新目录是 <root>/updates。
+			return filepath.Join(filepath.Dir(base), "updates")
+		}
+	}
+	// 从 state_file 推导更新目录：它与 state_file 同处数据目录，而数据目录是
+	// 配置里唯一**必然可写**的地方。
+	//
+	// 注意必须走绝对化：安卓上进程的 cwd 是 "/"（应用无权在根目录建目录），
+	// 桌面版的数据根由启动器通过 WB2A_DESKTOP_ROOT 指定。返回相对路径会让
+	// 「下载到 A、App 去 B 找安装包」——实测症状是下载与验签都成功、state 回到
+	// idle，而安装器始终没被拉起（因为标记文件根本没写到 App 看的地方）。
+	if abs, err := filepath.Abs(c.StateFile); err == nil && abs != "" {
+		return filepath.Join(filepath.Dir(abs), "updates")
+	}
+	if dir, err := os.Getwd(); err == nil && dir != "" {
+		return filepath.Join(dir, "data", "updates")
+	}
+	return filepath.Join("data", "updates")
+}
+
+// loadConfigOrEnv 读配置：配置文件不存在时回落「纯默认 + WB2A_* env」，其余错误原样返回。
+//
+// 这里是启动兜底的唯一判定点。必须用 errors.Is 而不是 os.IsNotExist：Load 返回的是
+// fmt.Errorf("read config: %w", err) 包装过的错误，os.IsNotExist 不拆包，对包装后的
+// fs.ErrNotExist 恒为 false，兜底分支会变成死代码，让「无 config.json、只用环境变量」
+// 的部署在启动时 log.Fatalf（审查发现 20）。
+func loadConfigOrEnv(path string) (*Config, error) {
+	cfg, err := Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	log.Printf("未找到配置文件 %s，改用默认值 + 环境变量", path)
+	return Load("")
+}
+
+// Load 从文件读，再用 WB2A_* env 覆盖。
+func Load(path string) (*Config, error) {
+	c := Default()
+	legacyScaleConfigured := os.Getenv("WB2A_INPUT_TOKEN_SCALE") != ""
+	if path != "" {
+		// #nosec G304 -- 配置文件路径来自命令行参数
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		if err := json.Unmarshal(raw, c); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		var retired struct {
+			Server struct {
+				InputTokenScale json.RawMessage `json:"input_token_scale"`
+			} `json:"server"`
+			Features struct {
+				ReasoningLoopGuard    json.RawMessage `json:"reasoning_loop_guard"`
+				ReasoningLoopStopOnly json.RawMessage `json:"reasoning_loop_stop_only"`
+			} `json:"features"`
+		}
+		if err := json.Unmarshal(raw, &retired); err != nil {
+			return nil, fmt.Errorf("parse retired config: %w", err)
+		}
+		if strings.TrimSpace(string(retired.Server.InputTokenScale)) == "null" {
+			return nil, fmt.Errorf("server.input_token_scale: null 非法（已退役兼容值仍需为 [1,5] 内的有限数字）")
+		}
+		if strings.TrimSpace(string(retired.Features.ReasoningLoopGuard)) == "null" {
+			return nil, fmt.Errorf("features.reasoning_loop_guard must be true or false")
+		}
+		if strings.TrimSpace(string(retired.Features.ReasoningLoopStopOnly)) == "null" {
+			return nil, fmt.Errorf("features.reasoning_loop_stop_only must be true or false")
+		}
+		legacyScaleConfigured = legacyScaleConfigured || retired.Server.InputTokenScale != nil
+	}
+	if err := applyEnv(c); err != nil {
+		return nil, err
+	}
+	applyAPIKeysDefault(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	if legacyScaleConfigured {
+		log.Printf("WARN: [config] server.input_token_scale / WB2A_INPUT_TOKEN_SCALE 已退役并被忽略；Responses usage 保留上游原值，请移除旧配置。")
+	}
+	return c, nil
+}
+
+// applyAPIKeysDefault 决定要不要走默认的密钥库路径。
+//
+// 规则很简单：没写 api_keys_enabled 或写了 true 就启用，路径为空时落到默认位置。
+// 启动时库里一把密钥都没有是正常状态——用户随后在管理台创建即可，「还没有密钥」
+// 不等于「关掉密钥功能」。只有显式写 `"api_keys_enabled": false` 才回到单密钥 /
+// 免鉴权模式。
+//
+// 这里刻意不再把「api_keys_file 为空」当成关闭信号：历史 config.example.json 里
+// 这一项就是空串，照抄它的部署很多，把空串解释成关闭会让这些用户继续看到
+// 「密钥管理尚未启用」而建不了密钥，正是这次要修的问题。
+func applyAPIKeysDefault(c *Config) {
+	if c.APIKeysEnabled != nil && !*c.APIKeysEnabled {
+		c.APIKeysFile = ""
+		log.Printf("[config] api_keys_enabled=false，不启用持久化密钥库")
+		return
+	}
+	if strings.TrimSpace(c.APIKeysFile) == "" {
+		c.APIKeysFile = DefaultAPIKeysFile
+	}
+	log.Printf("[config] 密钥管理已启用：%s", c.APIKeysFile)
+}
+
+// envInt 读取整数型 WB2A_* 覆盖：未设置时原样保留，设置但非法时明确报错。
+// 关键点是「非法就报错」——静默忽略会让运维以为覆盖生效了（2026-10-02 第二轮体检发现）。
+func envInt(name string, dst *int) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q 非法（需为整数）", name, v)
+	}
+	*dst = n
+	return nil
+}
+
+// envBool 同 envInt，用于布尔型覆盖：非法值报错而非静默保留默认。
+func envBool(name string, dst *bool) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q 非法（需为布尔值）", name, v)
+	}
+	*dst = b
+	return nil
+}
+
+func applyEnv(c *Config) error {
+	if v := os.Getenv("WB2A_LISTEN"); v != "" {
+		c.Listen = v
+	}
+	if v := os.Getenv("WB2A_API_KEY"); v != "" {
+		c.APIKey = v
+	}
+	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
+		c.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
+		c.StateFile = v
+	}
+	// 数值型 WB2A_* 覆盖：非法值直接报错，而不是静默忽略。
+	// 此前是 `if err == nil` 无 else——运维把 WB2A_TIMEOUT_SECONDS 打成 abc，
+	// 启动照常、日志一行没有，覆盖其实没生效（2026-10-02 第二轮体检发现）。
+	// 与 WB2A_INPUT_TOKEN_SCALE 的 fail-fast 口径一致。
+	if err := envInt("WB2A_MAX_BODY_MB", &c.Server.MaxBodyMB); err != nil {
+		return err
+	}
+	if err := envInt("WB2A_OUTBOUND_IMAGE_BUDGET_MB", &c.Server.OutboundImageBudgetMB); err != nil {
+		return err
+	}
+	if v := os.Getenv("WB2A_INPUT_TOKEN_SCALE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("WB2A_INPUT_TOKEN_SCALE: %q 非法（需为 [1,5] 内的有限数字）", v)
+		}
+		c.Server.InputTokenScale = f
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
+		c.Cooldown.SoftRate = v
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
+		c.Cooldown.SoftRateMax = v
+	}
+	if err := envInt("WB2A_TIMEOUT_SECONDS", &c.Upstream.TimeoutSeconds); err != nil {
+		return err
+	}
+	if err := envInt("WB2A_HEADER_TIMEOUT_SECONDS", &c.Upstream.HeaderTimeoutSeconds); err != nil {
+		return err
+	}
+	if err := envInt("WB2A_IDLE_TIMEOUT_SECONDS", &c.Upstream.IdleTimeoutSeconds); err != nil {
+		return err
+	}
+	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
+		c.Upstream.UserAgent = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
+		c.Upstream.DeviceToken = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
+		c.Upstream.DeviceTokenFile = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
+		c.Upstream.ClientName = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
+		c.Upstream.ClientVersion = v
+	}
+	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
+		c.Upstream.CliVersion = v
+	}
+	if err := envBool("WB2A_PASSTHROUGH_IP", &c.Upstream.PassthroughIP); err != nil {
+		return err
+	}
+	if err := envBool("WB2A_SANITIZE_FINGERPRINTS", &c.Features.SanitizeBlacklistFingerprints); err != nil {
+		return err
+	}
+	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
+		c.Prompt.Mode = v
+	}
+	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
+		c.Prompt.File = v
+	}
+	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+		c.Pool.ExpiringSoon = v
+	}
+	return nil
+}
+
+func (c *Config) normalize() error {
+	var err error
+	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
+	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
+	if c.Server.MaxBodyMB <= 0 {
+		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
+	// 显式拒绝 NaN：它与上下界的大小比较均为 false。
+	if math.IsNaN(c.Server.InputTokenScale) || math.IsInf(c.Server.InputTokenScale, 0) ||
+		c.Server.InputTokenScale < 1 || c.Server.InputTokenScale > 5 {
+		return fmt.Errorf("server.input_token_scale: %v 非法（已退役兼容值仍需为 [1,5] 内的有限数字）",
+			c.Server.InputTokenScale)
+	}
+	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
+		return fmt.Errorf("cooldown.soft_rate: %w", err)
+	}
+	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	if c.Cooldown.SoftRateMax == "" {
+		c.Cooldown.SoftRateMax = "2h"
+	}
+	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown: %w", err)
+	}
+	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	// 空值回落默认 10s（Default 已置；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	// 显式 "0s" 是有效配置（= 不等待，退化为立即 503），所以只有空串才回落。
+	if c.Pool.SlotWait == "" {
+		c.Pool.SlotWait = "10s"
+	}
+	if c.PoolSlotWaitDur, err = time.ParseDuration(c.Pool.SlotWait); err != nil {
+		return fmt.Errorf("pool.slot_wait: %w", err)
+	}
+	if c.PoolSlotWaitDur < 0 {
+		c.PoolSlotWaitDur = 0 // 负值等同关闭，避免把 deadline 算到过去之外的歧义
+	}
+	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+		return fmt.Errorf("session_sticky.ttl: %w", err)
+	}
+	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	if c.Pool.BreakerThreshold <= 0 {
+		c.Pool.BreakerThreshold = 3
+	}
+	if c.Pool.IdleWeightPerHour <= 0 {
+		c.Pool.IdleWeightPerHour = 0.5
+	}
+	if c.Pool.IdleWeightMax <= 0 {
+		c.Pool.IdleWeightMax = 5.0
+	}
+	// 快过期窗口：空值回落默认 168h（Default 已置；此兜底覆盖显式 ""）；显式 "0"/负值 = 禁用分桶。
+	if c.Pool.ExpiringSoon == "" {
+		c.Pool.ExpiringSoon = "168h"
+	}
+	if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+		return fmt.Errorf("pool.expiring_soon: %w", err)
+	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
+	}
+	// 上限校验：time.Duration(n)*time.Second 在 n > ~9.2e9 时溢出为负，
+	// net/http 把负 Timeout/ResponseHeaderTimeout 当「未设置」、idle<=0 直接返回原始流，
+	// 于是超时被静默禁用。这里明确拒绝而不是让它悄悄生效（2026-10-02 第二轮体检发现）。
+	const maxTimeoutSeconds = int64(math.MaxInt64) / int64(time.Second)
+	if int64(c.Upstream.TimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.TimeoutSeconds, maxTimeoutSeconds)
+	}
+	if int64(c.Upstream.HeaderTimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.header_timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.HeaderTimeoutSeconds, maxTimeoutSeconds)
+	}
+	if int64(c.Upstream.IdleTimeoutSeconds) > maxTimeoutSeconds {
+		return fmt.Errorf("upstream.idle_timeout_seconds: %d 超出上限 %d（再大将在 time.Duration 乘法中溢出为负）",
+			c.Upstream.IdleTimeoutSeconds, maxTimeoutSeconds)
+	}
+	if c.Upstream.TimeoutSeconds <= 0 {
+		c.Upstream.TimeoutSeconds = 120
+	}
+	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
+	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	if c.Upstream.HeaderTimeoutSeconds <= 0 {
+		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+	}
+	if c.Upstream.IdleTimeoutSeconds <= 0 {
+		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 空 listen 回落默认端口，而不是补一个冒号变成 ":"。
+	// ":" 会让 net.Listen 绑定所有网卡的随机端口：日志仍打印原始 cfg.Listen（看不到真实端口）、
+	// 容器 HEALTHCHECK 固定打 127.0.0.1:7863 必然失败（2026-10-02 第二轮体检发现）。
+	// 选择「回落默认」而非「报错」：Default() 已置 ":7863"，历史部署里把该项留空/置 null
+	// 的很多，报错会直接让这些部署起不来；回落到文档默认端口既保住可用性又让端口可预期。
+	if strings.TrimSpace(c.Listen) == "" {
+		c.Listen = ":7863"
+	} else if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+		c.Listen = ":" + c.Listen
+	}
+	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）
+	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
+	if err := c.Schedule.Normalize(); err != nil {
+		return err
+	}
+	return c.normalizePrompt()
+}
+
+// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom 模式）。
+//
+// mode 非法（非 custom/passthrough）启动报错，避免静默回落到某一分支；
+// custom 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认。
+// passthrough 模式不加载替换文本，保留调用者提供的 system。
+func (c *Config) normalizePrompt() error {
+	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
+	case "", "passthrough":
+		c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system
+	case "custom":
+		c.Prompt.Mode = "custom"
+	default:
+		return fmt.Errorf("prompt.mode: %q 不是合法值（custom / passthrough）", c.Prompt.Mode)
+	}
+	if c.Prompt.Mode == "custom" {
+		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
+		if err != nil {
+			return err
+		}
+		c.PromptText = text
+	}
+	return nil
+}
+
+// stateDirOf 返回 state.json 所在目录（Trae 签到状态 trae-checkin.json 与它同放）。
+//
+// 与 updateDir 同样的理由走绝对化：安卓上进程 cwd 是 "/"，桌面版数据根由启动器
+// 指定；相对路径会让状态落到 App 看不到的地方（表现为每次重启签到进度都归零）。
+func stateDirOf(stateFile string) string {
+	if abs, err := filepath.Abs(stateFile); err == nil && abs != "" {
+		return filepath.Dir(abs)
+	}
+	if dir, err := os.Getwd(); err == nil && dir != "" {
+		return filepath.Join(dir, "data")
+	}
+	return "data"
+}

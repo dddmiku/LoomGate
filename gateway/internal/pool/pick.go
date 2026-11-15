@@ -1,0 +1,503 @@
+// 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 在途占满过滤）。
+// ═══ 更新日志 ═══
+// 2026-10-10：付费模型（倍率>0）上快过期积分硬优先（issue:积分过期）。
+// 2026-09-25：删除已无调用的旧私有包装，选择与抽签继续复用同一实现，避免静态检查遗留。
+// 2026-09-25：在实际选号锁内记录阶段、排除、权重与成本事实；旧 API 复用同一算法且不增加抽签。
+// 2026-09-19：免费优先保留，每四次普通分配给未知可用账号一次轮询机会；粘性和跨模型流量不干扰探索。
+// 2026-09-18：全冷却兜底仍遵守请求模型的独立冷却，避免重复选择已明确限额或不可用的模型。
+// 2026-10-18：删除账号级冷却兜底（账号级限流冷却取消后该路径恒选不到号）。
+package pool
+
+import (
+	"math"
+	"math/rand/v2"
+	"sort"
+	"time"
+
+	"workbuddy2api/internal/auth"
+)
+
+// Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知）。
+// DeptestOnly: 全库仅 pool 包测试引用；生产选号全走 PickExcludingForRealm /
+// PickByUIDForModel。保留是因为测试需要无轮换/无 realm 的最小选号原语；
+// 迁 export_test.go 不可行——export_test 对包外不可见，而本方法的语义文档
+// （挑选策略全文）对生产簇（pick 私有实现）仍有维护参考价值。
+// 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
+// 意图是打散热点，避免永远打同一个账号。
+// model 非空时启用 6004 模型级冷却豁免（healthyForModel）；空则等价账号级 healthy。
+// 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
+func (p *Pool) Pick(model string) *auth.Auth {
+	return p.pick(nil, model, "")
+}
+
+// pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
+// 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
+// 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。
+// 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
+// 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
+// minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
+// reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效；PickExcluding 传 ""）。
+// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域；PickExcluding 传 ""）。
+// 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
+// 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickWithDecision(tried, reqModel, realm, nil)
+}
+
+func (p *Pool) pickWithDecision(tried map[string]bool, reqModel, realm string, d *Decision) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	d.begin("pool", len(p.byUID), now)
+	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
+	for _, e := range p.byUID {
+		e.pruneExpiredModelCooldowns(now)
+	}
+	var cands []*entry
+	for uid, e := range p.byUID {
+		d.increment("evaluated")
+		if tried != nil && tried[uid] {
+			d.exclude("already_tried")
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			d.exclude("realm_mismatch")
+			continue
+		}
+		if reason := e.unavailableReason(now, reqModel); reason != "" {
+			d.exclude(reason)
+			continue
+		}
+		d.increment("healthy")
+		if p.inFlightFull(e) {
+			d.exclude("in_flight_full")
+			continue // 在途占满：跳过（max=0 不限时不触发）
+		}
+		cands = append(cands, e)
+	}
+	d.stage("available", len(cands))
+	if len(cands) == 0 {
+		// 无可用候选即返回 nil，不再有「账号冷却兜底」这一层。
+		//
+		// 2026-10-18：账号级限流冷却已删除，兜底原本只在「整号软冷却」和「熔断」
+		// 两类账号里挑截止最早的一个；前者已不存在，后者在扫描里就已被排除，
+		// 于是这条路径恒选不到号。更关键的是它的语义本来就与用户要求相悖——
+		// 「不要账号冷却」意味着被限流的账号只应针对具体模型退避，而不是被
+		// 整号摘掉后再兜底放回。无号可用就如实返回，由上层跨域回落或 503 处理。
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "no_available_account", "none"
+		}
+		return nil
+	}
+	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
+	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
+	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
+	// 抽签权重共享同一基准，两个阶段权重可比（旧实现 pickWeighted 在 eligible 子集
+	// 上重取 max，全集最大 credits 号被 minPickGap 挤出后子集 max 偏小，剩余号的
+	// credits 比例整体膨胀 k=全集max/子集max，credits 项相对 idle/success 被放大）。
+	var maxCredits int64
+	for _, e := range cands {
+		if e.credits > maxCredits {
+			maxCredits = e.credits
+		}
+	}
+	// 付费模型的「快过期优先」硬过滤（issue:积分过期，2026-10-10）。
+	//
+	// 语义：付费模型（有正积分倍率）上，只要有候选在到期窗口内有快过期积分，
+	// 就**只从这些号里选**——压过下面的成本分层与三因子权重。
+	//
+	// 为什么是硬过滤而不是再加权重：积分到期即作废，花掉的每一分都省下了真金白银，
+	// 而"优先"若只是权重，抽签仍会经常落到没有快过期积分的号上，等于没优先。
+	// 用户明确要的是「只要快过期就压过一切」。
+	//
+	// 为什么只在付费模型上做：免费模型（倍率 x0.00）不扣积分，把流量硬压到快过期号
+	// 上没有收益，反而白白消耗这些号的并发名额。
+	//
+	// 安全边界（三条都必须成立，否则退回原有行为）：
+	//   - 池内注入了倍率表（p.paidModels != nil），且该模型倍率 > 0；
+	//   - 至少有一个候选的快过期积分 > 0（creditsExpiring 由签到/余额任务按
+	//     expiring_soon 窗口写入，见 entry.creditsExpiring）；
+	//   - 过滤后候选非空——若全部快过期号都被 tried/在途占满排除，本过滤不会
+	//     造成"无号可选"，直接退回全体候选（宁可花长期积分，也不能让请求失败）。
+	//
+	// 不做的事：不改动 costTier/weightOf 的既有口径，也不写 lastUsed/usedSeq——
+	// 过滤只是把候选集换成一个子集，后续排序/抽签/防撞号逻辑逐字不变。
+	if p.modelIsPaid(realm, reqModel) {
+		expiring := make([]*entry, 0, len(cands))
+		for _, e := range cands {
+			if e.creditsExpiring > 0 {
+				expiring = append(expiring, e)
+			}
+		}
+		if len(expiring) > 0 && len(expiring) < len(cands) {
+			if d != nil {
+				d.increment("paid_expiring_preferred")
+				d.exclude("paid_expiring_deferred")
+			}
+			cands = expiring
+		} else if len(expiring) > 0 && d != nil {
+			// 全员都有快过期积分：过滤无差别，仍记一笔，便于运维确认该特性在生效。
+			d.increment("paid_expiring_all")
+		}
+	}
+	// 权重与成本分层**各算一次、全程复用**（weighted 结构体定义见包级注释）：
+	// weightOf 每候选一次（预计算存入 ws.w），costTier/modelCostOf 同样每候选一次
+	// （存入 ws.tier/ws.cost1k）——sort 比较器与 pickWeighted 都只读缓存字段，
+	// 不再现算。比较器内现算会翻成 O(n log n) 次冗余浮点/map 查找（46 账号约
+	// 500 次比较），旧实现在此翻过车。
+	// 成本分层：按该模型实测扣费优先最优层；免费与未知同时存在时，
+	// 每四次普通分配探索一个未知号，防止第一个免费观测永久排除其他账号。
+	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
+	//   1 = 无观测（含观测过期）
+	//   2 = 已实测收费
+	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
+	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
+	// 已知收费号不参与免费层探索，避免仅为打散流量而产生额外已知费用。
+	costTier := func(e *entry) (int, float64, decisionCost) {
+		mc, ok := e.modelCostOf(reqModel, now)
+		var fact decisionCost
+		if d != nil {
+			fact = decisionCostOf(e, reqModel, now, mc, ok)
+		}
+		if !ok {
+			return 1, 0, fact
+		}
+		if mc.CostPer1k <= 0 {
+			return 0, 0, fact
+		}
+		return 2, mc.CostPer1k, fact
+	}
+	bestTier := 2
+	all := make([]weighted, 0, len(cands))
+	var unknown []*entry
+	d.stage("cost_free", 0)
+	d.stage("cost_unknown", 0)
+	d.stage("cost_paid", 0)
+	for _, e := range cands {
+		ti, ci, fact := costTier(e)
+		all = append(all, weighted{e: e, tier: ti, cost1k: ci, cost: fact})
+		switch ti {
+		case 0:
+			d.increment("cost_free")
+		case 1:
+			d.increment("cost_unknown")
+		case 2:
+			d.increment("cost_paid")
+		}
+		if ti == 1 {
+			unknown = append(unknown, e)
+		}
+		if ti < bestTier {
+			bestTier = ti
+		}
+	}
+	if bestTier == 0 && len(unknown) > 0 {
+		if e := p.exploreUnknownLocked(unknown, reqModel, realm); e != nil {
+			if d != nil {
+				d.ReasonCode, d.SelectionMethod = "unknown_exploration", "exploration"
+				d.stage("preferred", len(unknown))
+				for _, candidate := range all {
+					if candidate.e == e {
+						d.selected(e, candidate.cost, true)
+						break
+					}
+				}
+			}
+			e.lastUsed = now
+			p.pickSeq++
+			e.usedSeq = p.pickSeq
+			return e.a
+		}
+	}
+	ws := make([]weighted, 0, len(cands))
+	for _, candidate := range all {
+		if candidate.tier == bestTier {
+			candidate.w = p.weightOf(candidate.e, maxCredits, now)
+			ws = append(ws, candidate)
+		}
+	}
+	d.stage("preferred", len(ws))
+	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
+	// 候选数超过 top5 时，才对 ws 做 Fisher-Yates 洗牌（且**不消耗 p.randInt64N
+	// 注入源**，避免改变 pickWeighted 的确定性语义，见 TestPickDeterministicViaSet
+	// RandomSource）。权重全等或存在并列时，按字典序截断会让 uid 靠后的账号永远
+	// 进不了 top5（惊群测试 c00 集中 79/100 的根因：c05..c09 被字典序截断、LRU
+	// 兜底又只在 top5 内转）。洗牌用独立的 time-seeded 源，只在截断边界制造等
+	// 权重随机次序，不影响加权抽签本身的确定性。
+	if len(ws) > 5 {
+		eq := false
+		for i := 1; i < len(ws); i++ {
+			if math.Abs(ws[i].w-ws[0].w) < weightEpsilon {
+				eq = true
+				break
+			}
+		}
+		if eq {
+			// #nosec G404 -- 选号时对等权重候选做洗牌，本就是非安全用途；加权抽签另有注入的随机源
+			shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
+			shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+		}
+	}
+	sort.SliceStable(ws, func(i, j int) bool {
+		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
+		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
+		if ws[i].cost1k != ws[j].cost1k {
+			return ws[i].cost1k < ws[j].cost1k // 收费层：单价低的在前
+		}
+		if ws[i].w != ws[j].w {
+			return ws[i].w > ws[j].w
+		}
+		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
+	})
+	cands = cands[:0]
+	for _, c := range ws {
+		cands = append(cands, c.e)
+	}
+	// candsAll 保留截断前的全候选（权重降序），供 LRU 兜底在全量范围选最旧者，
+	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。
+	candsAll := cands
+	if len(cands) > 5 {
+		cands = cands[:5]
+	}
+	d.stage("shortlist", len(cands))
+	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
+	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
+	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
+	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入（此前 Acquire 在锁外，
+	// 多个 goroutine 在窗口内同时通过校验造成惊群，TestPickAntiThunderingHerd 实证）。
+	// 注意：先截断后过滤（截断边界内被挤出的号不回填）——与旧实现语义严格一致。
+	eligible := make([]weighted, 0, len(cands))
+	for _, we := range ws[:min(len(ws), 5)] {
+		if now.Sub(we.e.lastUsed) >= minPickGap {
+			eligible = append(eligible, we)
+		}
+	}
+	d.stage("eligible", len(eligible))
+	d.stage("recent", len(cands)-len(eligible))
+	var e *entry
+	if len(eligible) == 0 {
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "recent_lru", "lru"
+		}
+		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
+		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
+		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
+		// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
+		e = candsAll[0]
+		for _, c := range candsAll[1:] {
+			if c.usedSeq < e.usedSeq {
+				e = c
+			}
+		}
+	} else {
+		if d != nil {
+			d.ReasonCode, d.SelectionMethod = "weighted_selection", "weighted"
+			if bestTier == 0 {
+				d.ReasonCode = "free_preferred"
+			} else if bestTier == 1 && d.StageCounts["cost_paid"] > 0 {
+				d.ReasonCode = "unknown_preferred"
+			}
+		}
+		e = p.pickWeightedWithDecision(eligible, d) // 复用已有权重与相同一次抽签
+	}
+	if d != nil {
+		for _, candidate := range ws {
+			if candidate.e == e {
+				d.selected(e, candidate.cost, true)
+				d.weight(candidate.w)
+				break
+			}
+		}
+	}
+	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
+	p.pickSeq++
+	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	return e.a
+}
+
+// inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
+// 调用方需已持 p.mu（读锁或写锁均可，本方法只读 p.maxInFlight）。
+func (p *Pool) inFlightFull(e *entry) bool {
+	if p.maxInFlight <= 0 {
+		return false
+	}
+	return e.inFlight.Load() >= int64(p.maxInFlight)
+}
+
+// minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
+// 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
+var minPickGap = 100 * time.Millisecond
+
+// weighted 单个候选的选号预计算结果：权重（weightOf，每候选一次）+ 成本分层
+// （tier/cost1k，每候选一次）。sort 比较器与 pickWeighted 抽签都只读缓存字段，
+// 任何一处现算（旧实现在比较器内重算 costTier、在 pickWeighted 内重算 weightOf）
+// 都会翻成 O(n log n) 次冗余浮点/map 查找，且引入两阶段口径分裂。
+type weighted struct {
+	e      *entry
+	w      float64
+	tier   int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
+	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
+	cost   decisionCost
+}
+
+// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
+// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
+// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
+const expiringWeight = 8.0
+
+// pickWeightedWithDecision 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
+//
+//		weight = credits 比例 × 10 + idleWeight + successRate × 3
+//
+//	  - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
+//	    tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
+//	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
+//	  - successRate = successEMA/(successEMA+errorEMA)（EMA 衰减口径）；
+//	    无请求记录给 1.5（中性偏信任）
+//
+// credits 全 0 时仍按 idle+successRate 加权（不退化均匀随机）。
+// 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
+// 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
+// 候选携带调用方预计算的权重（weighted.w，maxCredits/now 均已按全集口径算好），
+// 本函数**不再调用 weightOf**——单次 pick 内每个候选的权重只算一次，预计算与抽签
+// 共用同一数值（旧实现在 eligible 子集上用子集 maxCredits 重算第二遍，两次口径
+// 分裂：全集最大 credits 号被 minPickGap 挤出后，子集内 credits 比例整体膨胀）。
+func (p *Pool) pickWeightedWithDecision(cands []weighted, d *Decision) *entry {
+	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
+	weights := make([]int64, len(cands))
+	var total int64
+	for i, c := range cands {
+		// 四舍五入并保底权重 ≥1：向零截断会让 w<1/scale 的低权重号权重归零，
+		// 彻底失去被抽中机会（候选少时加剧选号集中，惊群测试的放大因子之一）。
+		// 保底 ≥1 同时保证 total ≥ len(cands) > 0（抽签分支无需 total<=0 兜底）。
+		wi := int64(c.w*scale + 0.5)
+		if wi < 1 {
+			wi = 1
+		}
+		weights[i] = wi
+		total += wi
+	}
+	rnd := rand.Int64N
+	if p.randInt64N != nil {
+		rnd = p.randInt64N
+	}
+	r := rnd(total)
+	if d != nil {
+		d.WeightTotal = &total
+	}
+	var acc int64
+	for i := range cands {
+		acc += weights[i]
+		if r < acc {
+			if d != nil {
+				units := weights[i]
+				d.WeightUnits = &units
+			}
+			return cands[i].e
+		}
+	}
+	if d != nil {
+		units := weights[len(weights)-1]
+		d.WeightUnits = &units
+	}
+	return cands[len(cands)-1].e
+}
+
+// expiringDeferred 报告「这个账号应当为快过期积分让路」。
+//
+// 语义（与 pick() 里的硬过滤同一口径）：付费模型上，只要**池里存在别的号**有
+// 快过期积分、而本号没有，本号就不该被选中——积分到期即作废，花掉的每一分都是
+// 省下的真金白银。
+//
+// 为什么粘性路径也必须调它（2026-11-04 用户决策，第二次改回）：
+// 粘性命中发生在 pick() 之前（handler 先试 PickByUIDForModelRealm，未命中才回落
+// 普通选号），而硬过滤写在 pick() 里。生产实测 9862 次决策里 9822 次是 sticky_hit，
+// 全池 5 个带快过期积分的号一分没动，流量全压在无快过期积分的那一个号上
+// （已消耗 2000+ 积分）。「只在新建会话时优先」在粘性主导的负载下等于该特性不存在。
+//
+// 代价与取舍：让路会让同一对话切换账号，下一跳起重新绑定到新号（handler 在
+// acct==nil 时 unbindSticky，选到新号后 Bind）。切换只发生一次，之后稳定——
+// 相比「快过期积分整批作废」，用户明确选择前者。
+//
+// 三个安全边界（任一不成立即返回 false，保持原有粘性行为）：
+//   - 非付费模型：免费模型不扣积分，压流量到快过期号上无收益；
+//   - 本号自己就有快过期积分：无差别，不必让路；
+//   - 池里没有别的号带快过期积分：让路只会选不到号，宁可继续用本号。
+//
+// 调用方需持有 p.mu（读 byUID 与 pick 一致）。
+func (p *Pool) expiringDeferred(e *entry, model string) bool {
+	if e == nil || e.creditsExpiring > 0 {
+		return false
+	}
+	if !p.modelIsPaid(e.a.Realm(), model) {
+		return false
+	}
+	now := time.Now()
+	for _, other := range p.byUID {
+		if other == e || other.creditsExpiring <= 0 {
+			continue
+		}
+		// 只对**此刻真能服务这个模型**的号让路：让给一个正在冷却/禁用的号
+		// 等于白切一次号，还白白弄丢会话粘性。
+		if other.unavailableReason(now, model) != "" {
+			continue
+		}
+		if p.inFlightFull(other) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// weightEpsilon 等权重判定的浮点容差：权重公式微调（如 EMA 引入）后权重不再
+// 位级相等，精确相等比较会让等权重洗牌静默失效、回到字典序截断饿死问题。
+const weightEpsilon = 1e-9
+
+// weightOf 计算单个账号的三因子权重。单次 pick 内对每个候选只调用一次
+// （预计算存入 weighted.w，sort 比较器与 pickWeighted 均读缓存不重算）。
+func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	if p.weightOfHook != nil {
+		p.weightOfHook() // DeptestOnly 观测：验证单次 pick 只算一次
+	}
+	if p.weightOfMaxHook != nil {
+		p.weightOfMaxHook(maxCredits) // DeptestOnly 观测：验证全集口径
+	}
+	w := 1.0
+	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
+	if maxCredits > 0 {
+		w += float64(e.credits) / float64(maxCredits) * 10
+	}
+	// 1b. 快过期积分加成（issue:积分过期）：官方活动赠送的奖励积分按批过期，
+	// 不用就作废。creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期
+	// 占比"作为一个独立的强权重项（×expiringWeight），让快过期积分多的号优先选。
+	// 与成本分层（costTier 优先免费）正交：那是按"实测扣费"分层，这是按"过期紧迫度"。
+	if e.credits > 0 && e.creditsExpiring > 0 {
+		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
+	}
+	// 2. 闲置补偿。
+	if e.lastUsed.IsZero() {
+		w += p.idleWeightMax // 从未使用 → 满分
+	} else {
+		hours := now.Sub(e.lastUsed).Hours()
+		idleW := hours * p.idleWeightPerHour
+		if idleW > p.idleWeightMax {
+			idleW = p.idleWeightMax
+		}
+		if idleW < 0 {
+			idleW = 0 // lastUsed 在未来（时钟回拨）时钳 0
+		}
+		w += idleW
+	}
+	// 3. 成功率 ×3（EMA 衰减口径）：successEMA/(successEMA+errorEMA) 让近期行为
+	// 主导——旧终身累计口径下历史错误是分母的永久部分，上游修复后权重永久回不来。
+	// 无请求记录（两 EMA 均零）时给 1.5（中性偏信任，同旧口径）。
+	if obs := e.successEMA + e.errorEMA; obs > 0 {
+		w += e.successEMA / obs * 3
+	} else {
+		w += 1.5 // 无请求记录 → 中性偏信任
+	}
+	return w
+}
+
+// SetCredits 更新账号余额。

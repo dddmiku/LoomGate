@@ -1,0 +1,274 @@
+// ═══ 更新日志 ═══
+// 2026-09-20：新增 ContentKey：客户端一个会话标识都不发时，从请求正文派生对话级粘性键。
+// 2026-09-19：按已鉴权调用密钥隔离绑定键和关联 ID，保留同一调用方的稳定性。
+// ids.go 会话头族 ID 的解析与生成（issue #35 后台聚合）。
+//
+// 官方 CodeBuddy CLI 出站头族（X-Conversation-ID / X-Conversation-Request-ID /
+// X-Request-ID / X-B3-*），后台按 X-Conversation-Request-ID（对话轮）聚合请求；
+// 本文件提供 conversationId 提取、消息级 32 hex messageID、以及"同一会话键
+// 稳定复用"的 conversationRequestID 纯派生（加盐），供 handler 轮转循环外生成、
+// 循环内复用（换号/重试/降级全部同 ID → 后台不再碎片化）。
+package session
+
+import (
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math/rand/v2"
+	"strings"
+	"time"
+)
+
+// ScopeKey namespaces client-controlled identities with the authenticated key ID
+// (never the API secret). Length framing avoids ambiguous caller/key pairs.
+// Deterministic across restarts for persisted binds; legacy single-key mode keeps
+// its original identities. Missing session/trace IDs remain missing.
+func ScopeKey(callerID, key string) string {
+	if callerID == "" || key == "" {
+		return key
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("wb2api-caller-v1:%d:%s%s", len(callerID), callerID, key)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
+// 复用 ExtractKey 的识别顺序：metadata 优先、snake 优先于 camel）。
+// 与 ExtractKey 的差异：**只认 conversationId，绝不回落 user_id**——X-Conversation-ID
+// 语义是"对话 ID"，user_id 回落会污染后台按对话聚合的判据。
+// 缺失返回 ""（不伪造：透传客户端原值优先，客户端没给就不发）。
+func ResolveConversationID(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+			return v
+		}
+		if v := strOrEmpty(meta["conversationId"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	return strOrEmpty(obj["conversationId"])
+}
+
+// NewMessageID 生成消息级 ID：32 位 hex，**UUIDv7 形态**（前 48 位是毫秒时间戳，
+// 版本位 = 7，变体位 = RFC 4122）。
+//
+// 为什么必须是 v7 而不是纯随机（2026-10-31 抓包实证）：
+// 官方桌面端 X-Request-ID / X-Conversation-Message-ID / X-Conversation-Request-ID
+// / acp-connection-id 全部是 UUIDv7 去横线形态——把官方抓包（_wb_capture2 的
+// 005747_0101、_wb_capture_new 的 033/039）的 ID 前 48 位按毫秒时间戳解码，
+// 得到的时刻与抓包时刻逐秒吻合（01a145a5e4b6 → 2026-10-16T16:57:42.326Z）。
+// 网关此前用 crypto/rand 纯随机填充，解码后是 2001~8000 年间的乱值——这是
+// 「ID 形态不像官方客户端」的硬指纹：一个声称 WorkBuddy/5.9.3 的客户端，
+// 不可能发出时间戳乱跳的请求 ID。
+//
+// 保持向后兼容：仍是 32 位小写 hex、仍满足 validTraceID / uuidFormatted /
+// acpConnectionID 的全部前置条件（它们只校验长度与字符集）。
+func NewMessageID() string {
+	return newUUIDv7()
+}
+
+// newUUIDv7 生成 RFC 9562 UUIDv7 的 32 位小写 hex 形态（去横线）。
+// 布局：48 位 unix 毫秒 | 4 位版本(=7) | 12 位 rand_a | 2 位变体(=0b10) | 62 位 rand_b。
+func newUUIDv7() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		// 熵源故障的极端兜底：仍保证 32 hex、仍带正确时间戳与版本位。
+		// #nosec G404 -- crypto/rand 已先行；这里仅为理论上失败时的兜底，
+		// 生成的是对客户端可见的聚合 ID，不做安全凭据。
+		for i := 6; i < 16; i++ {
+			b[i] = byte(rand.Uint64())
+		}
+	}
+	b[6] = (b[6] & 0x0F) | 0x70 // 版本 7
+	b[8] = (b[8] & 0x3F) | 0x80 // 变体 RFC 4122
+	return hex.EncodeToString(b[:])
+}
+
+// deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
+// 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
+// 结束，不构成断档）。会话级（RequestIDForKey）与轮级（TurnRequestID）共用同一盐。
+var deriveSalt = NewMessageID()
+
+// RequestIDForKey 返回会话键的稳定 conversationRequestID：sha256(盐|键) 前 16 字节
+// 的 hex，纯派生（无缓存、无 TTL、内存不随键数增长）。
+//   - 同 key：进程内恒派生同值（一次 user send/同会话多轮聚合）；
+//   - 异 key：各自独立，互不相同；
+//   - 空 key：每次生成新值（无会话则无"会话内稳定"语义——调用方应在请求级
+//     捕获复用，handler 在轮转循环外取一次即天然共享）。
+//
+// 返回值恒为 32 hex（NewMessageID 形态），可直接用作 B3 TraceId（16/32 hex 合法）。
+func RequestIDForKey(key string) string {
+	if key == "" {
+		return NewMessageID()
+	}
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
+	return hex.EncodeToString(sum[:16])
+}
+
+// TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
+// 「序号 + 文本」。
+//
+// 为什么需要它：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry Studio
+// 等的请求体里既无 conversationId 也无 metadata 键）会让 ExtractKey 恒返回空串，
+// 会话头族的聚合主键便只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求
+// 一条记录。本函数给这类客户端一个**不依赖客户端配合**的轮级键：一次用户发送内的
+// 所有上游调用（tool call 多轮 / 换号重试 / 降级重发）body 里最后一条 user 消息
+// 恒定 → 同键；用户发下一条消息 → 换键。
+//
+// 为什么不取第一条 user 消息：首条在整个会话内不变，会把一次会话的所有轮并进
+// 同一个聚合键（跨对话轮混并）。取最后一条才对齐官方 X-Conversation-Request-ID
+// 的「对话轮」语义。序号一并入键：两次不同轮里内容相同的提问（"继续"）不会被并成
+// 一轮。
+//
+// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（调用方回落请求级随机
+// ID，不伪造聚合键）。
+func TurnKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	messages, ok := parseMessages(body)
+	if !ok {
+		return ""
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		text := contentText(messages[i].Content)
+		if text == "" {
+			// 最后一条 user 消息没有文本（纯图片等）→ 本轮不建立聚合键。
+			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
+			return ""
+		}
+		return fmt.Sprintf("u%d:%s", i, text)
+	}
+	return ""
+}
+
+// ContentKey 派生「对话级」回退粘性键：客户端一个会话标识都不发时使用。
+//
+// 背景：实测 narrafork（/v1/chat/completions）的请求体顶层只有
+// model / messages / stream / stream_options / max_tokens / tools / tool_choice /
+// reasoning_effort，既无 conversation_id 也无 metadata、prompt_cache_key，
+// 于是 ExtractKey 恒返回空串、会话粘性对这类客户端完全失效：同一对话每轮换号，
+// 上游提示缓存整段失效（线上日志里这类请求 hit 恒为 0）。
+//
+// 取**第一条** user 消息的文本并哈希：对话开头在整个对话内不变，因此同一对话恒同键
+// （实测同一对话多轮的首条 user 文本哈希一致，不同对话则不同）。与 TurnKey 取最后
+// 一条（轮级语义）相反，这里的语义是「对话级」。
+//
+// 返回值恒为 "c1:" + 32 hex（定长，可安全进绑定表与 redis 镜像；前缀避免与客户端
+// 自带的显式会话 ID 撞值）。
+//
+// 已知边界：客户端若把开头的 user 消息剪掉（少数客户端会裁剪历史），键会变化、
+// 绑定重新分配——只影响缓存亲和，不影响正确性。
+//
+// 粒度取舍：两条对话恰好以同样文本开头时会共用绑定（例如大量客户端都以同一句
+// 开场白开头）。这是可接受的——ExtractKey 第 5 步的 metadata.user_id 回退比这更粗
+// （一个用户的所有对话共用一个号），本函数只是把那档粒度细化到「对话」；
+// 单轮请求（如只发一句"hi"）确实会被并到同一个号上，但粘性 TTL 到期即重新分配，
+// 且只影响账号均衡，不影响正确性与用量记账。
+//
+// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（保持原有的无粘性行为，
+// 不伪造键）。
+func ContentKey(body []byte) string {
+	messages, ok := parseMessages(body)
+	if !ok {
+		return ""
+	}
+	for i := range messages {
+		if messages[i].Role != "user" {
+			continue
+		}
+		// 只取第一条：往前找会让键随对话推进漂移，失去「对话级」语义。
+		text := strings.TrimSpace(contentText(messages[i].Content))
+		if text == "" {
+			// 首条 user 消息没有文本（纯图片等）→ 本轮不建立回退键。
+			// 不继续往后找：后续消息位置会随对话推进漂移。
+			return ""
+		}
+		sum := sha256.Sum256([]byte(text))
+		return "c1:" + hex.EncodeToString(sum[:16])
+	}
+	return ""
+}
+
+// message 是 messages 数组里网关需要理解的最小字段子集。
+type message struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// parseMessages 解析请求体的 messages 数组；缺失或非法返回 ok=false。
+func parseMessages(body []byte) ([]message, bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	var obj struct {
+		Messages []message `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, false
+	}
+	return obj.Messages, true
+}
+
+// contentText 取消息 content 的文本：字符串形态直接返回；数组形态（多模态 parts）
+// 拼接各 part 的 text 字段。无文本（纯图片 / null / 未知形态）返回 ""。
+func contentText(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	switch s[0] {
+	case '"':
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return ""
+		}
+		return str
+	case '[':
+		var parts []struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &parts); err != nil {
+			return ""
+		}
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节的 hex（32 位，
+// 与 NewMessageID 同形态，可直接作 B3 TraceId）。与会话级 RequestIDForKey 共用同一
+// 派生盐（deriveSalt），两者皆纯派生、无缓存、内存有界。
+// 空键返回新随机值（无轮可聚合时保持原有的「每请求独立」行为）。
+func TurnRequestID(turnKey string) string {
+	if turnKey == "" {
+		return NewMessageID()
+	}
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
+	return hex.EncodeToString(sum[:16])
+}
