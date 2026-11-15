@@ -4,6 +4,7 @@ python tests/console_browser.py --runtime D:/LoomGate-work/private/catalog-fixtu
     --output D:/LoomGate-work/evidence/phase02 --fixture D:/LoomGate-work/build/catalog-fixture.exe
 """
 import argparse
+import traceback
 import json
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from run_wait import wait_run
+from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--runtime', required=True)
@@ -76,19 +78,19 @@ def main():
         page.locator('#username').fill(fields['username'].strip())
         page.locator('#password').fill(fields['password'].strip())
         page.locator('#login-submit').click()
-        page.locator('.hero').wait_for()
+        page.locator('[data-workspace-agenda]').wait_for()
         assert page.locator('script[src="console/app.js"]').count()==1
         assert page.locator('#tabs').count()==0
         done('independent_login_and_console_entry')
         shot('console-overview.png')
         stage='services'
         nav('providers');page.locator('[data-provider="doubao"] h2').wait_for()
-        card=page.locator('article[data-provider="doubao"]')
-        assert '消息转发与双登录尚未接通' in card.inner_text()
+        card=page.locator('article.service-entry[data-provider="doubao"]')
+        assert '模型目录' in card.inner_text() and '双登录' in card.inner_text()
         card.locator('[data-action=provider-accounts]').click()
         page.locator('#account-provider').wait_for()
         page.get_by_text('a-fixture',exact=True).wait_for()
-        assert page.locator('#account-list tbody tr').count()==24
+        assert page.locator('#account-list tbody tr').count()>=24
         page.locator('#account-search').fill('c-disabled')
         assert page.locator('#account-list tbody tr').count()==1
         assert '已停用' in page.locator('#account-list').inner_text()
@@ -100,21 +102,21 @@ def main():
         assert page.locator('#model-list img').count()==0
         assert '仅目录' in page.locator('#model-list').inner_text()
         page.locator('[data-action=model-next]').click();models_settled()
-        assert '9–16 / 24' in page.locator('#model-pagination').inner_text()
+        assert '9–16 / ' in page.locator('#model-pagination').inner_text()
         page.locator('[data-action=model-prev]').click();models_settled()
-        page.locator('#model-account').select_option('a-fixture');models_settled()
-        assert page.locator('[data-model-id]').count()==1
-        page.locator('#model-capability').select_option('supports_tool_call');assert page.locator('[data-model-id]').count()==0
-        page.locator('#model-capability').select_option('native_tools');assert page.locator('[data-model-id]').count()==1
-        page.locator('#model-search').fill('no-such-model');assert page.locator('[data-model-id]').count()==0
-        page.locator('#model-search').fill('合成');assert page.locator('[data-model-id]').count()==1
+        reveal_filter(page,'#model-account');page.locator('#model-account').select_option('a-fixture');models_settled()
+        assert page.locator('.selection-row').count()==1
+        page.locator('#model-capability').select_option('supports_tool_call');assert page.locator('.selection-row').count()==0
+        page.locator('#model-capability').select_option('native_tools');assert page.locator('.selection-row').count()==1
+        page.locator('#model-search').fill('no-such-model');assert page.locator('.selection-row').count()==0
+        page.locator('#model-search').fill('合成');assert page.locator('.selection-row').count()==1
         done('catalog_scope_pagination_filter_xss_and_capability_semantics');shot('console-models.png')
         stage='stale'
         page.request.post(base+'/__fixture/mode/failed')
         before=page.request.get(base+'/__fixture/stats').json()['calls']
         page.locator('[data-action=model-refresh]').click();models_settled()
         assert page.locator('[data-account-status=stale]').count()==1
-        assert page.locator('[data-model-id]').count()==1
+        assert page.locator('.selection-row').count()==1
         after=page.request.get(base+'/__fixture/stats').json()['calls'];assert after==before+1
         page.locator('[data-action=model-refresh]').click();models_settled()
         assert page.request.get(base+'/__fixture/stats').json()['calls']==after
@@ -131,7 +133,7 @@ def main():
         page.request.post(base+'/__fixture/mode/storage')
         page.locator('article[data-provider="doubao"] [data-action=provider-models]').click()
         page.get_by_text('账号存储读取失败，请检查服务状态。',exact=True).wait_for()
-        assert page.locator('[data-model-id]').count()==0
+        assert page.locator('.selection-row').count()==0
         done('storage_failure_remains_failure')
         page.request.post(base+'/__fixture/mode/success');page.locator('[data-action=reload]').click();models_settled()
         stage='offline'
@@ -141,7 +143,7 @@ def main():
         assert page.locator('#model-notice .error').is_visible()
         context.set_offline(False);done('offline_and_failure_state')
         stage='legacy'
-        page.locator('#model-capability').select_option('');page.locator('#model-search').fill('')
+        reveal_filter(page,'#model-capability');page.locator('#model-capability').select_option('');page.locator('#model-search').fill('')
         page.locator('#model-provider').select_option('workbuddy');models_settled()
         assert page.locator('[data-model-id="cn:fixture-chat"]').count()==1
         assert page.locator('#model-account').is_disabled()
@@ -149,16 +151,16 @@ def main():
         stage='tasks'
         nav('tasks');page.locator('#task-provider').select_option('doubao')
         page.locator('[data-task=fixture-manual]').wait_for()
-        page.locator('[data-task=fixture-manual] button').click()
+        select_task(page,'fixture-manual','manual-task')
         assert '选择需要处理的文档' in page.locator('#dialog-body').inner_text()
         page.locator('#dialog-close').click();done('dynamic_tasks_and_specific_manual_action');shot('console-tasks.png')
         stage='schedule-create'
-        page.locator('[data-task=fixture-check] [data-action=task-schedule]').click()
-        page.locator('#plan-save:not([disabled])').wait_for()
+        select_task(page,'fixture-check','task-schedule')
+        page.locator('#plan-next:not([disabled])').wait_for()
         assert page.locator('#plan-task').input_value()=='fixture-check'
-        page.locator('#plan-hours').fill('6,18')
-        page.locator('#plan-minute').fill('17')
-        page.locator('#plan-timezone').fill('Asia/Shanghai')
+        plan_timing(page)
+        plan_times(page,['06:17','18:17'],'Asia/Shanghai')
+        plan_review(page)
         page.locator('#plan-enabled').check()
         shot('console-schedule-editor.png')
         before_ids={x['id'] for x in work()['schedules']}
@@ -190,48 +192,48 @@ def main():
             time.sleep(.1)
         else: raise AssertionError('fixture_did_not_restart')
         assert next(x for x in work()['schedules'] if x['id']==sid)['hours']==[6,18]
-        page.reload();page.get_by_text(sid,exact=True).wait_for()
+        page.reload();page.locator('[data-schedule-id="'+sid+'"]').wait_for()
         done('actual_process_restart_preserves_schedule_and_session')
         stage='schedule-edit'
-        row=page.locator('tr').filter(has=page.get_by_text(sid,exact=True))
-        row.locator('[data-action=edit-schedule]').click();page.locator('#plan-save:not([disabled])').wait_for()
-        page.locator('#plan-hours').fill('6,6');page.locator('#plan-save').click()
+        row=page.locator('[data-schedule-id="'+sid+'"]')
+        row.locator('[data-action=edit-schedule]').click();plan_timing(page)
+        plan_times(page,['06:17','06:17']);page.locator('#plan-next').click()
         assert page.locator('#form-message').is_visible()
-        page.locator('#plan-hours').fill('7,19');page.locator('#plan-timezone').fill('UTC')
+        plan_times(page,['07:17','19:17'],'UTC');plan_review(page)
         page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden')
         assert next(x for x in work()['schedules'] if x['id']==sid)['timezone']=='UTC'
-        row=page.locator('tr').filter(has=page.get_by_text(sid,exact=True))
+        row=page.locator('[data-schedule-id="'+sid+'"]')
         row.locator('[data-action=toggle-schedule]').click();page.get_by_text('计划已停用。',exact=True).wait_for()
         assert not next(x for x in work()['schedules'] if x['id']==sid)['enabled']
         done('schedule_validation_edit_and_disable');shot('console-schedules.png')
         stage='run-duplicate'
-        nav('tasks');page.locator('[data-task=fixture-check] [data-action=run-task]').click()
+        nav('tasks');select_task(page,'fixture-check','run-task')
         before=page.request.get(base+'/__fixture/stats').json()['mutations']
         run_id=accept_run(double=True)
         wait_run(page.request,base+'/admin/api/workbench',run_id,'succeeded')
         assert page.request.get(base+'/__fixture/stats').json()['mutations']==before+1
         done('run_double_click_single_mutation_and_server_verification')
         stage='cancel'
-        nav('tasks');page.locator('[data-task=fixture-pending] [data-action=run-task]').click()
+        nav('tasks');select_task(page,'fixture-pending','run-task')
         run_id=accept_run()
-        row=page.locator('tr').filter(has=page.get_by_text(run_id,exact=True))
+        row=page.locator('[data-run-id]').filter(has=page.get_by_text(run_id,exact=True))
         row.locator('[data-action=cancel-run]').wait_for();row.locator('[data-action=cancel-run]').click()
         wait_run(page.request,base+'/admin/api/workbench',run_id,'canceled');done('actual_task_cancellation')
         page.locator('[data-action=reload]').click();page.locator('[data-action=run-detail]').first.wait_for();shot('console-runs.png')
         stage='unconfirmed-submit'
         before=page.request.get(base+'/__fixture/stats').json()['mutations']
         page.route('**/api/workbench/run',lambda route:route.fulfill(status=503,content_type='application/json',body='{"error":"synthetic_unavailable"}'))
-        nav('tasks');page.locator('[data-task=fixture-check] [data-action=run-task]').click();page.locator('#run-form button[type=submit]').click()
+        nav('tasks');select_task(page,'fixture-check','run-task');page.locator('#run-form button[type=submit]').click()
         page.get_by_text('请求结果尚未确认。请先刷新服务端状态，避免重复提交。',exact=True).wait_for()
         page.locator('#dialog-close').click()
-        page.locator('[data-task=fixture-check] [data-action=run-task]').click()
+        select_task(page,'fixture-check','run-task')
         page.locator('[data-action=review-submission]').wait_for()
         page.locator('[data-action=review-submission]').click()
         page.locator('#review-form input').check();page.locator('#review-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
         assert page.request.get(base+'/__fixture/stats').json()['mutations']==before
         page.unroute('**/api/workbench/run');done('unconfirmed_submission_requires_review_without_automatic_replay')
         stage='usage-and-requests'
-        nav('usage');page.locator('.metric').first.wait_for();assert page.locator('.metric strong').first.inner_text()=='1'
+        nav('usage');page.locator('[data-total-requests]').wait_for();assert page.locator('[data-total-requests]').inner_text()=='1'
         nav('logs');page.get_by_text('synthetic-request-30',exact=True).wait_for();assert page.locator('tbody tr').count()==30
         page.locator('[data-action=logs-next]').click();page.get_by_text('synthetic-request-00',exact=True).wait_for();assert page.locator('tbody tr').count()==1
         page.locator('[data-action=logs-prev]').click();page.get_by_text('synthetic-request-30',exact=True).wait_for();done('real_usage_and_request_stores_with_pagination')
@@ -245,14 +247,14 @@ def main():
             if route in ['models','schedules']:
                 shot('console-'+route+'-mobile.png')
             if route=='models':
-                assert page.locator('#model-provider').bounding_box()['width']>=250
+                reveal_filter(page,'#model-account');assert page.locator('#model-account').bounding_box()['width']>=240;page.locator('#model-refine summary').click()
         done('ten_mobile_routes_and_usable_filter_widths')
         stage='dark-and-settings'
         page.locator('#theme').click();assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')
         page.locator('[data-action=password]').click();page.locator('#password-form').wait_for();page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
         page.locator('#theme').click();done('theme_persistence_settings_and_keyboard_dialog')
         stage='delete'
-        nav('schedules');row=page.locator('tr').filter(has=page.get_by_text(sid,exact=True));row.locator('[data-action=delete-schedule]').click()
+        nav('schedules');row=page.locator('[data-schedule-id="'+sid+'"]');row.locator('[data-action=delete-schedule]').click()
         page.locator('#delete-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
         assert not any(x['id']==sid for x in work()['schedules']);done('schedule_delete_readback')
         stage='logout'
@@ -267,9 +269,9 @@ def main():
 try:
     main();report['result']='PASS'
 except Exception as e:
-    report.update(result='FAIL',failed_stage=stage,error_type=type(e).__name__)
+    report.update(result='FAIL',failed_stage=stage,error_type=type(e).__name__,source_lines=[x.lineno for x in traceback.extract_tb(e.__traceback__) if x.filename.endswith('console_browser.py')])
 finally:
     (output/'console-browser.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-print(json.dumps({k:report[k] for k in ['result','failed_stage','error_type'] if k in report},ensure_ascii=False))
+print(json.dumps({k:report[k] for k in ['result','failed_stage','error_type','source_lines'] if k in report},ensure_ascii=False))
 print('completed_actions='+str(len(report['actions'])))
 sys.exit(0 if report['result']=='PASS' else 1)

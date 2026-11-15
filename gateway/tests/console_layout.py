@@ -1,8 +1,9 @@
 """Responsive layout acceptance against the synthetic console runtime only."""
-import argparse,json,sys
+import argparse,json,sys,traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
+from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);a=p.parse_args()
 root=Path(a.runtime).resolve();out=Path(a.output).resolve()
 if root.name!='catalog-fixture' or root.drive.upper()!='D:' or out.drive.upper()!='D:':raise SystemExit('synthetic_runtime_required')
@@ -32,12 +33,18 @@ def main():
    if route=='tasks':page.locator('#task-list.loading').wait_for(state='detached')
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
   page.goto(base+'/admin/');page.locator('#login-submit').wait_for();bounds();shot('layout-login-desktop.png')
-  page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('.hero').wait_for()
+  page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
   for width in (1440,1024,768,390,320):
    page.set_viewport_size({'width':width,'height':1000 if width>900 else 844})
    for route in ('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','settings'):
     stage=f'{width}:{route}';nav(route);bounds();report['pages']+=1
     if width<=900:assert not page.locator('#navigation').is_visible()
+    assert page.locator('.hero,.metrics,.card,.eyebrow').count()==0
+    if route in ('tasks','models') and page.locator('.selection-row').count():
+     page.locator('.selection-row').first.click();page.locator('.detail-pane:visible').wait_for();bounds()
+     if width<=700:
+      assert not page.locator('.selection-pane').is_visible()
+      page.locator('.detail-back:visible').click();assert page.locator('.selection-pane').is_visible()
     if (width,route) in ((1440,'overview'),(1440,'models'),(390,'models'),(390,'overview'),(1024,'providers')):shot(f'layout-{width}-{route}.png')
    if width<=900:
     page.locator('#navigation-toggle').click();links=page.locator('#navigation a')
@@ -52,9 +59,9 @@ def main():
    nav('models')
    if width<=700:
     assert not page.locator('#model-account').is_visible()
-    page.locator('#model-refine-toggle').click();assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
-    page.locator('#model-refine-toggle').click()
-   stage=f'{width}:plan-dialog';nav('schedules');page.locator('[data-action=new-schedule]').click();page.locator('#plan-provider').select_option('doubao');page.locator('#plan-save:not([disabled])').wait_for()
+    reveal_filter(page,'#model-account');assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
+    page.locator('#model-refine summary').click()
+   stage=f'{width}:plan-dialog';nav('schedules');page.locator('[data-action=new-schedule]').click();page.locator('#plan-provider').select_option('doubao');page.locator('#plan-next:not([disabled])').wait_for();page.locator('#plan-task').select_option('fixture-check');page.locator('input[name=plan-account]').first.check();plan_timing(page);plan_times(page,['08:20','18:20']);plan_review(page)
    bounds();assert page.locator('#dialog').evaluate('(d)=>d.scrollWidth<=d.clientWidth+1')
    assert page.locator('#plan-save').is_visible();page.locator('#plan-save').scroll_into_view_if_needed()
    page.locator('#plan-enabled').scroll_into_view_if_needed()
@@ -63,22 +70,22 @@ def main():
    if width==390:page.screenshot(path=str(out/'layout-mobile-plan-dialog.png'),full_page=False);report['screenshots'].append('layout-mobile-plan-dialog.png')
    page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
   report['actions'].append('all_pages_5_widths_navigation_filters_and_dialogs')
-  stage='dark-contrast';page.set_viewport_size({'width':1440,'height':1000});nav('models')
+  stage='dark-contrast';page.set_viewport_size({'width':1440,'height':1000});nav('schedules')
   def luminance(color):
    values=[int(x) / 255 for x in color[color.index('(')+1:color.index(')')].split(',')[:3]]
    values=[x/12.92 if x<=.04045 else ((x+.055)/1.055)**2.4 for x in values]
    return sum(x*y for x,y in zip(values,(.2126,.7152,.0722)))
   for theme in ('light','dark'):
    if page.locator('html').get_attribute('data-theme')!=theme:page.locator('#theme').click()
-   button=page.locator('[data-action=model-refresh]');button.hover()
+   button=page.locator('[data-action=new-schedule]');button.hover()
    colors=button.evaluate('(e)=>{const s=getComputedStyle(e);return [s.color,s.backgroundColor]}')
    lo,hi=sorted(luminance(x) for x in colors);assert (hi+.05)/(lo+.05)>=4.5
-   if theme=='dark':shot('layout-models-dark.png')
+   if theme=='dark':shot('layout-plans-dark.png')
   page.locator('#theme').click();report['actions'].append('primary_hover_contrast_light_and_dark')
   browser.close()
  assert not report['page_errors'] and not report['console_errors'] and not report['external_requests']
 try:main();report['result']='PASS'
-except Exception as e:report.update(result='FAIL',stage=stage,error_type=type(e).__name__)
+except Exception as e:report.update(result='FAIL',stage=stage,error_type=type(e).__name__,source_lines=[x.lineno for x in traceback.extract_tb(e.__traceback__) if x.filename.endswith('console_layout.py')])
 (out/'layout-browser.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-print(json.dumps({k:report[k] for k in ('result','pages','stage','error_type') if k in report}))
+print(json.dumps({k:report[k] for k in ('result','pages','stage','error_type','source_lines') if k in report}))
 sys.exit(0 if report['result']=='PASS' else 1)

@@ -21,16 +21,18 @@ func TestConsoleEntryAndAssetSessionBoundary(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "console/login.js") {
 		t.Fatal("new login not served")
 	}
-	w = h.do(http.MethodGet, "/console/app.js", "", nil)
-	if w.Code != http.StatusFound {
-		t.Fatal("application asset exposed without session")
+	for _, path := range []string{"/console/app.js", "/console/plan-editor.js"} {
+		w = h.do(http.MethodGet, path, "", nil)
+		if w.Code != http.StatusFound {
+			t.Fatal("application asset exposed without session")
+		}
 	}
 	headers := map[string]string{"Cookie": CookieName + "=" + h.token(doc)}
 	w = h.do(http.MethodGet, "/", "", headers)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "console/app.js") || strings.Contains(w.Body.String(), "id=\"tabs\"") {
 		t.Fatal("independent console entry not served")
 	}
-	for _, path := range []string{"/console/app.js", "/console/style.css"} {
+	for _, path := range []string{"/console/app.js", "/console/style.css", "/console/plan-editor.js"} {
 		if h.do(http.MethodGet, path, "", headers).Code != 200 {
 			t.Fatalf("console asset missing: %s", path)
 		}

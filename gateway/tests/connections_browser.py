@@ -28,7 +28,7 @@ def main():
         def begin(method):
             page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('doubao');page.locator('#connection-method').select_option(method);page.locator('#connection-begin').click()
         fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
-        page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('.hero').wait_for()
+        page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
         assert 'sms_calls' in stats();page.request.post(base+'/__fixture/mode/success')
         # Only fixture flows are touched. A previous interrupted test is not
         # silently retried; it is canceled before this explicit test begins.

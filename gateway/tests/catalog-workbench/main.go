@@ -30,6 +30,7 @@ import (
 )
 
 type fixtures struct {
+	design    bool
 	mode      atomic.Int32
 	calls     atomic.Int32
 	mutations atomic.Int32
@@ -81,6 +82,15 @@ func (f *fixtures) RoundTrip(r *http.Request) (*http.Response, error) {
 	code := 200
 	model := map[string]any{"item_id": 7, "model_item_key": "fixture-model", "name": "合成模型 <img src=x onerror=alert(1)>", "show_task_tools": 1, "model_extra_params": map[string]any{"total_window_size": "131072"}, "reasoning_effort_config": map[string]any{"default_level": 2, "option_list": []any{map[string]any{"level": 2, "name": "合成档位"}}}, "tag_list": []any{map[string]any{"text": "合成倍率"}}}
 	mode := map[string]any{"mode_id": "work", "name": "合成工作模式", "model_list": map[string]any{"item_list": []any{model}}}
+	if f.design {
+		items := []any{}
+		for i, name := range []string{"澄明 Pro（合成）", "行舟 Flash（合成）", "远山 Reasoner（合成）"} {
+			items = append(items, map[string]any{"item_id": i + 1, "model_item_key": fmt.Sprintf("synthetic-model-%d", i), "name": name,
+				"show_task_tools": 1, "model_extra_params": map[string]any{"total_window_size": "256000"},
+				"reasoning_effort_config": map[string]any{"default_level": 1, "option_list": []any{map[string]any{"level": 1, "name": "标准"}, map[string]any{"level": 2, "name": "深入"}}}})
+		}
+		mode["model_list"] = map[string]any{"item_list": items}
+	}
 	menu := map[string]any{"use_mode_model_list": true, "mode_list": map[string]any{"item_list": []any{mode}}}
 	body := map[string]any{"code": 0, "data": map[string]any{"entry_list": []any{map[string]any{"active_switch_conf": map[string]any{"menu_conf_v2": menu}}}}}
 	if f.mode.Load() == 1 {
@@ -94,6 +104,7 @@ func main() {
 	root := flag.String("root", "", "dedicated synthetic runtime directory")
 	address := flag.String("listen", "127.0.0.1:17863", "loopback address")
 	modules := flag.Bool("task-modules", false, "use real WorkBuddy task modules with synthetic account transport")
+	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	flag.Parse()
 	host, _, err := net.SplitHostPort(*address)
 	if err != nil || host != "127.0.0.1" || *root == "" {
@@ -108,7 +119,7 @@ func main() {
 	if err = os.WriteFile(config, []byte(`{"api_keys_file":"./data/api_keys.json"}`), 0600); err != nil {
 		panic("fixture_config_failed")
 	}
-	fixture := &fixtures{}
+	fixture := &fixtures{design: *design}
 	vault, err := accountvault.Open(filepath.Join(*root, "data", "synthetic-accounts"))
 	if err != nil {
 		panic("fixture_vault_failed")

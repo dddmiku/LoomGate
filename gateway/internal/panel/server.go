@@ -341,7 +341,7 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		writeHTML(w, http.StatusOK, body)
 		return
-	case s.opts.Console && (path == "/console/app.js" || path == "/console/connections.js"):
+	case s.opts.Console && (path == "/console/app.js" || path == "/console/connections.js" || path == "/console/plan-editor.js"):
 		s.consoleAsset(w, path)
 		return
 	case strings.HasPrefix(path, "/vendor/"):
