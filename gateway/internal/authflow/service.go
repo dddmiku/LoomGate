@@ -213,6 +213,11 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 	if r.Provider == "workbuddy" && r.Realm == "" {
 		r.Realm = "cn"
 	}
+	// Validate the provider/realm pair before consulting a driver or touching
+	// persisted flows. A foreign realm must never fall through to a CN request.
+	if !validRealm(r) {
+		return View{}, ErrInvalid
+	}
 	d := s.opts.Drivers[r.Provider]
 	if d == nil {
 		return View{}, ErrInvalid
@@ -224,12 +229,6 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 		}
 	}
 	if !allowed {
-		return View{}, ErrInvalid
-	}
-	if r.Realm != "" && r.Realm != "cn" && r.Realm != "global" && r.Realm != "trae" {
-		return View{}, ErrInvalid
-	}
-	if r.Provider != "workbuddy" && r.Realm != "" {
 		return View{}, ErrInvalid
 	}
 	if r.AccountID != "" && !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(r.AccountID) {
@@ -276,6 +275,12 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 	s.active[f.ID] = cancel
 	s.mu.Unlock()
 	return s.call(bounded, cancel, f, func() (Result, error) { return d.Start(bounded, r) })
+}
+func validRealm(r Request) bool {
+	if r.Provider == "workbuddy" {
+		return r.Realm == "cn" || r.Realm == "global"
+	}
+	return r.Realm == ""
 }
 func allowed(status, action string) bool {
 	switch action {
@@ -337,6 +342,10 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 		return f.View, err
 	}
 	if !allowed(f.Status, action) {
+		s.mu.Unlock()
+		return f.View, ErrInvalid
+	}
+	if !validRealm(f.Request) {
 		s.mu.Unlock()
 		return f.View, ErrInvalid
 	}
