@@ -35,7 +35,7 @@
   async function providers() { if(!state.providers) { const data=await api('workbench/providers'); if(!Array.isArray(data.providers)) throw new APIError('request_failed',502); state.providers=data.providers; } return state.providers; }
   async function accountsFor(provider) {
     const p=state.providers.find(p=>p.id===provider);
-    if(p?.catalog_scope==='account') return (await api('workbench/accounts')).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,enabled:a.enabled,expires_at:a.expires_at}));
+    if(p?.catalog_scope==='account') return (await api('workbench/accounts')).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,enabled:a.enabled,expires_at:a.expires_at,revision:a.revision}));
     const data=await api('state');
     return (data.accounts || []).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(a=>({id:a.uid,enabled:!a.disabled,expires_at:a.expiresAt,realm:a.realm}));
   }
@@ -70,10 +70,11 @@
   }
   async function accounts() {
     const selected=state.accountProvider || state.providers[0]?.id || '';
-    $('#view').innerHTML=heading(button('connection-help','接入说明'))+`<div class="filters two"><label>服务<select id="account-provider">${providerOptions(selected)}</select></label><label>搜索账号标识<input id="account-search" placeholder="输入账号标识"></label></div><div id="account-list" class="loading">正在读取账号…</div>`;
+    $('#view').innerHTML=heading(button('connect-account','连接账号','','primary'))+`<div class="filters two"><label>服务<select id="account-provider">${providerOptions(selected)}</select></label><label>搜索账号标识<input id="account-search" placeholder="输入账号标识"></label></div><div id="account-list" class="loading">正在读取账号…</div><div id="connection-list"></div>`;
+    $('#account-provider').addEventListener('change',e=>{state.accountProvider=e.target.value;reload();});
     const rows=await accountsFor(selected);state.accountRows=rows;
-    const draw=()=>{const query=$('#account-search').value.toLowerCase();const list=rows.filter(a=>a.id.toLowerCase().includes(query));$('#account-list').className='';$('#account-list').innerHTML=list.length?table(['账号标识','状态','会话有效期','操作'],list.map(a=>[`<code>${esc(a.id)}</code>${a.realm?`<p>${esc(a.realm)}</p>`:''}`,badge(a.enabled?'ready':'disabled',a.enabled?'已启用':'已停用'),date(a.expires_at),button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')])):empty(query?'没有匹配的账号':'尚未接入账号','账号接入状态由服务端读取。');};
-    draw();$('#account-search').addEventListener('input',draw);$('#account-provider').addEventListener('change',e=>{state.accountProvider=e.target.value;reload();});
+    const draw=()=>{const query=$('#account-search').value.toLowerCase();const list=rows.filter(a=>a.id.toLowerCase().includes(query));$('#account-list').className='';$('#account-list').innerHTML=list.length?table(['账号标识','状态','会话有效期','操作'],list.map(a=>[`<code>${esc(a.id)}</code>${a.realm?`<p>${esc(a.realm)}</p>`:''}`,badge(a.enabled?'ready':'disabled',a.enabled?'已启用':'已停用'),date(a.expires_at),`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'quiet compact')}</div>`])):empty(query?'没有匹配的账号':'尚未接入账号','账号接入状态由服务端读取。');};
+    draw();$('#account-search').addEventListener('input',draw);await LoomConnections.list($('#connection-list'));
   }
   async function modelPage() {
     if(!state.providers.some(p=>p.id===state.modelProvider)) state.modelProvider=state.providers[0]?.id || '';
@@ -119,9 +120,10 @@
     state.taskProvider=state.taskProvider || state.providers[0]?.id || '';
     $('#view').innerHTML=heading(button('run-all','执行当前范围','','primary'))+`<div class="filters two"><label>服务<select id="task-provider">${providerOptions(state.taskProvider)}</select></label><label>账号<select id="task-account"><option>读取中…</option></select></label></div><div id="task-list" class="loading">正在发现任务…</div>`;
     $('[data-action=run-all]').disabled=true;
+    $('#task-provider').onchange=e=>{state.taskProvider=e.target.value;state.taskAccount='';reload();};
     const accounts=await accountsFor(state.taskProvider);
     $('#task-account').innerHTML=options([['','全部已启用账号'],...accounts.filter(a=>a.enabled).map(a=>[a.id,a.id])],state.taskAccount);
-    $('#task-provider').onchange=e=>{state.taskProvider=e.target.value;state.taskAccount='';reload();};$('#task-account').onchange=e=>{state.taskAccount=e.target.value;reload();};
+    $('#task-account').onchange=e=>{state.taskAccount=e.target.value;reload();};
     const query=new URLSearchParams({provider:state.taskProvider});if(state.taskAccount)query.set('accounts',state.taskAccount);
     const data=await api('workbench/catalog?'+query);state.tasks=data.tasks || [];
     $('#task-list').className='';$('#task-list').innerHTML=state.tasks.length?`<div class="grid">${state.tasks.map((t,i)=>`<article class="card" data-task="${esc(t.key)}"><div class="card-top"><span class="eyebrow">${esc(providerName(t.provider_id))}</span>${badge(t.manual_only?'manual_action':'ready',t.manual_only?'需人工操作':'可执行')}</div><h3>${esc(t.name)}</h3><p>${esc(t.description)}</p><div class="tags">${badge('neutral',t.once?'一次性':t.once_per_day?'每日任务':'按需执行')}${t.reward?badge('ready',t.reward):''}</div><p>账号 <code>${esc(t.account_id)}</code></p><div class="actions">${button(t.manual_only?'manual-task':'run-task',t.manual_only?'查看所需操作':'执行任务',`data-index="${i}"`,'compact')}${!t.manual_only?button('task-schedule','安排计划',`data-index="${i}"`,'quiet compact'):''}</div></article>`).join('')}</div>`:empty('未发现可用任务','请确认账号已启用，并在需要时完成官方客户端登录。');
@@ -204,6 +206,11 @@
     if(name==='theme'){toggleTheme();return;}
     if(name==='provider-models' || name==='account-models'){state.modelProvider=element.dataset.provider;state.modelAccount=element.dataset.account || '';state.modelOffset=0;location.hash='models';return;}
     if(name==='provider-accounts'){state.accountProvider=element.dataset.provider;location.hash='accounts';return;}
+    if(name==='connect-account'||name==='reconnect-account'){await LoomConnections.open(element.dataset.provider||$('#account-provider').value,element.dataset.account||'');return;}
+    if(name==='toggle-account'){
+      const a=state.accountRows[index],provider=element.dataset.provider;openDialog(a.enabled?'停用账号':'启用账号',`<form id="account-toggle-form" class="form"><p>账号 <code>${esc(a.id)}</code></p><p class="muted">${a.enabled?'停用后不再用于后续目录请求与任务。正在进行的操作应在执行记录中单独核验。':'启用后该账号可再次用于目录读取和任务。'}</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认${a.enabled?'停用':'启用'}</button></div></form>`);
+      $('#account-toggle-form').onsubmit=e=>{e.preventDefault();const modern=state.providers.find(p=>p.id===provider)?.catalog_scope==='account';mutate('account-toggle',modern?'workbench/account/toggle':'account/toggle',modern?{id:a.id,enabled:!a.enabled,revision:a.revision}:{uid:a.id,disabled:a.enabled},async()=>{const updated=(await accountsFor(provider)).find(x=>x.id===a.id);if(!updated||updated.enabled===a.enabled)throw new APIError('request_failed',502);closeDialog();toast('账号状态已从服务端核验。');await reload();});};return;
+    }
     if(name==='model-refresh'){await loadModels(true);return;}
     if(name==='model-next' || name==='model-prev'){state.modelOffset=Math.max(0,state.modelOffset+(name==='model-next'?8:-8));await loadModels(false);return;}
     if(name==='connection-help'){openDialog('账号接入状态',notice('现有账号已通过真实后端读取。新控制台的扫码、手机号和授权流程仍在接入，当前不会发送短信或自动开始登录。','warn')+'<p class="muted">豆包需在官方客户端完成登录；会话导入与续期界面将在后续阶段开放。</p>');return;}
@@ -224,5 +231,6 @@
   document.addEventListener('click',e=>{const target=e.target.closest('[data-action]');if(target && !target.disabled)action(target).catch(err=>{if(err.name!=='AbortError')toast(err instanceof APIError?err.message:'操作未完成，请刷新状态后重试。');});});
   $('#logout').onclick=()=>mutate('logout','auth/logout',{},async()=>location.replace('login'));
   const network=()=>{$('#connection').hidden=navigator.onLine;$('#connection').textContent='当前网络离线。页面中的数据可能已过期，恢复连接后请刷新。';};window.addEventListener('offline',network);window.addEventListener('online',network);network();
-  window.addEventListener('hashchange',navigate);window.addEventListener('pagehide',()=>{state.controller?.abort();clearTimeout(state.poll);});navigate();
+  LoomConnections.init({api,esc,openDialog,toast,reload,providerName,accountConnected:f=>{state.accountProvider=f.provider;}});
+  window.addEventListener('hashchange',navigate);window.addEventListener('pagehide',()=>{state.controller?.abort();clearTimeout(state.poll);LoomConnections.stop();});navigate();
 })();

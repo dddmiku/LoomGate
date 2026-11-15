@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/android"
+	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/panel"
 	panelassets "workbuddy2api/panel"
 )
@@ -156,8 +157,11 @@ func panelContainer() string {
 // adminHandler 是网关的管理接口 mux：面板与网关在同一个进程里，直接把它交给面板，
 // 由面板在进程内分发（不经 socket/TCP）。分进程部署的形态下传 nil，面板自己回落到
 // socket 路径。
-func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler) (http.Handler, error) {
+func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler, drivers ...map[string]authflow.Driver) (http.Handler, error) {
 	opts := goPanelOptions(layout)
+	if len(drivers) > 0 {
+		opts.ConnectionDrivers = drivers[0]
+	}
 	opts.AdminHandler = adminHandler
 	opts.UpdateDir = panelUpdateDir(cfg)
 	server, err := panel.New(opts)

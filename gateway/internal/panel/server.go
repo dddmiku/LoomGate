@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/authflow"
 	panelassets "workbuddy2api/panel"
 )
 
@@ -43,6 +44,8 @@ import (
 type Options struct {
 	// Console selects the independently designed LoomGate console for the rebuild runtime.
 	Console bool
+	// ConnectionDrivers overrides authentication drivers in isolated integration tests.
+	ConnectionDrivers map[string]authflow.Driver
 	// AdminDir 存 credentials.json / initial-password.txt。
 	AdminDir string
 	// AuthDir 是账号文件目录（网关的 auths）。
@@ -95,18 +98,19 @@ type Options struct {
 
 // Server 是面板的 HTTP 处理器。
 type Server struct {
-	opts      Options
-	assets    fs.FS
-	store     *AccountStore
-	creds     *CredentialStore
-	gateway   *GatewayClient
-	credits   *CreditCache
-	runner    Runner
-	throttle  *Throttle
-	state     *StateBuilder
-	version   string
-	now       func() time.Time
-	adminBase string
+	opts        Options
+	assets      fs.FS
+	store       *AccountStore
+	creds       *CredentialStore
+	gateway     *GatewayClient
+	credits     *CreditCache
+	runner      Runner
+	throttle    *Throttle
+	state       *StateBuilder
+	version     string
+	now         func() time.Time
+	adminBase   string
+	connections connections
 
 	// lock 串行化「改文件 + 重启」这一类复合操作（对应 Python 版的 document_lock）。
 	//
@@ -322,6 +326,9 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 	}
 
 	switch {
+	case s.opts.Console && strings.HasPrefix(path, "/api/connections/"):
+		s.serveConnections(w, r)
+		return
 	case path == "/" || path == "/index.html":
 		name := "index.html"
 		if s.opts.Console {
@@ -334,7 +341,7 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		writeHTML(w, http.StatusOK, body)
 		return
-	case s.opts.Console && path == "/console/app.js":
+	case s.opts.Console && (path == "/console/app.js" || path == "/console/connections.js"):
 		s.consoleAsset(w, path)
 		return
 	case strings.HasPrefix(path, "/vendor/"):
@@ -461,7 +468,7 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 	switch path {
 	case "/api/auth/password":
 		s.authPassword(w, r, body, session)
-	case "/api/workbench/run", "/api/workbench/cancel", "/api/workbench/schedule", "/api/workbench/schedule/delete":
+	case "/api/workbench/run", "/api/workbench/cancel", "/api/workbench/schedule", "/api/workbench/schedule/delete", "/api/workbench/account/toggle":
 		s.gatewayAdmin(w, r, http.MethodPost, strings.TrimPrefix(path, "/api"), body)
 	case "/api/login/start":
 		writeJSON(w, http.StatusOK, s.loginStart(r.Context(), body))
@@ -502,6 +509,13 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 	case "/api/credit":
 		writeJSON(w, http.StatusOK, map[string]any{"credit": s.credits.Get(r.Context(), true)})
 	default:
+		if s.opts.Console && strings.HasPrefix(path, "/api/connections/") {
+			encoded, _ := json.Marshal(body)
+			forward := r.Clone(r.Context())
+			forward.Body = io.NopCloser(bytes.NewReader(encoded))
+			s.serveConnections(w, forward)
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 	}
 }

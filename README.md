@@ -23,6 +23,7 @@
 | `gateway/internal/taskproviders` | provider 业务到任务引擎的适配 |
 | `gateway/internal/providers/doubao` | 官方豆包目录、活动与客户端请求 |
 | `gateway/internal/accountvault` | 新 provider 会话的加密存储与并发写保护 |
+| `gateway/internal/authflow` | 加密的认证流程、冷却、取消与中断恢复 |
 | `gateway/internal/providercatalog` | provider 能力、账号和目录管理视图；有界并发与失败隔离 |
 | `gateway/internal/server` | 已有 Chat / Responses / Messages / Gemini 协议 |
 | `gateway/internal/panel`、`gateway/panel` | 管理接口和内嵌前端 |
@@ -61,6 +62,8 @@ python -X utf8 -m unittest discover -s tools/buildtests -p 'test_*.py'
 开发运行目前通过 `LOOMGATE_REBUILD=1` 选择新工作台，明确停用旧任务调度入口，避免重复派发。它仍是迁移中的开发开关；全量旧任务接入完成前不会作为正式发布方案。测试运行应使用独立配置和数据目录。
 
 新控制台和隔离浏览器验收的启动方式见 [控制台验收](docs/console-acceptance.md)。旧面板资源暂留作兼容测试，不作为新 UI 的设计基础。豆包目录中的模型尚未加入对外推理路由。
+
+新账号接入入口、WorkBuddy/Trae 授权与豆包 SMS/QR 协议状态机见 [账号认证](docs/authentication.md)。真实豆包二维码初始化目前返回拒绝；短信、扫码确认、导入和续期尚未实测成功，不能把隔离测试结果作为生产接入承诺。
 
 ## 迁移与构建
 

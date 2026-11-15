@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"workbuddy2api/internal/accountvault"
+	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/providercatalog"
 	"workbuddy2api/internal/providers/doubao"
@@ -17,6 +21,67 @@ type workbenchRuntime struct {
 	engine *taskengine.Engine
 	vault  *accountvault.Vault
 	doubao *doubao.Client
+}
+
+func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
+	if w == nil {
+		return nil
+	}
+	driver := &doubao.Passport{Save: func(ctx context.Context, id string, p doubao.StoredProfile) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rows, err := w.vault.List()
+		if err != nil {
+			return err
+		}
+		var revision uint64
+		for _, a := range rows {
+			if a.ID == id {
+				if a.Provider != "doubao" {
+					return errors.New("account_provider_conflict")
+				}
+				revision = a.Revision
+			}
+		}
+		b, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for i := range b {
+				b[i] = 0
+			}
+		}()
+		_, err = w.vault.Put(accountvault.Account{ID: id, Provider: "doubao", Enabled: true}, b, revision)
+		return err
+	}}
+	if path := os.Getenv("LOOMGATE_DOUBAO_AUTH_PROFILE"); path != "" {
+		driver.Bootstrap = func(ctx context.Context) (doubao.StoredProfile, error) {
+			var p doubao.StoredProfile
+			if ctx.Err() != nil {
+				return p, ctx.Err()
+			}
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+				return p, errors.New("bootstrap_unavailable")
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return p, errors.New("bootstrap_unavailable")
+			}
+			defer func() {
+				for i := range b {
+					b[i] = 0
+				}
+			}()
+			if json.Unmarshal(b, &p) != nil {
+				return p, errors.New("bootstrap_invalid")
+			}
+			return p, nil
+		}
+	}
+	return map[string]authflow.Driver{"doubao": driver}
 }
 
 // The isolated reconstruction runtime mounts this service while the legacy

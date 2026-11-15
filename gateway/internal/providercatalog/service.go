@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -103,6 +104,10 @@ func (s *Service) accounts() ([]accountvault.Account, error) {
 // Route reports whether it owns the management path; authorization is applied
 // once by the caller's internal management boundary.
 func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path == "/workbench/account/toggle" {
+		s.toggleAccount(w, r)
+		return true
+	}
 	if r.URL.Path != "/workbench/providers" && r.URL.Path != "/workbench/accounts" && r.URL.Path != "/workbench/models" {
 		return false
 	}
@@ -140,6 +145,41 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 	}
 	s.models(w, r, accounts)
 	return true
+}
+
+func (s *Service) toggleAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		write(w, 405, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	var req struct {
+		ID       string `json:"id"`
+		Enabled  *bool  `json:"enabled"`
+		Revision uint64 `json:"revision"`
+	}
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	d.DisallowUnknownFields()
+	if d.Decode(&req) != nil || d.Decode(new(any)) != io.EOF || !accountID.MatchString(req.ID) || req.Revision == 0 || req.Enabled == nil {
+		write(w, 400, map[string]string{"error": "invalid_account_request"})
+		return
+	}
+	store, ok := s.opts.Accounts.(interface {
+		SetEnabled(string, bool, uint64) (accountvault.Account, error)
+	})
+	if !ok {
+		write(w, 503, map[string]string{"error": "accounts_read_only"})
+		return
+	}
+	a, err := store.SetEnabled(req.ID, *req.Enabled, req.Revision)
+	if err != nil {
+		if errors.Is(err, accountvault.ErrConflict) {
+			write(w, 409, map[string]string{"error": "account_revision_conflict"})
+		} else {
+			write(w, 503, map[string]string{"error": "accounts_unavailable"})
+		}
+		return
+	}
+	write(w, 200, map[string]any{"ok": true, "account": a})
 }
 
 var accountID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)

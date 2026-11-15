@@ -149,7 +149,9 @@ func (v *Vault) load(id string) (sealed, error) {
 func (v *Vault) List() ([]Account, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.closed{return nil,errors.New("vault_closed")}
+	if v.closed {
+		return nil, errors.New("vault_closed")
+	}
 	paths, err := filepath.Glob(filepath.Join(v.dir, "*.account"))
 	if err != nil {
 		return nil, errors.New("vault_list_failed")
@@ -183,6 +185,24 @@ func (v *Vault) Get(id string) (Account, []byte, error) {
 	}
 	plain, err := v.decrypt(s)
 	return s.Account, plain, err
+}
+
+// SetEnabled preserves the encrypted session and requires the observed revision.
+func (v *Vault) SetEnabled(id string, enabled bool, expected uint64) (Account, error) {
+	a, secret, err := v.Get(id)
+	if err != nil {
+		return Account{}, err
+	}
+	defer func() {
+		for i := range secret {
+			secret[i] = 0
+		}
+	}()
+	if a.Provider != "doubao" || a.Revision != expected {
+		return Account{}, ErrConflict
+	}
+	a.Enabled = enabled
+	return v.Put(a, secret, expected)
 }
 func (v *Vault) decrypt(s sealed) ([]byte, error) {
 	if len(s.Nonce) != v.aead.NonceSize() {

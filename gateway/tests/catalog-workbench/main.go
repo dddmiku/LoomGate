@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/accountvault"
+	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/providercatalog"
@@ -31,17 +32,31 @@ type fixtures struct {
 	mode      atomic.Int32
 	calls     atomic.Int32
 	mutations atomic.Int32
+	accounts  *accountvault.Vault
+	smsCalls  atomic.Int32
+	qrCalls   atomic.Int32
+	qrPolls   atomic.Int32
 }
 
 func (f *fixtures) List() ([]accountvault.Account, error) {
 	if f.mode.Load() == 3 {
 		return nil, fmt.Errorf("synthetic_storage_unavailable")
 	}
+	if f.accounts != nil {
+		return f.accounts.List()
+	}
+	rows := fixtureAccounts()
+	return rows, nil
+}
+func fixtureAccounts() []accountvault.Account {
 	rows := []accountvault.Account{{ID: "a-fixture", Provider: "doubao", Enabled: true}, {ID: "b-fixture", Provider: "doubao", Enabled: true}, {ID: "c-disabled", Provider: "doubao", Enabled: false}}
 	for i := 0; i < 21; i++ {
 		rows = append(rows, accountvault.Account{ID: fmt.Sprintf("z-page-%02d", i), Provider: "doubao", Enabled: true})
 	}
-	return rows, nil
+	return rows
+}
+func (f *fixtures) SetEnabled(id string, enabled bool, revision uint64) (accountvault.Account, error) {
+	return f.accounts.SetEnabled(id, enabled, revision)
 }
 func (f *fixtures) Session(ctx context.Context, id string) (doubao.Session, error) {
 	if id == "b-fixture" {
@@ -91,6 +106,27 @@ func main() {
 		panic("fixture_config_failed")
 	}
 	fixture := &fixtures{}
+	vault, err := accountvault.Open(filepath.Join(*root, "data", "synthetic-accounts"))
+	if err != nil {
+		panic("fixture_vault_failed")
+	}
+	defer vault.Close()
+	fixture.accounts = vault
+	current, err := vault.List()
+	if err != nil {
+		panic("fixture_vault_list_failed")
+	}
+	known := map[string]bool{}
+	for _, a := range current {
+		known[a.ID] = true
+	}
+	for _, a := range fixtureAccounts() {
+		if !known[a.ID] {
+			if _, err = vault.Put(a, []byte(`{"synthetic":true}`), 0); err != nil {
+				panic("fixture_vault_seed_failed")
+			}
+		}
+	}
 	client := doubao.New(fixture, fixture)
 	catalog := providercatalog.New(providercatalog.Options{Accounts: fixture, Doubao: client, Timeout: 3 * time.Second})
 	engine, err := taskengine.Open(taskengine.Options{Path: filepath.Join(*root, "data", "synthetic-tasks.json"), PollMin: 25 * time.Millisecond, PollMax: 50 * time.Millisecond, Timeout: 30 * time.Second})
@@ -147,17 +183,33 @@ func main() {
 			gateway.InternalHandler().ServeHTTP(w, r)
 		}
 	})
-	admin, err := panel.New(panel.Options{Console: true, BaseDir: *root, AdminDir: filepath.Join(*root, "panel-data"), AuthDir: filepath.Join(*root, "auths"), TrashDir: filepath.Join(*root, "auths-trash"), ConfigPath: config, Runtime: "native", AdminHandler: management, Version: "catalog-fixture"})
+	passport := &doubao.Passport{Bootstrap: syntheticPassportBootstrap, Transport: syntheticPassportTransport{fixture}, Save: func(ctx context.Context, id string, profile doubao.StoredProfile) error {
+		rows, err := vault.List()
+		if err != nil {
+			return err
+		}
+		var revision uint64
+		for _, a := range rows {
+			if a.ID == id {
+				revision = a.Revision
+			}
+		}
+		b, _ := json.Marshal(profile)
+		_, err = vault.Put(accountvault.Account{ID: id, Provider: "doubao", Enabled: true}, b, revision)
+		return err
+	}}
+	admin, err := panel.New(panel.Options{ConnectionDrivers: map[string]authflow.Driver{"doubao": passport, "workbuddy": &syntheticConnection{}, "trae": &syntheticConnection{}}, Console: true, BaseDir: *root, AdminDir: filepath.Join(*root, "panel-data"), AuthDir: filepath.Join(*root, "auths"), TrashDir: filepath.Join(*root, "auths-trash"), ConfigPath: config, Runtime: "native", AdminHandler: management, Version: "catalog-fixture"})
 	if err != nil {
 		panic("fixture_panel_failed")
 	}
+	defer admin.Close()
 	mux := http.NewServeMux()
 	mux.Handle("/admin/", http.StripPrefix("/admin", admin))
 	mux.HandleFunc("GET /__fixture/stats", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"calls": fixture.calls.Load(), "mode": fixture.mode.Load(), "mutations": fixture.mutations.Load()})
+		_ = json.NewEncoder(w).Encode(map[string]any{"calls": fixture.calls.Load(), "mode": fixture.mode.Load(), "mutations": fixture.mutations.Load(), "sms_calls": fixture.smsCalls.Load(), "qr_calls": fixture.qrCalls.Load(), "qr_polls": fixture.qrPolls.Load()})
 	})
 	mux.HandleFunc("POST /__fixture/mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
-		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3}
+		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6}
 		value, ok := mode[r.PathValue("mode")]
 		if !ok {
 			w.WriteHeader(400)
