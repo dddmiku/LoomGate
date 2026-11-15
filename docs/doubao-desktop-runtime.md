@@ -1,0 +1,42 @@
+# 官方桌面目录连接
+
+本阶段提供已登录豆包客户端的实时模型目录桥接。目录来自当前客户端 SDK，模型、档位和能力继续使用统一目录解析器、账号缓存和面板下拉。它尚不提供登录、任务执行或对外推理。
+
+## 模块与数据边界
+
+- `tools/doubao-runtime/bridge.py`：仅连接显式配置的 `127.0.0.1` 调试端口及官方主页面，通过继承的 stdin/stdout 管道运行一次只读操作。没有 HTTP 监听器、任意 URL 或通用脚本入口。
+- `runtime.js`：核对已适配官方 bundle 的公开摘要，调用官方 Passport SDK 核验身份，然后使用当前 `apiContext` 构造目录请求。账号在请求前后核验；客户端切换账号时拒绝结果。
+- `internal/providers/doubao/runtime.go`：进程生命周期、单并发队列、11 秒截止时间、取消、2 MiB 输出限制和固定错误码；不输出子进程 stderr、参数或 SDK 异常文本。
+- 加密账号记录保存身份摘要和从官方请求读取的 bot ID。客户端 Cookie、签名参数、设备参数留在官方客户端内存。输出仅包含目录 schema，排除签名图标 URL 和无关账号字段。
+
+官方 SDK 当前没有经过验证的取消接口。调用方取消会结束本机 helper；已经开始的只读 SDK 请求可能继续到完成，页面锁阻止另一个桥接请求重叠。若 SDK 永不返回，需要重新打开客户端。它不阻塞其他 provider。
+
+目录缓存按账号及账号版本隔离，正常 TTL 为 5 分钟。主动刷新核验实时身份；身份不匹配或退出登录会移除缓存。服务暂不可用时按既有契约显示带时间的旧缓存和退避状态，不静默使用历史抓包凭据。客户端切换不会主动通知网关，在下一次刷新前可能仍显示该绑定账号的缓存。
+
+## 本机设置
+
+依赖 Python 与 `tools/doubao-runtime/requirements.txt`。Windows 的 helper 以隐藏子进程运行。服务器配置通过三个环境变量指定：
+
+| 变量 | 内容 |
+|---|---|
+| `LOOMGATE_DOUBAO_DESKTOP_PYTHON` | Python 可执行文件绝对路径 |
+| `LOOMGATE_DOUBAO_DESKTOP_HELPER` | 本仓库 `bridge.py` 绝对路径 |
+| `LOOMGATE_DOUBAO_DESKTOP_PORT` | 已由操作者启用的官方客户端回环调试端口 |
+
+三个配置必须同时有效；配置错误直接终止该开发工作台启动。仅设置这些变量不会启动或修改豆包客户端。暂时开启调试前应保存原启动命令，验证结束后恢复原命令并核对端口关闭；不需要代理或证书变更。
+
+`cmd/doubao-desktop-inspect` 默认只读验证。`--bot-profile` 指向本机受保护的官方目录请求文件，程序只取其中的 `post_data.bot_id`，不复用签名或 Cookie。当前还没有动态 bot ID 发现入口，这是后续工作。
+
+显式传入 `--import-vault` 时，工具在指定的隔离 vault 创建身份绑定；使用统一身份派生的账号 ID，已有记录会冲突退出，不覆盖旧账号。此操作不是生产迁移。没有真实账号凭据的合成测试不得使用该选项指向真实 vault。
+
+## 失败和恢复
+
+客户端未运行、调试关闭、未登录、账号不同、版本不支持、超时、繁忙及上游拒绝均有独立错误码，控制台给出具体提示。升级客户端使 bundle 摘要变化时，桥接明确不可用；需重新核验官方 SDK 契约并更新适配摘要。摘要表是客户端适配版本守卫，不是模型表。
+
+该绑定只允许目录接口。签到、任务、活动、认证与消息接口返回未支持，不回落到旧 HTTP 配置；已有普通 profile 账号维持原接口。不能将目录成功解释为双登录、奖励或推理成功。
+
+## 验证
+
+在 `gateway` 目录运行 `go test ./internal/providers/doubao ./internal/providercatalog -count=1`。在 `tools/doubao-runtime` 目录运行 `python -m unittest -v test_bridge`；仓库根运行 `node tools/doubao-runtime/runtime.test.cjs`。合成测试覆盖进程终止、输出预算、同账号绑定、版本漂移、错误脱敏、CDP 主机限制、实际 WebSocket 通道和渲染器投影。
+
+真实只读检查与合成测试分别记录。Windows/Android/Linux 发行包、远程客户端桥接、双登录、初始消息/SSE传输和全部任务链仍待完成。

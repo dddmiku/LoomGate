@@ -22,6 +22,7 @@ type Session struct {
 	Headers  http.Header
 	BotID    string
 	Revision string
+	Runtime  *RuntimeBinding
 }
 
 func (Session) String() string   { return "doubao.Session[redacted]" }
@@ -35,6 +36,7 @@ type Client struct {
 	http     *http.Client
 	mu       sync.Mutex
 	cache    map[string]*catalogCache
+	runtime  CatalogRuntime
 }
 type APIError struct {
 	HTTPStatus int
@@ -62,6 +64,15 @@ func (c *Client) call(ctx context.Context, account, path string, body any) (json
 	return c.callSession(ctx, s, path, body)
 }
 func (c *Client) callSession(ctx context.Context, s Session, path string, body any) (json.RawMessage, error) {
+	if s.Runtime != nil {
+		if path != catalogPath {
+			return nil, &APIError{Kind: "desktop_operation_unsupported"}
+		}
+		if c.runtime == nil {
+			return nil, &APIError{Kind: "desktop_unavailable"}
+		}
+		return c.runtime.Catalog(ctx, *s.Runtime, s.BotID)
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, &APIError{Kind: "invalid_request"}

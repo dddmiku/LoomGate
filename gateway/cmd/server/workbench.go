@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/authflow"
@@ -88,6 +89,18 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 // The isolated reconstruction runtime mounts this service while the legacy
 // scheduler is stopped. Production remains on the released legacy runtime.
 func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
+	var desktop doubao.CatalogRuntime
+	if python, helper, port := os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PYTHON"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_HELPER"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PORT"); python != "" || helper != "" || port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil {
+			return nil, nil, errors.New("desktop_configuration_invalid")
+		}
+		bridge, err := doubao.NewDesktopRuntime(python, helper, portNumber)
+		if err != nil {
+			return nil, nil, err
+		}
+		desktop = bridge
+	}
 	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json")})
 	if err != nil {
 		return nil, nil, err
@@ -112,7 +125,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		e.Close()
 		return nil, nil, err
 	}
-	client := doubao.New(doubao.VaultSessions{Vault: vault}, nil)
+	client := doubao.NewWithRuntime(doubao.VaultSessions{Vault: vault}, desktop)
 	if err = e.Register("doubao", &taskproviders.Doubao{Vault: vault, Client: client}); err != nil {
 		e.Close()
 		vault.Close()

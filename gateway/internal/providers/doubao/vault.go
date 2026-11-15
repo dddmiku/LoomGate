@@ -13,9 +13,10 @@ import (
 // StoredProfile is serialized only immediately before encryption or after
 // decryption. HTTP response types never embed this private representation.
 type StoredProfile struct {
-	Query   url.Values  `json:"query"`
-	Headers http.Header `json:"headers"`
-	BotID   string      `json:"bot_id"`
+	Query   url.Values      `json:"query"`
+	Headers http.Header     `json:"headers"`
+	BotID   string          `json:"bot_id"`
+	Runtime *RuntimeBinding `json:"runtime,omitempty"`
 }
 
 func (StoredProfile) String() string   { return "doubao.StoredProfile[redacted]" }
@@ -43,5 +44,5 @@ func (v VaultSessions) Session(ctx context.Context, id string) (Session, error) 
 	if json.Unmarshal(plain, &p) != nil {
 		return Session{}, errors.New("doubao_session_invalid")
 	}
-	return Session{Query: p.Query, Headers: p.Headers, BotID: p.BotID, Revision: fmt.Sprint(account.Revision)}, nil
+	return Session{Query: p.Query, Headers: p.Headers, BotID: p.BotID, Runtime: p.Runtime, Revision: fmt.Sprint(account.Revision)}, nil
 }

@@ -14,7 +14,9 @@ def main():
   def api(path):return page.request.get(base+'/admin/api/'+path).json()
   def stats():return page.request.get(base+'/__fixture/task-stats').json()
   def done(x):report['actions'].append(x)
-  def nav(route):page.locator('#navigation a[href="#'+route+'"]').click()
+  def nav(route):
+   if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
+   page.locator('#navigation a[href="#'+route+'"]').click()
   def submit(status):
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:
     page.locator('#run-form button[type=submit]').click()

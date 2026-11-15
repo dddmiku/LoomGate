@@ -1,6 +1,8 @@
 # 新控制台验收
 
-新 UI 位于 `gateway/panel/console/`，以独立 HTML、CSS 和 JavaScript 实现。顶部导航分为连接、自动化和管理；主题、筛选、表格、卡片、状态及弹窗均为新组件。业务数据复用管理 API。
+新 UI 位于 `gateway/panel/console/`，以独立 HTML、CSS 和 JavaScript 实现，不参考旧 UI。左侧按工作区、资源连接、任务运行和运行管理分组；桌面使用常驻侧栏，窄屏使用可收起的左侧抽屉。顶部显示当前页面，主工作区按业务使用列表、表格和表单。
+
+模型目录采用横向能力对照列表；手机默认显示服务与搜索，账号/能力筛选可展开，正常账号详情默认收起。长表单标题和关闭按钮固定，内容区独立滚动，操作按钮保持可达。明暗主题共享语义颜色，主按钮悬停态也检查对比度。
 
 ## 开发入口
 
@@ -36,11 +38,14 @@ D:/LoomGate-work/build/catalog-fixture.exe -root D:/LoomGate-work/private/catalo
 
 ```powershell
 python tests/console_browser.py --runtime D:/LoomGate-work/private/catalog-fixture --output D:/LoomGate-work/evidence/phase02 --fixture D:/LoomGate-work/build/catalog-fixture.exe
+python tests/console_layout.py --runtime D:/LoomGate-work/private/catalog-fixture --output D:/LoomGate-work/evidence/phase06/layout
 ```
 
 浏览器测试从该合成环境的本地文件读取管理凭据，测试中不打印凭据。它会创建、编辑、启停和删除合成计划，执行/取消合成任务，并实际停止和重启该 fixture 进程以核对持久化。不可指向真实账号目录。生成的截图与报告保留在指定输出目录。
 
 报告区分页面异常、预期故障 HTTP 诊断及外网请求。外网请求必须为零。浏览器测试失败后先读取报告的 `failed_stage`；不会盲目重放真实操作。
+
+布局测试覆盖 1440、1024、768、390、320 五档宽度的十个页面、抽屉导航、筛选展开、长表单及明暗主题主按钮对比度；测试截图必须实际查看。合成数据检查与官方客户端实时目录验收分别留存，不混作真实登录或任务奖励证据。
 
 ## 回退边界
 

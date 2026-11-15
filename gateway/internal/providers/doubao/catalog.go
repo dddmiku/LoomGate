@@ -203,7 +203,7 @@ func (c *Client) Catalog(ctx context.Context, account string, force bool) (Catal
 		}
 		entry.loading = make(chan struct{})
 		c.mu.Unlock()
-		data, fetchErr := c.callSession(ctx, session, "/alice/slot/action_bar_v3/brief_list", map[string]any{"bot_id": session.BotID, "language_code": "zh"})
+		data, fetchErr := c.callSession(ctx, session, catalogPath, map[string]any{"bot_id": session.BotID, "language_code": "zh"})
 		var models []Model
 		if fetchErr == nil {
 			models, fetchErr = ParseCatalog(data)
@@ -217,6 +217,10 @@ func (c *Client) Catalog(ctx context.Context, account string, force bool) (Catal
 			entry.lastErr = nil
 			entry.retryAt = time.Time{}
 		} else {
+			var apiErr *APIError
+			if errors.As(fetchErr, &apiErr) && (apiErr.Kind == "desktop_identity_mismatch" || apiErr.Kind == "desktop_login_required" || apiErr.Kind == "desktop_binding_invalid") {
+				entry.snapshot = Catalog{}
+			}
 			entry.lastErr = fetchErr
 			entry.retryAt = time.Now().Add(15 * time.Second)
 		}

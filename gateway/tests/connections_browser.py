@@ -23,6 +23,7 @@ def main():
         def accounts():return api('workbench/accounts')['accounts']
         def shot(name):page.screenshot(path=str(out/name),full_page=False,animations='disabled',mask=[page.locator('input[type=password]')],mask_color='#e3e8e3');report['screenshots'].append(name)
         def nav():
+            if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
             page.locator('#navigation a[href="#accounts"]').click();page.locator('#account-provider').wait_for();page.locator('#account-provider').select_option('doubao');page.locator('#account-list .loading').wait_for(state='detached');page.locator('[data-action=connect-account]').wait_for()
         def begin(method):
             page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('doubao');page.locator('#connection-method').select_option(method);page.locator('#connection-begin').click()

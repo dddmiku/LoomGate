@@ -43,8 +43,10 @@ def main():
         assert 'mutations' in stats and 'calls' in stats
         page.request.post(base+'/__fixture/mode/success')
         def nav(route):
+            if not page.locator('#navigation').is_visible():
+                page.locator('#navigation-toggle').click()
             page.locator('#navigation a[href="#'+route+'"]').click()
-            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','schedules':'计划','runs':'执行记录','usage':'用量','logs':'请求记录','settings':'设置'}[route]).wait_for()
+            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','schedules':'计划','runs':'执行记录','usage':'用量','logs':'请求记录','settings':'设置'}[route]).wait_for(state='attached')
         def shot(name):
             if page.locator('#toast').count() and page.locator('#toast').is_visible():
                 page.locator('#toast').wait_for(state='hidden',timeout=7000)

@@ -20,6 +20,20 @@ type accountList struct {
 	err  error
 }
 
+func TestDesktopErrorsRemainActionableWithoutRawDetails(t *testing.T) {
+	for _, code := range []string{"desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected"} {
+		t.Run(code, func(t *testing.T) {
+			s := New(Options{Accounts: accountList{rows: []accountvault.Account{acct("synthetic", true)}}, Doubao: fetchFunc(func(context.Context, string, bool) (doubao.Catalog, error) {
+				return doubao.Catalog{}, &doubao.APIError{Kind: code}
+			})})
+			p := decodePage(t, request(t, s, "/workbench/models"))
+			if len(p.Catalogs) != 1 || p.Catalogs[0].ErrorCode != code || p.Catalogs[0].Status != "unavailable" {
+				t.Fatal("desktop failure became a generic or successful result")
+			}
+		})
+	}
+}
+
 func (a accountList) List() ([]accountvault.Account, error) { return a.rows, a.err }
 
 type fetchFunc func(context.Context, string, bool) (doubao.Catalog, error)

@@ -323,8 +323,11 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 			row.ErrorCode = "catalog_timeout"
 		}
 		var apiErr *doubao.APIError
-		if errors.As(err, &apiErr) && apiErr.Kind == "login_required" {
-			row.ErrorCode = "login_required"
+		if errors.As(err, &apiErr) {
+			switch apiErr.Kind {
+			case "login_required", "desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected":
+				row.ErrorCode = apiErr.Kind
+			}
 		}
 		if len(row.Models) > 0 {
 			row.Status = "stale"
