@@ -68,6 +68,8 @@ python -X utf8 -m unittest discover -s tools/buildtests -p 'test_*.py'
 
 Phase 04 已观察官方 UI 成功生成 QR（未扫码），识别出认证主机与 SDK 参数差异；生产实时签名尚未接通。新增流协议模块通过合成 HTTP 与既有抓包离线验证，仍未开放豆包推理路由，见 [协议状态](docs/doubao-stream.md)。
 
+Phase 05 将 WorkBuddy/Trae 已接入任务拆为模块，新增独立余额刷新与部分发现失败隔离；国际版只查余额，不发签到。全量旧任务迁移仍未完成，见 [任务模块及迁移范围](docs/task-modules.md)。
+
 ## 迁移与构建
 
 先阅读 [迁移与回滚](docs/migration.md)。真实数据必须在离线副本演练通过后再安排切换。Android 保留 `com.workbuddy2api.app` 和原签名；不能卸载后重装，也不能改用 CI 新生成的签名证书。

@@ -1,0 +1,14 @@
+{
+  "checkin": {
+    "key": "checkin", "name": "每日签到", "description": "检查官方签到状态，执行后再次读取服务端状态。",
+    "once_per_day": true, "side_effect": true, "stages": ["inspect", "execute", "verify"]
+  },
+  "balance": {
+    "key": "balance", "name": "余额刷新", "description": "只读查询积分与到期分桶，更新网关账号池；不签到、不生成内容。",
+    "side_effect": false, "idempotent": true, "stages": ["inspect"]
+  },
+  "growth": {
+    "name": "成长任务", "description": "任务标识和奖励来自官方目录；未达标需要在官方客户端完成实际工作。",
+    "side_effect": true, "stages": ["inspect", "claim", "verify"]
+  }
+}

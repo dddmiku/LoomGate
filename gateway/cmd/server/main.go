@@ -255,7 +255,7 @@ func main() {
 	var workbenchHandler http.Handler
 	var taskController server.TaskController = sch
 	if os.Getenv("LOOMGATE_REBUILD") == "1" {
-		workbench, workbenchHandler, err = openWorkbench(stateDirOf(cfg.StateFile), p, up)
+		workbench, workbenchHandler, err = openWorkbench(stateDirOf(cfg.StateFile), p, up, cfg.ExpiringSoonDur)
 		if err != nil {
 			log.Fatalf("open task engine: %v", err)
 		}

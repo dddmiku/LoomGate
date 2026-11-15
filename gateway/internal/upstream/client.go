@@ -2012,10 +2012,13 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 // billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
 // （global：/billing/meter/* → /v2/billing/meter/*；cn：单路径 /v2/billing/meter/* 现状）。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	return c.billingMeterJSONContext(context.Background(), a, paths, method, body)
+}
+func (c *Client) billingMeterJSONContext(ctx context.Context, a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
 	a = a.Snapshot()
 	var lastErr error
 	for i, p := range paths {
-		data, err := c.billingJSON(a, method, p, body)
+		data, err := c.billingJSONContext(ctx, a, method, p, body)
 		if err != nil {
 			lastErr = err
 			var ue *Error
@@ -2074,6 +2077,15 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // 到期时间解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
 // 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
+	return c.userResourceDetailed(context.Background(), a, soon, false)
+}
+
+// UserResourceDetailedContext preserves cancellation and rejects absent account
+// arrays rather than silently overwriting a live pool balance with zero.
+func (c *Client) UserResourceDetailedContext(ctx context.Context, a *auth.Auth, soon time.Duration) (int64, CreditBuckets, error) {
+	return c.userResourceDetailed(ctx, a, soon, true)
+}
+func (c *Client) userResourceDetailed(ctx context.Context, a *auth.Auth, soon time.Duration, strict bool) (remain int64, buckets CreditBuckets, err error) {
 	a = a.Snapshot()
 	now := time.Now()
 	body := map[string]any{
@@ -2084,7 +2096,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	data, err := c.billingMeterJSONContext(ctx, a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
 		return 0, CreditBuckets{}, err
 	}
@@ -2110,6 +2122,9 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, CreditBuckets{}, fmt.Errorf("resource parse: %w", err)
+	}
+	if strict && resp.Response.Data.Accounts == nil {
+		return 0, CreditBuckets{}, errors.New("resource_accounts_missing")
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		var r int64

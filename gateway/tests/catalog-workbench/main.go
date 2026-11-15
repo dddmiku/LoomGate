@@ -25,6 +25,7 @@ import (
 	"workbuddy2api/internal/requestlog"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/taskengine"
+	"workbuddy2api/internal/taskproviders"
 	"workbuddy2api/internal/usage"
 )
 
@@ -36,6 +37,7 @@ type fixtures struct {
 	smsCalls  atomic.Int32
 	qrCalls   atomic.Int32
 	qrPolls   atomic.Int32
+	legacy    *legacyTasksTransport
 }
 
 func (f *fixtures) List() ([]accountvault.Account, error) {
@@ -91,6 +93,7 @@ func (f *fixtures) RoundTrip(r *http.Request) (*http.Response, error) {
 func main() {
 	root := flag.String("root", "", "dedicated synthetic runtime directory")
 	address := flag.String("listen", "127.0.0.1:17863", "loopback address")
+	modules := flag.Bool("task-modules", false, "use real WorkBuddy task modules with synthetic account transport")
 	flag.Parse()
 	host, _, err := net.SplitHostPort(*address)
 	if err != nil || host != "127.0.0.1" || *root == "" {
@@ -134,16 +137,31 @@ func main() {
 		panic("fixture_engine_failed")
 	}
 	defer engine.Close()
+	p := pool.New("")
+	defer p.Close()
+	var workbuddy taskengine.Adapter
+	if *modules {
+		up, err := seedLegacyTaskFixture(*root, p, fixture)
+		if err != nil {
+			panic("fixture_legacy_seed_failed")
+		}
+		workbuddy, err = taskproviders.NewAccounts(p, up, "workbuddy", 48*time.Hour)
+		if err != nil {
+			panic("fixture_modules_failed")
+		}
+	}
 	for _, id := range []string{"workbuddy", "trae", "doubao"} {
-		if err = engine.Register(id, &syntheticTasks{provider: id, fixture: fixture}); err != nil {
+		var adapter taskengine.Adapter = &syntheticTasks{provider: id, fixture: fixture}
+		if id == "workbuddy" && workbuddy != nil {
+			adapter = workbuddy
+		}
+		if err = engine.Register(id, adapter); err != nil {
 			panic("fixture_adapter_failed")
 		}
 	}
 	engineContext, engineCancel := context.WithCancel(context.Background())
 	defer engineCancel()
 	go func() { _ = engine.Run(engineContext) }()
-	p := pool.New("")
-	defer p.Close()
 	ledger, err := usage.Open(filepath.Join(*root, "data", "synthetic-usage.json"), time.Second)
 	if err != nil {
 		panic("fixture_usage_failed")
@@ -207,6 +225,18 @@ func main() {
 	mux.Handle("/admin/", http.StripPrefix("/admin", admin))
 	mux.HandleFunc("GET /__fixture/stats", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"calls": fixture.calls.Load(), "mode": fixture.mode.Load(), "mutations": fixture.mutations.Load(), "sms_calls": fixture.smsCalls.Load(), "qr_calls": fixture.qrCalls.Load(), "qr_polls": fixture.qrPolls.Load()})
+	})
+	mux.HandleFunc("GET /__fixture/task-stats", func(w http.ResponseWriter, r *http.Request) {
+		if fixture.legacy == nil {
+			w.WriteHeader(404)
+			return
+		}
+		data := fixture.legacy.stats()
+		if status, ok := p.Status("1003"); ok {
+			data["global_credits"] = int(status.Credits)
+			data["global_expiring"] = int(status.CreditsExpiring)
+		}
+		json.NewEncoder(w).Encode(data)
 	})
 	mux.HandleFunc("POST /__fixture/mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
 		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6}

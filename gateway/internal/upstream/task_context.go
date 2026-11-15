@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"workbuddy2api/internal/auth"
@@ -15,6 +16,17 @@ func (c *Client) TaskCheckinStatus(ctx context.Context, a *auth.Auth) (*CheckinS
 	}
 	var s CheckinStatus
 	err = json.Unmarshal(data, &s)
+	var fields map[string]json.RawMessage
+	if err == nil {
+		err = json.Unmarshal(data, &fields)
+		var checked *bool
+		if err == nil {
+			err = json.Unmarshal(fields["today_checked_in"], &checked)
+			if err == nil && checked == nil {
+				err = errors.New("checkin_state_missing")
+			}
+		}
+	}
 	return &s, err
 }
 func (c *Client) TaskCheckin(ctx context.Context, a *auth.Auth) error {
@@ -34,6 +46,9 @@ func (c *Client) TaskCatalog(ctx context.Context, a *auth.Auth) ([]GrowthTask, e
 		Tasks []GrowthTask `json:"tasks"`
 	}
 	err = json.Unmarshal(data, &s)
+	if err == nil && s.Tasks == nil {
+		err = errors.New("task_catalog_missing")
+	}
 	return s.Tasks, err
 }
 func (c *Client) TaskClaim(ctx context.Context, a *auth.Auth, key string) error {

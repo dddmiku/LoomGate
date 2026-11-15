@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/pool"
@@ -86,13 +87,22 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 
 // The isolated reconstruction runtime mounts this service while the legacy
 // scheduler is stopped. Production remains on the released legacy runtime.
-func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client) (*workbenchRuntime, http.Handler, error) {
+func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
 	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json")})
 	if err != nil {
 		return nil, nil, err
 	}
 	for _, id := range []string{"workbuddy", "trae"} {
-		if err = e.Register(id, &taskproviders.Accounts{Pool: p, Upstream: up, Provider: id}); err != nil {
+		var soon time.Duration
+		if len(expiring) > 0 {
+			soon = expiring[0]
+		}
+		adapter, adapterErr := taskproviders.NewAccounts(p, up, id, soon)
+		if adapterErr != nil {
+			e.Close()
+			return nil, nil, adapterErr
+		}
+		if err = e.Register(id, adapter); err != nil {
 			e.Close()
 			return nil, nil, err
 		}

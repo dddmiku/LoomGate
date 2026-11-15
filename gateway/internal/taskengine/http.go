@@ -40,12 +40,12 @@ func (e *Engine) Handler() http.Handler {
 		if s := r.URL.Query().Get("accounts"); s != "" {
 			ids = strings.Split(s, ",")
 		}
-		out, err := e.Catalog(r.Context(), r.URL.Query().Get("provider"), Scope{AccountIDs: ids})
+		out, err := e.CatalogDetails(r.Context(), r.URL.Query().Get("provider"), Scope{AccountIDs: ids}, r.URL.Query().Get("task"))
 		if err != nil {
 			respond(w, 502, map[string]any{"error": "catalog_unavailable"})
 			return
 		}
-		respond(w, 200, map[string]any{"tasks": out})
+		respond(w, 200, out)
 	})
 	mux.HandleFunc("POST /workbench/run", func(w http.ResponseWriter, r *http.Request) {
 		var req Request

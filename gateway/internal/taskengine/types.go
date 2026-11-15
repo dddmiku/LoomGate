@@ -90,6 +90,23 @@ type Adapter interface {
 	Verify(context.Context, Task) (Observation, error)
 }
 
+type DiscoveryIssue struct {
+	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id"`
+	ModuleID   string `json:"module_id"`
+	ErrorCode  string `json:"error_code"`
+}
+type Catalog struct {
+	Tasks  []Task           `json:"tasks"`
+	Issues []DiscoveryIssue `json:"issues"`
+}
+
+// CatalogAdapter can isolate account/module failures and discover only the
+// requested task family. The scheduler still knows no provider task names.
+type CatalogAdapter interface {
+	DiscoverCatalog(context.Context, Scope, string) (Catalog, error)
+}
+
 type Schedule struct {
 	ID             string     `json:"id"`
 	TaskKey        string     `json:"task_key"`
@@ -116,21 +133,22 @@ type Step struct {
 	ErrorCode  string     `json:"error_code,omitempty"`
 }
 type Run struct {
-	ID         string     `json:"id"`
-	TaskKey    string     `json:"task_key"`
-	ProviderID string     `json:"provider_id"`
-	ScheduleID string     `json:"schedule_id,omitempty"`
-	Trigger    string     `json:"trigger"`
-	Status     Status     `json:"status"`
-	Stage      Stage      `json:"stage,omitempty"`
-	StartedAt  time.Time  `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-	AccountIDs []string   `json:"account_ids"`
-	Summary    string     `json:"summary,omitempty"`
-	ErrorCode  string     `json:"error_code,omitempty"`
-	Steps      []Step     `json:"steps"`
-	SideEffect bool       `json:"side_effect"`
-	Idempotent bool       `json:"idempotent"`
+	DiscoveryIssues []DiscoveryIssue `json:"discovery_issues,omitempty"`
+	ID              string           `json:"id"`
+	TaskKey         string           `json:"task_key"`
+	ProviderID      string           `json:"provider_id"`
+	ScheduleID      string           `json:"schedule_id,omitempty"`
+	Trigger         string           `json:"trigger"`
+	Status          Status           `json:"status"`
+	Stage           Stage            `json:"stage,omitempty"`
+	StartedAt       time.Time        `json:"started_at"`
+	FinishedAt      *time.Time       `json:"finished_at,omitempty"`
+	AccountIDs      []string         `json:"account_ids"`
+	Summary         string           `json:"summary,omitempty"`
+	ErrorCode       string           `json:"error_code,omitempty"`
+	Steps           []Step           `json:"steps"`
+	SideEffect      bool             `json:"side_effect"`
+	Idempotent      bool             `json:"idempotent"`
 }
 type Query struct {
 	TaskKey, ProviderID string

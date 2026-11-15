@@ -132,36 +132,49 @@ func safeDiscover(ctx context.Context, a Adapter, s Scope) (tasks []Task, err er
 // Catalog is always resolved from the registered provider. No captured task IDs
 // or model names are compiled into the scheduler.
 func (e *Engine) Catalog(ctx context.Context, provider string, scope Scope) ([]Task, error) {
+	catalog, err := e.CatalogDetails(ctx, provider, scope, "")
+	if err == nil && len(catalog.Issues) > 0 {
+		return catalog.Tasks, errors.New("partial_discovery_failed")
+	}
+	return catalog.Tasks, err
+}
+func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scope, key string) (Catalog, error) {
 	e.mu.Lock()
 	a := e.adapters[provider]
 	closed := e.closed
 	e.mu.Unlock()
 	if closed || a == nil {
-		return nil, ErrNotFound
+		return Catalog{}, ErrNotFound
 	}
 	ctx, cancel := context.WithTimeout(ctx, e.opts.Timeout)
 	defer cancel()
-	tasks, err := safeDiscover(ctx, a, scope)
+	catalog, err := discoverDetails(ctx, a, scope, key)
+	tasks := catalog.Tasks
 	if err != nil {
-		return nil, errors.New("discovery_failed")
+		return Catalog{}, errors.New("discovery_failed")
 	}
-	if len(tasks) > 1000 {
-		return nil, errors.New("catalog_limit_exceeded")
+	if len(tasks) > 1000 || len(catalog.Issues) > 1000 {
+		return Catalog{}, errors.New("catalog_limit_exceeded")
+	}
+	for _, issue := range catalog.Issues {
+		if issue.ProviderID != provider || !IDPattern.MatchString(issue.AccountID) || !IDPattern.MatchString(issue.ModuleID) || issue.ErrorCode != "module_discovery_failed" || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, issue.AccountID) {
+			return Catalog{}, errors.New("invalid_discovery_issue")
+		}
 	}
 	seen := map[string]bool{}
 	out := []Task{}
 	for _, t := range tasks {
 		if t.ProviderID != provider || t.Key == "" || len(t.Key) > 512 || !IDPattern.MatchString(t.AccountID) {
-			return nil, errors.New("invalid_catalog")
+			return Catalog{}, errors.New("invalid_catalog")
 		}
 		if len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, t.AccountID) {
-			return nil, errors.New("account_scope_violation")
+			return Catalog{}, errors.New("account_scope_violation")
 		}
 		if t.Once && t.OncePerDay {
-			return nil, errors.New("invalid_recurrence")
+			return Catalog{}, errors.New("invalid_recurrence")
 		}
 		if t.OncePerDay && t.PeriodKey == "" {
-			return nil, errors.New("business_period_missing")
+			return Catalog{}, errors.New("business_period_missing")
 		}
 		key := taskKey(t)
 		if seen[key] {
@@ -170,7 +183,22 @@ func (e *Engine) Catalog(ctx context.Context, provider string, scope Scope) ([]T
 		seen[key] = true
 		out = append(out, t)
 	}
-	return out, nil
+	if catalog.Issues == nil {
+		catalog.Issues = []DiscoveryIssue{}
+	}
+	return Catalog{Tasks: out, Issues: catalog.Issues}, nil
+}
+func discoverDetails(ctx context.Context, a Adapter, s Scope, key string) (out Catalog, err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("adapter_panic")
+		}
+	}()
+	if detailed, ok := a.(CatalogAdapter); ok {
+		return detailed.DiscoverCatalog(ctx, s, key)
+	}
+	tasks, err := safeDiscover(ctx, a, s)
+	return Catalog{Tasks: tasks, Issues: []DiscoveryIssue{}}, err
 }
 func contains(xs []string, s string) bool {
 	for _, x := range xs {
@@ -302,7 +330,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 		code = "storage_failed"
 		return
 	}
-	tasks, err := e.Catalog(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs})
+	catalog, err := e.CatalogDetails(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs}, r.TaskKey)
 	if err != nil {
 		code = "discovery_failed"
 		return
@@ -312,7 +340,15 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 	e.mu.Unlock()
 	selected := 0
 	status = StatusSucceeded
-	for _, t := range tasks {
+	if len(catalog.Issues) > 0 {
+		status = StatusFailed
+		code = "partial_discovery_failed"
+		if err := e.updateRun(r.ID, func(x *Run) { x.DiscoveryIssues = catalog.Issues }); err != nil {
+			code = "storage_failed"
+			return
+		}
+	}
+	for _, t := range catalog.Tasks {
 		if r.TaskKey != "" && r.TaskKey != "*" && r.TaskKey != t.Key {
 			continue
 		}
@@ -350,7 +386,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 			return
 		}
 	}
-	if selected == 0 {
+	if selected == 0 && len(catalog.Issues) == 0 {
 		status = StatusSkipped
 		code = "no_matching_tasks"
 	}
