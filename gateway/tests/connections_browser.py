@@ -3,6 +3,7 @@ import argparse,json,subprocess,sys,time,traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
+from console_actions import sidebar_action
 parser=argparse.ArgumentParser()
 parser.add_argument('--runtime',required=True);parser.add_argument('--output',required=True);parser.add_argument('--fixture',required=True)
 args=parser.parse_args();root=Path(args.runtime).resolve();out=Path(args.output).resolve();binary=Path(args.fixture).resolve()
@@ -88,7 +89,7 @@ def main():
         stage='mobile';page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');shot('connection-mobile.png');page.locator('#connection-cancel').click();page.locator('#connection-done').click();done('mobile_auth_forms_and_dialog')
         stage='permissions';assert page.request.post(base+'/admin/api/connections/start',data={'provider':'trae','method':'browser'}).status==403
         assert page.request.post(base+'/admin/api/connections/start',data={'provider':'trae','method':'browser'},headers={'Origin':'https://foreign.invalid','X-Admin-Request':'1'}).status==403
-        page.locator('#logout').click();page.locator('#login-submit').wait_for();assert page.request.get(base+'/admin/api/connections/flows').status==401;done('authentication_management_permission_boundary')
+        sidebar_action(page,'#logout',close=False);page.locator('#login-submit').wait_for();assert page.request.get(base+'/admin/api/connections/flows').status==401;done('authentication_management_permission_boundary')
         expected=['status of 409','status of 401','status of 403']
         report['unexpected_console_errors']=[x for x in report['console_errors'] if not any(t in x for t in expected)]
         assert not report['page_errors'] and not report['unexpected_console_errors'] and not report['external_requests']

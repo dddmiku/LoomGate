@@ -49,13 +49,15 @@ def main():
    if width<=900:
     page.locator('#navigation-toggle').click();links=page.locator('#navigation a')
     assert links.count()==10
-    sidebar=page.locator('#navigation').bounding_box()
+    sidebar=page.locator('#sidebar').bounding_box()
     assert sidebar['x']==0 and sidebar['height']>=page.viewport_size['height']-sidebar['y']-1
     for link in links.all():
      b=link.bounding_box();assert b and b['x']>=0 and b['x']+b['width']<=width+1 and b['height']>=35
     bounds()
     if width==390:page.screenshot(path=str(out/'layout-mobile-navigation.png'),full_page=False);report['screenshots'].append('layout-mobile-navigation.png')
     page.keyboard.press('Escape');assert not page.locator('#navigation').is_visible()
+    assert page.locator('#navigation-toggle').evaluate('(e)=>document.activeElement===e')
+    assert not page.locator('#main').evaluate('(e)=>e.inert')
    nav('models')
    if width<=700:
     assert not page.locator('#model-account').is_visible()
@@ -70,6 +72,45 @@ def main():
    if width==390:page.screenshot(path=str(out/'layout-mobile-plan-dialog.png'),full_page=False);report['screenshots'].append('layout-mobile-plan-dialog.png')
    page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
   report['actions'].append('all_pages_5_widths_navigation_filters_and_dialogs')
+  # The drawer owns keyboard focus, survives short viewports, and never leaves
+  # the content inert after a route change or desktop/mobile resize.
+  stage='drawer-accessibility';page.set_viewport_size({'width':390,'height':568})
+  page.locator('#navigation-toggle').click()
+  assert page.locator('#sidebar').get_attribute('aria-modal')=='true'
+  assert page.locator('.masthead').evaluate('(e)=>e.inert')
+  page.locator('#sidebar .brand').focus();page.keyboard.press('Shift+Tab')
+  assert page.locator('#logout').evaluate('(e)=>document.activeElement===e')
+  page.keyboard.press('Tab');assert page.locator('#sidebar .brand').evaluate('(e)=>document.activeElement===e')
+  for _ in range(20):
+   page.keyboard.press('Tab')
+   assert page.locator('#sidebar').evaluate('(e)=>e.contains(document.activeElement)')
+  page.locator('#navigation a[href="#settings"]').click()
+  assert not page.locator('#navigation').is_visible()
+  assert not page.locator('#main').evaluate('(e)=>e.inert')
+  page.locator('#navigation-toggle').click();page.locator('#theme').click()
+  assert page.locator('html').get_attribute('data-theme')=='dark'
+  assert page.locator('#theme-label').inner_text()=='浅色模式'
+  page.locator('#theme').click();page.locator('#navigation-close').click()
+  assert page.locator('#navigation-toggle').evaluate('(e)=>document.activeElement===e')
+  page.locator('#navigation-toggle').click();page.mouse.click(370,200)
+  assert not page.locator('#navigation').is_visible()
+  page.locator('#navigation-toggle').click();page.locator('#navigation-close').focus()
+  page.set_viewport_size({'width':1024,'height':768})
+  page.wait_for_function('!document.querySelector("main").inert')
+  assert page.locator('#sidebar').get_attribute('aria-modal') is None
+  assert page.locator('#navigation a[aria-current=page]').evaluate('(e)=>document.activeElement===e')
+  page.set_viewport_size({'width':390,'height':568})
+  page.wait_for_function('document.activeElement===document.querySelector("#navigation-toggle")')
+  page.locator('#navigation-toggle').click();page.keyboard.press('Escape')
+  report['actions'].append('drawer_focus_theme_close_backdrop_and_breakpoint_recovery')
+  stage='desktop-short-height';page.set_viewport_size({'width':1280,'height':600})
+  nav('models');page.locator('#navigation a[href="#settings"]').scroll_into_view_if_needed()
+  nav('accounts');page.evaluate('window.scrollTo(0,document.documentElement.scrollHeight)')
+  assert page.locator('#sidebar').bounding_box()['y']==0
+  assert page.locator('#theme').bounding_box()['y']>=0
+  page.locator('#navigation a[href="#tasks"]').click()
+  page.locator('#task-list.loading').wait_for(state='detached')
+  bounds();report['actions'].append('desktop_sidebar_independent_scroll_and_bottom_controls')
   stage='dark-contrast';page.set_viewport_size({'width':1440,'height':1000});nav('schedules')
   def luminance(color):
    values=[int(x) / 255 for x in color[color.index('(')+1:color.index(')')].split(',')[:3]]

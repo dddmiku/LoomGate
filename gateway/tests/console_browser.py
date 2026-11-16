@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from run_wait import wait_run
-from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review
+from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review, sidebar_action
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--runtime', required=True)
@@ -250,15 +250,15 @@ def main():
                 reveal_filter(page,'#model-account');assert page.locator('#model-account').bounding_box()['width']>=240;page.locator('#model-refine summary').click()
         done('ten_mobile_routes_and_usable_filter_widths')
         stage='dark-and-settings'
-        page.locator('#theme').click();assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')
+        sidebar_action(page,'#theme');assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')
         page.locator('[data-action=password]').click();page.locator('#password-form').wait_for();page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
-        page.locator('#theme').click();done('theme_persistence_settings_and_keyboard_dialog')
+        sidebar_action(page,'#theme');done('theme_persistence_settings_and_keyboard_dialog')
         stage='delete'
         nav('schedules');row=page.locator('[data-schedule-id="'+sid+'"]');row.locator('[data-action=delete-schedule]').click()
         page.locator('#delete-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
         assert not any(x['id']==sid for x in work()['schedules']);done('schedule_delete_readback')
         stage='logout'
-        page.locator('#logout').click();page.locator('#login-submit').wait_for()
+        sidebar_action(page,'#logout',close=False);page.locator('#login-submit').wait_for()
         assert page.request.get(base+'/admin/api/workbench').status==401
         done('logout_revokes_api_session')
         allowed=['net::ERR_INTERNET_DISCONNECTED','Failed to fetch','status of 503','status of 401']

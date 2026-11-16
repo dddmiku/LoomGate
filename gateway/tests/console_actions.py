@@ -10,6 +10,14 @@ def reveal_filter(page, selector):
     control.wait_for(state='visible')
 
 
+def sidebar_action(page, selector, close=True):
+    if not page.locator(selector).is_visible():
+        page.locator('#navigation-toggle').click()
+    page.locator(selector).click()
+    if close and page.locator('#sidebar').get_attribute('aria-modal') == 'true':
+        page.locator('#navigation-close').click()
+
+
 def select_task(page, key, action=None, first=False):
     row = page.locator('[data-task="' + key + '"]')
     if first:
