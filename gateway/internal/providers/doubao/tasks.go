@@ -54,10 +54,11 @@ func (c *Client) Checkin(ctx context.Context, account, group string) error {
 }
 
 type Activity struct {
-	Group       string `json:"group"`
-	Tasks       []Task `json:"tasks"`
-	Milestones  []Task `json:"milestones"`
-	TotalAmount int64  `json:"total_amount"`
+	Group           string `json:"group"`
+	Tasks           []Task `json:"tasks"`
+	Milestones      []Task `json:"milestones"`
+	TotalAmount     int64  `json:"total_amount"`
+	OperationStatus string `json:"operation_status,omitempty"`
 }
 
 func (c *Client) Activities(ctx context.Context, account string) (Activity, error) {
@@ -67,6 +68,13 @@ func (c *Client) Activities(ctx context.Context, account string) (Activity, erro
 			return Activity{}, canceled
 		}
 		return Activity{}, &APIError{Kind: "login_required"}
+	}
+	if session.Runtime != nil {
+		runtime, ok := c.runtime.(ActivityRuntime)
+		if !ok {
+			return Activity{}, &APIError{Kind: "desktop_activity_unavailable"}
+		}
+		return runtime.Activities(ctx, *session.Runtime)
 	}
 	basic, err := c.callSession(ctx, session, "/alice/basic/launch", map[string]any{})
 	if err != nil {

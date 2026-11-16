@@ -186,6 +186,11 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 	if catalog.Issues == nil {
 		catalog.Issues = []DiscoveryIssue{}
 	}
+	e.mu.Lock()
+	for i := range out {
+		_, out[i].PendingVerification = e.state.Uncertain[taskKey(out[i])]
+	}
+	e.mu.Unlock()
 	return Catalog{Tasks: out, Issues: catalog.Issues}, nil
 }
 func discoverDetails(ctx context.Context, a Adapter, s Scope, key string) (out Catalog, err error) {
@@ -404,14 +409,27 @@ func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, 
 	end := time.Now().UTC()
 	status := StatusSucceeded
 	code := ""
+	var upstreamCode *int
 	if err != nil {
 		status = StatusFailed
 		code = "upstream_failed"
+		var classified interface{ TaskFailure() (string, *int) }
+		if errors.As(err, &classified) {
+			candidate, number := classified.TaskFailure()
+			switch candidate {
+			case "provider_rejected", "operation_unconfirmed", "account_identity_changed", "authentication_required", "task_expired", "operation_not_eligible", "provider_busy":
+				code = candidate
+				if number != nil {
+					value := *number
+					upstreamCode = &value
+				}
+			}
+		}
 	}
 	// Provider errors and arbitrary response summaries are deliberately never persisted.
 	serr := e.updateRun(id, func(r *Run) {
 		r.Stage = stage
-		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, ErrorCode: code})
+		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, ErrorCode: code, UpstreamCode: upstreamCode})
 		if len(r.Steps) > 2000 {
 			r.Steps = r.Steps[len(r.Steps)-2000:]
 		}

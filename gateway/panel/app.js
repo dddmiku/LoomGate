@@ -395,7 +395,7 @@ function go(v){
   });
   $('#pgTitle').textContent = PAGE[v].t;
   $('#pgDesc').textContent = PAGE[v].d;
-  document.title = PAGE[v].t + ' · LoomGate 织枢';
+  document.title = PAGE[v].t + ' · LoomGate';
   try { localStorage.setItem('loomgate-view', v); } catch(e){}
   history.replaceState(null, '', '#' + v);
   if (typeof loomRoute === 'function') loomRoute(v);

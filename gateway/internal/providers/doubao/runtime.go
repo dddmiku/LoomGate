@@ -69,6 +69,9 @@ type runtimeRequest struct {
 	Lease     string          `json:"lease,omitempty"`
 	TaskID    string          `json:"task_id,omitempty"`
 	Scene     json.RawMessage `json:"scene,omitempty"`
+	Group     string          `json:"group,omitempty"`
+	Task      string          `json:"task,omitempty"`
+	Instance  string          `json:"instance,omitempty"`
 }
 type runtimeReply struct {
 	OK       bool            `json:"ok"`
@@ -76,6 +79,7 @@ type runtimeReply struct {
 	Identity string          `json:"identity,omitempty"`
 	Data     json.RawMessage `json:"data,omitempty"`
 	Signed   bool            `json:"signed,omitempty"`
+	Code     int             `json:"code,omitempty"`
 }
 
 var identityDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -123,7 +127,7 @@ func (r *CommandRuntime) PrepareCompletion(ctx context.Context, b RuntimeBinding
 // child stderr and process arguments are never included in errors or logs.
 func runtimeError(code string) error {
 	switch code {
-	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected", "desktop_binding_invalid", "desktop_cleanup_uncertain", "desktop_ownership_lost", "composer_not_empty", "desktop_model_unavailable", "desktop_native_tools_unsupported", "desktop_origin_rejected", "desktop_submission_uncertain", "desktop_response_rejected", "desktop_canceled", "desktop_stream_limit", "desktop_stream_interrupted":
+	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected", "desktop_binding_invalid", "desktop_cleanup_uncertain", "desktop_ownership_lost", "composer_not_empty", "desktop_model_unavailable", "desktop_native_tools_unsupported", "desktop_origin_rejected", "desktop_submission_uncertain", "desktop_response_rejected", "desktop_canceled", "desktop_stream_limit", "desktop_stream_interrupted", "desktop_activity_unavailable", "desktop_activity_failed", "desktop_task_expired", "desktop_task_manual", "desktop_task_not_claimable", "desktop_task_instance_missing", "desktop_checkin_unconfirmed":
 		return &APIError{Kind: code}
 	default:
 		return &APIError{Kind: "desktop_protocol_invalid"}
@@ -143,7 +147,11 @@ func (w *boundedOutput) Write(p []byte) (int, error) {
 	return w.buffer.Write(p)
 }
 func (r *CommandRuntime) run(ctx context.Context, request runtimeRequest) (runtimeReply, error) {
-	ctx, cancel := context.WithTimeout(ctx, 11*time.Second)
+	timeout := 11 * time.Second
+	if request.Operation == "activities" || request.Operation == "task_checkin" || request.Operation == "task_claim" {
+		timeout = 22 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	select {
 	case r.slot <- struct{}{}:
@@ -157,7 +165,9 @@ func (r *CommandRuntime) invoke(ctx context.Context, request runtimeRequest) (ru
 	if ctx.Err() != nil {
 		return runtimeReply{}, ctx.Err()
 	}
-	if request.Operation=="prepare_completion"{return r.invokeProbe(ctx,request)}
+	if request.Operation == "prepare_completion" {
+		return r.invokeProbe(ctx, request)
+	}
 	raw, _ := json.Marshal(request)
 	cmd := exec.CommandContext(ctx, r.command[0], r.command[1:]...)
 	configureDesktopProcess(cmd)
@@ -183,7 +193,11 @@ func (r *CommandRuntime) invoke(ctx context.Context, request runtimeRequest) (ru
 		return runtimeReply{}, &APIError{Kind: "desktop_protocol_invalid"}
 	}
 	if !reply.OK {
-		return runtimeReply{}, runtimeError(reply.Error)
+		failure := runtimeError(reply.Error)
+		if coded, ok := failure.(*APIError); ok && reply.Error == "desktop_upstream_rejected" {
+			coded.Code = reply.Code
+		}
+		return runtimeReply{}, failure
 	}
 	return reply, nil
 }

@@ -68,6 +68,8 @@ type Target struct {
 type Task struct {
 	Definition
 	Target
+	State               *Observation `json:"state,omitempty"`
+	PendingVerification bool         `json:"pending_verification,omitempty"`
 }
 
 // Observation is an adapter's factual result. Success at Execute/Claim alone
@@ -122,15 +124,16 @@ type Schedule struct {
 	LastDispatched *time.Time `json:"last_dispatched,omitempty"`
 }
 type Step struct {
-	TaskKey    string     `json:"task_key,omitempty"`
-	AccountID  string     `json:"account_id,omitempty"`
-	Stage      Stage      `json:"stage"`
-	Status     Status     `json:"status"`
-	Attempt    int        `json:"attempt"`
-	StartedAt  time.Time  `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-	Summary    string     `json:"summary,omitempty"`
-	ErrorCode  string     `json:"error_code,omitempty"`
+	TaskKey      string     `json:"task_key,omitempty"`
+	AccountID    string     `json:"account_id,omitempty"`
+	Stage        Stage      `json:"stage"`
+	Status       Status     `json:"status"`
+	Attempt      int        `json:"attempt"`
+	StartedAt    time.Time  `json:"started_at"`
+	FinishedAt   *time.Time `json:"finished_at,omitempty"`
+	Summary      string     `json:"summary,omitempty"`
+	ErrorCode    string     `json:"error_code,omitempty"`
+	UpstreamCode *int       `json:"upstream_code,omitempty"`
 }
 type Run struct {
 	DiscoveryIssues []DiscoveryIssue `json:"discovery_issues,omitempty"`

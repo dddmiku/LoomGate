@@ -67,6 +67,14 @@ def message_text(value):
 
 
 def validate(request):
+    if isinstance(request,dict) and request.get('operation') in ('activities','task_checkin','task_claim'):
+        if set(request)-{'operation','port','identity','group','task','instance'} or type(request.get('port')) is not int or not 1<=request['port']<=65535 or not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
+        if request['operation']=='activities' and set(request)!={'operation','port','identity'}:raise BridgeError('desktop_protocol_invalid')
+        if request['operation']!='activities':
+            for field in ('group','task'):
+                if not isinstance(request.get(field),str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',request[field]):raise BridgeError('desktop_protocol_invalid')
+            if request.get('instance') and (not isinstance(request['instance'],str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',request['instance'])):raise BridgeError('desktop_protocol_invalid')
+        return
     if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt', 'model', 'lease', 'path', 'body', 'resume','task_id','scene'}:
         raise BridgeError('desktop_protocol_invalid')
     if type(request.get('port')) is not int or not 1 <= request['port'] <= 65535:
@@ -261,7 +269,7 @@ def execute(request,canceled=None):
     validate(request)
     from websockets.sync.client import connect
     script = Path(__file__).with_name('runtime.js').read_text(encoding='utf-8')
-    deadline = time.monotonic()+10
+    deadline = time.monotonic()+(20 if request['operation'] in ('activities','task_checkin','task_claim') else 10)
     with connect(target(request['port']), open_timeout=2, close_timeout=.1, max_size=LIMIT) as ws:
         seq = 0
         signed = False
@@ -270,7 +278,7 @@ def execute(request,canceled=None):
             nonlocal seq, signed
             seq += 1
             ws.send(json.dumps({'id':seq, 'method':method, 'params':params or {}}))
-            rpc_deadline=min(getattr(call,'cleanup_deadline',deadline),time.monotonic()+getattr(call,'cleanup_rpc_timeout',10))
+            rpc_deadline=min(getattr(call,'cleanup_deadline',deadline),time.monotonic()+getattr(call,'cleanup_rpc_timeout',max(0,deadline-time.monotonic())))
             while True:
                 remaining = rpc_deadline-time.monotonic()
                 if remaining <= 0:
@@ -292,6 +300,13 @@ def execute(request,canceled=None):
                     pending.append(event)
         if request['operation'] == 'prepare_completion':
             return prepare_completion_transaction(ws, call, request, deadline, pending,canceled)
+        if request['operation'] in ('activities','task_checkin','task_claim'):
+            source=Path(__file__).with_name('tasks_runtime.js').read_text(encoding='utf-8')
+            value=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+')','awaitPromise':True,'returnByValue':True})
+            if value.get('exceptionDetails'):raise BridgeError('desktop_protocol_invalid')
+            result=value.get('result',{}).get('value')
+            if not isinstance(result,dict):raise BridgeError('desktop_protocol_invalid')
+            return result
         if request['operation'] in ('prepare_text','release_text','authorize_async'):
             source=Path(__file__).with_name('stream_runtime.js').read_text(encoding='utf-8')
             result=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+',('+script+'))','awaitPromise':True,'returnByValue':True})

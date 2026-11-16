@@ -19,12 +19,12 @@ async (input) => {
       window[reqKey]=req;
     }
     const factories = {
-      z5:'9687119c89c1376874f12b2c26072d6b908ae54c2b26c83dca8b9410ead436d8',
-      uui:'0e16f7576bb91259b254f905a5fe84f853d4d4289f57a6b1418fddd93bd2fc65',
-      Pp:'fdb80e31bbdecf4a092e0f242c334a70ebb98e6fd5cd85778ab44597dbca4775'
+      z5:['9687119c89c1376874f12b2c26072d6b908ae54c2b26c83dca8b9410ead436d8','1000758f339f2900cd6ed1a4b2ae31e8ecb785c6754fbce1e683ef35acb237ce'],
+      uui:['0e16f7576bb91259b254f905a5fe84f853d4d4289f57a6b1418fddd93bd2fc65'],
+      Pp:['fdb80e31bbdecf4a092e0f242c334a70ebb98e6fd5cd85778ab44597dbca4775','5ac8358b64a9b41d03249238a879aa1b6b5b1352174b8e43534a1b3db28f8518']
     };
-    for (const [id,hash] of Object.entries(factories)) {
-      if (typeof req.m?.[id] !== 'function' || await digest(String(req.m[id])) !== hash) return fail('desktop_version_unsupported');
+    for (const [id,hashes] of Object.entries(factories)) {
+      if (typeof req.m?.[id] !== 'function' || !hashes.includes(await digest(String(req.m[id])))) return fail('desktop_version_unsupported');
     }
     const sdk = await req('z5').getFlowAccount().passportApi.getPassportSDK();
     const identity = async () => {

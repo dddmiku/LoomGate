@@ -150,9 +150,23 @@ func ParseCatalog(data []byte) ([]Model, error) {
 	return out, nil
 }
 func copyCatalog(s Catalog) Catalog {
-	b, _ := json.Marshal(s)
-	var out Catalog
-	_ = json.Unmarshal(b, &out)
+	// Preserve internal provenance as well as wire fields. JSON serialization
+	// deliberately omits RuntimeBound and therefore cannot clone a snapshot.
+	out := s
+	if s.Models != nil {
+		out.Models = make([]Model, len(s.Models))
+		copy(out.Models, s.Models)
+		for i := range out.Models {
+			if s.Models[i].Efforts != nil {
+				out.Models[i].Efforts = make([]Effort, len(s.Models[i].Efforts))
+				copy(out.Models[i].Efforts, s.Models[i].Efforts)
+			}
+			if s.Models[i].Tiers != nil {
+				out.Models[i].Tiers = make([]string, len(s.Models[i].Tiers))
+				copy(out.Models[i].Tiers, s.Models[i].Tiers)
+			}
+		}
+	}
 	return out
 }
 

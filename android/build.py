@@ -430,7 +430,7 @@ def write_local_properties(sdk):
 
 
 def write_readme(abi):
-    text = """WorkBuddy 网关 · 安卓版
+    text = """LoomGate · 安卓版
 =========================
 
 安装

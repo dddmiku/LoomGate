@@ -129,7 +129,7 @@ def go_build(pkg: str, out: Path, goos: str, goarch: str, ldflags: str = "-s -w"
 def write_readme(target: Path, goos: str, tag: str) -> None:
     start = "双击 workbuddy2api.exe" if goos == "windows" else "双击 WorkBuddy2API.app"
 
-    text = """WorkBuddy2API {tag} — 桌面版
+    text = """LoomGate {tag} — 桌面版
 ==============================================
 
 一、怎么用
@@ -349,8 +349,8 @@ def build_macos(goarch: str, tag: str) -> Path:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>WorkBuddy2API</string>
-  <key>CFBundleDisplayName</key><string>WorkBuddy2API</string>
+  <key>CFBundleName</key><string>LoomGate</string>
+  <key>CFBundleDisplayName</key><string>LoomGate</string>
   <key>CFBundleIdentifier</key><string>com.dddmiku.workbuddy2api</string>
   <key>CFBundleVersion</key><string>%s</string>
   <key>CFBundleShortVersionString</key><string>%s</string>
@@ -393,7 +393,7 @@ def main():
         raise SystemExit("发行版本必须为 vX.Y.Z，不能用开发或无效版本冒充发行包。")
     release_public_key()  # 在清理旧构建目录之前先完成发布前置校验。
     DIST.mkdir(parents=True, exist_ok=True)
-    print("构建 WorkBuddy2API 桌面版 %s" % tag)
+    print("构建 LoomGate 桌面版 %s" % tag)
 
     built = []
     if args.target in ("windows", "all"):

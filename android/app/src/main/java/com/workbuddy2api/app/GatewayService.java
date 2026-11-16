@@ -380,7 +380,7 @@ public class GatewayService extends Service {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             flags |= PendingIntent.FLAG_IMMUTABLE;
         }
-        builder.setContentTitle("WorkBuddy 网关运行中")
+        builder.setContentTitle("LoomGate运行中")
                 .setContentText("点按打开管理面板")
                 .setSmallIcon(android.R.drawable.stat_sys_upload_done)
                 .setOngoing(true)

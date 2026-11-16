@@ -48,6 +48,27 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("doubao %s (http=%d, code=%d)", e.Kind, e.HTTPStatus, e.Code)
 }
 func (e *APIError) PublicCode() string { return e.Kind }
+func (e *APIError) TaskFailure() (string, *int) {
+	switch e.Kind {
+	case "desktop_upstream_rejected":
+		code := e.Code
+		return "provider_rejected", &code
+	case "desktop_checkin_unconfirmed", "desktop_submission_uncertain", "desktop_cleanup_uncertain":
+		return "operation_unconfirmed", nil
+	case "desktop_identity_mismatch", "desktop_binding_invalid":
+		return "account_identity_changed", nil
+	case "login_required", "desktop_login_required":
+		return "authentication_required", nil
+	case "desktop_task_expired":
+		return "task_expired", nil
+	case "desktop_task_not_claimable", "desktop_task_instance_missing", "desktop_task_manual":
+		return "operation_not_eligible", nil
+	case "desktop_busy":
+		return "provider_busy", nil
+	default:
+		return "upstream_failed", nil
+	}
+}
 func New(s Sessions, transport http.RoundTripper) *Client {
 	if transport == nil {
 		transport = http.DefaultTransport
