@@ -16,6 +16,18 @@ type discoveryAdapter struct {
 	catalog taskengine.Catalog
 }
 
+func TestProviderDiscoveryCannotSupplyAcceptedMutationReceipt(t *testing.T) {
+	e := openBehaviorEngine(t, taskengine.Options{})
+	task := syntheticTask("synthetic", "account-a", "receipt-task")
+	task.AcceptedStage = taskengine.StageClaim
+	a := singleAdapter(task)
+	registerBehavior(t, e, "synthetic", a)
+	catalog, err := e.CatalogDetails(context.Background(), "synthetic", taskengine.Scope{}, "")
+	if err != nil || len(catalog.Tasks) != 1 || catalog.Tasks[0].AcceptedStage != "" {
+		t.Fatal("untrusted discovery manufactured an accepted receipt")
+	}
+}
+
 func (d *discoveryAdapter) DiscoverCatalog(context.Context, taskengine.Scope, string) (taskengine.Catalog, error) {
 	return d.catalog, nil
 }

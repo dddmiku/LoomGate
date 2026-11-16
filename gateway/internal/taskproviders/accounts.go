@@ -22,6 +22,16 @@ type Module interface {
 	Claim(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error)
 	Verify(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error)
 }
+
+// Stateful modules discover definitions and their matching read snapshot in
+// one pass. This does not call Execute/Claim or refresh credentials.
+type ModuleTask struct {
+	Definition taskengine.Definition
+	State      taskengine.Observation
+}
+type CatalogModule interface {
+	DiscoverState(context.Context, *auth.Auth) ([]ModuleTask, error)
+}
 type ModuleSpec struct {
 	ID, Key string
 	Prefix  bool
@@ -152,7 +162,7 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 				continue
 			}
 			bounded, cancel := context.WithTimeout(ctx, timeout)
-			defs, err := discoverModule(bounded, m, account)
+			defs, states, err := discoverModuleState(bounded, m, account)
 			cancel()
 			if ctx.Err() != nil {
 				return out, ctx.Err()
@@ -170,12 +180,48 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 				continue
 			}
 			for _, d := range defs {
+				if key != "" && key != "*" && d.Key != key {
+					continue
+				}
 				d.ProviderID = a.Provider
-				out.Tasks = append(out.Tasks, taskengine.Task{Definition: d, Target: taskengine.Target{AccountID: account.UID, Realm: account.Realm()}})
+				task := taskengine.Task{Definition: d, Target: taskengine.Target{AccountID: account.UID, Realm: account.Realm()}}
+				if state, ok := states[d.Key]; ok {
+					copy := state
+					task.State = &copy
+				}
+				out.Tasks = append(out.Tasks, task)
 			}
 		}
 	}
 	return out, nil
+}
+func discoverModuleState(ctx context.Context, m Module, a *auth.Auth) (defs []taskengine.Definition, states map[string]taskengine.Observation, err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("module_discovery_failed")
+		}
+	}()
+	if catalog, ok := m.(CatalogModule); ok {
+		var rows []ModuleTask
+		rows, err = catalog.DiscoverState(ctx, a)
+		states = map[string]taskengine.Observation{}
+		if len(rows) > 256 {
+			return nil, nil, errors.New("module_catalog_limit")
+		}
+		for _, row := range rows {
+			if _, duplicate := states[row.Definition.Key]; duplicate {
+				return nil, nil, errors.New("module_duplicate_task")
+			}
+			defs = append(defs, row.Definition)
+			states[row.Definition.Key] = row.State
+		}
+	} else {
+		defs, err = discoverModule(ctx, m, a)
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return
 }
 func discoverModule(ctx context.Context, m Module, a *auth.Auth) (defs []taskengine.Definition, err error) {
 	defer func() {

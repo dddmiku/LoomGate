@@ -34,6 +34,18 @@ func (f *businessFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	var data any
 	switch r.URL.Path {
+	case "/activity/growth/buddy/info":
+		data = map[string]any{"buddy": nil}
+	case "/activity/growth/streak":
+		data = map[string]any{"launch_date": "2099-01-01", "streak": map[string]any{"days": 0, "makeup_dates": []string{}}, "makeup_cards": 0, "redemption_status": map[string]any{"tiers": []any{}}}
+	case "/activity/growth/heatmap":
+		data = map[string]any{"today": map[string]any{"date": "2099-01-02"}, "cells": []any{}}
+	case "/activity/growth/energy", "/activity/growth/lottery/chances":
+		data = map[string]any{"balance": 0}
+	case "/activity/growth/buddy/quota":
+		data = map[string]any{"affordable": 0, "max_open_count": 1}
+	case "/billing/meter/compensation-status":
+		data = map[string]any{"active": false, "claimed": false}
 	case "/v2/activity/growth/tasks":
 		if fail {
 			http.Error(w, "synthetic-private-upstream", 503)

@@ -164,7 +164,9 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 	seen := map[string]bool{}
 	out := []Task{}
 	for _, t := range tasks {
-		if t.ProviderID != provider || t.Key == "" || len(t.Key) > 512 || !IDPattern.MatchString(t.AccountID) {
+		// Provider discovery cannot manufacture an accepted mutation receipt.
+		t.AcceptedStage = ""
+		if t.ProviderID != provider || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || !IDPattern.MatchString(t.AccountID) {
 			return Catalog{}, errors.New("invalid_catalog")
 		}
 		if len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, t.AccountID) {
@@ -187,6 +189,35 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 		catalog.Issues = []DiscoveryIssue{}
 	}
 	e.mu.Lock()
+	// A changing period/record must not hide an unresolved mutation. Keep its
+	// exact non-secret definition available for read-back, including restart.
+	for pendingKey, pending := range e.state.PendingTasks {
+		if _, ok := e.state.Uncertain[pendingKey]; !ok {
+			continue
+		}
+		if pending.ProviderID != provider || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, pending.AccountID) || key != "" && key != "*" && key != pending.Key {
+			continue
+		}
+		found := false
+		for i, current := range out {
+			if current.AccountID == pending.AccountID && current.Key == pending.Key {
+				found = true
+				if taskKey(current) != pendingKey {
+					out[i] = pending
+				} else {
+					out[i].AcceptedStage = pending.AcceptedStage
+				}
+				break
+			}
+		}
+		if !found {
+			out = append(out, pending)
+		}
+	}
+	if len(out) > 1000 {
+		e.mu.Unlock()
+		return Catalog{}, errors.New("catalog_limit_exceeded")
+	}
 	for i := range out {
 		_, out[i].PendingVerification = e.state.Uncertain[taskKey(out[i])]
 	}
@@ -444,6 +475,14 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 	e.mu.Lock()
 	_, done := e.state.Completed[key]
 	_, uncertain := e.state.Uncertain[key]
+	for oldKey, pending := range e.state.PendingTasks {
+		if oldKey != key && pending.ProviderID == t.ProviderID && pending.AccountID == t.AccountID && pending.Key == t.Key {
+			if _, ok := e.state.Uncertain[oldKey]; ok {
+				e.mu.Unlock()
+				return StatusUncertain, ErrUncertain
+			}
+		}
+	}
 	e.mu.Unlock()
 	if done && (t.Once || t.OncePerDay) {
 		return StatusSkipped, nil
@@ -498,10 +537,26 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			return StatusFailed, errors.New("unknown_upstream_state")
 		}
 		if action != nil {
+			t.AcceptedStage = ""
 			// Commit uncertainty BEFORE sending a mutating request. On crash/retry, only
 			// authoritative read-back may clear this; never blindly replay a mutation.
 			e.mu.Lock()
-			err = e.commit(func(s *persisted) { s.Uncertain[key] = stage })
+			if len(e.state.PendingTasks) >= 1000 {
+				if _, exists := e.state.PendingTasks[key]; !exists {
+					e.mu.Unlock()
+					return StatusFailed, ErrBusy
+				}
+			}
+			err = e.commit(func(s *persisted) {
+				s.Uncertain[key] = stage
+				if s.PendingTasks == nil {
+					s.PendingTasks = map[string]Task{}
+				}
+				pending := t
+				pending.State = nil
+				pending.PendingVerification = true
+				s.PendingTasks[key] = pending
+			})
 			e.mu.Unlock()
 			if err != nil {
 				return StatusFailed, err
@@ -510,6 +565,17 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			if err != nil {
 				return StatusUncertain, ErrUncertain
 			}
+			e.mu.Lock()
+			err = e.commit(func(s *persisted) {
+				pending := s.PendingTasks[key]
+				pending.AcceptedStage = stage
+				s.PendingTasks[key] = pending
+			})
+			e.mu.Unlock()
+			if err != nil {
+				return StatusUncertain, ErrUncertain
+			}
+			t.AcceptedStage = stage
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -544,6 +610,7 @@ func (e *Engine) confirm(key string, t Task) (Status, error) {
 	defer e.mu.Unlock()
 	err := e.commit(func(s *persisted) {
 		delete(s.Uncertain, key)
+		delete(s.PendingTasks, key)
 		if t.Once || t.OncePerDay {
 			s.Completed[key] = time.Now().UTC()
 		}

@@ -20,12 +20,19 @@ type legacyTasksTransport struct {
 	fixture                *fixtures
 	reads, signins, claims int
 	checked, claimed       map[string]bool
+	lifecycle              *lifecycleFixture
 }
 
 func (s *legacyTasksTransport) stats() map[string]int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return map[string]int{"balance_reads": s.reads, "signins": s.signins, "claims": s.claims}
+	out := map[string]int{"balance_reads": s.reads, "signins": s.signins, "claims": s.claims}
+	if s.lifecycle != nil {
+		for k, v := range s.lifecycle.counts {
+			out[k] = v
+		}
+	}
+	return out
 }
 func (s *legacyTasksTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Host != "fixture.invalid" {
@@ -34,8 +41,30 @@ func (s *legacyTasksTransport) RoundTrip(r *http.Request) (*http.Response, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	identity := r.Header.Get("Authorization")
+	if s.lifecycle != nil {
+		data, handled, err := s.lifecycle.respond(r, identity)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			b, _ := json.Marshal(map[string]any{"code": 0, "data": data})
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+		}
+	}
 	var data any
 	switch r.URL.Path {
+	case "/activity/growth/buddy/info":
+		data = map[string]any{"buddy": nil}
+	case "/activity/growth/streak":
+		data = map[string]any{"launch_date": "2099-01-01", "streak": map[string]any{"days": 0, "makeup_dates": []string{}}, "makeup_cards": 0, "redemption_status": map[string]any{"tiers": []any{}}}
+	case "/activity/growth/heatmap":
+		data = map[string]any{"today": map[string]any{"date": "2099-01-02"}, "cells": []any{}}
+	case "/activity/growth/energy", "/activity/growth/lottery/chances":
+		data = map[string]any{"balance": 0}
+	case "/activity/growth/buddy/quota":
+		data = map[string]any{"affordable": 0, "max_open_count": 1}
+	case "/billing/meter/compensation-status":
+		data = map[string]any{"active": false, "claimed": false}
 	case "/v2/activity/growth/tasks":
 		if s.fixture.mode.Load() == 1 {
 			return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":"synthetic_failure"}`)), Request: r}, nil

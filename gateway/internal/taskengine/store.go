@@ -9,15 +9,16 @@ import (
 )
 
 type persisted struct {
-	Version   int                  `json:"version"`
-	Schedules map[string]Schedule  `json:"schedules"`
-	Runs      []Run                `json:"runs"`
-	Completed map[string]time.Time `json:"completed"`
-	Uncertain map[string]Stage     `json:"uncertain"`
+	Version      int                  `json:"version"`
+	Schedules    map[string]Schedule  `json:"schedules"`
+	Runs         []Run                `json:"runs"`
+	Completed    map[string]time.Time `json:"completed"`
+	Uncertain    map[string]Stage     `json:"uncertain"`
+	PendingTasks map[string]Task      `json:"pending_tasks,omitempty"`
 }
 
 func newState() persisted {
-	return persisted{Version: 1, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}}
+	return persisted{Version: 1, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}}
 }
 func readState(path string) (persisted, error) {
 	s := newState()
@@ -30,6 +31,20 @@ func readState(path string) (persisted, error) {
 	}
 	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || s.Version != 1 || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
 		return s, errors.New("task_store_invalid")
+	}
+	if s.PendingTasks == nil {
+		s.PendingTasks = map[string]Task{}
+	}
+	if len(s.PendingTasks) > 1000 {
+		return s, errors.New("task_store_pending_limit")
+	}
+	for key, task := range s.PendingTasks {
+		if task.AcceptedStage != "" && task.AcceptedStage != StageExecute && task.AcceptedStage != StageClaim {
+			return s, errors.New("task_store_receipt_invalid")
+		}
+		if key != taskKey(task) || !IDPattern.MatchString(task.ProviderID) || !IDPattern.MatchString(task.AccountID) || task.Key == "" || len(task.Key) > 512 || len(task.PeriodKey) > 512 || task.Once && task.OncePerDay || task.OncePerDay && task.PeriodKey == "" {
+			return s, errors.New("task_store_pending_invalid")
+		}
 	}
 	for i := range s.Runs {
 		if s.Runs[i].Status == StatusRunning || s.Runs[i].Status == StatusQueued {

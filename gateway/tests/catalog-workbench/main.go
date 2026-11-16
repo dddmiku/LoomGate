@@ -104,6 +104,7 @@ func main() {
 	root := flag.String("root", "", "dedicated synthetic runtime directory")
 	address := flag.String("listen", "127.0.0.1:17863", "loopback address")
 	modules := flag.Bool("task-modules", false, "use real WorkBuddy task modules with synthetic account transport")
+	lifecycle := flag.Bool("lifecycle-modules", false, "use registered lifecycle modules with persisted synthetic upstream state")
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
 	flag.Parse()
@@ -152,10 +153,13 @@ func main() {
 	p := pool.New("")
 	defer p.Close()
 	var workbuddy taskengine.Adapter
-	if *modules {
+	if *modules || *lifecycle {
 		up, err := seedLegacyTaskFixture(*root, p, fixture)
 		if err != nil {
 			panic("fixture_legacy_seed_failed")
+		}
+		if *lifecycle {
+			fixture.legacy.lifecycle = openLifecycleFixture(*root, fixture)
 		}
 		workbuddy, err = taskproviders.NewAccounts(p, up, "workbuddy", 48*time.Hour)
 		if err != nil {
@@ -263,7 +267,7 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 	mux.HandleFunc("POST /__fixture/mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
-		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6, "client-disconnected": 7, "client-switched": 8, "client-login": 9}
+		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6, "client-disconnected": 7, "client-switched": 8, "client-login": 9, "lifecycle-arrived": 10, "lifecycle-silent": 11, "lifecycle-rollover": 12}
 		value, ok := mode[r.PathValue("mode")]
 		if !ok {
 			w.WriteHeader(400)

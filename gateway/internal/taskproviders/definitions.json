@@ -1,14 +1,87 @@
 {
   "checkin": {
-    "key": "checkin", "name": "每日签到", "description": "检查官方签到状态，执行后再次读取服务端状态。",
-    "once_per_day": true, "side_effect": true, "stages": ["inspect", "execute", "verify"]
+    "key": "checkin",
+    "name": "每日签到",
+    "description": "检查官方签到状态，执行后再次读取服务端状态。",
+    "once_per_day": true,
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "execute",
+      "verify"
+    ]
   },
   "balance": {
-    "key": "balance", "name": "余额刷新", "description": "只读查询积分与到期分桶，更新网关账号池；不签到、不生成内容。",
-    "side_effect": false, "idempotent": true, "stages": ["inspect"]
+    "key": "balance",
+    "name": "余额刷新",
+    "description": "只读查询积分与到期分桶，更新网关账号池；不签到、不生成内容。",
+    "side_effect": false,
+    "idempotent": true,
+    "stages": [
+      "inspect"
+    ]
   },
   "growth": {
-    "name": "成长任务", "description": "任务标识和奖励来自官方目录；未达标需要在官方客户端完成实际工作。",
-    "side_effect": true, "stages": ["inspect", "claim", "verify"]
+    "name": "成长任务",
+    "description": "任务标识和奖励来自官方目录；未达标需要在官方客户端完成实际工作。",
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "claim",
+      "verify"
+    ]
+  },
+  "travel": {
+    "name": "Buddy 旅行",
+    "description": "地点、业务日与旅行记录来自官方响应；每次只处理一个明确动作，再回读结果。",
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "execute",
+      "claim",
+      "verify"
+    ]
+  },
+  "redemption": {
+    "name": "连登奖励兑换",
+    "description": "动态读取官方档位和月份，仅领取明确可用的档位，未知状态不写入。",
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "claim",
+      "verify"
+    ]
+  },
+  "makeup": {
+    "key": "makeup",
+    "name": "日历补登",
+    "description": "根据服务端当天、上线日和日历选择最近断点，一轮最多使用一张补登卡。",
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "execute",
+      "verify"
+    ]
+  },
+  "resources": {
+    "key": "resources",
+    "name": "成长资源状态",
+    "description": "读取能量、抽奖机会、Buddy 额度与连登；不抽奖、不开箱、不消耗权益。",
+    "side_effect": false,
+    "idempotent": true,
+    "stages": [
+      "inspect"
+    ]
+  },
+  "compensation": {
+    "key": "compensation",
+    "name": "补偿领取",
+    "description": "检查当前补偿活动和领取状态，领取后再次确认结果。",
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "claim",
+      "verify"
+    ]
   }
 }

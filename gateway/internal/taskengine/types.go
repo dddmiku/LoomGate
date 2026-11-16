@@ -70,6 +70,10 @@ type Task struct {
 	Target
 	State               *Observation `json:"state,omitempty"`
 	PendingVerification bool         `json:"pending_verification,omitempty"`
+	// Set only by the engine after a successful adapter action result is durably
+	// recorded. Missing on an interrupted/unknown response; never inferred from
+	// an empty directory or HTTP200 alone.
+	AcceptedStage Stage `json:"accepted_stage,omitempty"`
 }
 
 // Observation is an adapter's factual result. Success at Execute/Claim alone

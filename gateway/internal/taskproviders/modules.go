@@ -43,7 +43,7 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	if json.Unmarshal(moduleDefinitions, &defs) != nil {
 		return nil, errors.New("task_definitions_invalid")
 	}
-	for _, id := range []string{"checkin", "growth", "balance"} {
+	for _, id := range []string{"checkin", "growth", "balance", "travel", "redemption", "makeup", "resources", "compensation"} {
 		if defs[id].Name == "" {
 			return nil, errors.New("task_definition_missing")
 		}
@@ -61,7 +61,8 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	if a.Provider != "workbuddy" {
 		return nil, errors.New("provider_unsupported")
 	}
-	return []Module{check, &balanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"cn", "global"}}, definition: defs["balance"]}, owner: a}, &growthModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "growth", Key: "growth/", Prefix: true, Realms: []string{"cn"}}, definition: defs["growth"]}, up: a.Upstream}}, nil
+	modules := []Module{check, &balanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"cn", "global"}}, definition: defs["balance"]}, owner: a}, &growthModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "growth", Key: "growth/", Prefix: true, Realms: []string{"cn"}}, definition: defs["growth"]}, up: a.Upstream}}
+	return append(modules, newLifecycleModules(a.Upstream, defs)...), nil
 }
 
 type checkinModule struct {
