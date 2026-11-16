@@ -141,7 +141,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		if len(expiring) > 0 {
 			soon = expiring[0]
 		}
-		adapter, adapterErr := taskproviders.NewAccounts(p, up, id, soon, taskproviders.AccountsOptions{TraeStore: traeState})
+		adapter, adapterErr := taskproviders.NewAccounts(p, up, id, soon, taskproviders.AccountsOptions{TraeStore: traeState, RefreshVault: taskVault})
 		if adapterErr != nil {
 			e.Close()
 			return nil, nil, adapterErr

@@ -108,6 +108,7 @@ func main() {
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
 	traeTasks := flag.Bool("trae-tasks", false, "use real Trae lifecycle modules with synthetic transport")
+	keepalive := flag.Bool("keepalive-modules", false, "use official refresh adapters with synthetic transport and encrypted recovery")
 	flag.Parse()
 	host, _, err := net.SplitHostPort(*address)
 	if err != nil || host != "127.0.0.1" || *root == "" {
@@ -156,6 +157,21 @@ func main() {
 	var workbuddy taskengine.Adapter
 	var traeAdapter taskengine.Adapter
 	var traeFixture *traeTaskFixture
+	var refreshFixture *keepaliveFixture
+	if *keepalive {
+		refreshVault, err := accountvault.Open(filepath.Join(*root, "data", "refresh-state"))
+		if err != nil {
+			panic("fixture_refresh_vault_failed")
+		}
+		defer refreshVault.Close()
+		var adapters map[string]*taskproviders.Accounts
+		adapters, refreshFixture, err = seedKeepalive(*root, p, fixture, refreshVault)
+		if err != nil {
+			panic("fixture_refresh_seed_failed")
+		}
+		workbuddy = adapters["workbuddy"]
+		traeAdapter = adapters["trae"]
+	}
 	if *traeTasks {
 		moduleVault, err := accountvault.Open(filepath.Join(*root, "data", "trae-module-state"))
 		if err != nil {
@@ -267,6 +283,13 @@ func main() {
 	}
 	defer admin.Close()
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__fixture/refresh-stats", func(w http.ResponseWriter, r *http.Request) {
+		if refreshFixture == nil {
+			w.WriteHeader(404)
+			return
+		}
+		json.NewEncoder(w).Encode(refreshFixture.stats(p))
+	})
 	mux.HandleFunc("GET /__fixture/trae-stats", func(w http.ResponseWriter, r *http.Request) {
 		if traeFixture == nil {
 			w.WriteHeader(404)

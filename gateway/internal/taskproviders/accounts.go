@@ -23,6 +23,35 @@ type Module interface {
 	Verify(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error)
 }
 
+// Optional pacing runs outside the per-task request timeout and before any
+// write marker. It cannot submit work; the usual dispatch rechecks the account.
+type GatedModule interface {
+	AcquireTask(context.Context, *auth.Auth, taskengine.Task) (func(), error)
+}
+
+func (a *Accounts) AcquireTask(ctx context.Context, t taskengine.Task) (func(), error) {
+	modules, err := a.modules()
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range modules {
+		if m.Spec().matches(t.Key) {
+			account, err := a.accountForTask(t.AccountID, m.Spec().RecoverSession)
+			if err != nil {
+				return nil, err
+			}
+			if !m.Spec().realm(account.Realm()) {
+				continue
+			}
+			if gate, ok := m.(GatedModule); ok {
+				return gate.AcquireTask(ctx, account, t)
+			}
+			return func() {}, nil
+		}
+	}
+	return nil, errors.New("task_module_unavailable")
+}
+
 // Stateful modules discover definitions and their matching read snapshot in
 // one pass. This does not call Execute/Claim or refresh credentials.
 type ModuleTask struct {
@@ -33,9 +62,10 @@ type CatalogModule interface {
 	DiscoverState(context.Context, *auth.Auth) ([]ModuleTask, error)
 }
 type ModuleSpec struct {
-	ID, Key string
-	Prefix  bool
-	Realms  []string
+	ID, Key        string
+	Prefix         bool
+	Realms         []string
+	RecoverSession bool
 }
 
 func (s ModuleSpec) matches(key string) bool {
@@ -85,11 +115,14 @@ func NewAccounts(p *pool.Pool, up *upstream.Client, provider string, soon time.D
 	return a, nil
 }
 func (a *Accounts) account(id string) (*auth.Auth, error) {
+	return a.accountForTask(id, false)
+}
+func (a *Accounts) accountForTask(id string, recoverSession bool) (*auth.Auth, error) {
 	if a.Pool == nil {
 		return nil, errors.New("account_pool_unavailable")
 	}
 	status, ok := a.Pool.Status(id)
-	if !ok || status.Disabled {
+	if !ok || status.Disabled && !(recoverSession && status.DisabledReason == pool.SessionDeadReason()) {
 		return nil, errors.New("account_unavailable")
 	}
 	account := a.Pool.AuthByUID(id)
@@ -147,7 +180,7 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		if status.Disabled {
+		if status.Disabled && status.DisabledReason != pool.SessionDeadReason() {
 			continue
 		}
 		selected := len(scope.AccountIDs) == 0
@@ -159,12 +192,15 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 		if !selected {
 			continue
 		}
-		account, err := a.account(status.UID)
+		account, err := a.accountForTask(status.UID, true)
 		if err != nil {
 			continue
 		}
 		for _, m := range modules {
 			s := m.Spec()
+			if status.Disabled && !s.RecoverSession {
+				continue
+			}
 			if !s.realm(account.Realm()) || key != "" && key != "*" && !s.matches(key) {
 				continue
 			}
@@ -246,10 +282,6 @@ func (a *Accounts) dispatch(ctx context.Context, t taskengine.Task, fn func(Modu
 	if t.ProviderID != a.Provider {
 		return taskengine.Observation{}, errors.New("provider_mismatch")
 	}
-	account, err := a.account(t.AccountID)
-	if err != nil {
-		return taskengine.Observation{}, err
-	}
 	modules, err := a.modules()
 	if err != nil {
 		return taskengine.Observation{}, err
@@ -259,6 +291,13 @@ func (a *Accounts) dispatch(ctx context.Context, t taskengine.Task, fn func(Modu
 	}
 	for _, m := range modules {
 		s := m.Spec()
+		if !s.matches(t.Key) {
+			continue
+		}
+		account, err := a.accountForTask(t.AccountID, s.RecoverSession)
+		if err != nil {
+			return taskengine.Observation{}, err
+		}
 		if s.matches(t.Key) && s.realm(account.Realm()) {
 			if ctx.Err() != nil {
 				return taskengine.Observation{}, ctx.Err()

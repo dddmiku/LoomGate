@@ -99,6 +99,13 @@ type Adapter interface {
 	Verify(context.Context, Task) (Observation, error)
 }
 
+// TaskGate owns provider pacing before the action timeout and write marker.
+// The release always runs, including storage failure, cancellation and panic.
+// Waiting must not submit requests. Inspect/Execute recheck eligibility after it.
+type TaskGate interface {
+	AcquireTask(context.Context, Task) (func(), error)
+}
+
 type DiscoveryIssue struct {
 	ProviderID string `json:"provider_id"`
 	AccountID  string `json:"account_id"`

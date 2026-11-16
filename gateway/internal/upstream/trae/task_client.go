@@ -123,7 +123,7 @@ func (c *TaskClient) Credits(ctx context.Context, a *auth.Auth) (Credits, error)
 	}
 	total, totalOK := asFloat(summary["total_amount"])
 	used, usedOK := asFloat(summary["consumed_amount"])
-	if !totalOK || !usedOK || total < 0 || used < 0 || math.IsNaN(total) || math.IsNaN(used) || math.IsInf(total, 0) || math.IsInf(used, 0) {
+	if !totalOK || !usedOK || !validTaskCredits(total) || !validTaskCredits(used) {
 		return Credits{}, errors.New("trae_credit_summary_invalid")
 	}
 	packs, ok := data["user_entitlement_pack_list"].([]any)
@@ -136,21 +136,107 @@ func (c *TaskClient) Credits(ctx context.Context, a *auth.Auth) (Credits, error)
 		if !ok {
 			return Credits{}, errors.New("trae_credit_pack_invalid")
 		}
-		usage, known := pack["usage"].(map[string]any)
-		if !known {
-			return Credits{}, errors.New("trae_credit_pack_usage_missing")
-		}
-		if rawUsed, exists := usage["credits_amount"]; exists {
-			n, valid := asFloat(rawUsed)
-			if !valid || n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
-				return Credits{}, errors.New("trae_credit_pack_usage_invalid")
-			}
-		}
-		parsed := parseCreditPack(pack)
-		if math.IsNaN(parsed.Limit) || math.IsInf(parsed.Limit, 0) || math.IsNaN(parsed.Remaining) || math.IsInf(parsed.Remaining, 0) || parsed.Limit < 0 || parsed.Remaining < 0 {
-			return Credits{}, errors.New("trae_credit_pack_invalid")
+		parsed, err := strictCreditPack(pack)
+		if err != nil {
+			return Credits{}, err
 		}
 		result.Packs = append(result.Packs, parsed)
 	}
 	return result, nil
+}
+
+func validTaskCredits(n float64) bool {
+	return !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0 && n < float64(math.MaxInt64)
+}
+
+// These raw fields are the observed entitlement contract, rather than the
+// legacy display parser's defaults. An explicit empty usage object means zero
+// consumed; absent, null or renamed usage is not evidence of an unused pack.
+func strictCreditPack(pack map[string]any) (CreditPack, error) {
+	invalid := errors.New("trae_credit_pack_invalid")
+	base, ok := pack["entitlement_base_info"].(map[string]any)
+	if !ok {
+		return CreditPack{}, invalid
+	}
+	extra, ok := base["product_extra"].(map[string]any)
+	if !ok {
+		return CreditPack{}, invalid
+	}
+	pe, ok := extra["package_extra"].(map[string]any)
+	if !ok {
+		return CreditPack{}, invalid
+	}
+	quota, ok := pe["quota"].(map[string]any)
+	if !ok {
+		return CreditPack{}, invalid
+	}
+	limit, ok := asFloat(quota["credits_limit"])
+	if !ok || !validTaskCredits(limit) {
+		return CreditPack{}, invalid
+	}
+	usage, ok := pack["usage"].(map[string]any)
+	if !ok {
+		return CreditPack{}, invalid
+	}
+	used := float64(0)
+	if len(usage) != 0 {
+		used, ok = asFloat(usage["credits_amount"])
+		if !ok || !validTaskCredits(used) {
+			return CreditPack{}, invalid
+		}
+	}
+	// end_time=0 plus top-level expire_time is another observed shape. Explicit
+	// zero with no fallback means no expiry; omitted or malformed time is unknown.
+	end, hasEnd := base["end_time"]
+	fallback, hasFallback := pack["expire_time"]
+	validTime := func(raw any) (int64, bool) {
+		n, ok := asFloat(raw)
+		if !ok || n < 0 || n > 253402300799 || math.Trunc(n) != n {
+			return 0, false
+		}
+		return int64(n), true
+	}
+	var stamp int64
+	if hasEnd {
+		stamp, ok = validTime(end)
+		if !ok {
+			return CreditPack{}, invalid
+		}
+	}
+	if hasFallback {
+		f, good := validTime(fallback)
+		if !good {
+			return CreditPack{}, invalid
+		}
+		if stamp == 0 {
+			stamp = f
+		}
+	}
+	if !hasEnd && !hasFallback {
+		return CreditPack{}, invalid
+	}
+	parsed := parseCreditPack(pack)
+	parsed.Limit = limit
+	parsed.Remaining = math.Max(0, limit-used)
+	parsed.EndTime = stamp
+	return parsed, nil
+}
+
+// TaskExpiry validates a complete snapshot before the pool adopts any part of
+// it. Sum in the bounded remaining domain so large packs cannot overflow int64.
+func TaskExpiry(credits Credits, window time.Duration, now time.Time) (int64, error) {
+	if !validTaskCredits(credits.Total) || !validTaskCredits(credits.Consumed) || !validTaskCredits(credits.Remaining) {
+		return 0, errors.New("trae_credit_snapshot_invalid")
+	}
+	remaining := int64(credits.Remaining)
+	var bucket int64
+	for _, p := range credits.Packs {
+		if !validTaskCredits(p.Limit) || !validTaskCredits(p.Remaining) || p.Remaining > p.Limit || p.EndTime < 0 || p.EndTime > 253402300799 {
+			return 0, errors.New("trae_credit_pack_invalid")
+		}
+		if window > 0 && p.EndTime > now.Unix() && !time.Unix(p.EndTime, 0).After(now.Add(window)) {
+			bucket += min(int64(p.Remaining), remaining-bucket)
+		}
+	}
+	return bucket, nil
 }

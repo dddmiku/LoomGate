@@ -144,7 +144,7 @@ func TestV1AcceptedStageAndCompletionCacheRequireReconciliation(t *testing.T) {
 	a := &actionFixture{task: task, action: func(Task) (Observation, error) { t.Fatal("legacy unknown replayed"); return Observation{}, nil }}
 	e := actionEngine(t, path, a)
 	defer e.Close()
-	if e.state.Version != 2 || len(e.state.Completed) != 0 || len(e.state.LegacyCompleted) != 1 || e.state.PendingTasks[key].AcceptedStage != "" || len(e.state.Uncertain) != 1 {
+	if e.state.Version != 3 || len(e.state.Completed) != 0 || len(e.state.LegacyCompleted) != 1 || e.state.PendingTasks[key].AcceptedStage != "" || len(e.state.Uncertain) != 1 {
 		t.Fatal("v1 trust was silently upgraded")
 	}
 	if actionRun(t, e).Status != StatusUncertain {

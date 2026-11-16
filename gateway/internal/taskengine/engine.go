@@ -70,6 +70,13 @@ func (e *Engine) Register(id string, a Adapter) error {
 		return ErrInvalid
 	}
 	e.adapters[id] = a
+	for _, r := range e.state.Runs {
+		if r.ProviderID == id {
+			if _, ok := e.state.Work[r.ID]; ok {
+				e.startLocked(r)
+			}
+		}
+	}
 	return nil
 }
 func (e *Engine) Providers() []string {
@@ -119,6 +126,15 @@ func safeCall(fn func() (Observation, error)) (o Observation, err error) {
 		}
 	}()
 	return fn()
+}
+
+func safeGate(ctx context.Context, g TaskGate, t Task) (release func(), err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("adapter_panic")
+		}
+	}()
+	return g.AcquireTask(ctx, t)
 }
 func safeDiscover(ctx context.Context, a Adapter, s Scope) (tasks []Task, err error) {
 	defer func() {
@@ -271,12 +287,18 @@ func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, err
 			return Run{}, ErrInvalid
 		}
 	}
-	if len(e.running) >= 64 {
+	if len(e.running) >= 64 || len(e.state.Work) >= 64 {
 		return Run{}, ErrBusy
 	}
 	r := Run{ID: randomID(), ProviderID: req.ProviderID, TaskKey: req.TaskKey, ScheduleID: req.ScheduleID, Trigger: req.Trigger, Status: StatusQueued, StartedAt: time.Now().UTC(), AccountIDs: append([]string{}, req.AccountIDs...), Steps: []Step{}}
 	if err := e.commit(func(s *persisted) {
 		s.Runs = append(s.Runs, r)
+		// Reserve durable work before dispatch; no discovery or action can occur
+		// before this intent. Restart rediscovery is safe until Tasks is captured.
+		if s.Work == nil {
+			s.Work = map[string]runWork{}
+		}
+		s.Work[r.ID] = runWork{Status: StatusSkipped}
 		if schedule != nil {
 			schedule.LastRunID = r.ID
 			s.Schedules[schedule.ID] = *schedule
@@ -292,11 +314,17 @@ func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, err
 	}); err != nil {
 		return Run{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), e.opts.Timeout)
+	e.startLocked(r)
+	return r, nil
+}
+func (e *Engine) startLocked(r Run) {
+	if e.running[r.ID] != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	e.running[r.ID] = cancel
 	e.wg.Add(1)
 	go e.perform(ctx, r)
-	return r, nil
 }
 func (e *Engine) updateRun(id string, fn func(*Run)) error {
 	e.mu.Lock()
@@ -322,6 +350,9 @@ func (e *Engine) Cancel(id string) bool {
 	defer e.mu.Unlock()
 	cancel := e.running[id]
 	if cancel == nil {
+		return false
+	}
+	if err := e.commit(func(s *persisted) { w := s.Work[id]; w.CancelRequested = true; s.Work[id] = w }); err != nil {
 		return false
 	}
 	cancel()
@@ -360,48 +391,112 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 			status = StatusUncertain
 			code = "adapter_panic"
 		}
-		_ = e.updateRun(r.ID, func(x *Run) { now := time.Now().UTC(); x.FinishedAt = &now; x.Status = status; x.ErrorCode = code })
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		_ = e.commit(func(s *persisted) {
+			w, ok := s.Work[r.ID]
+			for i := range s.Runs {
+				x := &s.Runs[i]
+				if x.ID != r.ID {
+					continue
+				}
+				if e.closed && ok && !w.CancelRequested {
+					x.Status = StatusQueued
+					x.ErrorCode = "interrupted_resume"
+					return
+				}
+				if w.CancelRequested && status != StatusUncertain {
+					status = StatusCanceled
+				}
+				now := time.Now().UTC()
+				x.FinishedAt = &now
+				x.Status = status
+				x.ErrorCode = code
+			}
+			delete(s.Work, r.ID)
+		})
 	}()
 	if err := e.updateRun(r.ID, func(x *Run) { x.Status = StatusRunning }); err != nil {
 		code = "storage_failed"
 		return
 	}
-	catalog, err := e.CatalogDetails(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs}, r.TaskKey)
-	if err != nil {
-		code = "discovery_failed"
-		return
-	}
 	e.mu.Lock()
 	a := e.adapters[r.ProviderID]
+	work := cloneState(e.state).Work[r.ID]
 	e.mu.Unlock()
-	selected := 0
-	status = StatusSkipped
-	if len(catalog.Issues) > 0 {
-		status = StatusFailed
-		code = "partial_discovery_failed"
-		if err := e.updateRun(r.ID, func(x *Run) { x.DiscoveryIssues = catalog.Issues }); err != nil {
+	if work.Tasks == nil {
+		catalog, err := e.CatalogDetails(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs}, r.TaskKey)
+		if err != nil {
+			code = "discovery_failed"
+			return
+		}
+		work.Tasks = []Task{}
+		work.Confirmed = map[string]bool{}
+		for _, t := range catalog.Tasks {
+			if r.TaskKey == "" || r.TaskKey == "*" || r.TaskKey == t.Key {
+				t.State = nil
+				work.Tasks = append(work.Tasks, t)
+			}
+		}
+		if len(catalog.Issues) > 0 {
+			work.Status = StatusFailed
+			work.ErrorCode = "partial_discovery_failed"
+		}
+		e.mu.Lock()
+		err = e.commit(func(s *persisted) {
+			current := s.Work[r.ID]
+			work.CancelRequested = current.CancelRequested
+			s.Work[r.ID] = work
+			for i := range s.Runs {
+				if s.Runs[i].ID == r.ID {
+					s.Runs[i].DiscoveryIssues = catalog.Issues
+				}
+			}
+		})
+		e.mu.Unlock()
+		if err != nil {
 			code = "storage_failed"
 			return
 		}
 	}
-	for _, t := range catalog.Tasks {
-		if r.TaskKey != "" && r.TaskKey != "*" && r.TaskKey != t.Key {
-			continue
+	status = work.Status
+	code = work.ErrorCode
+	for index := work.Next; index < len(work.Tasks); index++ {
+		t := work.Tasks[index]
+		if ctx.Err() != nil {
+			return
 		}
-		selected++
 		result, err := func() (Status, error) {
+			if work.Confirmed[taskKey(t)] {
+				return StatusSucceeded, nil
+			}
 			release, err := e.accountLock(ctx, t)
 			if err != nil {
 				return StatusCanceled, err
 			}
 			defer release()
+			if gate, ok := a.(TaskGate); ok {
+				// Bounded admission covers the maximum registered run queue and the
+				// per-task request limit; a broken gate cannot wait forever.
+				gateCtx, gateCancel := context.WithTimeout(ctx, 64*(e.opts.Timeout+10*time.Second))
+				free, err := safeGate(gateCtx, gate, t)
+				gateCancel()
+				if err != nil {
+					return StatusFailed, err
+				}
+				if free != nil {
+					defer free()
+				}
+			}
 			select {
 			case e.workers <- struct{}{}:
 				defer func() { <-e.workers }()
 			case <-ctx.Done():
 				return StatusCanceled, ctx.Err()
 			}
-			return e.runTask(ctx, r.ID, t, a)
+			bounded, cancel := context.WithTimeout(ctx, e.opts.Timeout)
+			defer cancel()
+			return e.runTask(bounded, r.ID, t, a)
 		}()
 		if err != nil {
 			result = mergeStatus(result, StatusFailed)
@@ -421,8 +516,22 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 		if ctx.Err() != nil {
 			return
 		}
+		e.mu.Lock()
+		err = e.commit(func(s *persisted) {
+			w := s.Work[r.ID]
+			w.Next = index + 1
+			w.Status = status
+			w.ErrorCode = code
+			s.Work[r.ID] = w
+		})
+		e.mu.Unlock()
+		if err != nil {
+			status = StatusUncertain
+			code = "storage_failed"
+			return
+		}
 	}
-	if selected == 0 && len(catalog.Issues) == 0 {
+	if len(work.Tasks) == 0 && status == StatusSkipped {
 		status = StatusSkipped
 		code = "no_matching_tasks"
 	}
@@ -512,7 +621,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 		return StatusFailed, err
 	}
 	if o.Phase == "done" {
-		return e.confirm(key, t)
+		return e.confirm(id, key, t)
 	}
 	if uncertain {
 		return StatusUncertain, ErrUncertain
@@ -533,7 +642,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 		var action func() (Observation, error)
 		switch o.Phase {
 		case "done":
-			return e.confirm(key, t)
+			return e.confirm(id, key, t)
 		case "manual":
 			return StatusManual, nil
 		case "blocked":
@@ -669,10 +778,17 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 		}
 	}
 }
-func (e *Engine) confirm(key string, t Task) (Status, error) {
+func (e *Engine) confirm(id, key string, t Task) (Status, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	err := e.commit(func(s *persisted) {
+		if work, ok := s.Work[id]; ok {
+			if work.Confirmed == nil {
+				work.Confirmed = map[string]bool{}
+			}
+			work.Confirmed[key] = true
+			s.Work[id] = work
+		}
 		delete(s.Uncertain, key)
 		delete(s.PendingTasks, key)
 		delete(s.Receipts, key)

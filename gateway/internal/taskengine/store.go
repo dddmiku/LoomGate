@@ -17,10 +17,20 @@ type persisted struct {
 	PendingTasks    map[string]Task          `json:"pending_tasks,omitempty"`
 	Receipts        map[string]actionReceipt `json:"receipts,omitempty"`
 	LegacyCompleted map[string]time.Time     `json:"legacy_completed,omitempty"`
+	Work            map[string]runWork       `json:"work,omitempty"`
+}
+
+type runWork struct {
+	Tasks           []Task          `json:"tasks"`
+	Next            int             `json:"next"`
+	Status          Status          `json:"status"`
+	ErrorCode       string          `json:"error_code,omitempty"`
+	Confirmed       map[string]bool `json:"confirmed,omitempty"`
+	CancelRequested bool            `json:"cancel_requested,omitempty"`
 }
 
 func newState() persisted {
-	return persisted{Version: 2, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}}
+	return persisted{Version: 3, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}, Work: map[string]runWork{}}
 }
 func readState(path string) (persisted, error) {
 	s := newState()
@@ -31,7 +41,7 @@ func readState(path string) (persisted, error) {
 	if err != nil {
 		return s, errors.New("task_store_unreadable")
 	}
-	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version != 1 && s.Version != 2) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
+	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version != 1 && s.Version != 2 && s.Version != 3) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
 		return s, errors.New("task_store_invalid")
 	}
 	if s.Version == 1 {
@@ -41,7 +51,48 @@ func readState(path string) (persisted, error) {
 		s.LegacyCompleted = s.Completed
 		s.Completed = map[string]time.Time{}
 		s.Receipts = map[string]actionReceipt{}
-		s.Version = 2
+	}
+	s.Version = 3
+	if s.Work == nil {
+		s.Work = map[string]runWork{}
+	}
+	if len(s.Work) > 64 {
+		return s, errors.New("task_work_limit")
+	}
+	for id, work := range s.Work {
+		if len(work.Tasks) > 1000 || work.Next < 0 || work.Next > len(work.Tasks) {
+			return s, errors.New("task_work_invalid")
+		}
+		var run *Run
+		for i := range s.Runs {
+			if s.Runs[i].ID == id {
+				run = &s.Runs[i]
+				break
+			}
+		}
+		if run == nil || run.FinishedAt != nil {
+			return s, errors.New("task_work_orphan")
+		}
+		if run.Status != StatusQueued && run.Status != StatusRunning {
+			return s, errors.New("task_work_status_invalid")
+		}
+		switch work.Status {
+		case StatusSkipped, StatusSucceeded, StatusManual, StatusCanceled, StatusFailed, StatusUncertain:
+		default:
+			return s, errors.New("task_work_status_invalid")
+		}
+		keys := map[string]bool{}
+		for _, t := range work.Tasks {
+			if t.ProviderID != run.ProviderID || !IDPattern.MatchString(t.AccountID) || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || len(run.AccountIDs) > 0 && !contains(run.AccountIDs, t.AccountID) || t.Once && t.OncePerDay || t.OncePerDay && t.PeriodKey == "" || keys[taskKey(t)] {
+				return s, errors.New("task_work_invalid")
+			}
+			keys[taskKey(t)] = true
+		}
+		for key, done := range work.Confirmed {
+			if !done || !keys[key] {
+				return s, errors.New("task_work_confirmation_invalid")
+			}
+		}
 	}
 	if s.Receipts == nil {
 		s.Receipts = map[string]actionReceipt{}
@@ -75,6 +126,27 @@ func readState(path string) (persisted, error) {
 	}
 	for i := range s.Runs {
 		if s.Runs[i].Status == StatusRunning || s.Runs[i].Status == StatusQueued {
+			if work, ok := s.Work[s.Runs[i].ID]; ok {
+				onlyUnknown := len(work.Tasks) > work.Next
+				for _, t := range work.Tasks[work.Next:] {
+					if _, unknown := s.Uncertain[taskKey(t)]; !unknown {
+						onlyUnknown = false
+					}
+				}
+				if onlyUnknown {
+					delete(s.Work, s.Runs[i].ID)
+				} else {
+					if work.CancelRequested {
+						s.Runs[i].Status = StatusCanceled
+						now := time.Now().UTC()
+						s.Runs[i].FinishedAt = &now
+						delete(s.Work, s.Runs[i].ID)
+					} else {
+						s.Runs[i].Status = StatusQueued
+					}
+					continue
+				}
+			}
 			s.Runs[i].Status = StatusUncertain
 			s.Runs[i].ErrorCode = "interrupted_restart"
 			now := time.Now().UTC()
@@ -90,6 +162,9 @@ func writeState(path string, s persisted) error {
 	b, err := json.Marshal(s)
 	if err != nil {
 		return errors.New("task_store_encode_failed")
+	}
+	if len(b) > 32<<20 {
+		return errors.New("task_store_limit")
 	}
 	tmp := path + ".pending"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)

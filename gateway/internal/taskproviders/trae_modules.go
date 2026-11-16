@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"time"
+	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/taskengine"
 	"workbuddy2api/internal/upstream/trae"
@@ -17,9 +18,11 @@ type TraeTaskAPI interface {
 	Credits(context.Context, *auth.Auth) (trae.Credits, error)
 }
 type AccountsOptions struct {
-	TraeStore  *TraeTaskStore
-	TraeClient TraeTaskAPI
-	Now        func() time.Time
+	TraeStore    *TraeTaskStore
+	TraeClient   TraeTaskAPI
+	Now          func() time.Time
+	RefreshVault *accountvault.Vault
+	Refresh      func(context.Context, *auth.Auth) (auth.TokenUpdate, error)
 }
 
 func newTraeModules(a *Accounts, defs map[string]taskengine.Definition) ([]Module, error) {
@@ -39,7 +42,7 @@ func newTraeModules(a *Accounts, defs map[string]taskengine.Definition) ([]Modul
 	if now == nil {
 		now = time.Now
 	}
-	check := &traeCheckinModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "checkin", Key: "checkin", Realms: []string{"trae"}}, definition: defs["checkin"]}, api: client, store: s, now: now}
+	check := &traeCheckinModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "checkin", Key: "checkin", Realms: []string{"trae"}}, definition: defs["checkin"]}, api: client, store: s, now: now, owner: a}
 	balance := &traeBalanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"trae"}}, definition: defs["balance"]}, owner: a, api: client, now: now}
 	return []Module{check, balance}, nil
 }
@@ -66,7 +69,10 @@ func (m *traeBalanceModule) Inspect(ctx context.Context, a *auth.Auth, t taskeng
 		return taskengine.Observation{}, err
 	}
 	remain := int64(credits.Remaining)
-	expiring := trae.ExpiringWithin(credits, m.owner.ExpiringSoon, m.now())
+	expiring, err := trae.TaskExpiry(credits, m.owner.ExpiringSoon, m.now())
+	if err != nil {
+		return taskengine.Observation{}, err
+	}
 	m.owner.Pool.SetCreditsDetailed(a.UID, remain, expiring)
 	m.owner.Pool.ReenableIfCredits(a.UID, remain)
 	return taskengine.Observation{Phase: "done", Current: remain, Summary: fmt.Sprintf("剩余 %d 积分；配置窗口内将到期 %d 积分。已更新账号池。", remain, expiring)}, nil
@@ -80,6 +86,40 @@ type traeCheckinModule struct {
 	api   TraeTaskAPI
 	store *TraeTaskStore
 	now   func() time.Time
+	owner *Accounts
+}
+
+func (m *traeCheckinModule) AcquireTask(ctx context.Context, a *auth.Auth, t taskengine.Task) (func(), error) {
+	// FIFO channel admission bounds concurrent claim preparation to one. No
+	// engine worker or write marker is held while waiting for local pacing.
+	select {
+	case m.store.claimGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-m.store.claimGate }
+	stored := m.store.read(a.UID)
+	if stored.CheckedDay == t.PeriodKey || t.PeriodKey != m.day() || m.now().Before(stored.RetryAt) {
+		return release, nil
+	}
+	m.store.mu.Lock()
+	delay := m.store.state.NextClaim.Sub(m.now())
+	m.store.mu.Unlock()
+	if delay > 3*time.Second {
+		release()
+		return nil, errors.New("trae_task_clock_invalid")
+	}
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			release()
+			return nil, ctx.Err()
+		}
+	}
+	return release, nil
 }
 
 func (m *traeCheckinModule) day() string {
@@ -160,6 +200,10 @@ func (m *traeCheckinModule) Execute(ctx context.Context, a *auth.Auth, t taskeng
 	}
 	if err != nil {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, o), err
+	}
+	current, err := m.owner.account(a.UID)
+	if err != nil || current.AccessToken != a.AccessToken || current.RefreshToken != a.RefreshToken || t.PeriodKey != m.day() {
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, observation("blocked", "账号或业务日发生变化，请重新核验。")), err
 	}
 	_, err = m.api.Claim(ctx, a)
 	if err != nil {

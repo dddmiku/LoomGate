@@ -114,6 +114,30 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
+func SessionDeadReason() string { return sessionDeadReason }
+
+// CompleteSessionRefresh rechecks the live identity and reason under the pool
+// lock. A concurrent manual/review disable cannot be undone by a refresh.
+func (p *Pool) CompleteSessionRefresh(uid string, expected *auth.Auth) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.a != expected {
+		return false
+	}
+	if e.disabled && e.reason != sessionDeadReason {
+		return false
+	}
+	if e.disabled {
+		e.disabled = false
+		e.reason = ""
+		p.markStateFieldsLocked(uid, "disabled", "reason")
+	}
+	e.sessionDeadFails = 0
+	p.markStateFieldsLocked(uid, "session_dead_fails")
+	return true
+}
+
 // NoteContentBlocked 记录一次「内容审核拒绝」（ErrContentBlocked）并累计连续计数。
 //
 // 返回 true 表示本次计数达到 reviewFailThreshold、该账号已被停用。
@@ -634,19 +658,19 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 不算冷却——上游没有限制这个账号，只是积分花完，免费模型照常可用
 		// （2026-10-18 用户指出「账号级冷却其实没有存在的必要，都是针对模型的，
 		// 只是没有积分余额而已」）。余额不足由 CreditsExhausted 单独表达。
-		Cooling:         (now.Before(e.until) && e.coolKind != CoolHard) || now.Before(e.breakerUntil),
+		Cooling:          (now.Before(e.until) && e.coolKind != CoolHard) || now.Before(e.breakerUntil),
 		CreditsExhausted: now.Before(e.until) && e.coolKind == CoolHard,
-		Reason:          reason,
-		Disabled:        e.disabled,
-		SuccessCount:    e.successCount,
-		ErrTotal:        e.errTotal,
-		LastSuccessTime: e.lastSuccess,
-		LastErrTime:     e.lastErr,
-		Until:           e.until,
-		SoftStreak:      e.softStreak,
-		InFlight:        int(e.inFlight.Load()),
-		BreakerFails:    e.fails,
-		BreakerUntil:    e.breakerUntil,
+		Reason:           reason,
+		Disabled:         e.disabled,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		LastSuccessTime:  e.lastSuccess,
+		LastErrTime:      e.lastErr,
+		Until:            e.until,
+		SoftStreak:       e.softStreak,
+		InFlight:         int(e.inFlight.Load()),
+		BreakerFails:     e.fails,
+		BreakerUntil:     e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

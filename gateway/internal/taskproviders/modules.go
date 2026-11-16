@@ -48,15 +48,29 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 			return nil, errors.New("task_definition_missing")
 		}
 	}
+	if a.options.RefreshVault != nil && defs["keepalive"].Name == "" {
+		return nil, errors.New("task_definition_missing")
+	}
 	check := &checkinModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "checkin", Key: "checkin", Realms: []string{"cn"}}, definition: defs["checkin"]}, up: a.Upstream}
 	if a.Provider == "trae" {
-		return newTraeModules(a, defs)
+		modules, err := newTraeModules(a, defs)
+		if err != nil {
+			return nil, err
+		}
+		if a.options.RefreshVault != nil {
+			return append(modules, newKeepaliveModule(a, defs["keepalive"])), nil
+		}
+		return modules, nil
 	}
 	if a.Provider != "workbuddy" {
 		return nil, errors.New("provider_unsupported")
 	}
 	modules := []Module{check, &balanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"cn", "global"}}, definition: defs["balance"]}, owner: a}, &growthModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "growth", Key: "growth/", Prefix: true, Realms: []string{"cn"}}, definition: defs["growth"]}, up: a.Upstream}}
-	return append(modules, newLifecycleModules(a.Upstream, defs)...), nil
+	modules = append(modules, newLifecycleModules(a.Upstream, defs)...)
+	if a.options.RefreshVault != nil {
+		modules = append(modules, newKeepaliveModule(a, defs["keepalive"]))
+	}
+	return modules, nil
 }
 
 type checkinModule struct {

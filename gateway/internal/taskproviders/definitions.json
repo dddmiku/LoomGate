@@ -1,4 +1,11 @@
 {
+  "keepalive": {
+    "key": "keepalive",
+    "name": "账号会话保活",
+    "description": "通过官方刷新接口续期，安全保存后重新读取凭据确认。仅恢复会话失效停用，人工与审核停用不会自动启用。",
+    "side_effect": true,
+    "stages": ["inspect", "execute", "verify"]
+  },
   "checkin": {
     "key": "checkin",
     "name": "每日签到",

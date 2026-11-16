@@ -5,6 +5,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -86,14 +87,25 @@ type refreshCall struct {
 // RefreshOnce 合并同一个 Auth 上重叠的刷新调用，包括来自不同 Client 的调用。
 // refresh 只接收独立快照；没有任何凭据锁跨过网络调用。失败会传给全部等待者。
 func (a *Auth) RefreshOnce(refresh func(*Auth) (TokenUpdate, error)) (err error) {
+	return a.RefreshOnceContext(context.Background(), refresh)
+}
+
+func (a *Auth) RefreshOnceContext(ctx context.Context, refresh func(*Auth) (TokenUpdate, error)) (err error) {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if a == nil {
 		return fmt.Errorf("no auth credentials")
 	}
 	a.refreshMu.Lock()
 	if pending := a.refreshing; pending != nil {
 		a.refreshMu.Unlock()
-		<-pending.done
-		return pending.err
+		select {
+		case <-pending.done:
+			return pending.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	pending := &refreshCall{done: make(chan struct{})}
 	a.refreshing = pending
@@ -345,6 +357,10 @@ func (a *Auth) SaveAtomic() error {
 	a.saveMu.Lock()
 	defer a.saveMu.Unlock()
 	a = a.Snapshot()
+	return saveSnapshot(a)
+}
+
+func saveSnapshot(a *Auth) error {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}

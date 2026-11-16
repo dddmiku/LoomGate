@@ -22,14 +22,15 @@ type traeTaskStateData struct {
 	NextClaim time.Time                `json:"next_claim"`
 }
 type TraeTaskStore struct {
-	mu       sync.Mutex
-	vault    *accountvault.Vault
-	state    traeTaskStateData
-	revision uint64
+	mu        sync.Mutex
+	vault     *accountvault.Vault
+	state     traeTaskStateData
+	revision  uint64
+	claimGate chan struct{}
 }
 
 func NewTraeTaskStore(v *accountvault.Vault) (*TraeTaskStore, error) {
-	s := &TraeTaskStore{vault: v, state: traeTaskStateData{Accounts: map[string]traeTaskState{}}}
+	s := &TraeTaskStore{vault: v, state: traeTaskStateData{Accounts: map[string]traeTaskState{}}, claimGate: make(chan struct{}, 1)}
 	if v == nil {
 		return s, nil
 	}
