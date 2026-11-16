@@ -107,6 +107,7 @@ func main() {
 	lifecycle := flag.Bool("lifecycle-modules", false, "use registered lifecycle modules with persisted synthetic upstream state")
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
+	traeTasks := flag.Bool("trae-tasks", false, "use real Trae lifecycle modules with synthetic transport")
 	flag.Parse()
 	host, _, err := net.SplitHostPort(*address)
 	if err != nil || host != "127.0.0.1" || *root == "" {
@@ -153,6 +154,19 @@ func main() {
 	p := pool.New("")
 	defer p.Close()
 	var workbuddy taskengine.Adapter
+	var traeAdapter taskengine.Adapter
+	var traeFixture *traeTaskFixture
+	if *traeTasks {
+		moduleVault, err := accountvault.Open(filepath.Join(*root, "data", "trae-module-state"))
+		if err != nil {
+			panic("fixture_trae_vault_failed")
+		}
+		defer moduleVault.Close()
+		traeAdapter, traeFixture, err = seedTraeTasks(*root, p, fixture, moduleVault)
+		if err != nil {
+			panic("fixture_trae_modules_failed")
+		}
+	}
 	if *modules || *lifecycle {
 		up, err := seedLegacyTaskFixture(*root, p, fixture)
 		if err != nil {
@@ -170,6 +184,9 @@ func main() {
 		var adapter taskengine.Adapter = &syntheticTasks{provider: id, fixture: fixture}
 		if id == "workbuddy" && workbuddy != nil {
 			adapter = workbuddy
+		}
+		if id == "trae" && traeAdapter != nil {
+			adapter = traeAdapter
 		}
 		if err = engine.Register(id, adapter); err != nil {
 			panic("fixture_adapter_failed")
@@ -250,6 +267,16 @@ func main() {
 	}
 	defer admin.Close()
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__fixture/trae-stats", func(w http.ResponseWriter, r *http.Request) {
+		if traeFixture == nil {
+			w.WriteHeader(404)
+			return
+		}
+		traeFixture.mu.Lock()
+		defer traeFixture.mu.Unlock()
+		status, _ := p.Status("3001")
+		json.NewEncoder(w).Encode(map[string]any{"claims": traeFixture.state.Claims, "statuses": traeFixture.state.Statuses, "reads": traeFixture.state.Reads, "credits": status.Credits, "expiring": status.CreditsExpiring})
+	})
 	mux.Handle("/admin/", http.StripPrefix("/admin", admin))
 	mux.HandleFunc("GET /__fixture/stats", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"calls": fixture.calls.Load(), "mode": fixture.mode.Load(), "mutations": fixture.mutations.Load(), "sms_calls": fixture.smsCalls.Load(), "qr_calls": fixture.qrCalls.Load(), "qr_polls": fixture.qrPolls.Load()})
@@ -267,7 +294,7 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 	mux.HandleFunc("POST /__fixture/mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
-		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6, "client-disconnected": 7, "client-switched": 8, "client-login": 9, "lifecycle-arrived": 10, "lifecycle-silent": 11, "lifecycle-rollover": 12}
+		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6, "client-disconnected": 7, "client-switched": 8, "client-login": 9, "lifecycle-arrived": 10, "lifecycle-silent": 11, "lifecycle-rollover": 12, "trae-rate": 20, "trae-advance": 21, "trae-broken-balance": 22, "trae-device": 23}
 		value, ok := mode[r.PathValue("mode")]
 		if !ok {
 			w.WriteHeader(400)

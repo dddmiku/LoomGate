@@ -35,10 +35,10 @@ func (c *Client) TaskCheckin(ctx context.Context, a *auth.Auth) error {
 }
 func (c *Client) taskBilling(ctx context.Context, a *auth.Auth, paths []string) (json.RawMessage, error) {
 	// The configured realm chooses the endpoint; no cross-provider fallback.
-	return c.billingJSONContext(ctx, a, http.MethodPost, paths[0], map[string]any{})
+	return c.billingJSONContext(strictTaskContext(ctx), a, http.MethodPost, paths[0], map[string]any{})
 }
 func (c *Client) TaskCatalog(ctx context.Context, a *auth.Auth) ([]GrowthTask, error) {
-	data, err := c.growthJSONContext(ctx, a, http.MethodGet, growthTasksPath, nil)
+	data, err := c.growthJSONContext(strictTaskContext(ctx), a, http.MethodGet, growthTasksPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +52,6 @@ func (c *Client) TaskCatalog(ctx context.Context, a *auth.Auth) ([]GrowthTask, e
 	return s.Tasks, err
 }
 func (c *Client) TaskClaim(ctx context.Context, a *auth.Auth, key string) error {
-	_, err := c.growthJSONContext(ctx, a, http.MethodPost, growthTaskClaimPrefix+url.PathEscape(key)+"/claim", map[string]any{})
+	_, err := c.growthJSONContext(strictTaskContext(ctx), a, http.MethodPost, growthTaskClaimPrefix+url.PathEscape(key)+"/claim", map[string]any{})
 	return err
 }

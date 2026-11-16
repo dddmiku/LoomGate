@@ -74,12 +74,15 @@ type Task struct {
 	// recorded. Missing on an interrupted/unknown response; never inferred from
 	// an empty directory or HTTP200 alone.
 	AcceptedStage Stage `json:"accepted_stage,omitempty"`
+	actionAttempt string
 }
 
 // Observation is an adapter's factual result. Success at Execute/Claim alone
 // does not prove a completed task: a declared Verify stage must confirm it.
 // Summary must be safe operator text; raw response bodies and credentials are forbidden.
 type Observation struct {
+	// Action evidence is private transport metadata, not an upstream phase.
+	action    *actionEvidence
 	Status    Status `json:"status"`
 	Summary   string `json:"summary,omitempty"`
 	ErrorCode string `json:"error_code,omitempty"`
@@ -128,16 +131,17 @@ type Schedule struct {
 	LastDispatched *time.Time `json:"last_dispatched,omitempty"`
 }
 type Step struct {
-	TaskKey      string     `json:"task_key,omitempty"`
-	AccountID    string     `json:"account_id,omitempty"`
-	Stage        Stage      `json:"stage"`
-	Status       Status     `json:"status"`
-	Attempt      int        `json:"attempt"`
-	StartedAt    time.Time  `json:"started_at"`
-	FinishedAt   *time.Time `json:"finished_at,omitempty"`
-	Summary      string     `json:"summary,omitempty"`
-	ErrorCode    string     `json:"error_code,omitempty"`
-	UpstreamCode *int       `json:"upstream_code,omitempty"`
+	ActionOutcome string     `json:"action_outcome,omitempty"`
+	TaskKey       string     `json:"task_key,omitempty"`
+	AccountID     string     `json:"account_id,omitempty"`
+	Stage         Stage      `json:"stage"`
+	Status        Status     `json:"status"`
+	Attempt       int        `json:"attempt"`
+	StartedAt     time.Time  `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	Summary       string     `json:"summary,omitempty"`
+	ErrorCode     string     `json:"error_code,omitempty"`
+	UpstreamCode  *int       `json:"upstream_code,omitempty"`
 }
 type Run struct {
 	DiscoveryIssues []DiscoveryIssue `json:"discovery_issues,omitempty"`

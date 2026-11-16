@@ -3,7 +3,7 @@ import argparse,json,subprocess,sys,time,traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
-from console_actions import sidebar_action
+from console_actions import choose_provider, choose_account, choose_capability, sidebar_action
 parser=argparse.ArgumentParser()
 parser.add_argument('--runtime',required=True);parser.add_argument('--output',required=True);parser.add_argument('--fixture',required=True)
 args=parser.parse_args();root=Path(args.runtime).resolve();out=Path(args.output).resolve();binary=Path(args.fixture).resolve()
@@ -25,7 +25,7 @@ def main():
         def shot(name):page.screenshot(path=str(out/name),full_page=False,animations='disabled',mask=[page.locator('input[type=password]')],mask_color='#e3e8e3');report['screenshots'].append(name)
         def nav():
             if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
-            page.locator('#navigation a[href="#accounts"]').click();page.locator('#account-provider').wait_for();page.locator('#account-provider').select_option('doubao');page.locator('#account-list .loading').wait_for(state='detached');page.locator('[data-action=connect-account]').wait_for()
+            page.locator('#navigation a[href="#accounts"]').click();page.locator('#account-provider').wait_for();choose_provider(page,'#account-provider','doubao');page.locator('#account-list .loading').wait_for(state='detached');page.locator('[data-action=connect-account]').wait_for()
         def begin(method):
             page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('doubao');page.locator('#connection-method').select_option(method);page.locator('#connection-begin').click()
         fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)

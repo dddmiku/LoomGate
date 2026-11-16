@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from run_wait import wait_run
-from console_actions import reveal_filter,select_task,plan_timing,plan_times,plan_review
+from console_actions import choose_provider, choose_account, choose_capability, reveal_filter,select_task,plan_timing,plan_times,plan_review
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);p.add_argument('--fixture',required=True);args=p.parse_args()
 root=Path(args.runtime).resolve();out=Path(args.output).resolve();binary=Path(args.fixture).resolve()
 if root.name!='catalog-fixture' or any(x.drive.upper()!='D:' for x in [root,out,binary]):raise SystemExit('synthetic_runtime_required')
@@ -22,7 +22,7 @@ def main():
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
    page.locator('#navigation a[href="#'+route+'"]').click()
   def tasks():
-   nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');page.locator('[data-task=balance]').first.wait_for();reveal_filter(page,'#task-account');page.locator('#task-account').select_option('1001');page.locator('[data-task=compensation]').wait_for()
+   nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');page.locator('[data-task=balance]').first.wait_for();choose_account(page,'#task-account','1001');page.locator('[data-task=compensation]').wait_for()
   def run(key,status):
    select_task(page,key,'run-task')
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:page.locator('#run-form button[type=submit]').click()
@@ -61,7 +61,7 @@ def main():
   report['actions'].append('plan_time_timezone_scope_and_live_enable_survive_process_restart')
   stage='no-replay';tasks();run('compensation','uncertain');assert stats()['compensation_claims']==1;work=api('workbench');assert any(r['id']==unknown['id'] and r['status']=='uncertain' for r in work['runs']);report['actions'].append('restart_and_explicit_recheck_never_repeat_unknown_claim')
   stage='mobile';tasks();select_task(page,'compensation');page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.locator('#toast').wait_for(state='hidden');page.screenshot(path=str(out/'lifecycle-pending-mobile.png'),full_page=True)
-  nav('tasks');reveal_filter(page,'#task-account');page.locator('#task-account').select_option('1003');page.locator('[data-task=balance]').wait_for();assert all(not page.locator('[data-task="'+key+'"]').count() for key in expected);report['actions'].append('mobile_layout_and_global_account_excluded_from_writes')
+  nav('tasks');choose_account(page,'#task-account','1003');page.locator('[data-task=balance]').wait_for();assert all(not page.locator('[data-task="'+key+'"]').count() for key in expected);report['actions'].append('mobile_layout_and_global_account_excluded_from_writes')
   assert not report['page_errors'] and not report['console_errors'] and not report['external_requests'];browser.close()
 try:main();report['result']='PASS'
 except Exception as e:report.update(result='FAIL',stage=stage,error_type=type(e).__name__,lines=[x.lineno for x in traceback.extract_tb(e.__traceback__) if x.filename.endswith('lifecycle_modules_browser.py')])

@@ -3,7 +3,7 @@ import argparse,json,sys,traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
-from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review
+from console_actions import choose_provider, choose_account, choose_capability, reveal_filter, select_task, plan_timing, plan_times, plan_review
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);a=p.parse_args()
 root=Path(a.runtime).resolve();out=Path(a.output).resolve()
 if root.name!='catalog-fixture' or root.drive.upper()!='D:' or out.drive.upper()!='D:':raise SystemExit('synthetic_runtime_required')
@@ -60,9 +60,8 @@ def main():
     assert not page.locator('#main').evaluate('(e)=>e.inert')
    nav('models')
    if width<=700:
-    assert not page.locator('#model-account').is_visible()
-    reveal_filter(page,'#model-account');assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
-    page.locator('#model-refine summary').click()
+    assert page.locator('#model-account').is_visible()
+    assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
    stage=f'{width}:plan-dialog';nav('schedules');page.locator('[data-action=new-schedule]').click();page.locator('#plan-provider').select_option('doubao');page.locator('#plan-next:not([disabled])').wait_for();page.locator('#plan-task').select_option('fixture-check');page.locator('input[name=plan-account]').first.check();plan_timing(page);plan_times(page,['08:20','18:20']);plan_review(page)
    bounds();assert page.locator('#dialog').evaluate('(d)=>d.scrollWidth<=d.clientWidth+1')
    assert page.locator('#plan-save').is_visible();page.locator('#plan-save').scroll_into_view_if_needed()

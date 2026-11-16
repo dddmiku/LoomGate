@@ -10,6 +10,24 @@ def reveal_filter(page, selector):
     control.wait_for(state='visible')
 
 
+def choose_provider(page, selector, value):
+    page.locator(selector + ' [data-provider-choice="' + value + '"]').click()
+    page.locator(selector + ' [data-provider-choice="' + value + '"][aria-pressed=true]').wait_for()
+
+
+def choose_account(page, selector, value):
+    page.locator(selector + ':not([disabled])').click()
+    page.locator('#scope-search').fill(value)
+    page.locator('[data-account-choice="' + value + '"]').click()
+    page.locator('#dialog').wait_for(state='hidden')
+    label = value or ('所有账号（分页）' if selector == '#model-account' else '全部已启用账号')
+    page.wait_for_function('([selector,label])=>document.querySelector(selector+" strong")?.textContent===label', arg=[selector,label])
+
+
+def choose_capability(page, value):
+    page.locator('#model-capability [data-capability="' + value + '"]').click()
+
+
 def sidebar_action(page, selector, close=True):
     if not page.locator(selector).is_visible():
         page.locator('#navigation-toggle').click()

@@ -164,26 +164,30 @@ func (m *travelModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.T
 func (m *travelModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	s, e := m.read(ctx, a)
 	if e != nil {
-		return taskengine.Observation{}, e
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), e
 	}
 	state := m.state(t, s)
 	if t.Key != "travel/depart" || state.Phase != "ready" {
-		return state, nil
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, state), nil
 	}
 	e = m.up.TaskTravelDepart(ctx, a, s.locations[0].ID)
-	return observation("pending", "派出已提交，等待状态复核。"), e
+	return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "派出已提交，等待状态复核。")), e
 }
 func (m *travelModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	s, e := m.read(ctx, a)
 	if e != nil {
-		return taskengine.Observation{}, e
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, taskengine.Observation{}), e
 	}
 	state := m.state(t, s)
 	if t.Key != "travel/claim" || state.Phase != "claimable" {
-		return state, nil
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), nil
 	}
 	e = m.up.TaskTravelClaim(ctx, a, s.travel.RecordID)
-	return observation("pending", "领取已提交，等待原记录结算。"), e
+	result := observation("pending", "领取已提交，等待原记录结算。")
+	if e == nil {
+		return taskengine.Accepted(t, taskengine.StageClaim, result), nil
+	}
+	return taskengine.UnknownAction(t, taskengine.StageClaim, result), e
 }
 func (m *travelModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)
@@ -283,12 +287,12 @@ func (m *redemptionModule) Inspect(ctx context.Context, a *auth.Auth, t taskengi
 func (m *redemptionModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	state, e := m.Inspect(ctx, a, t)
 	if e != nil || state.Phase != "claimable" {
-		return state, e
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), e
 	}
 	// Stable for this account, upstream month and tier; never regenerated on retry.
 	operation := fmt.Sprintf("loomgate-%x", sha256.Sum256([]byte(a.UID+"\x00"+t.Key+"\x00"+t.PeriodKey)))
 	e = m.up.TaskRedeem(ctx, a, strings.TrimPrefix(t.Key, "redeem/"), operation)
-	return observation("pending", "兑换已提交，等待官方档位状态确认。"), e
+	return taskengine.UnknownAction(t, taskengine.StageClaim, observation("pending", "兑换已提交，等待官方档位状态确认。")), e
 }
 func (m *redemptionModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)
@@ -405,10 +409,10 @@ func (m *makeupModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.T
 func (m *makeupModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	state, e := m.Inspect(ctx, a, t)
 	if e != nil || state.Phase != "ready" {
-		return state, e
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, state), e
 	}
 	e = m.up.TaskMakeup(ctx, a, t.PeriodKey)
-	return observation("pending", "补登已提交，等待目标日期回读。"), e
+	return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "补登已提交，等待目标日期回读。")), e
 }
 func (m *makeupModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)
@@ -479,10 +483,10 @@ func (m *compensationModule) Inspect(ctx context.Context, a *auth.Auth, t tasken
 func (m *compensationModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	state, e := m.Inspect(ctx, a, t)
 	if e != nil || state.Phase != "claimable" {
-		return state, e
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), e
 	}
 	e = m.up.TaskCompensationClaim(ctx, a)
-	return observation("pending", "补偿领取已提交，等待 claimed 回读。"), e
+	return taskengine.UnknownAction(t, taskengine.StageClaim, observation("pending", "补偿领取已提交，等待 claimed 回读。")), e
 }
 func (m *compensationModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)

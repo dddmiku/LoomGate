@@ -295,13 +295,15 @@ func TestTraeModuleKeepsItsOwnContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	module := traeAdapter.Modules[0].(*checkinModule)
+	module := traeAdapter.Modules[0].(*traeCheckinModule)
 	checked := false
-	module.traeStatus = func(context.Context, *auth.Auth) (trae.CheckinStatus, error) {
+	module.api = &traeModuleStub{status: func(context.Context, *auth.Auth) (trae.CheckinStatus, error) {
 		return trae.CheckinStatus{Enabled: true, CheckedIn: checked}, nil
-	}
-	module.traeClaim = func(context.Context, *auth.Auth) error { checked = true; return nil }
-	catalog, err := traeAdapter.DiscoverCatalog(context.Background(), taskengine.Scope{}, "")
+	}, claim: func(context.Context, *auth.Auth) (trae.CheckinStatus, error) {
+		checked = true
+		return trae.CheckinStatus{CheckedIn: true}, nil
+	}}
+	catalog, err := traeAdapter.DiscoverCatalog(context.Background(), taskengine.Scope{}, "checkin")
 	if err != nil || len(catalog.Tasks) != 1 || catalog.Tasks[0].AccountID != "trae-fixture" {
 		t.Fatal("Trae scope changed")
 	}

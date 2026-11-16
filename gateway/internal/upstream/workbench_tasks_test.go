@@ -65,3 +65,18 @@ func TestWorkbenchReadsAndMutationsUseCallerCancellation(t *testing.T) {
 		t.Fatal("cancellation request not exercised")
 	}
 }
+
+func TestTravelAcceptanceRequiresExplicitBusinessCodeAndReward(t *testing.T) {
+	for _, body := range []string{`{"data":{"reward_credit":7}}`, `{"code":null,"data":{"reward_credit":7}}`, `{"code":0,"data":{}}`, `{"code":2,"data":{"reward_credit":7}}`} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(body))
+		}))
+		c := &Client{HTTP: s.Client(), ChatBaseCN: s.URL}
+		err := c.TaskTravelClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, 901)
+		s.Close()
+		if err == nil {
+			t.Fatal("HTTP200 without business acceptance manufactured receipt")
+		}
+	}
+}

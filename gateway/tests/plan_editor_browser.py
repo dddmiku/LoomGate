@@ -4,7 +4,7 @@ Uses only the synthetic catalog-workbench runtime; no real provider account.
 import argparse,json,sys,traceback
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from console_actions import reveal_filter,select_task,plan_timing,plan_times,plan_review
+from console_actions import choose_provider, choose_account, choose_capability, reveal_filter,select_task,plan_timing,plan_times,plan_review
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);args=p.parse_args()
 root=Path(args.runtime).resolve();out=Path(args.output).resolve()
 if root.name!='catalog-fixture' or root.drive.upper()!='D:' or out.drive.upper()!='D:':raise SystemExit('synthetic_runtime_required')
@@ -53,7 +53,7 @@ def main():
   assert [x.input_value() for x in page.locator('[name=plan-time]').all()]==['08:35','17:35'];plan_times(page,['10:00'],'Asia/Shanghai');page.locator('#dialog-close').click()
   assert next(x for x in api()['schedules'] if x['id']==sid)==record and len(writes)==1
   report['actions'].append('cancel_edit_preserves_persisted_plan')
-  stage='mobile-detail';page.set_viewport_size({'width':390,'height':844});nav('tasks');page.locator('#task-provider').select_option('doubao');page.locator('[data-task=fixture-check]').wait_for()
+  stage='mobile-detail';page.set_viewport_size({'width':390,'height':844});nav('tasks');choose_provider(page,'#task-provider','doubao');page.locator('[data-task=fixture-check]').wait_for()
   assert page.locator('.selection-pane').is_visible() and not page.locator('#task-detail').is_visible()
   select_task(page,'fixture-check');assert not page.locator('.selection-pane').is_visible();assert page.locator('#task-detail [data-action=run-task]').is_visible();page.screenshot(path=str(out/'task-detail-mobile.png'),full_page=True)
   page.locator('[data-action=task-back]').click();assert page.locator('[data-task=fixture-check]').evaluate('(e)=>e===document.activeElement');assert page.locator('.selection-pane').is_visible()

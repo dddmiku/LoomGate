@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 from run_wait import wait_run
-from console_actions import reveal_filter, select_task, plan_timing, plan_times, plan_review, sidebar_action
+from console_actions import choose_provider, choose_account, choose_capability, reveal_filter, select_task, plan_timing, plan_times, plan_review, sidebar_action
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--runtime', required=True)
@@ -104,10 +104,10 @@ def main():
         page.locator('[data-action=model-next]').click();models_settled()
         assert '9–16 / ' in page.locator('#model-pagination').inner_text()
         page.locator('[data-action=model-prev]').click();models_settled()
-        reveal_filter(page,'#model-account');page.locator('#model-account').select_option('a-fixture');models_settled()
+        choose_account(page,'#model-account','a-fixture');models_settled()
         assert page.locator('.selection-row').count()==1
-        page.locator('#model-capability').select_option('supports_tool_call');assert page.locator('.selection-row').count()==0
-        page.locator('#model-capability').select_option('native_tools');assert page.locator('.selection-row').count()==1
+        choose_capability(page,'supports_tool_call');assert page.locator('.selection-row').count()==0
+        choose_capability(page,'native_tools');assert page.locator('.selection-row').count()==1
         page.locator('#model-search').fill('no-such-model');assert page.locator('.selection-row').count()==0
         page.locator('#model-search').fill('合成');assert page.locator('.selection-row').count()==1
         done('catalog_scope_pagination_filter_xss_and_capability_semantics');shot('console-models.png')
@@ -123,7 +123,7 @@ def main():
         done('stale_cache_and_manual_refresh_backoff');shot('console-stale.png')
         stage='route-cancel'
         page.request.post(base+'/__fixture/mode/slow')
-        page.locator('#model-account').select_option('z-page-20')
+        choose_account(page,'#model-account','z-page-20')
         page.locator('#model-list .loading').wait_for()
         nav('providers');page.locator('article[data-provider="doubao"] h2').wait_for()
         page.wait_for_timeout(1700)
@@ -143,13 +143,13 @@ def main():
         assert page.locator('#model-notice .error').is_visible()
         context.set_offline(False);done('offline_and_failure_state')
         stage='legacy'
-        reveal_filter(page,'#model-capability');page.locator('#model-capability').select_option('');page.locator('#model-search').fill('')
-        page.locator('#model-provider').select_option('workbuddy');models_settled()
+        choose_capability(page,'');page.locator('#model-search').fill('')
+        choose_provider(page,'#model-provider','workbuddy');models_settled()
         assert page.locator('[data-model-id="cn:fixture-chat"]').count()==1
         assert page.locator('#model-account').is_disabled()
         done('existing_provider_catalog_contract')
         stage='tasks'
-        nav('tasks');page.locator('#task-provider').select_option('doubao')
+        nav('tasks');choose_provider(page,'#task-provider','doubao')
         page.locator('[data-task=fixture-manual]').wait_for()
         select_task(page,'fixture-manual','manual-task')
         assert '选择需要处理的文档' in page.locator('#dialog-body').inner_text()
@@ -247,7 +247,7 @@ def main():
             if route in ['models','schedules']:
                 shot('console-'+route+'-mobile.png')
             if route=='models':
-                reveal_filter(page,'#model-account');assert page.locator('#model-account').bounding_box()['width']>=240;page.locator('#model-refine summary').click()
+                assert page.locator('#model-account').bounding_box()['width']>=240
         done('ten_mobile_routes_and_usable_filter_widths')
         stage='dark-and-settings'
         sidebar_action(page,'#theme');assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')

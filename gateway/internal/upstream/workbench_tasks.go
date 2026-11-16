@@ -4,10 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"workbuddy2api/internal/auth"
 )
+
+type taskEnvelopeKey struct{}
+
+func strictTaskContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, taskEnvelopeKey{}, true)
+}
+func (c *Client) doTaskJSON(req *http.Request) (json.RawMessage, error) {
+	client := *c.HTTP
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(req)
+	if err != nil {
+		if req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
+		return nil, errors.New("task_transport_failed")
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(raw) > 1<<20 {
+		return nil, errors.New("task_response_invalid")
+	}
+	if response.StatusCode != 200 {
+		return nil, errors.New("task_http_rejected")
+	}
+	var envelope struct {
+		Code *int            `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil || envelope.Code == nil {
+		return nil, errors.New("task_business_code_missing")
+	}
+	if *envelope.Code != 0 {
+		return nil, errors.New("task_business_rejected")
+	}
+	return envelope.Data, nil
+}
 
 // These operations reuse the existing signed transport, but reject absent
 // state fields instead of interpreting a changed schema as an eligible task.
@@ -30,7 +67,7 @@ func (c *Client) taskGrowthRead(ctx context.Context, a *auth.Auth, path string, 
 	if a.Realm() != "cn" {
 		return errors.New("task_realm_unsupported")
 	}
-	raw, err := c.growthJSONContext(ctx, a, http.MethodGet, path, nil)
+	raw, err := c.growthJSONContext(strictTaskContext(ctx), a, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -40,7 +77,7 @@ func (c *Client) taskGrowthWrite(ctx context.Context, a *auth.Auth, path string,
 	if a.Realm() != "cn" {
 		return nil, errors.New("task_realm_unsupported")
 	}
-	return c.growthJSONContext(ctx, a, http.MethodPost, path, body)
+	return c.growthJSONContext(strictTaskContext(ctx), a, http.MethodPost, path, body)
 }
 func (c *Client) TaskBuddy(ctx context.Context, a *auth.Auth) (*Buddy, error) {
 	var data map[string]json.RawMessage
@@ -209,7 +246,7 @@ func (c *Client) TaskCompensation(ctx context.Context, a *auth.Auth) (TaskCompen
 	if a.Realm() != "cn" {
 		return result, errors.New("task_realm_unsupported")
 	}
-	raw, err := c.billingJSONContext(ctx, a, http.MethodPost, "/billing/meter/compensation-status", map[string]any{})
+	raw, err := c.billingJSONContext(strictTaskContext(ctx), a, http.MethodPost, "/billing/meter/compensation-status", map[string]any{})
 	if err != nil {
 		return result, err
 	}
@@ -225,6 +262,6 @@ func (c *Client) TaskCompensationClaim(ctx context.Context, a *auth.Auth) error 
 	if a.Realm() != "cn" {
 		return errors.New("task_realm_unsupported")
 	}
-	_, err := c.billingJSONContext(ctx, a, http.MethodPost, "/billing/meter/claim-compensation", map[string]any{})
+	_, err := c.billingJSONContext(strictTaskContext(ctx), a, http.MethodPost, "/billing/meter/claim-compensation", map[string]any{})
 	return err
 }

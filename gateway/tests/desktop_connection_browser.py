@@ -2,6 +2,7 @@
 import argparse,json,os,subprocess,sys,time,traceback
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from console_actions import choose_provider, choose_account, choose_capability
 from urllib.parse import urlsplit
 p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--output',required=True);p.add_argument('--fixture',required=True);args=p.parse_args()
 root=Path(args.runtime).resolve();out=Path(args.output).resolve();binary=Path(args.fixture).resolve()
@@ -36,7 +37,7 @@ def main():
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
   assert page.request.get(base+'/admin/api/workbench/client').status in (401,302)
   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
-  page.locator('#navigation a[href="#accounts"]').click();page.locator('#account-provider').select_option('doubao');page.locator('[data-client-state=unbound]').wait_for()
+  page.locator('#navigation a[href="#accounts"]').click();choose_provider(page,'#account-provider','doubao');page.locator('[data-client-state=unbound]').wait_for()
   before=len(snapshot());mode('client-disconnected');page.locator('#client-status-refresh').click();page.locator('[data-client-state=disconnected]').wait_for();page.locator('#connect-official-client').click();page.locator('#connection-begin').click();page.locator('#connection-verify').wait_for();assert flows()[-1]['status']=='waiting_authorization';assert len(snapshot())==before
   report['actions'].append('disconnected_state_and_explicit_readonly_recovery')
   stage='restart';page.locator('#dialog-close').click();assert page.request.post(base+'/__fixture/stop').status==204

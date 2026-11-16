@@ -2,10 +2,10 @@
 
 依据只读 v3.16.1 / `4b6452e5e0e4c49b45604fd878f6174701bce5eb` 的 `internal/scheduler/tasks.go`、`scheduler.go`、`travel.go`、`growth_center.go`、`school.go`，以及 `scripts/task_runner.py`、`school_open_day_2026.py`、`compensation_claim.py`。以上文件与旧工作区基线 diff 为空。这里只审代码，不执行旧脚本或真实账号操作。
 
-| 原入口/子步骤 | 新引擎位置 | Phase14 入口状态与未完成边界 |
+| 原入口/子步骤 | 新引擎位置 | 当前入口状态与未完成边界 |
 |---|---|---|
 | checkin / WorkBuddy 国内签到 | checkinModule | 已有检查→签到→复核；余额独立任务 |
-| trae_check / Trae 签到、余额、到期桶、9074退避 | checkinModule | 签到已有；独立余额/原退避迁移未完成 |
+| trae_check / Trae 签到、余额、到期桶、9074退避 | traeCheckinModule / traeBalanceModule | Phase15实现独立余额/到期池更新、加密持久退避/业务日缓存/全局间隔、逐项和计划接线；旧设备旋转与keepalive未迁入，真实执行NOT RUN |
 | balance / WorkBuddy CN/global | balanceModule | 已有只读余额与池更新；global不做活动写操作 |
 | travel / 首次领养、协议、门槛 | travelModule | 本轮显示真实门槛及官方领养步骤；协议与首次领养仍人工 |
 | travel / 地点、每日派出、在途状态、记录领奖 | travelModule | 本轮实现，地点/记录来自响应；分别派出与领奖，不阻塞等待数小时 |
@@ -25,4 +25,4 @@
 
 新模块沿用 taskengine 的账号锁、单次写入前持久化未知状态、取消、复核轮询、时区/时刻/账号范围/开关和重启恢复。只有新运行模式关闭旧调度器与旧手动控制；未切换生产。
 
-Phase14 实现项已通过合成HTTP/真实任务引擎回归及9项真实浏览器操作，覆盖逐项执行、权威回读、时区/时刻/账号范围/启停、进程重启、换期未知保护与窄屏。所有新增真实上游执行 `NOT RUN`，合成行为覆盖不能替代真实任务奖励核验。完整旧任务迁移仍未完成。
+Phase14合成HTTP/浏览器绿测后发现F11无请求假回执，Phase14未被接受。Phase15通过明确动作证据契约修复，详见[动作证据](task-action-evidence.md)。Trae新模块见[独立任务](trae-tasks.md)。新增真实上游执行均 `NOT RUN`，合成行为覆盖不能替代真实任务奖励核验。完整旧任务迁移仍未完成。

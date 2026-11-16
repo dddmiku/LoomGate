@@ -31,11 +31,11 @@ func (m moduleBase) Discover(ctx context.Context, a *auth.Auth) ([]taskengine.De
 	}
 	return []taskengine.Definition{d}, ctx.Err()
 }
-func (moduleBase) Execute(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
-	return taskengine.Observation{Phase: "manual"}, nil
+func (moduleBase) Execute(_ context.Context, _ *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{Phase: "manual"}), nil
 }
-func (moduleBase) Claim(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
-	return taskengine.Observation{}, errors.New("claim_unsupported")
+func (moduleBase) Claim(_ context.Context, _ *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.NotSubmitted(t, taskengine.StageClaim, taskengine.Observation{}), errors.New("claim_unsupported")
 }
 
 func DefaultModules(a *Accounts) ([]Module, error) {
@@ -50,13 +50,7 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	}
 	check := &checkinModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "checkin", Key: "checkin", Realms: []string{"cn"}}, definition: defs["checkin"]}, up: a.Upstream}
 	if a.Provider == "trae" {
-		check.spec.Realms = []string{"trae"}
-		check.traeStatus = trae.CheckinStatusOf
-		check.traeClaim = func(ctx context.Context, account *auth.Auth) error {
-			_, err := trae.ClaimCheckin(ctx, account, 0)
-			return err
-		}
-		return []Module{check}, nil
+		return newTraeModules(a, defs)
 	}
 	if a.Provider != "workbuddy" {
 		return nil, errors.New("provider_unsupported")
@@ -109,7 +103,7 @@ func (m *checkinModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.
 	// Recheck under the engine account lock, including externally completed signins.
 	s, err := m.Inspect(ctx, a, t)
 	if err != nil || s.Phase != "ready" {
-		return s, err
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, s), err
 	}
 	if a.Realm() == "trae" {
 		err = m.traeClaim(ctx, a)
@@ -119,7 +113,7 @@ func (m *checkinModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.
 			err = nil
 		}
 	}
-	return taskengine.Observation{Phase: "pending"}, err
+	return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), err
 }
 func (m *checkinModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)
@@ -210,10 +204,10 @@ func (m *growthModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.T
 func (m *growthModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	current, err := m.Inspect(ctx, a, t)
 	if err != nil || current.Phase != "claimable" {
-		return current, err
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, current), err
 	}
 	err = m.up.TaskClaim(ctx, a, strings.TrimPrefix(t.Key, "growth/"))
-	return taskengine.Observation{Phase: "pending"}, err
+	return taskengine.UnknownAction(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending"}), err
 }
 func (m *growthModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	return m.Inspect(ctx, a, t)

@@ -153,26 +153,26 @@ func (a *Doubao) Inspect(ctx context.Context, t taskengine.Task) (taskengine.Obs
 func (a *Doubao) Execute(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
 	current, activity, err := a.find(ctx, t)
 	if err != nil {
-		return taskengine.Observation{}, err
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), err
 	}
 	state := doubaoObservation(current, activity.TotalAmount)
 	if state.Phase != "ready" || current.Daily == nil {
-		return state, nil
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, state), nil
 	}
 	_, err = a.Client.TaskAction(ctx, t.AccountID, "task_checkin", current)
-	return taskengine.Observation{Phase: "pending"}, err
+	return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), err
 }
 func (a *Doubao) Claim(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
 	current, activity, err := a.find(ctx, t)
 	if err != nil {
-		return taskengine.Observation{}, err
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, taskengine.Observation{}), err
 	}
 	state := doubaoObservation(current, activity.TotalAmount)
 	if state.Phase != "claimable" {
-		return state, nil
+		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), nil
 	}
 	_, err = a.Client.TaskAction(ctx, t.AccountID, "task_claim", current)
-	return taskengine.Observation{Phase: "pending"}, err
+	return taskengine.UnknownAction(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending"}), err
 }
 func (a *Doubao) Verify(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
 	return a.Inspect(ctx, t)

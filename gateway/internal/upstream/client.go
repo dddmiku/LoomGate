@@ -1302,6 +1302,9 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
+	if strict, _ := req.Context().Value(taskEnvelopeKey{}).(bool); strict {
+		return c.doTaskJSON(req)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

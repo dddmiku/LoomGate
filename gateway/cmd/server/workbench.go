@@ -23,6 +23,7 @@ import (
 type workbenchRuntime struct {
 	engine     *taskengine.Engine
 	vault      *accountvault.Vault
+	taskVault  *accountvault.Vault
 	doubao     *doubao.Client
 	inference  map[string]inference.Provider
 	connection *doubao.DesktopConnection
@@ -119,12 +120,28 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 	if err != nil {
 		return nil, nil, err
 	}
+	taskVault, err := accountvault.Open(filepath.Join(stateDir, "task-provider-state"))
+	if err != nil {
+		e.Close()
+		return nil, nil, err
+	}
+	keepTaskVault := false
+	defer func() {
+		if !keepTaskVault {
+			taskVault.Close()
+		}
+	}()
+	traeState, err := taskproviders.NewTraeTaskStore(taskVault)
+	if err != nil {
+		e.Close()
+		return nil, nil, err
+	}
 	for _, id := range []string{"workbuddy", "trae"} {
 		var soon time.Duration
 		if len(expiring) > 0 {
 			soon = expiring[0]
 		}
-		adapter, adapterErr := taskproviders.NewAccounts(p, up, id, soon)
+		adapter, adapterErr := taskproviders.NewAccounts(p, up, id, soon, taskproviders.AccountsOptions{TraeStore: traeState})
 		if adapterErr != nil {
 			e.Close()
 			return nil, nil, adapterErr
@@ -145,7 +162,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		vault.Close()
 		return nil, nil, err
 	}
-	workbench := &workbenchRuntime{engine: e, vault: vault, doubao: client}
+	workbench := &workbenchRuntime{engine: e, vault: vault, taskVault: taskVault, doubao: client}
 	workbench.connection = &doubao.DesktopConnection{Vault: vault}
 	if runtime, ok := desktop.(*doubao.CommandRuntime); ok {
 		workbench.connection.Runtime = runtime
@@ -179,9 +196,13 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		}
 		base.ServeHTTP(w, r)
 	})
+	keepTaskVault = true
 	return workbench, handler, nil
 }
 func runWorkbench(ctx context.Context, w *workbenchRuntime) error {
+	if w.taskVault != nil {
+		defer w.taskVault.Close()
+	}
 	defer w.vault.Close()
 	defer w.engine.Close()
 	return w.engine.Run(ctx)

@@ -15,7 +15,41 @@
   const notice = (text, kind='') => `<div class="notice ${kind}" role="status">${esc(text)}</div>`;
   const options = (rows, value) => rows.map(([id,name]) => `<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('');
   const providerName = id => state.providers?.find(p=>p.id===id)?.name || id;
-  const providerOptions = value => options((state.providers || []).map(p=>[p.id,p.name]),value);
+  function providerFilter(id, value) {
+    return `<div class="provider-filter"><span id="${id}-label" class="filter-label">服务</span><div id="${id}" class="provider-choices" role="group" aria-labelledby="${id}-label">${(state.providers||[]).map(p=>`<button type="button" data-provider-choice="${esc(p.id)}" aria-pressed="${p.id===value}">${esc(p.name)}</button>`).join('')}</div></div>`;
+  }
+  function bindProviderFilter(id, change) {
+    $('#'+id).onclick=async e=>{
+      const target=e.target.closest('[data-provider-choice]');if(!target||target.getAttribute('aria-pressed')==='true')return;
+      const route=state.route,value=target.dataset.providerChoice;
+      change(value);await reload();
+      if(state.route===route)[...document.querySelectorAll('#'+id+' button')].find(b=>b.dataset.providerChoice===value)?.focus({preventScroll:true});
+    };
+  }
+  const accountIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg>';
+  const accountScope = id => `<button type="button" id="${id}" class="account-scope" aria-haspopup="dialog" disabled>${accountIcon}<span><small>账号范围</small><strong>正在读取账号…</strong></span></button>`;
+  function bindAccountScope(id, rows, value, allLabel, change) {
+    const trigger=$('#'+id),label=value||allLabel;
+    trigger.disabled=false;trigger.setAttribute('aria-label','账号范围：'+label+'，更改');
+    trigger.innerHTML=`${accountIcon}<span><small>账号范围</small><strong>${esc(label)}</strong></span><span class="scope-change">更改 <span aria-hidden="true">›</span></span>`;
+    trigger.onclick=()=>{
+      const route=state.route;
+      const choice=(key,title,detail)=>`<button type="button" class="account-choice" data-account-choice="${esc(key)}" aria-pressed="${key===value}"><span class="choice-mark" aria-hidden="true">${key===value?'✓':''}</span><span><strong>${esc(title)}</strong><small>${esc(detail)}</small></span></button>`;
+      openDialog('选择账号范围',`<p class="scope-description">${esc(providerName(state.route==='tasks'?state.taskProvider:state.modelProvider))} · 选择账号后立即应用</p><label class="scope-search">搜索账号<input id="scope-search" type="search" autocomplete="off" placeholder="输入账号标识" autofocus></label><div id="scope-all">${choice('',allLabel,`${rows.length} 个账号`)}</div><div class="scope-results"><p id="scope-count" class="small muted" role="status" aria-live="polite"></p><div id="scope-accounts" class="account-choices"></div></div><div class="scope-footer">${button('close','取消','','quiet')}</div>`,'account-dialog');
+      const draw=()=>{
+        const query=$('#scope-search').value.trim().toLowerCase(),filtered=rows.filter(a=>String(a.id).toLowerCase().includes(query));
+        $('#scope-count').textContent=`${query?'匹配':'可选'} ${filtered.length} 个账号`;
+        $('#scope-accounts').innerHTML=filtered.length?filtered.map(a=>choice(a.id,a.id,a.enabled?(a.realm==='global'?'国际区 · 已启用':a.realm==='cn'?'国内区 · 已启用':'已启用'):'已停用 · 可查看目录状态')).join(''):empty(query?'没有匹配的账号':'暂无可选账号',query?'试试其他账号标识，或清空搜索。':'接入并启用账号后，可在这里切换范围。');
+      };
+      const select=async e=>{
+        const target=e.target.closest('[data-account-choice]');if(!target)return;
+        const next=target.dataset.accountChoice;closeDialog();
+        if(next!==value){try{await change(next);}catch(err){if(err.name!=='AbortError')toast(err instanceof APIError?err.message:'账号范围未能读取，请重试。');}}
+        if(state.route===route)$('#'+id)?.focus({preventScroll:true});
+      };
+      $('#scope-all').onclick=select;$('#scope-accounts').onclick=select;$('#scope-search').oninput=draw;draw();$('#scope-search').focus();
+    };
+  }
   function toast(text) { $('#toast').textContent = text; $('#toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(()=>$('#toast').hidden=true,6000); }
   function heading(actions='') { const r=routes[state.route]; return `<div class="page-heading"><div><h1>${r[1]}</h1><p>${r[2]}</p></div><div class="actions">${actions}</div></div>`; }
   function table(headers, rows) { return `<div class="table-wrap"><table class="responsive"><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map((cell,i)=>`<td data-label="${esc(headers[i])}"><div>${cell}</div></td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
@@ -41,8 +75,8 @@
     return (data.accounts || []).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(a=>({id:a.uid,enabled:!a.disabled,expires_at:a.expiresAt,realm:a.realm}));
   }
   function fail(e) { if(e.name==='AbortError') return; $('#view').innerHTML=heading()+notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取')+(e.status===401?' <a href="login">重新登录 →</a>':''); }
-  function openDialog(title, html) { $('#dialog').classList.remove('plan-dialog'); $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
-  function closeDialog() { $('#dialog').classList.remove('plan-dialog');$('#dialog').close(); $('#dialog-body').replaceChildren(); }
+  function openDialog(title, html, style='') { $('#dialog').className=style; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
+  function closeDialog() { $('#dialog').close();$('#dialog').className=''; $('#dialog-body').replaceChildren(); }
   async function mutate(key, path, body, after) {
     if(state.pending.has(key)) return;
     state.pending.add(key);
@@ -74,22 +108,25 @@
 
   async function accounts() {
     const selected=state.accountProvider || state.providers[0]?.id || '';
-    $('#view').innerHTML=heading(button('connect-account','连接账号','','primary'))+`<div class="context-bar"><label>服务<select id="account-provider">${providerOptions(selected)}</select></label><label class="search"><span class="sr-only">搜索账号标识</span><input id="account-search" placeholder="输入账号标识"></label></div><div id="client-status"></div><div id="account-list" class="loading">正在读取账号…</div><div id="connection-list"></div>`;
-    $('#account-provider').addEventListener('change',e=>{state.accountProvider=e.target.value;reload();});
-    const rows=await accountsFor(selected);state.accountRows=rows;const clientStates=new Map();
+    state.accountProvider=selected;const generation=state.version;
+    $('#view').innerHTML=heading(button('connect-account','连接账号','','primary'))+`<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索账号标识</span><input id="account-search" placeholder="搜索账号标识"></label></div><div id="client-status"></div><div id="account-list" class="loading">正在读取账号…</div><div id="connection-list"></div>`;
+    bindProviderFilter('account-provider',value=>{state.accountProvider=value;});
+    const rows=await accountsFor(selected);if(generation!==state.version)return;state.accountRows=rows;const clientStates=new Map();
     const draw=()=>{const query=$('#account-search').value.toLowerCase();const list=rows.filter(a=>a.id.toLowerCase().includes(query));$('#account-list').className='account-directory';$('#account-list').innerHTML=list.length?table(['账号标识','状态','会话与连接','操作'],list.map(a=>[`<code>${esc(a.id)}</code>${a.realm?`<p>${esc(a.realm)}</p>`:''}`,badge(a.enabled?'ready':'disabled',a.enabled?'已启用':'已停用'),clientStates.has(a.id)?esc(LoomConnections.clientLabels[clientStates.get(a.id).state]||'待核验')+(clientStates.get(a.id).verified_at?`<p class="small muted">最近核验 ${esc(date(clientStates.get(a.id).verified_at))}</p>`:''):date(a.expires_at),`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'quiet compact')}</div>`])):empty(query?'没有匹配的账号':'尚未接入账号','账号接入状态由服务端读取。');};
     draw();$('#account-search').addEventListener('input',draw);if(selected==='doubao')await LoomConnections.client($('#client-status'),list=>{clientStates.clear();list.forEach(x=>clientStates.set(x.id,x));draw();});await LoomConnections.list($('#connection-list'));
   }
   async function modelPage() {
     if(!state.providers.some(p=>p.id===state.modelProvider)) state.modelProvider=state.providers[0]?.id || '';
-    $('#view').innerHTML=heading(button('model-refresh','刷新目录','','quiet'))+`<div class="context-bar"><label>服务<select id="model-provider">${providerOptions(state.modelProvider)}</select></label><details id="model-refine" class="refine"><summary>账号与能力筛选</summary><div><label>账号<select id="model-account"><option value="">读取中…</option></select></label><label>能力<select id="model-capability">${options([['','全部能力'],['native_tools','官方工作工具'],['supports_tool_call','API 工具调用'],['supports_images','图像输入'],['supports_reasoning','推理']],state.capability)}</select></label></div></details><label class="search"><span class="sr-only">搜索模型</span><input id="model-search" placeholder="查找模型" value="${esc(state.search)}"></label></div><div id="model-notice"></div><div id="model-status"></div><div id="model-list"></div><div id="model-pagination" class="pagination"></div>`;
-    $('#model-provider').onchange=e=>{state.modelProvider=e.target.value;state.modelAccount='';state.modelOffset=0;reload();};
-    $('#model-account').onchange=e=>{state.modelAccount=e.target.value;state.modelOffset=0;loadModels(false).catch(fail);};
-    $('#model-capability').onchange=e=>{state.capability=e.target.value;drawModels();};
+    const generation=state.version;
+    $('#view').innerHTML=heading(button('model-refresh','刷新目录','','quiet'))+`<div class="context-bar scope-toolbar">${providerFilter('model-provider',state.modelProvider)}${accountScope('model-account')}</div><div class="model-filters"><label class="search"><span class="sr-only">搜索模型</span><input id="model-search" type="search" placeholder="查找模型" value="${esc(state.search)}"></label><div id="model-capability" class="capability-choices" role="group" aria-label="模型能力">${[['','全部能力'],['native_tools','官方工作工具'],['supports_tool_call','API 工具调用'],['supports_images','图像输入'],['supports_reasoning','推理']].map(([id,name])=>`<button type="button" data-capability="${id}" aria-pressed="${id===state.capability}">${name}</button>`).join('')}</div></div><div id="model-notice"></div><div id="model-status"></div><div id="model-list"></div><div id="model-pagination" class="pagination"></div>`;
+    bindProviderFilter('model-provider',value=>{state.modelProvider=value;state.modelAccount='';state.modelOffset=0;});
+    $('#model-capability').onclick=e=>{const b=e.target.closest('[data-capability]');if(!b)return;state.capability=b.dataset.capability;$('#model-capability').querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));drawModels();};
     $('#model-search').oninput=e=>{state.search=e.target.value;drawModels();};
     const p=state.providers.find(p=>p.id===state.modelProvider);
-    if(p.catalog_scope==='account') { const rows=await accountsFor(p.id);$('#model-account').innerHTML=options([['','所有账号（分页）'],...rows.map(a=>[a.id,a.id+(a.enabled?'':' · 已停用')])],state.modelAccount); }
-    else {state.modelAccount='';$('#model-account').innerHTML='<option value="">服务级目录</option>';$('#model-account').disabled=true;}
+    if(p.catalog_scope==='account') {
+      const rows=await accountsFor(p.id);if(generation!==state.version)return;
+      const bind=()=>bindAccountScope('model-account',rows,state.modelAccount,'所有账号（分页）',async value=>{state.modelAccount=value;state.modelOffset=0;bind();await loadModels(false);});bind();
+    } else {state.modelAccount='';$('#model-account').innerHTML=`${accountIcon}<span><small>账号范围</small><strong>服务共享目录</strong></span>`;$('#model-account').setAttribute('aria-label','服务共享目录，无需选择账号');}
     await loadModels(false);
   }
   async function loadModels(force) {
@@ -137,15 +174,15 @@
 
   async function tasks() {
     state.taskProvider=state.taskProvider||state.providers[0]?.id||'';
-    $('#view').innerHTML=heading(button('reload','刷新状态','','quiet')+button('run-all','执行当前范围','','quiet'))+`<div class="context-bar"><label>服务<select id="task-provider">${providerOptions(state.taskProvider)}</select></label><details class="refine"><summary>选择账号范围</summary><div><label>账号<select id="task-account"><option>读取中…</option></select></label></div></details><span id="task-scope" class="small muted"></span></div><div id="task-list" class="loading">正在发现任务…</div>`;
+    const generation=state.version;
+    $('#view').innerHTML=heading(button('reload','刷新状态','','quiet')+button('run-all','执行当前范围','','quiet'))+`<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}${accountScope('task-account')}</div><div id="task-list" class="loading">正在发现任务…</div>`;
     $('[data-action=run-all]').disabled=true;
-    $('#task-provider').onchange=e=>{state.taskProvider=e.target.value;state.taskAccount='';reload();};
+    bindProviderFilter('task-provider',value=>{state.taskProvider=value;state.taskAccount='';});
     const accounts=await accountsFor(state.taskProvider);
-    $('#task-account').innerHTML=options([['','全部已启用账号'],...accounts.filter(a=>a.enabled).map(a=>[a.id,a.id])],state.taskAccount);
-    $('#task-scope').textContent=state.taskAccount||'全部已启用账号';
-    $('#task-account').onchange=e=>{state.taskAccount=e.target.value;reload();};
+    if(generation!==state.version)return;
+    bindAccountScope('task-account',accounts.filter(a=>a.enabled),state.taskAccount,'全部已启用账号',async value=>{state.taskAccount=value;await reload();});
     const query=new URLSearchParams({provider:state.taskProvider});if(state.taskAccount)query.set('accounts',state.taskAccount);
-    const data=await api('workbench/catalog?'+query);state.tasks=data.tasks||[];
+    const data=await api('workbench/catalog?'+query);if(generation!==state.version)return;state.tasks=data.tasks||[];
     const issues=data.issues||[];
     if(issues.length){const box=document.createElement('div');box.className='notice warn';box.setAttribute('role','status');box.dataset.discoveryIssues=String(issues.length);box.textContent=`${issues.length} 项账号任务目录未能读取：`+issues.map(x=>`${x.account_id} / ${x.module_id}`).join('、')+'。可用任务仍可执行，全部执行会保留部分失败记录。';$('#task-list').before(box);}
     $('#task-list').className='';
@@ -224,7 +261,7 @@
     if(name==='theme'){toggleTheme();return;}
     if(name==='provider-models' || name==='account-models'){state.modelProvider=element.dataset.provider;state.modelAccount=element.dataset.account || '';state.modelOffset=0;location.hash='models';return;}
     if(name==='provider-accounts'){state.accountProvider=element.dataset.provider;location.hash='accounts';return;}
-    if(name==='connect-account'||name==='reconnect-account'){await LoomConnections.open(element.dataset.provider||$('#account-provider').value,element.dataset.account||'');return;}
+    if(name==='connect-account'||name==='reconnect-account'){await LoomConnections.open(element.dataset.provider||state.accountProvider,element.dataset.account||'');return;}
     if(name==='toggle-account'){
       const a=state.accountRows[index],provider=element.dataset.provider;openDialog(a.enabled?'停用账号':'启用账号',`<form id="account-toggle-form" class="form"><p>账号 <code>${esc(a.id)}</code></p><p class="muted">${a.enabled?'停用后不再用于后续目录请求与任务。正在进行的操作应在执行记录中单独核验。':'启用后该账号可再次用于目录读取和任务。'}</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认${a.enabled?'停用':'启用'}</button></div></form>`);
       $('#account-toggle-form').onsubmit=e=>{e.preventDefault();const modern=state.providers.find(p=>p.id===provider)?.catalog_scope==='account';mutate('account-toggle',modern?'workbench/account/toggle':'account/toggle',modern?{id:a.id,enabled:!a.enabled,revision:a.revision}:{uid:a.id,disabled:a.enabled},async()=>{const updated=(await accountsFor(provider)).find(x=>x.id===a.id);if(!updated||updated.enabled===a.enabled)throw new APIError('request_failed',502);closeDialog();toast('账号状态已从服务端核验。');await reload();});};return;
@@ -283,7 +320,16 @@
   function toggleTheme(){const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;themeLabel();try{localStorage.setItem('loomgate.theme',theme);}catch{}}
   try{document.documentElement.dataset.theme=localStorage.getItem('loomgate.theme') || 'light';}catch{}
   themeLabel();
-  $('#theme').onclick=toggleTheme;$('#dialog-close').onclick=closeDialog;$('#dialog').addEventListener('cancel',()=>$('#dialog-body').replaceChildren());
+  $('#dialog').addEventListener('keydown',e=>{
+    if(!$('#dialog').classList.contains('account-dialog'))return;
+    if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeDialog();}
+    if(e.key==='Tab'){
+      const controls=[...$('#dialog').querySelectorAll('button:not(:disabled),input:not(:disabled)')].filter(x=>x.getClientRects().length),first=controls[0],last=controls.at(-1);
+      if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}
+      else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}
+    }
+  });
+  $('#theme').onclick=toggleTheme;$('#dialog-close').onclick=closeDialog;$('#dialog').addEventListener('cancel',e=>{e.preventDefault();closeDialog();});
   document.addEventListener('click',e=>{const target=e.target.closest('[data-action]');if(target && !target.disabled)action(target).catch(err=>{if(err.name!=='AbortError')toast(err instanceof APIError?err.message:'操作未完成，请刷新状态后重试。');});});
   $('#logout').onclick=()=>mutate('logout','auth/logout',{},async()=>location.replace('login'));
   const network=()=>{$('#connection').hidden=navigator.onLine;$('#connection').textContent='当前网络离线。页面中的数据可能已过期，恢复连接后请刷新。';};window.addEventListener('offline',network);window.addEventListener('online',network);network();

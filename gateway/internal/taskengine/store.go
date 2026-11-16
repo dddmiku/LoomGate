@@ -9,16 +9,18 @@ import (
 )
 
 type persisted struct {
-	Version      int                  `json:"version"`
-	Schedules    map[string]Schedule  `json:"schedules"`
-	Runs         []Run                `json:"runs"`
-	Completed    map[string]time.Time `json:"completed"`
-	Uncertain    map[string]Stage     `json:"uncertain"`
-	PendingTasks map[string]Task      `json:"pending_tasks,omitempty"`
+	Version         int                      `json:"version"`
+	Schedules       map[string]Schedule      `json:"schedules"`
+	Runs            []Run                    `json:"runs"`
+	Completed       map[string]time.Time     `json:"completed"`
+	Uncertain       map[string]Stage         `json:"uncertain"`
+	PendingTasks    map[string]Task          `json:"pending_tasks,omitempty"`
+	Receipts        map[string]actionReceipt `json:"receipts,omitempty"`
+	LegacyCompleted map[string]time.Time     `json:"legacy_completed,omitempty"`
 }
 
 func newState() persisted {
-	return persisted{Version: 1, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}}
+	return persisted{Version: 2, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}}
 }
 func readState(path string) (persisted, error) {
 	s := newState()
@@ -29,8 +31,20 @@ func readState(path string) (persisted, error) {
 	if err != nil {
 		return s, errors.New("task_store_unreadable")
 	}
-	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || s.Version != 1 || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
+	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version != 1 && s.Version != 2) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
 		return s, errors.New("task_store_invalid")
+	}
+	if s.Version == 1 {
+		// v1 inferred acceptance from nil errors (F11). Preserve history and
+		// uncertainty, but require authoritative inspection instead of trusting
+		// its accepted_stage or cached completion markers.
+		s.LegacyCompleted = s.Completed
+		s.Completed = map[string]time.Time{}
+		s.Receipts = map[string]actionReceipt{}
+		s.Version = 2
+	}
+	if s.Receipts == nil {
+		s.Receipts = map[string]actionReceipt{}
 	}
 	if s.PendingTasks == nil {
 		s.PendingTasks = map[string]Task{}
@@ -44,6 +58,19 @@ func readState(path string) (persisted, error) {
 		}
 		if key != taskKey(task) || !IDPattern.MatchString(task.ProviderID) || !IDPattern.MatchString(task.AccountID) || task.Key == "" || len(task.Key) > 512 || len(task.PeriodKey) > 512 || task.Once && task.OncePerDay || task.OncePerDay && task.PeriodKey == "" {
 			return s, errors.New("task_store_pending_invalid")
+		}
+		task.AcceptedStage = ""
+		if receipt, ok := s.Receipts[key]; ok {
+			task.AcceptedStage = receiptStage(task, receipt)
+			if task.AcceptedStage == "" || s.Uncertain[key] != task.AcceptedStage {
+				return s, errors.New("task_store_receipt_invalid")
+			}
+		}
+		s.PendingTasks[key] = task
+	}
+	for key := range s.Receipts {
+		if _, ok := s.PendingTasks[key]; !ok {
+			return s, errors.New("task_store_receipt_orphan")
 		}
 	}
 	for i := range s.Runs {

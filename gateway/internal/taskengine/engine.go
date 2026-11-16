@@ -375,7 +375,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 	a := e.adapters[r.ProviderID]
 	e.mu.Unlock()
 	selected := 0
-	status = StatusSucceeded
+	status = StatusSkipped
 	if len(catalog.Issues) > 0 {
 		status = StatusFailed
 		code = "partial_discovery_failed"
@@ -428,7 +428,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 	}
 }
 func mergeStatus(a, b Status) Status {
-	rank := map[Status]int{StatusSucceeded: 0, StatusSkipped: 0, StatusManual: 1, StatusCanceled: 2, StatusFailed: 3, StatusUncertain: 4}
+	rank := map[Status]int{StatusSucceeded: 0, StatusSkipped: -1, StatusManual: 1, StatusCanceled: 2, StatusFailed: 3, StatusUncertain: 4}
 	if rank[b] > rank[a] {
 		return b
 	}
@@ -458,9 +458,25 @@ func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, 
 		}
 	}
 	// Provider errors and arbitrary response summaries are deliberately never persisted.
+	outcome := ""
+	if stage == StageExecute || stage == StageClaim {
+		outcome = actionOutcome(t, stage, o)
+		if outcome == "accepted" && err != nil {
+			outcome = "unknown"
+		}
+		if outcome == "not_submitted" && err == nil {
+			status = StatusSkipped
+		}
+		if outcome == "rejected" {
+			status = StatusFailed
+			code = "provider_rejected"
+			number := o.action.code
+			upstreamCode = &number
+		}
+	}
 	serr := e.updateRun(id, func(r *Run) {
 		r.Stage = stage
-		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, ErrorCode: code, UpstreamCode: upstreamCode})
+		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, ErrorCode: code, UpstreamCode: upstreamCode, ActionOutcome: outcome})
 		if len(r.Steps) > 2000 {
 			r.Steps = r.Steps[len(r.Steps)-2000:]
 		}
@@ -475,6 +491,10 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 	e.mu.Lock()
 	_, done := e.state.Completed[key]
 	_, uncertain := e.state.Uncertain[key]
+	t.AcceptedStage = ""
+	if receipt, ok := e.state.Receipts[key]; ok {
+		t.AcceptedStage = receiptStage(t, receipt)
+	}
 	for oldKey, pending := range e.state.PendingTasks {
 		if oldKey != key && pending.ProviderID == t.ProviderID && pending.AccountID == t.AccountID && pending.Key == t.Key {
 			if _, ok := e.state.Uncertain[oldKey]; ok {
@@ -538,9 +558,13 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 		}
 		if action != nil {
 			t.AcceptedStage = ""
+			t.actionAttempt = randomID()
 			// Commit uncertainty BEFORE sending a mutating request. On crash/retry, only
 			// authoritative read-back may clear this; never blindly replay a mutation.
 			e.mu.Lock()
+			previousStage, hadPrevious := e.state.Uncertain[key]
+			previousTask := e.state.PendingTasks[key]
+			previousReceipt, hadReceipt := e.state.Receipts[key]
 			if len(e.state.PendingTasks) >= 1000 {
 				if _, exists := e.state.PendingTasks[key]; !exists {
 					e.mu.Unlock()
@@ -549,6 +573,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			}
 			err = e.commit(func(s *persisted) {
 				s.Uncertain[key] = stage
+				delete(s.Receipts, key)
 				if s.PendingTasks == nil {
 					s.PendingTasks = map[string]Task{}
 				}
@@ -561,21 +586,60 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			if err != nil {
 				return StatusFailed, err
 			}
-			_, err = e.record(id, t, stage, action)
-			if err != nil {
+			result, actionErr := e.record(id, t, stage, action)
+			outcome := actionOutcome(t, stage, result)
+			if outcome == "not_submitted" || outcome == "rejected" {
+				e.mu.Lock()
+				err = e.commit(func(s *persisted) {
+					delete(s.Uncertain, key)
+					delete(s.PendingTasks, key)
+					delete(s.Receipts, key)
+					if hadPrevious {
+						s.Uncertain[key] = previousStage
+						s.PendingTasks[key] = previousTask
+					}
+					if hadReceipt {
+						s.Receipts[key] = previousReceipt
+					}
+				})
+				e.mu.Unlock()
+				if err != nil || hadPrevious {
+					return StatusUncertain, ErrUncertain
+				}
+				if ctx.Err() != nil {
+					return StatusCanceled, ctx.Err()
+				}
+				if actionErr != nil {
+					return StatusFailed, actionErr
+				}
+				if result.Phase == "manual" {
+					return StatusManual, nil
+				}
+				if result.Phase == "blocked" {
+					return StatusFailed, errors.New("task_unavailable")
+				}
+				return StatusSkipped, nil
+			}
+			if actionErr != nil {
 				return StatusUncertain, ErrUncertain
 			}
-			e.mu.Lock()
-			err = e.commit(func(s *persisted) {
-				pending := s.PendingTasks[key]
-				pending.AcceptedStage = stage
-				s.PendingTasks[key] = pending
-			})
-			e.mu.Unlock()
-			if err != nil {
-				return StatusUncertain, ErrUncertain
+			if outcome == "accepted" {
+				e.mu.Lock()
+				err = e.commit(func(s *persisted) {
+					if s.Receipts == nil {
+						s.Receipts = map[string]actionReceipt{}
+					}
+					s.Receipts[key] = actionReceipt{Attempt: t.actionAttempt, Stage: stage, Binding: actionBinding(t, stage)}
+					pending := s.PendingTasks[key]
+					pending.AcceptedStage = stage
+					s.PendingTasks[key] = pending
+				})
+				e.mu.Unlock()
+				if err != nil {
+					return StatusUncertain, ErrUncertain
+				}
+				t.AcceptedStage = stage
 			}
-			t.AcceptedStage = stage
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -611,6 +675,7 @@ func (e *Engine) confirm(key string, t Task) (Status, error) {
 	err := e.commit(func(s *persisted) {
 		delete(s.Uncertain, key)
 		delete(s.PendingTasks, key)
+		delete(s.Receipts, key)
 		if t.Once || t.OncePerDay {
 			s.Completed[key] = time.Now().UTC()
 		}

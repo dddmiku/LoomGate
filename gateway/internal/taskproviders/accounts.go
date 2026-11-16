@@ -60,6 +60,7 @@ type Accounts struct {
 	Modules       []Module
 	ExpiringSoon  time.Duration
 	ModuleTimeout time.Duration
+	options       AccountsOptions
 }
 
 func (a *Accounts) modules() ([]Module, error) {
@@ -68,8 +69,14 @@ func (a *Accounts) modules() ([]Module, error) {
 	}
 	return DefaultModules(a)
 }
-func NewAccounts(p *pool.Pool, up *upstream.Client, provider string, soon time.Duration) (*Accounts, error) {
+func NewAccounts(p *pool.Pool, up *upstream.Client, provider string, soon time.Duration, options ...AccountsOptions) (*Accounts, error) {
 	a := &Accounts{Pool: p, Upstream: up, Provider: provider, ExpiringSoon: soon}
+	if len(options) > 1 {
+		return nil, errors.New("task_options_invalid")
+	}
+	if len(options) == 1 {
+		a.options = options[0]
+	}
 	modules, err := DefaultModules(a)
 	if err != nil {
 		return nil, err
@@ -265,10 +272,21 @@ func (a *Accounts) Inspect(ctx context.Context, t taskengine.Task) (taskengine.O
 	return a.dispatch(ctx, t, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Inspect(ctx, a, t) })
 }
 func (a *Accounts) Execute(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
-	return a.dispatch(ctx, t, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Execute(ctx, a, t) })
+	return a.dispatchAction(ctx, t, taskengine.StageExecute, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Execute(ctx, a, t) })
 }
 func (a *Accounts) Claim(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
-	return a.dispatch(ctx, t, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Claim(ctx, a, t) })
+	return a.dispatchAction(ctx, t, taskengine.StageClaim, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Claim(ctx, a, t) })
+}
+func (a *Accounts) dispatchAction(ctx context.Context, t taskengine.Task, stage taskengine.Stage, fn func(Module, *auth.Auth) (taskengine.Observation, error)) (taskengine.Observation, error) {
+	invoked := false
+	o, err := a.dispatch(ctx, t, func(m Module, account *auth.Auth) (taskengine.Observation, error) {
+		invoked = true
+		return fn(m, account)
+	})
+	if !invoked {
+		o = taskengine.NotSubmitted(t, stage, o)
+	}
+	return o, err
 }
 func (a *Accounts) Verify(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
 	return a.dispatch(ctx, t, func(m Module, a *auth.Auth) (taskengine.Observation, error) { return m.Verify(ctx, a, t) })
