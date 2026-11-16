@@ -157,12 +157,12 @@ def ensure(root, explicit, start):
 def login_shape(page):
     # Return booleans only. Input values, QR content and displayed private text
     # never leave the official renderer.
-    return page.evaluate('''()=>{const text=document.body.innerText;return {
+    return page.evaluate('''()=>{const text=document.body?.innerText||'';const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};return {
       sms:!!document.querySelector('input[type=tel],input[autocomplete=tel],input[placeholder*="手机号"]'),
       code:!!document.querySelector('input[placeholder*="验证码"]')||/重新获取|重新发送|秒后/.test(text),
       expired:/二维码已过期|二维码失效/.test(text),
       scanned:/扫码成功|请在手机上确认|已扫码/.test(text),
-      manual:/安全验证|滑动验证|拖动滑块|完成验证|身份验证/.test(text),
+      manual:/安全验证|滑动验证|拖动滑块|完成验证|身份验证/.test(text)||[...document.querySelectorAll('[data-testid="captcha"],#captcha_container,[class*="captcha_verify_container"]')].some(visible),
       qr:[...document.querySelectorAll('img,canvas,svg')].some(e=>{const b=e.getBoundingClientRect();return b.width>=120&&b.height>=120}),
       error:/验证码错误|验证码不正确|验证码已失效|验证码已过期/.test(text)
     }}''')
@@ -176,14 +176,25 @@ def login(root, state, action, nonce, method):
         atomic(root/'client.json',state)
     if entry and entry['nonce'] != nonce and entry['status'] not in ('canceled','expired','verified'):
         raise Failure('desktop_busy')
-    if action != 'login_start' and (not entry or entry['nonce'] != nonce):
+    # An explicit resume may finish a start that failed before the durable
+    # opening marker. A present marker always forbids reopening the login.
+    starting = action == 'login_start' or action == 'login_resume' and entry is None
+    if not starting and (not entry or entry['nonce'] != nonce):
         raise Failure('desktop_login_attempt_missing')
+    if entry and entry['nonce']==nonce:
+        if entry['method']!=method:raise Failure('desktop_login_attempt_conflict')
+        if action not in ('login_cancel',) and entry['status'] in ('canceled','expired'):
+            return {'state':entry['status']}
     with sync_playwright() as pw:
         browser = pw.chromium.connect_over_cdp('http://127.0.0.1:'+str(state['port']), timeout=4000)
         pages = [p for c in browser.contexts for p in c.pages]
         chat = next((p for p in pages if urlsplit(p.url).hostname == 'doubao-chat'), None)
         if not chat:
             raise Failure('desktop_unavailable')
+        if starting:
+            # CDP is ready before the official renderer/SDK on a cold launch.
+            # This waits for a read-only readiness condition, not for success.
+            chat.wait_for_function("document.readyState!=='loading' && !!window['chunk_@flow-web/desktop'] && !!document.body",timeout=5000)
         windows = [p for p in pages if urlsplit(p.url).hostname == 'doubao-login']
         if action == 'login_cancel':
             # Closing only the official login window stops its own polling. It
@@ -193,7 +204,7 @@ def login(root, state, action, nonce, method):
             for page in windows:
                 page.close(run_before_unload=False)
             return {'state':'canceled'}
-        if action == 'login_start' and (not entry or entry['nonce'] != nonce):
+        if starting and (not entry or entry['nonce'] != nonce):
             if windows:
                 raise Failure('desktop_login_attempt_conflict')
             identity = chat.evaluate(Path(__file__).with_name('runtime.js').read_text(encoding='utf-8'), {'operation':'identity'})
@@ -217,6 +228,8 @@ def login(root, state, action, nonce, method):
             if not windows:
                 raise Failure('desktop_login_open_unconfirmed')
         if action in ('login_start','login_resume') and windows and entry and entry['nonce']==nonce:
+            windows[0].wait_for_load_state('domcontentloaded',timeout=5000)
+            windows[0].locator('body').wait_for(state='attached',timeout=3000)
             if method=='sms' and not login_shape(windows[0])['sms']:
                 # Selecting the already-open official SMS tab never sends an
                 # SMS. Recovery may repeat this idempotent navigation only.

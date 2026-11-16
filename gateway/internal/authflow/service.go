@@ -540,7 +540,7 @@ func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, f
 		f.Notice = "操作结果未确认，请核验官方界面后取消或重新接入。"
 	} else {
 		switch result.Status {
-		case "waiting_phone", "waiting_code", "waiting_scan", "scanned", "waiting_authorization", "verifying", "verified", "manual_action", "succeeded", "failed", "expired":
+		case "waiting_phone", "waiting_code", "waiting_scan", "scanned", "waiting_authorization", "verifying", "verified", "manual_action", "uncertain", "succeeded", "failed", "expired":
 			f.Status = result.Status
 		default:
 			f.Status = "uncertain"

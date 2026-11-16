@@ -107,6 +107,7 @@ func main() {
 	lifecycle := flag.Bool("lifecycle-modules", false, "use registered lifecycle modules with persisted synthetic upstream state")
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
+	managedLogin := flag.Bool("managed-login", false, "exercise managed login with synthetic official state only")
 	traeTasks := flag.Bool("trae-tasks", false, "use real Trae lifecycle modules with synthetic transport")
 	keepalive := flag.Bool("keepalive-modules", false, "use official refresh adapters with synthetic transport and encrypted recovery")
 	flag.Parse()
@@ -233,7 +234,7 @@ func main() {
 	}
 	gateway := server.NewHandler(server.Config{Pool: p, Usage: ledger, Requests: journal})
 	connection := &doubao.DesktopConnection{Vault: vault}
-	if *desktop {
+	if *desktop || *managedLogin {
 		connection.Runtime = &syntheticDesktop{fixture: fixture}
 	}
 	management := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +277,9 @@ func main() {
 	if *desktop {
 		connection.Fallback = passport
 		doubaoDriver = connection
+	}
+	if *managedLogin {
+		doubaoDriver = &doubao.ManagedConnection{Binding: connection, Client: &syntheticManaged{fixture: fixture}}
 	}
 	admin, err := panel.New(panel.Options{ConnectionDrivers: map[string]authflow.Driver{"doubao": doubaoDriver, "workbuddy": &syntheticConnection{}, "trae": &syntheticConnection{}}, Console: true, BaseDir: *root, AdminDir: filepath.Join(*root, "panel-data"), AuthDir: filepath.Join(*root, "auths"), TrashDir: filepath.Join(*root, "auths-trash"), ConfigPath: config, Runtime: "native", AdminHandler: management, Version: "catalog-fixture"})
 	if err != nil {

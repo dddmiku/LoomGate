@@ -400,6 +400,9 @@ func (d *DesktopConnection) Status(ctx context.Context) (ConnectionStatus, error
 		}
 		if p.Runtime != nil {
 			row.State = "connection_unavailable"
+			if out.State == "login_required" {
+				row.State = "login_required"
+			}
 			if current != "" {
 				row.State = "switch_required"
 				if p.Runtime.Identity == current {

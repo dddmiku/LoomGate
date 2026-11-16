@@ -38,6 +38,11 @@ window.LoomConnections = (() => {
     const callback=document.getElementById('connection-callback');if(callback)callback.onsubmit=e=>{e.preventDefault();const input=Object.fromEntries(new FormData(callback));step('callback',input);callback.reset();};
     const verify=document.getElementById('connection-verify');if(verify)verify.onclick=()=>step('verify');
     if(f.input_mode==='official'&&['uncertain','manual_action','waiting_authorization'].includes(f.status)&&f.provider==='doubao'&&f.method!=='desktop'&&f.error_code!=='official_already_authenticated'){const resume=document.createElement('button');resume.id='connection-resume';resume.textContent='继续当前官方窗口';resume.onclick=()=>step('resume');document.querySelector('#dialog-body .actions').prepend(resume);}
+    if(f.input_mode==='official'&&f.provider==='doubao'&&f.status==='expired'){
+      const note=document.createElement('p');note.className='notice';note.textContent='如果你已在官方窗口完成登录，可核验当前会话并另行保存连接。原过期记录保留，不会重新发送短信或生成二维码。';document.getElementById('connection-progress').before(note);
+      const recover=document.createElement('button');recover.id='connection-recover-session';recover.textContent='核验已完成的官方登录';recover.onclick=()=>recoverSession(f);document.querySelector('#dialog-body .actions').prepend(recover);
+    }
+    if(f.authentication==='existing_session'){const source=document.createElement('p');source.className='muted small';source.textContent='本次核验的是官方客户端已有会话，没有新发起登录。';document.getElementById('connection-progress').before(source);}
     const commit=document.getElementById('connection-commit');if(commit)commit.onclick=()=>step('commit');
     const cancel=document.getElementById('connection-cancel');if(cancel)cancel.onclick=()=>step('cancel');
     const done=document.getElementById('connection-done');if(done)done.onclick=()=>{if(f.status==='succeeded')ui.accountConnected(f);document.getElementById('dialog').close();ui.reload();};
@@ -45,6 +50,13 @@ window.LoomConnections = (() => {
     if(['waiting_code','waiting_scan','waiting_authorization','manual_action'].includes(f.status)&&(f.method!=='desktop'||f.error_code==='desktop_login_required'))notifyOnce(f);
   }
   async function refresh(){const data=await ui.api('connections/flows');const f=data.flows.find(x=>x.id===current?.id);if(f)show(f);}
+  async function recoverSession(f){
+    if(step.pending||current?.id!==f.id)return;step.pending=true;
+    document.querySelectorAll('#dialog-body button').forEach(b=>b.disabled=true);
+    try{const data=await ui.api('connections/start',{body:{provider:'doubao',method:'desktop',account_id:f.account_id||''},signal:null});if(current?.id===f.id)show(data.flow);}
+    catch{if(current?.id===f.id){const box=document.getElementById('connection-error');box.textContent='会话核验结果未确认，请关闭窗口后在接入进度查看现有流程。不会自动重复发起登录。';box.hidden=false;}}
+    finally{step.pending=false;if(current?.id===f.id){document.getElementById('dialog-close').disabled=false;document.getElementById('connection-refresh').disabled=false;}}
+  }
   async function step(action,input={}){
     if(!current||step.pending)return;step.pending=true;clearTimeout(timer);const id=current.id;
     document.querySelectorAll('#dialog-body button').forEach(b=>b.disabled=true);
@@ -61,7 +73,7 @@ window.LoomConnections = (() => {
     timer=setTimeout(()=>{if(generation===stamp&&current?.id===f.id)step('poll');},delay);
   }
   function notifyOnce(f){
-    const key='loomgate.auth-notified.'+f.id;if(sessionStorage.getItem(key))return;sessionStorage.setItem(key,'1');
+    const key='loomgate.auth-notified.'+f.id+(f.error_code==='official_mfa_required'?'.mfa':'');try{if(sessionStorage.getItem(key))return;sessionStorage.setItem(key,'1');}catch{return;}
     try{const Audio=window.AudioContext||window.webkitAudioContext;const a=new Audio(),o=a.createOscillator(),g=a.createGain();o.frequency.value=660;g.gain.value=.08;o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.2);o.onended=()=>a.close();}catch{}
   }
   const clientLabels={not_configured:'尚未连接',disconnected:'连接已断开',unbound:'等待绑定当前账号',login_required:'需要官方登录',busy:'连接正忙',unsupported:'客户端版本待适配',ready:'当前账号可用',switch_required:'需切换官方账号',connection_unavailable:'等待连接恢复',disabled:'账号已停用',legacy_session:'原有会话',conflict:'绑定冲突'};

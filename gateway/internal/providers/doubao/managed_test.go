@@ -232,3 +232,146 @@ func TestManagedExistingSessionNotMisreportedAsFreshLogin(t *testing.T) {
 		t.Fatal("existing session polled a nonexistent login")
 	}
 }
+
+func TestManagedMFARecoversWithoutRestartingLoginAndRetainsExpiry(t *testing.T) {
+	for _, end := range []string{"recover", "cancel", "expire"} {
+		t.Run(end, func(t *testing.T) {
+			s, d, m, r, v, now, fv := managedService(t)
+			m.state = "manual_action"
+			m.reason = "official_verification_required"
+			f, err := s.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "qr"})
+			if err != nil || f.Status != "manual_action" || f.ErrorCode != "official_mfa_required" || f.InputMode != "official" {
+				t.Fatal("MFA not projected as an official action")
+			}
+			expires := f.ExpiresAt
+			for _, input := range []authflow.Input{{Phone: "synthetic-sensitive"}, {Code: "000000"}, {Callback: "synthetic-sensitive"}} {
+				if _, err = s.Step(context.Background(), f.ID, "verify", input); err != authflow.ErrInvalid {
+					t.Fatal("MFA accepted sensitive input")
+				}
+			}
+			s, err = authflow.Open(authflow.Options{Vault: fv, Drivers: map[string]authflow.Driver{"doubao": d}, Now: func() time.Time { return *now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := s.List()
+			if err != nil || len(rows) != 1 || !rows[0].ExpiresAt.Equal(expires) || !rows[0].CanVerify {
+				t.Fatal("MFA restart lost its state or extended deadline")
+			}
+			switch end {
+			case "recover":
+				*now = now.Add(5 * time.Second)
+				m.state = "verified"
+				r.err = nil
+				f, err = s.Step(context.Background(), f.ID, "verify", authflow.Input{})
+				if err != nil || f.Status != "verified" || f.Authentication != "official_login" {
+					t.Fatal("MFA completion was not verified")
+				}
+			case "cancel":
+				f, err = s.Step(context.Background(), f.ID, "cancel", authflow.Input{})
+				if err != nil || f.Status != "canceled" || m.cancels != 1 {
+					t.Fatal("MFA cancellation failed")
+				}
+			case "expire":
+				*now = now.Add(11 * time.Minute)
+				rows, err = s.List()
+				if err != nil || rows[0].Status != "expired" || rows[0].CanVerify {
+					t.Fatal("expired MFA remained actionable")
+				}
+				if _, err = s.Step(context.Background(), f.ID, "verify", authflow.Input{}); err != authflow.ErrInvalid {
+					t.Fatal("expired MFA was polled")
+				}
+			}
+			accounts, _ := v.List()
+			if len(accounts) != 0 || m.starts != 1 || m.launches != 1 {
+				t.Fatal("MFA recovery performed an extra start or saved uncommitted account")
+			}
+		})
+	}
+}
+
+func TestManagedLostOutcomeRetainsErrorForSafeRecovery(t *testing.T) {
+	s, _, m, _, _, _, _ := managedService(t)
+	m.err = errors.New("synthetic-interrupted-start")
+	f, err := s.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "qr"})
+	if err != nil || f.Status != "uncertain" || f.ErrorCode != "official_login_unconfirmed" {
+		t.Fatal("uncertain driver result was replaced by generic invalid state")
+	}
+}
+
+func TestSessionExpiryReadbackAndRenewalNeverMutateAccount(t *testing.T) {
+	d, r, v := connectionFixture(t)
+	start, err := d.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "desktop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := d.Step(context.Background(), bindingFlow(start), "commit", authflow.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, before, err := v.Get(saved.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.err = runtimeError("desktop_login_required")
+	state, err := d.Status(context.Background())
+	if err != nil || state.State != "login_required" || state.Accounts[0].State != "login_required" {
+		t.Fatal("expired official session presented as connected")
+	}
+	r.err = nil
+	state, err = d.Status(context.Background())
+	if err != nil || state.State != "ready" {
+		t.Fatal("official session recovery not recognized")
+	}
+	after, plain, err := v.Get(saved.AccountID)
+	if err != nil || a.Revision != after.Revision || string(plain) != string(before) {
+		t.Fatal("read-only renewal changed credentials or revision")
+	}
+	v.SetEnabled(a.ID, false, a.Revision)
+	state, err = d.Status(context.Background())
+	if err != nil || state.State == "ready" || state.Accounts[0].State != "disabled" {
+		t.Fatal("renewal resurrected disabled account")
+	}
+}
+
+func TestConcurrentManagedRenewalCannotOverwriteNewerBinding(t *testing.T) {
+	d, r, v := connectionFixture(t)
+	start, err := d.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "desktop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := d.Step(context.Background(), bindingFlow(start), "commit", authflow.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFlow := func() (*authflow.Service, authflow.View) {
+		fv, err := accountvault.Open(filepath.Join(t.TempDir(), "flow"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { fv.Close() })
+		binding := &DesktopConnection{Vault: v, Runtime: r}
+		service, err := authflow.Open(authflow.Options{Vault: fv, Drivers: map[string]authflow.Driver{"doubao": &ManagedConnection{Binding: binding, Client: &managedFixture{state: "verified"}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		flow, err := service.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "desktop", AccountID: saved.AccountID})
+		if err != nil || flow.Status != "verified" {
+			t.Fatal("renewal verification failed")
+		}
+		return service, flow
+	}
+	first, a := newFlow()
+	second, b := newFlow()
+	if result, err := first.Step(context.Background(), a.ID, "commit", authflow.Input{}); err != nil || result.Status != "succeeded" {
+		t.Fatal("first renewal did not commit")
+	}
+	before, plain, _ := v.Get(saved.AccountID)
+	result, err := second.Step(context.Background(), b.ID, "commit", authflow.Input{})
+	if err != nil || result.Status == "succeeded" || result.ErrorCode != "account_revision_conflict" {
+		t.Fatal("stale renewal overwrote newer binding")
+	}
+	after, current, _ := v.Get(saved.AccountID)
+	if after.Revision != before.Revision || string(current) != string(plain) {
+		t.Fatal("stale renewal changed account material")
+	}
+}

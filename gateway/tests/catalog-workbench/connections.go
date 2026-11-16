@@ -59,6 +59,32 @@ type syntheticConnection struct{}
 
 type syntheticDesktop struct{ fixture *fixtures }
 
+type syntheticManaged struct{ fixture *fixtures }
+
+func (d *syntheticManaged) Endpoint(context.Context, bool) (int, error) { return 19227, nil }
+func (d *syntheticManaged) Login(_ context.Context, action, nonce, method string) (string, string, error) {
+	if action == "login_start" {
+		d.fixture.qrCalls.Add(1)
+	}
+	if action == "login_poll" {
+		d.fixture.qrPolls.Add(1)
+	}
+	if action == "login_cancel" {
+		return "canceled", "", nil
+	}
+	switch d.fixture.mode.Load() {
+	case 5:
+		return "expired", "", nil
+	case 6:
+		return "manual_action", "official_verification_required", nil
+	case 7:
+		return "", "", errors.New("synthetic_connection_unavailable")
+	case 9:
+		return "waiting_scan", "", nil
+	}
+	return "verified", "", nil
+}
+
 func (d *syntheticDesktop) Bind(context.Context) (doubao.RuntimeBinding, error) {
 	switch d.fixture.mode.Load() {
 	case 7:

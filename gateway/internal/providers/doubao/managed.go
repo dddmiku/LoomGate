@@ -220,6 +220,7 @@ func (d *ManagedConnection) loginResult(ctx context.Context, st managedIntent, s
 		}
 		if reason == "official_verification_required" {
 			notice = "请在豆包官方窗口完成安全验证，再返回核验。"
+			return d.pending(st, "manual_action", "official_mfa_required", notice), nil
 		}
 		return d.pending(st, "manual_action", "official_action_required", notice), nil
 	default:
