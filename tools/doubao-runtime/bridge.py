@@ -13,14 +13,26 @@ from urllib.parse import parse_qs, urlsplit
 
 LIMIT = 2 << 20
 CATALOG_PATH = '/alice/slot/action_bar_v3/brief_list'
+COMPLETION_PATH = '/chat/completion'
+ASYNC_PATH = '/chat/async/chunk_stream'
 
 
 class BridgeError(Exception):
     pass
 
+def shape(value, depth=0):
+    if depth > 4: return '<nested>'
+    if isinstance(value, dict): return {k: shape(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, list): return [shape(v, depth + 1) for v in value[:3]]
+    if isinstance(value, str): return '<string>'
+    if isinstance(value, bool): return 'bool'
+    if isinstance(value, (int, float)): return 'number'
+    if value is None: return 'null'
+    return '<value>'
+
 
 def validate(request):
-    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id'}:
+    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt'}:
         raise BridgeError('desktop_protocol_invalid')
     if type(request.get('port')) is not int or not 1 <= request['port'] <= 65535:
         raise BridgeError('desktop_protocol_invalid')
@@ -29,6 +41,9 @@ def validate(request):
             raise BridgeError('desktop_protocol_invalid')
     elif request.get('operation') == 'catalog':
         if not isinstance(request.get('identity'), str) or not isinstance(request.get('bot_id'), str) or not re.fullmatch('[a-f0-9]{64}', request['identity']) or not re.fullmatch('[A-Za-z0-9_-]{1,128}', request['bot_id']):
+            raise BridgeError('desktop_protocol_invalid')
+    elif request.get('operation') == 'prepare_completion':
+        if not isinstance(request.get('identity'), str) or not isinstance(request.get('bot_id'), str) or not isinstance(request.get('prompt'), str) or not re.fullmatch('[a-f0-9]{64}', request['identity']) or not re.fullmatch('[A-Za-z0-9_-]{1,128}', request['bot_id']) or not 1 <= len(request['prompt']) <= 8192:
             raise BridgeError('desktop_protocol_invalid')
     else:
         raise BridgeError('desktop_protocol_invalid')
@@ -49,7 +64,7 @@ def target(port):
         conn.close()
     if not isinstance(rows, list):
         raise BridgeError('desktop_unavailable')
-    pages = [r for r in rows if r.get('type') == 'page' and r.get('url') in ('doubao://doubao-chat/chat', 'chrome://doubao-chat/chat')]
+    pages = [r for r in rows if r.get('type') == 'page' and urlsplit(r.get('url','')).scheme == 'doubao' and urlsplit(r.get('url','')).hostname == 'doubao-chat' and urlsplit(r.get('url','')).path.startswith('/chat')]
     if len(pages) != 1:
         raise BridgeError('desktop_unavailable')
     ws = pages[0].get('webSocketDebuggerUrl', '')
@@ -67,6 +82,7 @@ def execute(request):
     with connect(target(request['port']), open_timeout=2, close_timeout=.1, max_size=LIMIT) as ws:
         seq = 0
         signed = False
+        pending = []
         def call(method, params=None):
             nonlocal seq, signed
             seq += 1
@@ -84,7 +100,36 @@ def execute(request):
                     if 'error' in event:
                         raise BridgeError('desktop_protocol_invalid')
                     return event.get('result', {})
+                if event.get('method') == 'Fetch.requestPaused':
+                    pending.append(event)
         call('Network.enable')
+        if request['operation'] == 'prepare_completion':
+            call('Fetch.enable', {'patterns':[{'urlPattern':'https://www.doubao.com/chat/completion*','requestStage':'Request'},{'urlPattern':'https://www.doubao.com/chat/async/chunk_stream*','requestStage':'Request'}]})
+            identity_script = """async()=>{const c=window['chunk_@flow-web/desktop'];const k=Symbol.for('loomgate.phase08.require');let r=window[k];if(typeof r!=='function'){r=await new Promise(resolve=>c.push([['phase08-identity'],{},x=>resolve(x)]));if(typeof r!=='function')throw Error('require_unavailable');window[k]=r}const sdk=await r('z5').getFlowAccount().passportApi.getPassportSDK();const u=await sdk.login.checkLogin({});const id=String(u?.user_id_str||u?.user_id||'');const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id));return Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('')}"""
+            identity = call('Runtime.evaluate', {'expression':'('+identity_script+')()','awaitPromise':True,'returnByValue':True}).get('result',{}).get('value','')
+            if identity != request['identity']:
+                raise BridgeError('desktop_identity_mismatch')
+            expr = """(prompt)=>{const e=document.querySelector('[contenteditable=true]');if(!e) return {ok:false,error:'desktop_version_unsupported'};e.focus();e.innerHTML='<p>'+prompt.replace(/[&<>]/g,'')+'</p>';e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt}));const b=document.querySelector('[data-testid=chat_input_send_button]');if(!b) return {ok:false,error:'desktop_version_unsupported'};b.click();return {ok:true}}"""
+            started = call('Runtime.evaluate', {'expression':'('+expr+')('+json.dumps(request['prompt'])+')','returnByValue':True}).get('result',{}).get('value',{})
+            if not started.get('ok'):
+                raise BridgeError(started.get('error','desktop_protocol_invalid'))
+            captured = None
+            while time.monotonic() < deadline:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0: break
+                event = pending.pop(0) if pending else json.loads(ws.recv(timeout=remaining))
+                if event.get('method') != 'Fetch.requestPaused': continue
+                p = event.get('params',{});u = urlsplit(p.get('request',{}).get('url',''))
+                if u.hostname != 'www.doubao.com' or u.path not in (COMPLETION_PATH,ASYNC_PATH):
+                    call('Fetch.failRequest', {'requestId':p.get('requestId'),'errorReason':'BlockedByClient'}); continue
+                body = p.get('request',{}).get('postData','') or ''
+                try: parsed=json.loads(body)
+                except Exception: parsed=None
+                captured={'host':u.hostname,'path':u.path,'query_keys':sorted(parse_qs(u.query).keys()),'method':p.get('request',{}).get('method'),'header_keys':sorted((p.get('request',{}).get('headers') or {}).keys()),'body_shape':shape(parsed),'body_sha256':__import__('hashlib').sha256(body.encode()).hexdigest() if body else None,'network_sent':False,'mutations':0}
+                call('Fetch.failRequest', {'requestId':p.get('requestId'),'errorReason':'BlockedByClient'})
+                break
+            if captured is None: raise BridgeError('desktop_timeout')
+            return {'ok':True,'identity':identity,'data':captured,'signed':('a_bogus' in captured['query_keys'] and 'msToken' in captured['query_keys'])}
         result = call('Runtime.evaluate', {'expression':'('+script+')('+json.dumps(request)+')', 'awaitPromise':True, 'returnByValue':True})
         if 'exceptionDetails' in result:
             raise BridgeError('desktop_protocol_invalid')

@@ -126,6 +126,17 @@ func (c *Client) callSession(ctx context.Context, s Session, path string, body a
 	}
 	return envelope.Data, nil
 }
+
+// PrepareCompletion proves that the current official desktop can construct a
+// signed request without sending it. It never exposes cookies or signed values.
+func (c *Client) PrepareCompletion(ctx context.Context, account, prompt string) (json.RawMessage, error) {
+	s, err := c.sessions.Session(ctx, account)
+	if err != nil { return nil, &APIError{Kind: "login_required"} }
+	if s.Runtime == nil || c.runtime == nil { return nil, &APIError{Kind: "desktop_unavailable"} }
+	preparer, ok := c.runtime.(CompletionPreparer)
+	if !ok { return nil, &APIError{Kind: "desktop_unavailable"} }
+	return preparer.PrepareCompletion(ctx, *s.Runtime, s.BotID, prompt)
+}
 func contextFailure(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()

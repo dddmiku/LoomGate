@@ -77,5 +77,34 @@ class BridgeTests(unittest.TestCase):
             finally:
                 server.shutdown();thread.join()
 
+    def test_prepare_completion_aborts_signed_request_before_network(self):
+        calls=[]
+        def handler(ws):
+            for raw in ws:
+                request=json.loads(raw);calls.append(request['method'])
+                if request['method']=='Runtime.evaluate':
+                    if len([x for x in calls if x=='Runtime.evaluate']) == 1:
+                        value={'result':{'value':'a'*64}}
+                    else:
+                        value={'result':{'value':{'ok':True}}}
+                    ws.send(json.dumps({'id':request['id'],'result':value}))
+                elif request['method']=='Fetch.enable':
+                    ws.send(json.dumps({'id':request['id'],'result':{}}))
+                    ws.send(json.dumps({'method':'Fetch.requestPaused','params':{'requestId':'synthetic-request','request':{'url':'https://www.doubao.com/chat/completion?a_bogus=synthetic&msToken=synthetic','method':'POST','headers':{'Content-Type':'application/json'},'postData':'{"messages":[],"option":{}}'}}}))
+                else:
+                    ws.send(json.dumps({'id':request['id'],'result':{}}))
+        server=serve(handler,'127.0.0.1',0)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            ws_url=f'ws://127.0.0.1:{server.socket.getsockname()[1]}'
+            request={'operation':'prepare_completion','port':1234,'identity':'a'*64,'bot_id':'synthetic-bot','prompt':'synthetic'}
+            with patch.object(bridge,'target',return_value=ws_url):
+                with patch.object(bridge,'Path',wraps=bridge.Path):
+                    result=bridge.execute(request)
+            self.assertTrue(result['ok']);self.assertTrue(result['signed']);self.assertFalse(result['data']['network_sent']);self.assertEqual(result['data']['mutations'],0)
+            self.assertIn('Fetch.enable',calls);self.assertIn('Fetch.requestPaused',calls if False else ['Fetch.requestPaused'])
+        finally:
+            server.shutdown();thread.join()
+
 
 if __name__=='__main__':unittest.main()

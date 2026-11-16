@@ -102,6 +102,22 @@ func TestDesktopCommandBoundary(t *testing.T) {
 		t.Fatal("invalid binding accepted")
 	}
 }
+
+func TestDesktopCompletionPreparationRejectsWithoutRuntimeAndInvalidInputs(t *testing.T) {
+	s := sessionSourceFunc(func(context.Context, string) (Session, error) {
+		return Session{BotID: "synthetic-bot", Runtime: &RuntimeBinding{Identity: strings.Repeat("a", 64)}, Revision: "1"}, nil
+	})
+	if _, err := NewWithRuntime(s, nil).PrepareCompletion(context.Background(), "account", "synthetic"); err == nil {
+		t.Fatal("missing completion runtime accepted")
+	}
+	r := desktopFixture(t, "success")
+	b := RuntimeBinding{Identity: strings.Repeat("a", 64)}
+	for _, prompt := range []string{"", strings.Repeat("x", 8193)} {
+		if _, err := r.PrepareCompletion(context.Background(), b, "synthetic-bot", prompt); err == nil {
+			t.Fatal("invalid completion prompt accepted")
+		}
+	}
+}
 func TestDesktopCancellationStopsChildAndQueuedRead(t *testing.T) {
 	r := desktopFixture(t, "delay")
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)

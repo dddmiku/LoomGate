@@ -28,6 +28,10 @@ type CatalogRuntime interface {
 	Catalog(context.Context, RuntimeBinding, string) (json.RawMessage, error)
 }
 
+type CompletionPreparer interface {
+	PrepareCompletion(context.Context, RuntimeBinding, string, string) (json.RawMessage, error)
+}
+
 // CommandRuntime runs the restricted, local desktop helper without a shell or
 // network listener. One process per read keeps cancellation and output bounded.
 // The helper never exports cookies, signed URLs or SDK request headers.
@@ -60,6 +64,7 @@ type runtimeRequest struct {
 	Port      int    `json:"port"`
 	Identity  string `json:"identity,omitempty"`
 	BotID     string `json:"bot_id,omitempty"`
+	Prompt    string `json:"prompt,omitempty"`
 }
 type runtimeReply struct {
 	OK       bool            `json:"ok"`
@@ -96,11 +101,25 @@ func (r *CommandRuntime) Catalog(ctx context.Context, b RuntimeBinding, bot stri
 	return reply.Data, nil
 }
 
+func (r *CommandRuntime) PrepareCompletion(ctx context.Context, b RuntimeBinding, bot, prompt string) (json.RawMessage, error) {
+	if !identityDigest.MatchString(b.Identity) || !runtimeBotID.MatchString(bot) || len(prompt) < 1 || len(prompt) > 8192 {
+		return nil, &APIError{Kind: "desktop_binding_invalid"}
+	}
+	reply, err := r.run(ctx, runtimeRequest{Operation: "prepare_completion", Port: r.port, Identity: b.Identity, BotID: bot, Prompt: prompt})
+	if err != nil {
+		return nil, err
+	}
+	if reply.Identity != b.Identity || !reply.Signed || len(reply.Data) == 0 {
+		return nil, &APIError{Kind: "desktop_protocol_invalid"}
+	}
+	return reply.Data, nil
+}
+
 // Only these fixed codes cross the process boundary; upstream exception text,
 // child stderr and process arguments are never included in errors or logs.
 func runtimeError(code string) error {
 	switch code {
-	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected":
+	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected", "desktop_binding_invalid":
 		return &APIError{Kind: code}
 	default:
 		return &APIError{Kind: "desktop_protocol_invalid"}
