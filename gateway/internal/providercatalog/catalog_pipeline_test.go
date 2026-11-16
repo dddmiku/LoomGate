@@ -71,6 +71,9 @@ func TestRealCatalogClientToManagementHTTPPreservesRuntimeCapabilities(t *testin
 				if row.Status != "ready" || row.RoutingStatus != want || len(row.Models) != 2 {
 					t.Fatalf("%s wrong catalog route", phase)
 				}
+				if (row.StreamingMode == "incremental") != bound {
+					t.Fatal("stream capability differs from runtime availability")
+				}
 				for _, model := range row.Models {
 					if model.InferenceAvailable != (bound && !model.NativeTools) {
 						t.Fatalf("%s wrong inference capability", phase)
@@ -89,6 +92,9 @@ func TestRealCatalogClientToManagementHTTPPreservesRuntimeCapabilities(t *testin
 				row := page.Catalogs[0]
 				if row.Status != "stale" || len(row.Models) != 2 {
 					t.Fatalf("%s lost stale models", phase)
+				}
+				if row.StreamingMode != "" {
+					t.Fatal("stale directory advertised live streaming")
 				}
 				for _, model := range row.Models {
 					if model.InferenceAvailable {

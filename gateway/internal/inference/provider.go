@@ -3,12 +3,14 @@ package inference
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
 type Model struct {
 	ID, Name      string
 	ContextWindow int64
+	Incremental   bool
 }
 type Result struct {
 	Text, AccountRef, RequestDigest   string
@@ -30,4 +32,15 @@ func (Result) GoString() string { return "inference.Result[redacted]" }
 type Provider interface {
 	Models(context.Context) ([]Model, error)
 	Complete(context.Context, string, string) (Result, error)
+}
+
+var ErrStreamRevised = errors.New("provider_stream_revised")
+var ErrStreamContract = errors.New("provider_stream_contract_invalid")
+
+// StreamingProvider emits acknowledged, ordered text deltas synchronously.
+// The callback provides backpressure and its error must cancel upstream work.
+// Emission never implies completion: only a successful final Result does.
+type StreamingProvider interface {
+	Provider
+	Stream(context.Context, string, string, func(string) error) (Result, error)
 }

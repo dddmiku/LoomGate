@@ -55,6 +55,7 @@ type Row struct {
 	ProviderID    string         `json:"provider_id"`
 	Status        string         `json:"status"`
 	RoutingStatus string         `json:"routing_status"`
+	StreamingMode string         `json:"streaming_mode,omitempty"`
 	Models        []doubao.Model `json:"models"`
 	FetchedAt     *time.Time     `json:"fetched_at,omitempty"`
 	ExpiresAt     *time.Time     `json:"expires_at,omitempty"`
@@ -343,6 +344,9 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		return
 	}
 	row.Status = "ready"
+	if s.opts.DoubaoInference && snapshot.RuntimeBound {
+		row.StreamingMode = "incremental"
+	}
 	for i := range row.Models {
 		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound && !row.Models[i].NativeTools
 	}

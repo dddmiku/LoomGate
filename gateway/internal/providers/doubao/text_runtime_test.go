@@ -30,6 +30,10 @@ func TestTextPipeChild(t *testing.T) {
 	_ = json.Unmarshal(in["operation"], &operation)
 	_ = json.Unmarshal(in["identity"], &identity)
 	enc := json.NewEncoder(os.Stdout)
+	if operation == "identity" {
+		_ = enc.Encode(runtimeReply{OK: true, Identity: strings.Repeat("a", 64)})
+		os.Exit(0)
+	}
 	if operation == "prepare_text" {
 		var model string
 		_ = json.Unmarshal(in["model"], &model)
@@ -43,6 +47,20 @@ func TestTextPipeChild(t *testing.T) {
 	}
 	_ = enc.Encode(streamFrame{Kind: "start", Status: 200, Signed: mode != "unsigned"})
 	switch mode {
+	case "protocol", "protocol-rewrite", "protocol-noack":
+		body := ""
+		if mode != "protocol-noack" {
+			body += "event: SSE_ACK\nid: 1\ndata: {\"query_list\":[{}],\"ack_client_meta\":{\"synthetic\":true}}\n\n"
+		}
+		body += "event: STREAM_MSG_NOTIFY\nid: 2\ndata: {\"meta\":{\"message_id\":\"synthetic-assistant\",\"user_type\":2},\"content\":{\"content_block\":[{\"block_id\":\"text\",\"block_type\":10000,\"content\":{\"text_block\":{\"text\":\"first\"}}}]}}\n\n"
+		tail := "first second"
+		if mode == "protocol-rewrite" {
+			tail = "changed"
+		}
+		body += fmt.Sprintf("event: FULL_MSG_NOTIFY\nid: 3\ndata: {\"message\":{\"message_id\":\"synthetic-assistant\",\"user_type\":2,\"content_block\":[{\"block_id\":\"text\",\"block_type\":10000,\"content\":{\"text_block\":{\"text\":%q}}}]}}\n\n", tail)
+		body += "event: SSE_REPLY_END\nid: 4\ndata: {\"end_type\":3}\n\n"
+		_ = enc.Encode(streamFrame{Kind: "chunk", Data: base64.StdEncoding.EncodeToString([]byte(body))})
+		_ = enc.Encode(streamFrame{Kind: "end"})
 	case "success":
 		_ = enc.Encode(streamFrame{Kind: "chunk", Data: base64.StdEncoding.EncodeToString([]byte("synthetic stream"))})
 		_ = enc.Encode(streamFrame{Kind: "end"})

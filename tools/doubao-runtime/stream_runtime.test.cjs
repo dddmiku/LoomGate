@@ -2,25 +2,26 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const source=fs.readFileSync(__dirname+'/stream_runtime.js','utf8');
 const identity=()=>crypto.subtle.digest('SHA-256',new TextEncoder().encode('synthetic-account')).then(b=>Buffer.from(b).toString('hex'));
 async function fixture({busy=false,hang=false,media='text/event-stream'}={}){
-  let clock=Date.now(),watchdog,requests=[],cancelled=false;
+  let clock=Date.now(),watchdog,requests=[],cancelled=false,currentAccount='synthetic-account',messageLoaded=false,earlyRequires=0;
   const window={};
-  const im={getTaskService:()=>({checkpointService:{getIncompleteMainTasks:()=>busy?[{}]:[]}}),externalService:{sseRequestContextService:{getRequestMeta:async()=>({baseURL:'https://www.doubao.com',params:{synthetic:'safe'},headers:{'x-private':'synthetic-private-marker'}})},request:{apiContext:{fetch:async(url,options)=>{
+  const im={getMessageService:async()=>{messageLoaded=true;requireModule.m.WdY=()=>{};requireModule.m.Kk=()=>{};return {};},getTaskService:()=>({checkpointService:{getIncompleteMainTasks:()=>busy?[{}]:[]}}),externalService:{sseRequestContextService:{getRequestMeta:async()=>({baseURL:'https://www.doubao.com',params:{synthetic:'safe'},headers:{'x-private':'synthetic-private-marker'}})},request:{apiContext:{fetch:async(url,options)=>{
     requests.push({url,options});options.signal.addEventListener('abort',()=>{cancelled=true;});
     return new Response(new ReadableStream({start(c){if(!hang){c.enqueue(new TextEncoder().encode('event: SYNTHETIC\ndata: {}\n\n'));c.close();}},cancel(){cancelled=true;}}),{headers:{'content-type':media}});
   }}}}};
-  const modules={z5:{getFlowAccount:()=>({passportApi:{getPassportSDK:async()=>({login:{checkLogin:async()=>({user_id_str:'synthetic-account'})}})}})},Z9:{K:async()=>im},WMy:{useFeedStore:{getState:()=>({bot:'synthetic-current-bot'})},mainConvBotIdSelector:s=>s.bot,createLocalConversationId:()=> 'local_'+crypto.randomUUID()},ntm:{G:{Available:1}},S6:{N:text=>({block_type:10000,content:{text_block:{text}}})},WdY:{createChatQueryUplinkBody:async({messages,sessionId})=>({client_meta:{bot_id:messages[0].bot_id},messages:[{content_block:messages[0].content_blocks_v2}],option:{unique_key:sessionId,start_seq:0,model_config:{model_item_key:messages[0].ext.model_item_key},recovery_option:{is_recovery:false,req_create_time_sec:1}}})},Kk:{P:x=>x}};
-  window['chunk_@flow-web/desktop']={push:a=>a[2](id=>modules[id])};
+  const modules={z5:{getFlowAccount:()=>({passportApi:{getPassportSDK:async()=>({login:{checkLogin:async()=>({user_id_str:currentAccount})}})}})},Z9:{K:async()=>im},WMy:{useFeedStore:{getState:()=>({bot:'synthetic-current-bot'})},mainConvBotIdSelector:s=>s.bot,createLocalConversationId:()=> 'local_'+crypto.randomUUID()},ntm:{G:{Available:1}},S6:{N:text=>({block_type:10000,content:{text_block:{text}}})},WdY:{createChatQueryUplinkBody:async({messages,sessionId})=>({client_meta:{bot_id:messages[0].bot_id},messages:[{content_block:messages[0].content_blocks_v2}],option:{unique_key:sessionId,start_seq:0,model_config:{model_item_key:messages[0].ext.model_item_key},recovery_option:{is_recovery:false,req_create_time_sec:1}}})},Kk:{P:x=>x}};
+  const requireModule=id=>{if(['WdY','Kk'].includes(id)&&!messageLoaded){earlyRequires++;throw Error('chunk_not_loaded');}return modules[id];};requireModule.m={};
+  window['chunk_@flow-web/desktop']={push:a=>a[2](requireModule)};
   const context=vm.createContext({window,crypto,TextEncoder,TextDecoder,structuredClone,URL,Intl,AbortController,setTimeout,clearTimeout,setInterval:f=>{watchdog=f;return 1;},clearInterval:()=>{},Date:class extends Date{static now(){return clock;}},btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary')});
   const run=vm.runInContext('('+source+')',context);
   const catalog=async()=>({ok:true,data:{entry_list:[{active_switch_conf:{menu_conf_v2:{use_mode_model_list:true,mode_list:{item_list:[{mode_id:'synthetic-mode',model_list:{item_list:[{model_item_key:'synthetic-model',show_task_tools:0,reasoning_effort_config:{default_level:5}}]}}]}}}}]}});
   const base={identity:await identity()};
   const invoke=(op,data={})=>run({...base,operation:op,...data},catalog);
   const prepare=async()=>{const reply=await invoke('prepare_text',{model:'doubao:synthetic-mode:synthetic-model',prompt:'synthetic text'});if(reply.ok)base.lease=reply.data.lease;return reply;};
-  return {invoke,prepare,requests,advance(){clock+=16000;watchdog();},cancelled:()=>cancelled,async probe(input){return vm.runInContext('('+fs.readFileSync(__dirname+'/probe_runtime.js','utf8')+')',context)({...base,...input},catalog);},async probeCleanup(owner){return vm.runInContext('('+fs.readFileSync(__dirname+'/probe_cleanup.js','utf8')+')',context)(owner);}};
+  return {invoke,prepare,requests,earlyRequires:()=>earlyRequires,initialized:()=>messageLoaded,switchAccount(){currentAccount='another-synthetic-account';},advance(){clock+=16000;watchdog();},cancelled:()=>cancelled,async probe(input){return vm.runInContext('('+fs.readFileSync(__dirname+'/probe_runtime.js','utf8')+')',context)({...base,...input},catalog);},async probeCleanup(owner){return vm.runInContext('('+fs.readFileSync(__dirname+'/probe_cleanup.js','utf8')+')',context)(owner);}};
 }
 test('pure construction chooses dynamic bot/model, protects identity and never exports request headers',async()=>{
   const f=await fixture();const bad=await f.invoke('prepare_text',{identity:'b'.repeat(64),model:'doubao:synthetic-mode:synthetic-model',prompt:'synthetic'});assert.equal(bad.error,'desktop_identity_mismatch');
-  const p=await f.prepare();assert.equal(p.ok,true);assert.equal(p.data.body.client_meta.bot_id,'synthetic-current-bot');assert.equal(f.requests.length,0);assert.ok(!JSON.stringify(p).includes('synthetic-private-marker'));
+  const p=await f.prepare();assert.equal(p.ok,true);assert.equal(f.initialized(),true);assert.equal(f.earlyRequires(),0);assert.equal(p.data.body.client_meta.bot_id,'synthetic-current-bot');assert.equal(f.requests.length,0);assert.ok(!JSON.stringify(p).includes('synthetic-private-marker'));
   assert.equal((await f.prepare()).error,'desktop_busy');await f.invoke('release_text');
 });
 test('body ownership and exactly one initial submission, with bounded raw chunks',async()=>{
@@ -66,4 +67,9 @@ test('actual diagnostic constructs a private owned fetch without composer or sen
   const request=f.requests[0];assert.equal(new URL(request.url).searchParams.get('loomgate_probe'),owner);
   assert.equal(JSON.parse(request.options.body).option.unique_key,owner);
   assert.equal((await f.probeCleanup(owner)).ok,true);assert.equal(f.cancelled(),true);
+});
+
+test('identity switch before a queued chunk prevents delivery and cancels the owned stream',async()=>{
+ const f=await fixture(),p=await f.prepare();assert.equal((await f.invoke('open_text',{path:'/chat/completion',body:p.data.body})).ok,true);
+ f.switchAccount();const next=await f.invoke('pull_text');assert.equal(next.error,'desktop_identity_mismatch');assert.equal(next.data,undefined);assert.equal(f.cancelled(),true);await f.invoke('release_text');
 });

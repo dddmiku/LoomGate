@@ -100,6 +100,16 @@ type Runner struct {
 }
 
 func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Update) error) (Report, error) {
+	return r.run(ctx, initial, emit, nil)
+}
+
+// RunObserved publishes only fully applied and validated event states. A full
+// message replacement must not expose its intermediate delete operations.
+func (r Runner) RunObserved(ctx context.Context, initial json.RawMessage, observe func(TextSnapshot) error) (Report, error) {
+	return r.run(ctx, initial, nil, observe)
+}
+
+func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Update) error, observe func(TextSnapshot) error) (Report, error) {
 	o := r.Options
 	if o.Timeout <= 0 {
 		o.Timeout = 2 * time.Minute
@@ -208,11 +218,22 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 							break
 						}
 					}
+					priorEvents := state.Events
 					if err = state.Apply(cursor, event, emit); err != nil {
 						break
 					}
 					if cursor.Acknowledged {
 						report.Acknowledged = true
+					}
+					if observe != nil && state.Events != priorEvents {
+						var snapshot TextSnapshot
+						snapshot, err = state.textSnapshot(report.Acknowledged)
+						if err == nil {
+							err = observe(snapshot)
+						}
+						if err != nil {
+							break
+						}
 					}
 					if cursor.Terminal {
 						break

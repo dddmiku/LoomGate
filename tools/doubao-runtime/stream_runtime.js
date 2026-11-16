@@ -27,6 +27,13 @@ async (input, catalogRuntime) => {
       try {
         const im=await r('Z9').K('chatIMService');
         if(!im||im.getTaskService().checkpointService.getIncompleteMainTasks().length||im.getTaskService().checkpointService.getIncompleteSubTasks?.().length)return fail('desktop_busy');
+	    // Message construction is lazy-loaded by the official service. Requiring
+	    // an absent chunk first can cache empty exports for the client lifetime.
+	    if(typeof im.getMessageService!=='function')return fail('desktop_version_unsupported');
+	    await im.getMessageService();
+	    if(typeof r.m?.WdY!=='function'||typeof r.m?.Kk!=='function')return fail('desktop_version_unsupported');
+	    const uplink=r('WdY'),contextModule=r('Kk');
+	    if(typeof uplink.createChatQueryUplinkBody!=='function'||typeof contextModule.P!=='function')return fail('desktop_version_unsupported');
         const bot=r('WMy').mainConvBotIdSelector(r('WMy').useFeedStore.getState());
         if(typeof bot!=='string'||!bot)return fail('desktop_version_unsupported');
         const catalog=await catalogRuntime({operation:'catalog',identity:input.identity,bot_id:bot});
@@ -37,11 +44,11 @@ async (input, catalogRuntime) => {
         if(chosen.show_task_tools===1)return fail('desktop_native_tools_unsupported');
         const message={local_message_id:crypto.randomUUID(),local_conversation_id:r('WMy').createLocalConversationId(),bot_id:bot,create_time:Date.now(),status:r('ntm').G.Available,content_blocks_v2:[r('S6').N(input.prompt)],ext:{model_item_key:chosen.model_item_key,mode_id:chosen.mode_id,conversation_mode:'chat',model_extra_params:JSON.stringify(chosen.model_extra_params||{}),reasoning_effort:String(chosen.reasoning_effort_config.default_level)}};
         const sessionId=crypto.randomUUID();
-        const body=await r('WdY').createChatQueryUplinkBody({messages:[message],sessionId});
+        const body=await uplink.createChatQueryUplinkBody({messages:[message],sessionId});
         if(body.option?.unique_key!==sessionId||body.option.model_config?.model_item_key!==chosen.model_item_key||body.messages?.length!==1||body.client_meta?.bot_id!==bot)return fail('desktop_protocol_invalid');
         if(await identity()!==input.identity)return fail('desktop_identity_mismatch');
         lease.im=im;lease.body=JSON.parse(JSON.stringify(body));
-        lease.context={messages:{[message.local_message_id]:r('Kk').P({message,sessionId,conversationId:message.local_conversation_id})}};
+        lease.context={messages:{[message.local_message_id]:contextModule.P({message,sessionId,conversationId:message.local_conversation_id})}};
         lease.touched=Date.now();lease.prepared=true;
         return {ok:true,identity:input.identity,data:{lease:lease.id,body:lease.body,model:input.model}};
       } finally {if(!lease.prepared)release(lease);}
@@ -113,6 +120,7 @@ async (input, catalogRuntime) => {
       return {ok:true,identity:input.identity,data:{status:response.status,request_digest:requestDigest}};
     }
     if(input.operation==='pull_text') {
+	  if(await identity()!==input.identity){stop(lease);lease.queue=[];lease.bytes=0;return fail('desktop_identity_mismatch');}
       if(!lease.queue.length&&!lease.done)await new Promise(resolve=>{const timer=setTimeout(resolve,600);lease.wake=()=>{clearTimeout(timer);resolve();};});
       lease.wake=null;lease.touched=Date.now();
       if(lease.queue.length){const chunk=lease.queue.shift();lease.bytes-=atob(chunk).length;lease.drain?.();lease.drain=null;return {ok:true,identity:input.identity,data:{chunk}};}

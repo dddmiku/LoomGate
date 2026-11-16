@@ -50,6 +50,31 @@ def regular_file(path: Path) -> None:
         raise MigrationError("hardlinked_data_requires_export")
 
 
+def runtime_socket(path: Path) -> bool:
+    """Recognize Unix endpoints without following arbitrary reparse points."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISSOCK(info.st_mode) or getattr(info, "st_reparse_tag", 0) == 0x80000023
+
+
+def socket_path(value: str, source: Path) -> Path:
+    path = Path(value)
+    candidate = path if path.is_absolute() else source / path
+    reject_links(candidate.parent)
+    # AF_UNIX is a Windows reparse tag, but it has no link target to follow.
+    # Canonicalize only its verified parent; never resolve the endpoint.
+    candidate = candidate.parent.resolve() / candidate.name
+    try:
+        relative = candidate.relative_to(source)
+    except ValueError:
+        raise MigrationError("external_config_path_requires_export") from None
+    if not relative.parts or relative.parts[0] not in CATEGORIES:
+        raise MigrationError("config_path_outside_migration_categories")
+    return candidate
+
+
 def private_directory(path: Path) -> None:
     path.mkdir(mode=0o700)
     if os.name == "nt":
@@ -200,7 +225,7 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         raise MigrationError("destination_must_not_exist")
     files: list[tuple[Path, Path, str]] = []
     counts = {name: {"files": 0, "bytes": 0} for name in CATEGORIES}
-    excluded = {"runtime_updates": 0, "transient_files": 0}
+    excluded = {"runtime_updates": 0, "transient_files": 0, "runtime_sockets": 0}
     config_candidates = (source / "config/config.json", source / "config.json")
     for candidate in config_candidates:
         reject_links(candidate)
@@ -209,6 +234,13 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         raise MigrationError("exactly_one_configuration_required")
     config_path = configs[0]
     config = object_file(config_path)
+    registry_value = config.get("api_keys_file") or "./data/api_keys.json"
+    if not isinstance(registry_value, str):
+        raise MigrationError("invalid_configuration_path")
+    endpoint_value = config.get("api_keys_socket") or str(Path(registry_value).parent / "api_keys.sock")
+    if not isinstance(endpoint_value, str):
+        raise MigrationError("invalid_configuration_path")
+    endpoint = socket_path(endpoint_value, source)
     mapped = dict(config)
     remapped = []
     for field in PATH_FIELDS:
@@ -216,7 +248,9 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         if value is not None and not isinstance(value, str):
             raise MigrationError("invalid_configuration_path")
         if isinstance(value, str) and value.strip():
-            next_value = mapped_path(value, source)
+            next_value = ("./" + endpoint.relative_to(source).as_posix()
+                          if field == "api_keys_socket" and runtime_socket(endpoint)
+                          else mapped_path(value, source))
             if next_value != value:
                 remapped.append(field)
             mapped[field] = next_value
@@ -279,6 +313,11 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
                     excluded["runtime_updates"] += 1
             for name in names:
                 entry = current_path / name
+                if entry == endpoint and runtime_socket(entry):
+                    # Only the configured/default local management endpoint is
+                    # transient. Apply still requires --offline-confirmed.
+                    excluded["runtime_sockets"] += 1
+                    continue
                 reject_links(entry)
                 mode = entry.lstat().st_mode
                 if stat.S_ISSOCK(mode) or name.endswith(".sock"):

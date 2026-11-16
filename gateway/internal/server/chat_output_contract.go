@@ -513,7 +513,9 @@ func (w *chatContractWriter) StreamFailure(code, message string) bool {
 		return false
 	}
 	w.writeRaw(append(append([]byte("data: "), encoded...), '\n', '\n'))
-	w.writeRaw([]byte("data: [DONE]\n\n"))
+	if w.Header().Get("X-Gateway-Streaming") != "incremental" {
+		w.writeRaw([]byte("data: [DONE]\n\n"))
+	}
 	w.Flush()
 	// 标记已完成：否则 defer 的 finishResponseWriters 会再进 CompletionError，
 	// 把 stale 的 raw 聚合一遍、再写一遍错误帧与 [DONE]（客户端看到重复终态）。
@@ -715,7 +717,11 @@ func (w *chatContractWriter) CompletionError() error {
 			}
 		}
 	}
-	w.writeRaw([]byte("data: [DONE]\n\n"))
+	// Incremental providers use a strict error terminator: no successful DONE
+	// marker after a partial answer was rejected or revised upstream.
+	if w.err == nil || w.Header().Get("X-Gateway-Streaming") != "incremental" {
+		w.writeRaw([]byte("data: [DONE]\n\n"))
+	}
 	w.Flush()
 	if w.writeErr != nil {
 		return w.writeErr

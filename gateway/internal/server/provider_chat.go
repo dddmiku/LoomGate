@@ -15,6 +15,12 @@ import (
 )
 
 func providerErrorCode(err error) string {
+	if errors.Is(err, inference.ErrStreamRevised) {
+		return "provider_stream_revised"
+	}
+	if errors.Is(err, inference.ErrStreamContract) {
+		return "provider_stream_contract_invalid"
+	}
 	var coded interface{ PublicCode() string }
 	if errors.As(err, &coded) {
 		switch code := coded.PublicCode(); code {
@@ -60,6 +66,10 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 		}
 		for _, m := range models {
 			entry := map[string]any{"id": m.ID, "object": "model", "created": 0, "owned_by": id, "name": m.Name, "supports_tool_call": false, "supports_images": false, "single_turn_text_only": true}
+			entry["streaming_mode"] = "buffered"
+			if m.Incremental {
+				entry["streaming_mode"] = "incremental"
+			}
 			if m.ContextWindow > 0 {
 				entry["context_length"] = m.ContextWindow
 			}
@@ -109,7 +119,18 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		writeOpenAIError(w, 400, "provider_input_unsupported", "this provider currently requires exactly one user message containing text (up to 65536 bytes)")
 		return
 	}
-	result, err := providerCompleteSafely(r.Context(), provider, model, text)
+	var result inference.Result
+	var err error
+	var sink *providerStreamSink
+	if progressive, ok := provider.(inference.StreamingProvider); streaming && ok {
+		sink = newProviderStreamSink(w, r, model, st)
+		result, err = providerStreamSafely(r.Context(), progressive, model, text, sink.emit)
+		if err == nil && result.Complete && result.Acknowledged {
+			err = sink.validate(result)
+		}
+	} else {
+		result, err = providerCompleteSafely(r.Context(), provider, model, text)
+	}
 	st.upstreamStarted = result.Attempted
 	st.uid = result.AccountRef
 	st.unreported = !result.UsageReported
@@ -143,7 +164,23 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			st.status = 504
 			code = "desktop_timeout"
 		}
+		if st.trace != nil {
+			st.trace.record.ErrorCode = code
+		}
+		if sink != nil && sink.started {
+			sink.fail(code)
+			return
+		}
 		writeOpenAIError(w, st.status, code, "provider processing did not finish cleanly; inspect status before resubmitting")
+		return
+	}
+	if sink != nil {
+		err = sink.finish(result)
+		st.failed = err != nil
+		st.status = 200
+		if err != nil {
+			st.status = 502
+		}
 		return
 	}
 	id := "chatcmpl-" + requestID(r)

@@ -1,5 +1,6 @@
 """All data is generated locally; never open real account directories."""
 import contextlib
+import ctypes
 import importlib.util
 import hashlib
 import io
@@ -7,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +17,32 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("migration", Path(__file__).with_name("migrate.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+
+def create_closed_socket(path):
+    if os.name != "nt":
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(path))
+        return
+    # CPython on Windows may not expose AF_UNIX although Windows/Go support it.
+    # Exercise a real Windows AF_UNIX endpoint through Winsock, not a fake tag.
+    api = ctypes.WinDLL("Ws2_32", use_last_error=True)
+    api.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    api.socket.restype = ctypes.c_size_t
+    api.bind.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    api.closesocket.argtypes = [ctypes.c_size_t]
+    raw = str(path).encode("utf-8")
+    if len(raw) >= 108:
+        raise RuntimeError("synthetic_socket_path_too_long")
+    handle = api.socket(1, socket.SOCK_STREAM, 0)
+    if handle == ctypes.c_size_t(-1).value:
+        raise RuntimeError("synthetic_socket_creation_failed")
+    try:
+        address = ctypes.create_string_buffer(b"\x01\x00" + raw + b"\0" * (108 - len(raw)), 110)
+        if api.bind(handle, address, len(address)) != 0:
+            raise RuntimeError("synthetic_socket_bind_failed")
+    finally:
+        api.closesocket(handle)
 
 
 class MigrationTests(unittest.TestCase):
@@ -43,6 +71,39 @@ class MigrationTests(unittest.TestCase):
         target = self.source / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_offline_management_socket_excluded_without_following_links(self):
+        for explicit in [False, True]:
+            endpoint = self.source / "data/api_keys.sock"
+            if explicit:
+                self.config["api_keys_socket"] = str(endpoint)
+                self.write("config/config.json", self.config)
+            create_closed_socket(endpoint)
+            target = self.root / ("explicit" if explicit else "default")
+            report = m.migrate(self.source, target)
+            self.assertEqual(report["excluded"]["runtime_sockets"], 1)
+            self.assertFalse(target.exists())
+            m.migrate(self.source, target, apply=True, offline=True)
+            self.assertFalse((target / "data/api_keys.sock").exists())
+            self.assertEqual((self.source / "data/state.json").read_bytes(), (target / "data/state.json").read_bytes())
+            self.assertTrue(endpoint.exists())
+            endpoint.unlink()
+
+    def test_other_socket_and_socket_named_regular_file_are_not_silently_dropped(self):
+        path = self.source / "data/unknown.sock"
+        create_closed_socket(path)
+        with self.assertRaises(m.MigrationError):
+            m.migrate(self.source, self.dest)
+        path.unlink()
+        (self.source / "data/api_keys.sock").write_text("synthetic important data")
+        with self.assertRaises(m.MigrationError):
+            m.migrate(self.source, self.dest)
+
+    def test_management_socket_symlink_cannot_escape_or_hide_data(self):
+        endpoint = self.source / "data/api_keys.sock"
+        endpoint.symlink_to(self.source / "data/state.json")
+        with self.assertRaisesRegex(m.MigrationError, "link_or_junction"):
+            m.migrate(self.source, self.dest)
 
     def test_dry_run_has_no_writes_and_redacts_names(self):
         before = {p.relative_to(self.source): p.read_bytes() for p in self.source.rglob("*") if p.is_file()}

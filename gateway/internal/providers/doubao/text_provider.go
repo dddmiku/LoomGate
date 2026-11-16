@@ -53,12 +53,21 @@ func (p *TextProvider) Models(ctx context.Context) ([]inference.Model, error) {
 	models := []inference.Model{}
 	for _, m := range c.Models {
 		if !m.NativeTools {
-			models = append(models, inference.Model{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow})
+			models = append(models, inference.Model{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow, Incremental: true})
 		}
 	}
 	return models, nil
 }
 func (p *TextProvider) Complete(ctx context.Context, model, text string) (inference.Result, error) {
+	return p.complete(ctx, model, text, nil)
+}
+func (p *TextProvider) Stream(ctx context.Context, model, text string, emit func(string) error) (inference.Result, error) {
+	if emit == nil {
+		return inference.Result{}, inference.ErrStreamContract
+	}
+	return p.complete(ctx, model, text, emit)
+}
+func (p *TextProvider) complete(ctx context.Context, model, text string, emit func(string) error) (inference.Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	a, s, err := p.account(ctx)
@@ -74,45 +83,20 @@ func (p *TextProvider) Complete(ctx context.Context, model, text string) (infere
 	if err = p.verifyAccount(ctx, a.ID, s.Revision); err != nil {
 		return result, err
 	}
-	blocks := map[string]string{}
-	order := []string{}
-	known := map[string]bool{}
-	size := 0
-	report, err := (stream.Runner{Opener: prepared, Options: stream.Options{Timeout: 90 * time.Second, AttemptTimeout: 30 * time.Second, MaxResumes: 1}}).Run(ctx, prepared.Body, func(u stream.Update) error {
-		key := u.MessageID + "/" + u.BlockID
-		if u.Operation == 3 {
-			size -= len(blocks[key])
-			delete(blocks, key)
-			delete(known, key)
-			kept := order[:0]
-			for _, k := range order {
-				if k != key {
-					kept = append(kept, k)
-				}
+	progress := textProgress{}
+	if emit != nil {
+		progress.emit = func(delta string) error {
+			if err := p.verifyAccount(ctx, a.ID, s.Revision); err != nil {
+				return err
 			}
-			order = kept
-			return nil
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return emit(delta)
 		}
-		if u.Kind != "text" {
-			return nil
-		}
-		if !known[key] {
-			known[key] = true
-			order = append(order, key)
-		}
-		if u.Operation == 1 {
-			blocks[key] += u.Text
-			size += len(u.Text)
-		} else {
-			size -= len(blocks[key])
-			blocks[key] = u.Text
-			size += len(u.Text)
-		}
-		if size > 8<<20 {
-			return stream.ErrLimit
-		}
-		return nil
-	})
+	}
+	report, err := (stream.Runner{Opener: prepared, Options: stream.Options{Timeout: 90 * time.Second, AttemptTimeout: 30 * time.Second, MaxResumes: 1}}).RunObserved(ctx, prepared.Body, progress.apply)
+
 	result.RequestDigest = prepared.RequestDigest
 	result.Attempted = prepared.Submitted
 	result.Acknowledged = report.Acknowledged
@@ -132,11 +116,7 @@ func (p *TextProvider) Complete(ctx context.Context, model, text string) (infere
 	if err = prepared.Close(); err != nil {
 		return result, runtimeError("desktop_cleanup_uncertain")
 	}
-	var output strings.Builder
-	for _, key := range order {
-		output.WriteString(blocks[key])
-	}
-	result.Text = output.String()
+	result.Text = progress.text
 	if !result.Complete || !result.Acknowledged || strings.TrimSpace(result.Text) == "" {
 		return result, stream.ErrIncomplete
 	}
