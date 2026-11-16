@@ -94,6 +94,8 @@ def validate(request):
     if request.get('operation') == 'identity':
         if set(request) != {'operation', 'port'}:
             raise BridgeError('desktop_protocol_invalid')
+    elif request.get('operation') == 'connection':
+        if set(request)-{'operation','port','identity'} or (request.get('identity') and (not isinstance(request['identity'],str) or not re.fullmatch('[a-f0-9]{64}',request['identity']))):raise BridgeError('desktop_protocol_invalid')
     elif request.get('operation') == 'catalog':
         if not isinstance(request.get('identity'), str) or not isinstance(request.get('bot_id'), str) or not re.fullmatch('[a-f0-9]{64}', request['identity']) or not re.fullmatch('[A-Za-z0-9_-]{1,128}', request['bot_id']):
             raise BridgeError('desktop_protocol_invalid')
@@ -321,7 +323,7 @@ def execute(request,canceled=None):
         value = result.get('result', {}).get('value')
         if not isinstance(value, dict):
             raise BridgeError('desktop_protocol_invalid')
-        if value.get('ok') and request['operation'] == 'catalog':
+        if value.get('ok') and request['operation'] in ('catalog','connection'):
             if not signed:
                 raise BridgeError('desktop_protocol_invalid')
             value['signed'] = True

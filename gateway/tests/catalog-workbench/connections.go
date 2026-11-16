@@ -57,6 +57,30 @@ func (s syntheticPassportTransport) RoundTrip(r *http.Request) (*http.Response, 
 
 type syntheticConnection struct{}
 
+type syntheticDesktop struct{ fixture *fixtures }
+
+func (d *syntheticDesktop) Bind(context.Context) (doubao.RuntimeBinding, error) {
+	switch d.fixture.mode.Load() {
+	case 7:
+		return doubao.RuntimeBinding{}, &doubao.APIError{Kind: "desktop_unavailable"}
+	case 9:
+		return doubao.RuntimeBinding{}, &doubao.APIError{Kind: "desktop_login_required"}
+	case 8:
+		return doubao.RuntimeBinding{Identity: strings.Repeat("b", 64)}, nil
+	}
+	return doubao.RuntimeBinding{Identity: strings.Repeat("a", 64)}, nil
+}
+func (d *syntheticDesktop) Connection(ctx context.Context, expected doubao.RuntimeBinding) (doubao.ConnectionProof, error) {
+	b, err := d.Bind(ctx)
+	if err != nil {
+		return doubao.ConnectionProof{}, err
+	}
+	if expected.Identity != "" && expected.Identity != b.Identity {
+		return doubao.ConnectionProof{}, &doubao.APIError{Kind: "desktop_identity_mismatch"}
+	}
+	return doubao.ConnectionProof{Binding: b, BotID: "synthetic-current-bot", Models: 2}, nil
+}
+
 func (*syntheticConnection) Methods() []authflow.Method {
 	return []authflow.Method{{ID: "qr", Name: "合成官方授权", Available: true}, {ID: "browser", Name: "合成网页授权", Available: true}}
 }

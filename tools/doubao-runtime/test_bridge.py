@@ -17,7 +17,7 @@ class BridgeTests(unittest.TestCase):
                 bridge.target(1234)
 
     def test_operation_validation(self):
-        for value in ({'operation':'sms','port':1234}, {'operation':'identity','port':1234,'url':'https://example.invalid/'}, {'operation':'catalog','port':1234,'identity':'bad','bot_id':'x'}, {'operation':'identity','port':True}):
+        for value in ({'operation':'sms','port':1234}, {'operation':'identity','port':1234,'url':'https://example.invalid/'}, {'operation':'catalog','port':1234,'identity':'bad','bot_id':'x'}, {'operation':'identity','port':True},{'operation':'connection','port':1234,'identity':'invalid'},{'operation':'connection','port':1234,'bot_id':'forbidden'}):
             with self.assertRaises(bridge.BridgeError):
                 bridge.validate(value)
 

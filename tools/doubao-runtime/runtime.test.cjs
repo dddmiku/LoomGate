@@ -26,6 +26,8 @@ function fixture({users=['synthetic-user','synthetic-user'],badVersion=false,rej
   const input={operation:'catalog',identity:hash('synthetic-user'),bot_id:'synthetic-bot'};
   const good=fixture(),result=await good.run(input);
   assert.equal(result.ok,true);assert.equal(good.calls(),1);
+  const connection=fixture(),proof=await connection.run({operation:'connection'});
+  assert.equal(proof.ok,true);assert.equal(proof.identity,input.identity);assert.equal(proof.data.bot_id,'synthetic-bot');assert.equal(proof.data.model_count,1);assert.ok(!JSON.stringify(proof).includes('entry_list'));
   assert(JSON.stringify(result).includes('dynamic-new-model'));
   for(const excluded of ['private_fixture','icon_url','not-exported','example.invalid'])assert(!JSON.stringify(result).includes(excluded));
   const switched=fixture({users:['synthetic-user','other-user']});assert.equal((await switched.run(input)).error,'desktop_identity_mismatch');assert.equal(switched.calls(),1);

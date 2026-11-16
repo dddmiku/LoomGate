@@ -105,6 +105,7 @@ func main() {
 	address := flag.String("listen", "127.0.0.1:17863", "loopback address")
 	modules := flag.Bool("task-modules", false, "use real WorkBuddy task modules with synthetic account transport")
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
+	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
 	flag.Parse()
 	host, _, err := net.SplitHostPort(*address)
 	if err != nil || host != "127.0.0.1" || *root == "" {
@@ -194,7 +195,14 @@ func main() {
 		}
 	}
 	gateway := server.NewHandler(server.Config{Pool: p, Usage: ledger, Requests: journal})
+	connection := &doubao.DesktopConnection{Vault: vault}
+	if *desktop {
+		connection.Runtime = &syntheticDesktop{fixture: fixture}
+	}
 	management := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connection.Route(w, r) {
+			return
+		}
 		if catalog.Route(w, r) {
 			return
 		}
@@ -227,7 +235,12 @@ func main() {
 		_, err = vault.Put(accountvault.Account{ID: id, Provider: "doubao", Enabled: true}, b, revision)
 		return err
 	}}
-	admin, err := panel.New(panel.Options{ConnectionDrivers: map[string]authflow.Driver{"doubao": passport, "workbuddy": &syntheticConnection{}, "trae": &syntheticConnection{}}, Console: true, BaseDir: *root, AdminDir: filepath.Join(*root, "panel-data"), AuthDir: filepath.Join(*root, "auths"), TrashDir: filepath.Join(*root, "auths-trash"), ConfigPath: config, Runtime: "native", AdminHandler: management, Version: "catalog-fixture"})
+	var doubaoDriver authflow.Driver = passport
+	if *desktop {
+		connection.Fallback = passport
+		doubaoDriver = connection
+	}
+	admin, err := panel.New(panel.Options{ConnectionDrivers: map[string]authflow.Driver{"doubao": doubaoDriver, "workbuddy": &syntheticConnection{}, "trae": &syntheticConnection{}}, Console: true, BaseDir: *root, AdminDir: filepath.Join(*root, "panel-data"), AuthDir: filepath.Join(*root, "auths"), TrashDir: filepath.Join(*root, "auths-trash"), ConfigPath: config, Runtime: "native", AdminHandler: management, Version: "catalog-fixture"})
 	if err != nil {
 		panic("fixture_panel_failed")
 	}
@@ -250,7 +263,7 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 	mux.HandleFunc("POST /__fixture/mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
-		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6}
+		mode := map[string]int32{"success": 0, "failed": 1, "slow": 2, "storage": 3, "qr-expired": 5, "challenge": 6, "client-disconnected": 7, "client-switched": 8, "client-login": 9}
 		value, ok := mode[r.PathValue("mode")]
 		if !ok {
 			w.WriteHeader(400)

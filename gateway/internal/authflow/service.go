@@ -20,6 +20,7 @@ type Method struct {
 	Name      string `json:"name"`
 	Available bool   `json:"available"`
 	Reason    string `json:"reason,omitempty"`
+	InputMode string `json:"input_mode,omitempty"`
 }
 type Provider struct {
 	ID      string   `json:"id"`
@@ -54,6 +55,7 @@ type View struct {
 	UpstreamCode *int64    `json:"upstream_code,omitempty"`
 	Notice       string    `json:"notice,omitempty"`
 	Revision     uint64    `json:"revision"`
+	CanVerify    bool      `json:"can_verify,omitempty"`
 }
 
 // Flow is private storage. Only View may be serialized into management responses.
@@ -82,6 +84,13 @@ type Driver interface {
 	Methods() []Method
 	Start(context.Context, Request) (Result, error)
 	Step(context.Context, Flow, string, Input) (Result, error)
+}
+
+// Verifier permits only an explicit read-only recovery. It must not send codes,
+// create QR sessions, commit accounts or otherwise replay an interrupted write.
+type Verifier interface {
+	CanVerify(Flow) bool
+	Verify(context.Context, Flow) (Result, error)
 }
 type Options struct {
 	Vault    *accountvault.Vault
@@ -207,7 +216,11 @@ func (s *Service) List() ([]View, error) {
 	}
 	out := []View{}
 	for _, f := range s.flows {
-		out = append(out, f.View)
+		view := f.View
+		if verifier, ok := s.opts.Drivers[f.Provider].(Verifier); ok {
+			view.CanVerify = !terminal(f.Status) && f.Status != "working" && s.active[f.ID] == nil && verifier.CanVerify(f)
+		}
+		out = append(out, view)
 	}
 	return out, nil
 }
@@ -343,7 +356,19 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 		s.mu.Unlock()
 		return f.View, err
 	}
-	if !allowed(f.Status, action) {
+	// A canceled operation may still be returning from its driver. Do not let
+	// recovery replace its cancellation handle or overlap another operation.
+	if s.active[id] != nil {
+		s.mu.Unlock()
+		return f.View, ErrBusy
+	}
+	verifier, canVerify := s.opts.Drivers[f.Provider].(Verifier)
+	readVerify := action == "verify" && canVerify && !terminal(f.Status) && f.Status != "working" && verifier.CanVerify(f)
+	if readVerify && (input.Phone != "" || input.Code != "" || input.Callback != "") {
+		s.mu.Unlock()
+		return f.View, ErrInvalid
+	}
+	if !allowed(f.Status, action) && !readVerify {
 		s.mu.Unlock()
 		return f.View, ErrInvalid
 	}
@@ -360,7 +385,7 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 			}
 		}
 	}
-	if action == "poll" && now.Before(f.NextPollAt) || action == "send_code" && now.Before(f.RetryAt) {
+	if (action == "poll" || readVerify) && now.Before(f.NextPollAt) || action == "send_code" && now.Before(f.RetryAt) {
 		s.mu.Unlock()
 		return f.View, ErrBusy
 	}
@@ -383,6 +408,9 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 	bounded, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	s.active[id] = cancel
 	s.mu.Unlock()
+	if readVerify {
+		return s.call(bounded, cancel, f, func() (Result, error) { return verifier.Verify(bounded, f) })
+	}
 	return s.call(bounded, cancel, f, func() (Result, error) { return d.Step(bounded, f, action, input) })
 }
 func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, fn func() (Result, error)) (View, error) {
@@ -460,7 +488,11 @@ func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, f
 	if err := s.save(rows); err != nil {
 		return View{}, err
 	}
-	return f.View, nil
+	view := f.View
+	if verifier, ok := s.opts.Drivers[f.Provider].(Verifier); ok {
+		view.CanVerify = !terminal(f.Status) && verifier.CanVerify(f)
+	}
+	return view, nil
 }
 func safeCall(fn func() (Result, error)) (out Result, err error) {
 	defer func() {

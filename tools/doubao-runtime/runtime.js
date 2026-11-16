@@ -2,7 +2,7 @@
 // are public bundle hashes, not model IDs, device data or signing material.
 async (input) => {
   const fail = error => ({ok:false,error});
-  if (!['identity','catalog'].includes(input.operation)) return fail('desktop_protocol_invalid');
+  if (!['identity','catalog','connection'].includes(input.operation)) return fail('desktop_protocol_invalid');
   const digest = async value => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value))),x=>x.toString(16).padStart(2,'0')).join('');
   const slot = Symbol.for('loomgate.catalog.read.v1');
   if (window[slot]) return fail('desktop_busy');
@@ -37,7 +37,7 @@ async (input) => {
     try { before = await identity(); } catch { return fail('desktop_login_required'); }
     if (!before) return fail('desktop_login_required');
     if (input.operation === 'identity') return {ok:true,identity:before};
-    if (before !== input.identity) return fail('desktop_identity_mismatch');
+    if (input.identity && before !== input.identity) return fail('desktop_identity_mismatch');
     const bot=req('WMy').mainConvBotIdSelector(req('WMy').useFeedStore.getState());
     if(typeof bot!=='string'||!bot)return fail('desktop_version_unsupported');
     const api = req('uui').createRequest().apiContext;
@@ -77,6 +77,11 @@ async (input) => {
         mode_list:{item_list:(m.mode_list?.item_list||[]).slice(0,64).map(o=>({mode_id:str(o.mode_id),name:str(o.name),model_list:{item_list:items(o.model_list?.item_list)}}))}
       }}};
     });
+    if(input.operation==='connection'){
+      const count=entries.reduce((n,e)=>{const menu=e.active_switch_conf?.menu_conf_v2;return n+(menu?.use_mode_model_list?(menu.mode_list?.item_list||[]).reduce((sum,m)=>sum+(m.model_list?.item_list||[]).length,0):(menu?.model_list?.item_list||[]).length);},0);
+      if(!count)return fail('desktop_protocol_invalid');
+      return {ok:true,identity:before,data:{bot_id:bot,model_count:count}};
+    }
     return {ok:true,identity:before,data:{entry_list:entries}};
   };
   let timer;

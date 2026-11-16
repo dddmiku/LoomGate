@@ -46,6 +46,19 @@ func TestDesktopHelperProcess(t *testing.T) {
 		_ = json.NewEncoder(os.Stdout).Encode(runtimeReply{OK: true, Identity: strings.Repeat("b", 64), Signed: true, Data: json.RawMessage(`{}`)})
 	case "unsigned":
 		_ = json.NewEncoder(os.Stdout).Encode(runtimeReply{OK: true, Identity: in.Identity, Data: json.RawMessage(`{}`)})
+	case "connection", "connection-empty", "connection-large", "connection-bot":
+		bot, count := "synthetic-live-bot", 12
+		if mode == "connection-empty" {
+			count = 0
+		}
+		if mode == "connection-large" {
+			count = 4097
+		}
+		if mode == "connection-bot" {
+			bot = "../invalid"
+		}
+		data, _ := json.Marshal(map[string]any{"bot_id": bot, "model_count": count})
+		_ = json.NewEncoder(os.Stdout).Encode(runtimeReply{OK: true, Identity: strings.Repeat("a", 64), Signed: true, Data: data})
 	case "success":
 		if in.Operation == "identity" {
 			_ = json.NewEncoder(os.Stdout).Encode(runtimeReply{OK: true, Identity: strings.Repeat("a", 64)})
@@ -58,6 +71,23 @@ func TestDesktopHelperProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestDesktopConnectionProofCommandBoundary(t *testing.T) {
+	for _, expected := range []string{"", strings.Repeat("a", 64)} {
+		proof, err := desktopFixture(t, "connection").Connection(context.Background(), RuntimeBinding{Identity: expected})
+		if err != nil || proof.Models != 12 || proof.BotID != "synthetic-live-bot" {
+			t.Fatal("valid connection proof rejected")
+		}
+	}
+	for _, mode := range []string{"unsigned", "wrong-identity", "connection-empty", "connection-large", "connection-bot", "error", "trailing"} {
+		if _, err := desktopFixture(t, mode).Connection(context.Background(), RuntimeBinding{Identity: strings.Repeat("a", 64)}); err == nil {
+			t.Fatal("invalid connection proof accepted")
+		}
+	}
+	if _, err := desktopFixture(t, "connection").Connection(context.Background(), RuntimeBinding{Identity: strings.Repeat("b", 64)}); err == nil {
+		t.Fatal("connection identity mismatch accepted")
+	}
 }
 func desktopFixture(t *testing.T, mode string) *CommandRuntime {
 	t.Helper()

@@ -21,10 +21,11 @@ import (
 )
 
 type workbenchRuntime struct {
-	engine    *taskengine.Engine
-	vault     *accountvault.Vault
-	doubao    *doubao.Client
-	inference map[string]inference.Provider
+	engine     *taskengine.Engine
+	vault      *accountvault.Vault
+	doubao     *doubao.Client
+	inference  map[string]inference.Provider
+	connection *doubao.DesktopConnection
 }
 
 func workbenchInference(w *workbenchRuntime) map[string]inference.Provider {
@@ -92,6 +93,10 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 			return p, nil
 		}
 	}
+	if w.connection != nil {
+		w.connection.Fallback = driver
+		return map[string]authflow.Driver{"doubao": w.connection}
+	}
 	return map[string]authflow.Driver{"doubao": driver}
 }
 
@@ -141,7 +146,9 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		return nil, nil, err
 	}
 	workbench := &workbenchRuntime{engine: e, vault: vault, doubao: client}
+	workbench.connection = &doubao.DesktopConnection{Vault: vault}
 	if runtime, ok := desktop.(*doubao.CommandRuntime); ok {
+		workbench.connection.Runtime = runtime
 		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime}}
 	}
 	base := e.Handler()
@@ -164,6 +171,9 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		return counts
 	}})
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if workbench.connection.Route(w, r) {
+			return
+		}
 		if catalogs.Route(w, r) {
 			return
 		}

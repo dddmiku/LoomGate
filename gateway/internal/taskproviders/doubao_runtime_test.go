@@ -20,6 +20,7 @@ type taskRuntimeFixture struct {
 	date                        string
 	total                       int64
 	actions                     int
+	rejectClaim                 bool
 }
 
 func (f *taskRuntimeFixture) Catalog(context.Context, doubao.RuntimeBinding, string) (json.RawMessage, error) {
@@ -49,6 +50,9 @@ func (f *taskRuntimeFixture) TaskAction(_ context.Context, _ doubao.RuntimeBindi
 		f.date = "2099-01-02"
 		f.total += 400
 	case "task_claim":
+		if f.rejectClaim {
+			return doubao.Activity{}, &doubao.APIError{Kind: "desktop_upstream_rejected", Code: 2}
+		}
 		if f.total < 500 {
 			return doubao.Activity{}, errors.New("threshold not met")
 		}
@@ -58,6 +62,56 @@ func (f *taskRuntimeFixture) TaskAction(_ context.Context, _ doubao.RuntimeBindi
 		return doubao.Activity{}, errors.New("unexpected mutation")
 	}
 	return f.snapshot(), nil
+}
+
+func TestDoubaoNestedClaimRejectionKeepsCodeAndCannotReplayAfterRestart(t *testing.T) {
+	adapter, runtime := taskRuntimeAdapter(t)
+	runtime.total, runtime.rejectClaim = 600, true
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	engine, err := taskengine.Open(taskengine.Options{Path: path, PollMin: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.Register("doubao", adapter); err != nil {
+		t.Fatal(err)
+	}
+	request := taskengine.Request{ProviderID: "doubao", TaskKey: "synthetic-group:synthetic-milestone", AccountIDs: []string{"synthetic-account"}}
+	run, err := engine.Submit(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := waitModuleRun(t, engine, run.ID)
+	if finished.Status != taskengine.StatusUncertain {
+		t.Fatal("unverified rejected claim lost uncertainty")
+	}
+	found := false
+	for _, step := range finished.Steps {
+		if step.Stage == taskengine.StageClaim {
+			found = step.Status == taskengine.StatusFailed && step.ErrorCode == "provider_rejected" && step.UpstreamCode != nil && *step.UpstreamCode == 2
+		}
+	}
+	if !found {
+		t.Fatal("nested business rejection not preserved safely")
+	}
+	engine.Close()
+	engine, err = taskengine.Open(taskengine.Options{Path: path, PollMin: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	engine.Register("doubao", adapter)
+	run, err = engine.Submit(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waitModuleRun(t, engine, run.ID).Status != taskengine.StatusUncertain {
+		t.Fatal("restart removed pending verification")
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.actions != 1 {
+		t.Fatal("rejected but unverified claim replayed")
+	}
 }
 func taskRuntimeAdapter(t *testing.T) (*Doubao, *taskRuntimeFixture) {
 	t.Helper()

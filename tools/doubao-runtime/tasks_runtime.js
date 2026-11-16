@@ -46,7 +46,17 @@ async input=>{
         if(task.task_id&&task.task_id!==input.instance)return fail('desktop_task_expired');
         if(task.campaign_type==='WorkTaskMode'&&!task.task_id)return fail('desktop_task_instance_missing');
         const body=task.task_id?{task_id:task.task_id,...(task.campaign_type==='WorkTaskMode'?{campaign_group_code:group,campaign_item_code:task.campaign_code}:{})}:{task_id:'',campaign_group_code:group,campaign_item_code:task.campaign_code};
-        await call('/alice/ug/campaign/item/reward/claim/',body);changed=true;operationStatus='submitted';
+        const response=await call('/alice/ug/campaign/item/reward/claim/',body);
+        // The official claim mapper treats nested business rejection separately
+        // from the outer HTTP/API code. Accepted codes still require read-back.
+        if(response.biz_error!=null){
+          const code=response.biz_error.code;
+          if(!['0','4','6'].includes(String(code))){
+            if(!Number.isSafeInteger(code)&&!(typeof code==='string'&&/^-?\d{1,9}$/.test(code)))return fail('desktop_protocol_invalid');
+            return fail('desktop_upstream_rejected',Number(code));
+          }
+        }
+        changed=true;operationStatus='submitted';
       }else return fail('desktop_protocol_invalid');
       if(changed)detail=await read();
     }

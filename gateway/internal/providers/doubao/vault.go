@@ -7,16 +7,19 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 	"workbuddy2api/internal/accountvault"
 )
 
 // StoredProfile is serialized only immediately before encryption or after
 // decryption. HTTP response types never embed this private representation.
 type StoredProfile struct {
-	Query   url.Values      `json:"query"`
-	Headers http.Header     `json:"headers"`
-	BotID   string          `json:"bot_id"`
-	Runtime *RuntimeBinding `json:"runtime,omitempty"`
+	Query       url.Values      `json:"query"`
+	Headers     http.Header     `json:"headers"`
+	BotID       string          `json:"bot_id"`
+	Runtime     *RuntimeBinding `json:"runtime,omitempty"`
+	BindingFlow string          `json:"binding_flow,omitempty"`
+	VerifiedAt  time.Time       `json:"verified_at,omitempty"`
 }
 
 func (StoredProfile) String() string   { return "doubao.StoredProfile[redacted]" }
