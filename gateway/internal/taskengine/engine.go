@@ -182,6 +182,8 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 	for _, t := range tasks {
 		// Provider discovery cannot manufacture an accepted mutation receipt.
 		t.AcceptedStage = ""
+		t.actionAttempt = ""
+		t.actionStage = ""
 		if t.ProviderID != provider || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || !IDPattern.MatchString(t.AccountID) {
 			return Catalog{}, errors.New("invalid_catalog")
 		}
@@ -600,6 +602,13 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 	e.mu.Lock()
 	_, done := e.state.Completed[key]
 	_, uncertain := e.state.Uncertain[key]
+	t.PendingVerification = uncertain
+	t.actionAttempt = ""
+	t.actionStage = ""
+	if attempt, ok := e.state.Attempts[key]; ok && uncertain && receiptStage(t, attempt) != "" {
+		t.actionAttempt = attempt.Attempt
+		t.actionStage = attempt.Stage
+	}
 	t.AcceptedStage = ""
 	if receipt, ok := e.state.Receipts[key]; ok {
 		t.AcceptedStage = receiptStage(t, receipt)
@@ -668,12 +677,14 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 		if action != nil {
 			t.AcceptedStage = ""
 			t.actionAttempt = randomID()
+			t.actionStage = stage
 			// Commit uncertainty BEFORE sending a mutating request. On crash/retry, only
 			// authoritative read-back may clear this; never blindly replay a mutation.
 			e.mu.Lock()
 			previousStage, hadPrevious := e.state.Uncertain[key]
 			previousTask := e.state.PendingTasks[key]
 			previousReceipt, hadReceipt := e.state.Receipts[key]
+			previousAttempt, hadAttempt := e.state.Attempts[key]
 			if len(e.state.PendingTasks) >= 1000 {
 				if _, exists := e.state.PendingTasks[key]; !exists {
 					e.mu.Unlock()
@@ -682,6 +693,10 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			}
 			err = e.commit(func(s *persisted) {
 				s.Uncertain[key] = stage
+				if s.Attempts == nil {
+					s.Attempts = map[string]actionReceipt{}
+				}
+				s.Attempts[key] = actionReceipt{Attempt: t.actionAttempt, Stage: stage, Binding: actionBinding(t, stage)}
 				delete(s.Receipts, key)
 				if s.PendingTasks == nil {
 					s.PendingTasks = map[string]Task{}
@@ -703,12 +718,16 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 					delete(s.Uncertain, key)
 					delete(s.PendingTasks, key)
 					delete(s.Receipts, key)
+					delete(s.Attempts, key)
 					if hadPrevious {
 						s.Uncertain[key] = previousStage
 						s.PendingTasks[key] = previousTask
 					}
 					if hadReceipt {
 						s.Receipts[key] = previousReceipt
+					}
+					if hadAttempt {
+						s.Attempts[key] = previousAttempt
 					}
 				})
 				e.mu.Unlock()
@@ -792,6 +811,7 @@ func (e *Engine) confirm(id, key string, t Task) (Status, error) {
 		delete(s.Uncertain, key)
 		delete(s.PendingTasks, key)
 		delete(s.Receipts, key)
+		delete(s.Attempts, key)
 		if t.Once || t.OncePerDay {
 			s.Completed[key] = time.Now().UTC()
 		}

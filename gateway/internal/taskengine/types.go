@@ -75,6 +75,7 @@ type Task struct {
 	// an empty directory or HTTP200 alone.
 	AcceptedStage Stage `json:"accepted_stage,omitempty"`
 	actionAttempt string
+	actionStage   Stage
 }
 
 // Observation is an adapter's factual result. Success at Execute/Claim alone

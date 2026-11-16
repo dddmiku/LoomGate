@@ -5,7 +5,7 @@
 | 原入口/子步骤 | 新引擎位置 | 当前入口状态与未完成边界 |
 |---|---|---|
 | checkin / WorkBuddy 国内签到 | checkinModule | 已有检查→签到→复核；余额独立任务 |
-| trae_check / Trae 签到、余额、到期桶、9074退避 | traeCheckinModule / traeBalanceModule | Phase15实现独立余额/到期池更新、加密持久退避/业务日缓存/全局间隔、逐项和计划接线；旧设备旋转与keepalive未迁入，真实执行NOT RUN |
+| trae_check / Trae 签到、余额、到期桶、9074退避 | traeCheckinModule / traeBalanceModule | Phase15/16已实现独立余额、严格到期快照、加密退避与多账号持久间隔；keepalive已独立接线，旧设备旋转不照搬；真实执行NOT RUN |
 | balance / WorkBuddy CN/global | balanceModule | 已有只读余额与池更新；global不做活动写操作 |
 | travel / 首次领养、协议、门槛 | travelModule | 本轮显示真实门槛及官方领养步骤；协议与首次领养仍人工 |
 | travel / 地点、每日派出、在途状态、记录领奖 | travelModule | 本轮实现，地点/记录来自响应；分别派出与领奖，不阻塞等待数小时 |
@@ -16,7 +16,7 @@
 | growth / 抽奖机会和抽奖 | resourcesModule | 本轮只读机会；完整抽奖/奖品历史复核未完成，不自动消耗 |
 | growth / 能量、Buddy额度、开盲盒 | resourcesModule | 本轮只读余额/额度；开箱与所得Buddy权威复核未完成 |
 | growth / 连登、能量展示 | resourcesModule | 本轮真实只读状态接线 |
-| keepalive / 刷新、持久化、停用原因 | keepaliveModule | Phase16真实模块/官方HTTP/安全恢复/版本校验/单飞取消/落盘回读/仅session-dead恢复已接线，三域与计划/浏览器/重启合成验证；真实续期NOT RUN |
+| keepalive / 刷新、持久化、停用原因 | keepaliveModule | Phase16已接线；Phase17修复F14旧凭据证明污染新attempt，原外部负例、崩溃窗口与保存失败恢复回归通过；真实续期NOT RUN |
 | keepalive / 原自动补注册地 | 官方人工核验 | 不按出口IP擅自填账号国家；续期成功不等于注册已完成 |
 | school / 动态任务、官方工作、领奖、抽奖 | 待迁移 | 原限时活动/任务/抽奖全部未迁移；不能靠历史日期或伪造事件完成 |
 | cat / 夜猫窗口与实际工作 | 动态成长目录可见 | 官方真实工作与窗口执行未迁移 |

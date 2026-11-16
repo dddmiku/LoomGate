@@ -18,6 +18,7 @@ type persisted struct {
 	Receipts        map[string]actionReceipt `json:"receipts,omitempty"`
 	LegacyCompleted map[string]time.Time     `json:"legacy_completed,omitempty"`
 	Work            map[string]runWork       `json:"work,omitempty"`
+	Attempts        map[string]actionReceipt `json:"attempts,omitempty"`
 }
 
 type runWork struct {
@@ -30,7 +31,7 @@ type runWork struct {
 }
 
 func newState() persisted {
-	return persisted{Version: 3, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}, Work: map[string]runWork{}}
+	return persisted{Version: 4, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}, Work: map[string]runWork{}, Attempts: map[string]actionReceipt{}}
 }
 func readState(path string) (persisted, error) {
 	s := newState()
@@ -41,7 +42,7 @@ func readState(path string) (persisted, error) {
 	if err != nil {
 		return s, errors.New("task_store_unreadable")
 	}
-	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version != 1 && s.Version != 2 && s.Version != 3) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
+	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version < 1 || s.Version > 4) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
 		return s, errors.New("task_store_invalid")
 	}
 	if s.Version == 1 {
@@ -52,7 +53,18 @@ func readState(path string) (persisted, error) {
 		s.Completed = map[string]time.Time{}
 		s.Receipts = map[string]actionReceipt{}
 	}
-	s.Version = 3
+	if s.Version < 4 {
+		// Only existing bound receipts carry a recoverable legacy attempt.
+		// Unknown v3 operations without one stay unresolved, with no invented ID.
+		s.Attempts = map[string]actionReceipt{}
+		for key, receipt := range s.Receipts {
+			s.Attempts[key] = receipt
+		}
+	}
+	s.Version = 4
+	if s.Attempts == nil {
+		s.Attempts = map[string]actionReceipt{}
+	}
 	if s.Work == nil {
 		s.Work = map[string]runWork{}
 	}
@@ -122,6 +134,15 @@ func readState(path string) (persisted, error) {
 	for key := range s.Receipts {
 		if _, ok := s.PendingTasks[key]; !ok {
 			return s, errors.New("task_store_receipt_orphan")
+		}
+	}
+	for key, attempt := range s.Attempts {
+		task, ok := s.PendingTasks[key]
+		if !ok || receiptStage(task, attempt) == "" || s.Uncertain[key] != attempt.Stage {
+			return s, errors.New("task_attempt_invalid")
+		}
+		if receipt, ok := s.Receipts[key]; ok && receipt != attempt {
+			return s, errors.New("task_attempt_receipt_mismatch")
 		}
 	}
 	for i := range s.Runs {

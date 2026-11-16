@@ -20,6 +20,16 @@ func actionBinding(t Task, stage Stage) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(t.ProviderID+"\x00"+t.AccountID+"\x00"+t.Key+"\x00"+t.PeriodKey+"\x00"+string(stage)+"\x00"+t.actionAttempt)))
 }
 
+// ActionReference identifies only the engine-issued attempt for this stage.
+// It is not acceptance evidence. Discovery cannot supply it and it is omitted
+// from public JSON. Adapters can bind private recovery journals to this value.
+func ActionReference(t Task, stage Stage) string {
+	if len(t.actionAttempt) != 32 || t.actionStage != stage {
+		return ""
+	}
+	return actionBinding(t, stage)
+}
+
 // NotSubmitted is permitted only before calling a mutating transport, or after
 // explicit provider evidence that no operation was accepted. It releases only
 // the provisional marker for this exact attempt, never a previous unknown.

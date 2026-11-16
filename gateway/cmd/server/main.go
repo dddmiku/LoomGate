@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -320,6 +321,20 @@ func main() {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Installed desktop owns the inherited stdin pipe. This gives Windows the
+	// same graceful drain path as SIGTERM without an unauthenticated HTTP route.
+	if os.Getenv("LOOMGATE_REBUILD") == "1" && os.Getenv("LOOMGATE_DESKTOP_CONTROL") == "stdin" {
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				if scanner.Text() == "stop" {
+					stop()
+					return
+				}
+			}
+			stop()
+		}()
+	}
 	defer stop()
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	defer stopBackground()

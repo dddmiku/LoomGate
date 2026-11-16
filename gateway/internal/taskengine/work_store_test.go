@@ -22,7 +22,7 @@ func TestV2BoundReceiptsRemainTrustedWhileAddingWorkRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, err := readState(path)
-	if err != nil || restored.Version != 3 || restored.PendingTasks[key].AcceptedStage != StageClaim || len(restored.Receipts) != 1 || len(restored.Uncertain) != 1 {
+	if err != nil || restored.Version != 4 || restored.PendingTasks[key].AcceptedStage != StageClaim || len(restored.Receipts) != 1 || len(restored.Uncertain) != 1 {
 		t.Fatal("v2 evidence lost during work format migration")
 	}
 }

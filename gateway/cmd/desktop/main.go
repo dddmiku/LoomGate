@@ -37,8 +37,9 @@ import (
 
 // 版本由构建脚本注入（与网关同一套 ldflags 约定）。
 var (
-	version = "dev"
-	builtAt = "unknown"
+	version    = "dev"
+	builtAt    = "unknown"
+	deployment = "legacy"
 )
 
 // desktopLayout 是桌面版的数据目录布局。
@@ -115,12 +116,12 @@ func defaultConfig() string {
 			"trae_check_hours": []int{0},
 			"growth_hours":     []int{9, 21},
 			"balance_hours":    []int{9, 21},
-			"checkin_enabled": true, "travel_enabled": true,
+			"checkin_enabled":  true, "travel_enabled": true,
 			"activity_enabled": true, "keepalive_enabled": true,
 			"school_enabled": true, "cat_enabled": true,
 			"trae_check_enabled": true,
-			"growth_enabled":  true,
-			"balance_enabled": true,
+			"growth_enabled":     true,
+			"balance_enabled":    true,
 		},
 	}
 	raw, _ := json.MarshalIndent(cfg, "", "  ")
@@ -194,10 +195,20 @@ func waitForHealth(addr string, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(url)
 		if err == nil {
-			io.Copy(io.Discard, resp.Body)
+			var health struct {
+				Service string `json:"service"`
+			}
+			decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&health)
 			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				return true
+			if decodeErr == nil && health.Service == "workbuddy2api" && resp.Header.Get("X-Service") == "workbuddy2api" && (resp.StatusCode == 200 || resp.StatusCode == 503) {
+				panel, panelErr := client.Get("http://" + addr + desktopAdminPrefix() + "/login")
+				if panelErr == nil {
+					io.Copy(io.Discard, io.LimitReader(panel.Body, 256<<10))
+					panel.Body.Close()
+					if panel.StatusCode == 200 {
+						return true
+					}
+				}
 			}
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -261,6 +272,9 @@ func main() {
 	root := strings.TrimSpace(os.Getenv("WB2A_DESKTOP_ROOT"))
 	if root == "" {
 		root = exeDir
+		if deployment == "loomgate-installed" {
+			root = filepath.Join(filepath.Dir(exeDir), "workspace")
+		}
 	}
 	// 运行目录（网关与辅助程序所在）：单文件分发时先把内嵌的那份解到 <root>/runtime。
 	// 必须在算出 root 之后——解压目标就在数据目录下。
@@ -279,7 +293,7 @@ func main() {
 	// 而 Go 引擎与 Python 引擎功能等价（同一套前端、同一份凭据格式）。
 	panelEngine := "go"
 	python := ""
-	if usePythonPanel() {
+	if usePythonPanel() && deployment != "loomgate-installed" {
 		resolved, err := findPython()
 		if err != nil {
 			printPythonHelp(err)
@@ -288,7 +302,7 @@ func main() {
 		python = resolved
 		panelEngine = "python"
 		fmt.Printf("使用解释器: %s\n", python)
-	} else {
+	} else if deployment != "loomgate-installed" {
 		// 面板不需要 Python，但**排程的脚本类任务需要**（school / cat / redeem /
 		// lottery / makeup 跑的是 scripts/*.py，由 scheduler 的 pythonCmd() 起进程）。
 		// 找不到就只是那几个任务跳过——不拦启动，但要把解释器路径传下去。
@@ -331,6 +345,15 @@ func main() {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	var childInput io.WriteCloser
+	if deployment == "loomgate-installed" {
+		cmd.Stdin = nil
+		childInput, err = cmd.StdinPipe()
+		if err != nil {
+			fatal("无法建立本机进程控制通道")
+		}
+		defer childInput.Close()
+	}
 	env := []string{
 		"WB2API_PANEL_ENABLED=1",
 		"WB2API_RUNTIME=native",
@@ -362,6 +385,9 @@ func main() {
 			env = append(env, "WB2A_PYTHON="+python)
 		}
 	}
+	if deployment == "loomgate-installed" {
+		env = append(env, "LOOMGATE_REBUILD=1", "LOOMGATE_DESKTOP_CONTROL=stdin")
+	}
 	cmd.Env = append(os.Environ(), env...)
 	if err := cmd.Start(); err != nil {
 		fatal("启动网关失败: %v", err)
@@ -371,8 +397,23 @@ func main() {
 	// 否则会在任务管理器里留下一个占着端口的孤儿进程。
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	if deployment == "loomgate-installed" && os.Getenv("LOOMGATE_DESKTOP_HEADLESS") == "1" {
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				if scanner.Text() == "stop" {
+					signals <- os.Interrupt
+					return
+				}
+			}
+		}()
+	}
 	go func() {
 		<-signals
+		if childInput != nil {
+			_, _ = io.WriteString(childInput, "stop\n")
+			return
+		}
 		stopChild(cmd)
 		os.Exit(0)
 	}()
@@ -385,7 +426,9 @@ func main() {
 	panelURL := fmt.Sprintf("http://%s%s/", addr, desktopAdminPrefix())
 	if waitForHealth(addr, 30*time.Second) {
 		fmt.Printf("\n网关已启动：http://%s\n管理面板：%s\n（关闭本窗口即停止服务）\n\n", addr, panelURL)
-		openBrowser(panelURL)
+		if os.Getenv("LOOMGATE_DESKTOP_HEADLESS") != "1" {
+			openBrowser(panelURL)
+		}
 	} else {
 		fmt.Printf("\n网关启动较慢或失败，请查看上方日志。\n管理面板（就绪后打开）：%s\n\n", panelURL)
 	}
