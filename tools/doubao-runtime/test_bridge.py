@@ -87,6 +87,14 @@ class BridgeTests(unittest.TestCase):
                 if request['method']=='Runtime.evaluate':
                     if len([x for x in calls if x=='Runtime.evaluate']) == 1:
                         value={'result':{'value':{'identity':'a'*64,'composerEmpty':True}}}
+                    elif '/*loomgate-input*/' in request['params']['expression']:
+                        owner=json.JSONDecoder().raw_decode(request['params']['expression'].split('/*loomgate-input*/',1)[1])[0]['owner']
+                        value={'result':{'value':{'ok':True,'owner':owner,'local_conversation_id':'local_'+owner}}}
+                        ws.send(json.dumps({'id':request['id'],'result':value}))
+                        body=json.dumps({'client_meta':{'bot_id':'synthetic-bot','local_conversation_id':'local_'+owner},'messages':[{'content_block':[{'content':{'text_block':{'text':'synthetic'}}}]}],'option':{'unique_key':owner,'start_seq':0,'sse_recv_event_options':{'support_chunk_delta':True}}})
+                        for rid in ('synthetic-first','synthetic-second'):
+                            ws.send(json.dumps({'method':'Fetch.requestPaused','params':{'requestId':rid,'request':{'url':'https://www.doubao.com/chat/completion?a_bogus=synthetic&msToken=synthetic&loomgate_probe='+owner,'method':'POST','headers':{'Content-Type':'application/json'},'postData':body}}}))
+                        continue
                     else:
                         value={'result':{'value':{'ok':True}}}
                     ws.send(json.dumps({'id':request['id'],'result':value}))
@@ -96,9 +104,6 @@ class BridgeTests(unittest.TestCase):
                     ws.send(json.dumps({'id':request['id'],'result':{}}));return
                 elif request['method']=='Fetch.enable':
                     ws.send(json.dumps({'id':request['id'],'result':{}}))
-                    body='{"client_meta":{"bot_id":"synthetic-bot","local_conversation_id":"c"},"messages":[{"content_block":[{}]}],"option":{"unique_key":"u","start_seq":0,"sse_recv_event_options":{"support_chunk_delta":true}}}'
-                    for rid in ('synthetic-first','synthetic-second'):
-                        ws.send(json.dumps({'method':'Fetch.requestPaused','params':{'requestId':rid,'request':{'url':'https://www.doubao.com/chat/completion?a_bogus=synthetic&msToken=synthetic','method':'POST','headers':{'Content-Type':'application/json'},'postData':body}}}))
                 else:
                     ws.send(json.dumps({'id':request['id'],'result':{}}))
         server=serve(handler,'127.0.0.1',0)

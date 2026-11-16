@@ -65,6 +65,7 @@ import (
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/hotupdate"
+	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/keylimit"
 	"workbuddy2api/internal/logfmt"
@@ -171,6 +172,7 @@ type Config struct {
 	// Tasks 排程任务控制器（可选；nil = /tasks 报 available=false，面板渲染说明态）。
 	Tasks     TaskController
 	Workbench http.Handler
+	Inference map[string]inference.Provider
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -935,9 +937,11 @@ const (
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 // 绑定模型的密钥只会看到自己可用的模型，客户端据此选择也不会撞 403。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	models, issues := h.visibleModelsWithIssues(r)
 	_ = writeJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data":   h.visibleModels(r),
+		"object":          "list",
+		"data":            models,
+		"provider_errors": issues,
 	})
 }
 
@@ -1549,6 +1553,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model name exceeds %d bytes", maxModelNameBytes))
 		return
 	}
+	// Preserve the caller's exact capability request. Legacy normalizers may
+	// remove tool declarations; external providers must reject those explicitly.
+	providerBody:=append([]byte(nil),body...)
 	if r.URL.Path == "/v1/chat/completions" && peek.Stream && hideChatStreamUsage(requestObject) {
 		w = &chatUsageVisibilityWriter{inner: w}
 	}
@@ -1687,6 +1694,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
+	if namespace, _, ok := strings.Cut(peek.Model, ":"); ok {
+		if provider := h.cfg.Inference[namespace]; provider != nil {
+			h.providerChat(w, r, providerBody, peek.Model, peek.Stream, st, provider)
+			return
+		}
+		if namespace == "doubao" {
+			st.status = 400
+			writeOpenAIError(w, 400, "provider_unavailable", "requested provider is not configured")
+			return
+		}
+	}
 	if info, ok := requestKeyInfo(r); ok && info.ReasoningLoopGuard != nil {
 		reasoningLoopGuard = *info.ReasoningLoopGuard
 	}

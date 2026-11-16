@@ -1,13 +1,15 @@
-"""Restricted one-shot CDP reader. JSON over inherited pipes; no HTTP listener.
+"""Restricted CDP adapter. JSON over inherited pipes; no HTTP listener.
 
-Only the logged-in identity digest and projected public model catalog can leave
-the renderer. No generic URL, JavaScript, cookie export or mutation operation.
+The protocol permits fixed identity/catalog/owned-text operations only. No
+generic URL or script execution endpoint, cookie export, or credential output.
+Message data is private pipe traffic and must never be written to shared logs.
 """
 import http.client
 import json
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -48,11 +50,39 @@ def completion_body_valid(value, bot_id):
     return isinstance(message, dict) and isinstance(message.get('content_block'), list) and bool(message['content_block'])
 
 
+def message_text(value):
+    """Only text block payloads count; metadata never proves message ownership."""
+    try:
+        blocks = value['messages'][0]['content_block']
+        parts = []
+        for block in blocks:
+            content = block.get('content', {})
+            text = content.get('text_block', {}).get('text')
+            if text is None: text = block.get('text')  # isolated schema fixtures
+            if not isinstance(text, str): return None
+            parts.append(text)
+        return ''.join(parts)
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return None
+
+
 def validate(request):
-    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt'}:
+    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt', 'model', 'lease', 'path', 'body', 'resume','task_id','scene'}:
         raise BridgeError('desktop_protocol_invalid')
     if type(request.get('port')) is not int or not 1 <= request['port'] <= 65535:
         raise BridgeError('desktop_protocol_invalid')
+    if request.get('operation') in ('prepare_text','release_text','stream_text','authorize_async'):
+        if not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
+        if request['operation']=='prepare_text':
+            if set(request)!={'operation','port','identity','model','prompt'} or not isinstance(request.get('model'),str) or not request['model'].startswith('doubao:') or len(request['model'])>256 or not isinstance(request.get('prompt'),str) or not 1<=len(request['prompt'].encode())<=65536:raise BridgeError('desktop_protocol_invalid')
+        else:
+            if not isinstance(request.get('lease'),str) or not re.fullmatch('[a-f0-9-]{36}',request['lease']):raise BridgeError('desktop_protocol_invalid')
+            if request['operation']=='release_text' and set(request)!={'operation','port','identity','lease'}:raise BridgeError('desktop_protocol_invalid')
+            if request['operation']=='authorize_async' and (set(request)!={'operation','port','identity','lease','task_id','scene'} or not isinstance(request.get('task_id'),str) or not 1<=len(request['task_id'])<=512):raise BridgeError('desktop_protocol_invalid')
+            if request['operation']=='stream_text':
+                if set(request)-{'operation','port','identity','lease','path','body','resume'} or request.get('path') not in (COMPLETION_PATH,ASYNC_PATH) or not isinstance(request.get('body'),dict) or type(request.get('resume',False)) is not bool:raise BridgeError('desktop_protocol_invalid')
+        return
+    if set(request)-{'operation','port','identity','bot_id','prompt'}:raise BridgeError('desktop_protocol_invalid')
     if request.get('operation') == 'identity':
         if set(request) != {'operation', 'port'}:
             raise BridgeError('desktop_protocol_invalid')
@@ -90,18 +120,24 @@ def target(port):
         raise BridgeError('desktop_unavailable')
     return ws
 
-def prepare_completion_transaction(ws, call, request, deadline, pending):
+def prepare_completion_transaction(ws, call, request, deadline, pending, canceled=None):
     request_ids = set()
-    editor = {'original': None, 'modified': False}
+    editor = {'modified': False}
+    owner = str(uuid.uuid4())
+    cleanup_failed = False
     identity = ''
     result = None
     failure = None
     enabled = False
 
     def receive():
-        remaining = deadline-time.monotonic()
-        if remaining <= 0: raise BridgeError('desktop_timeout')
-        return json.loads(ws.recv(timeout=remaining))
+        while True:
+            if canceled and canceled.is_set():raise BridgeError('desktop_canceled')
+            remaining = deadline-time.monotonic()
+            if remaining <= 0: raise BridgeError('desktop_timeout')
+            try:return json.loads(ws.recv(timeout=min(.2,remaining) if canceled else remaining))
+            except TimeoutError:
+                if not canceled:raise
 
     def evaluate(expression, await_promise=False):
         response = call('Runtime.evaluate', {'expression':expression,'awaitPromise':await_promise,'returnByValue':True})
@@ -118,20 +154,22 @@ def prepare_completion_transaction(ws, call, request, deadline, pending):
         request_ids.discard(rid)
 
     try:
-        c=Symbol=None
-        identity_script="""async()=>{const c=window['chunk_@flow-web/desktop'];if(!c)return {error:'desktop_version_unsupported'};const e=document.querySelector('[contenteditable=true]');if(!e)return {error:'desktop_version_unsupported'};const k=Symbol.for('loomgate.phase08.require');let r=window[k];if(typeof r!=='function'){r=await new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(Error('timeout')),3000);c.push([['phase08-identity'],{},x=>{clearTimeout(t);resolve(x)}])});if(typeof r!=='function')return {error:'desktop_version_unsupported'};window[k]=r}const sdk=await r('z5').getFlowAccount().passportApi.getPassportSDK();const u=await sdk.login.checkLogin({});const id=String(u?.user_id_str||u?.user_id||'');if(!id)return {error:'desktop_login_required'};const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id));return {identity:Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join(''),composerEmpty:!(e.innerText||'').trim()}}"""
+        identity_script="""async()=>{const c=window['chunk_@flow-web/desktop'];if(!c)return {error:'desktop_version_unsupported'};const e=document.querySelector('[contenteditable=true]');if(!e)return {error:'desktop_version_unsupported'};const k=Symbol.for('loomgate.phase08.require');let r=window[k];if(typeof r!=='function'){r=await new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(Error('timeout')),3000);c.push([['loomgate-identity-'+crypto.randomUUID()],{},x=>{clearTimeout(t);resolve(x)}])});if(typeof r!=='function')return {error:'desktop_version_unsupported'};window[k]=r}const sdk=await r('z5').getFlowAccount().passportApi.getPassportSDK();const u=await sdk.login.checkLogin({});const id=String(u?.user_id_str||u?.user_id||'');if(!id)return {error:'desktop_login_required'};const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id));return {identity:Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join(''),composerEmpty:!(e.innerText||'').trim()}}"""
         ident=evaluate('('+identity_script+')()',True)
         if ident.get('error'): raise BridgeError(ident['error'])
         if ident.get('composerEmpty') is not True: raise BridgeError('composer_not_empty')
         identity=ident.get('identity','')
         if identity!=request['identity']: raise BridgeError('desktop_identity_mismatch')
 
-        call('Fetch.enable',{'patterns':[{'urlPattern':'https://www.doubao.com/chat/completion*','requestStage':'Request'}]})
+        call('Fetch.enable',{'patterns':[{'urlPattern':'https://www.doubao.com/chat/completion*loomgate_probe='+owner+'*','requestStage':'Request'}]})
         enabled=True
-        prepare_script="""(prompt)=>{const e=document.querySelector('[contenteditable=true]');if(!e||(e.innerText||'').trim())return {error:'composer_not_empty'};window.__loomgatePhase08Original=e.innerHTML;window.__loomgatePhase08Touched=false;e.innerText=prompt;const b=document.querySelector('[data-testid=chat_input_send_button]');if(!b)return {error:'desktop_version_unsupported'};window.__loomgatePhase08Touched=true;b.click();return {ok:true}}"""
-        started=evaluate('('+prepare_script+')('+json.dumps(request['prompt'])+')')
+        prepare_script=Path(__file__).with_name('probe_runtime.js').read_text(encoding='utf-8')
+        catalog_script=Path(__file__).with_name('runtime.js').read_text(encoding='utf-8')
+        editor['modified']=True  # means an owned fetch lease may now exist, never a DOM edit
+        probe_input={'prompt':request['prompt'],'owner':owner,'identity':identity,'bot_id':request['bot_id']}
+        started=evaluate('('+prepare_script+')(/*loomgate-input*/'+json.dumps(probe_input)+',('+catalog_script+'))',True)
         if started.get('error'): raise BridgeError(started['error'])
-        editor['modified']=True
+        if started.get('owner')!=owner or not isinstance(started.get('local_conversation_id'),str): raise BridgeError('desktop_protocol_invalid')
         captured=None
         while time.monotonic()<deadline:
             event=pending.pop(0) if pending else receive()
@@ -146,9 +184,13 @@ def prepare_completion_transaction(ws, call, request, deadline, pending):
             except Exception: body=None
             if not completion_body_valid(body,request['bot_id']):
                 stop_paused(event);continue
-            if request['prompt'] not in raw:
+            if message_text(body) != request['prompt']:
+                stop_paused(event);continue
+            if body['option']['unique_key']!=owner or body['client_meta']['local_conversation_id']!=started['local_conversation_id']:
                 stop_paused(event);continue
             query=parse_qs(u.query)
+            if query.get('loomgate_probe')!=[owner]:
+                stop_paused(event);continue
             if not query.get('a_bogus') or not query.get('msToken'):
                 stop_paused(event);continue
             captured={'host':u.hostname,'path':u.path,'method':'POST','query_keys':sorted(query),'header_keys':sorted((params.get('request',{}).get('headers') or {}).keys()),'body_shape':shape(body),'body_sha256':__import__('hashlib').sha256(raw.encode()).hexdigest(),'network_sent':False,'mutations':0,'conversation_bound':True,'identity_bound':identity}
@@ -158,12 +200,18 @@ def prepare_completion_transaction(ws, call, request, deadline, pending):
         if result is None: raise BridgeError('desktop_timeout')
     except BridgeError as e:
         failure=e
+    except TimeoutError:
+        failure=BridgeError('desktop_timeout')
     except Exception:
         failure=BridgeError('desktop_unavailable')
     finally:
         # Drain every currently paused matching request before detaching Fetch.
         # Paused requests from other origins are outside this probe and untouched.
-        drain_end=time.monotonic()+1.5
+        # Each cleanup RPC has a separate short deadline. A missing fail ACK must
+        # leave enough time for the renderer's owned AbortController to settle.
+        call.cleanup_deadline = time.monotonic()+5
+        call.cleanup_rpc_timeout = .9
+        drain_end=time.monotonic()+.2
         while pending:
             event=pending.pop(0)
             if event.get('method')!='Fetch.requestPaused': continue
@@ -180,20 +228,36 @@ def prepare_completion_transaction(ws, call, request, deadline, pending):
                 try: stop_paused(event)
                 except Exception: pass
         for rid in list(request_ids):
-            try: call('Fetch.failRequest',{'requestId':rid,'errorReason':'BlockedByClient'})
+            try:
+                call('Fetch.failRequest',{'requestId':rid,'errorReason':'BlockedByClient'})
+                request_ids.discard(rid)
             except Exception: pass
         if editor['modified']:
-            restore="""()=>{const e=document.querySelector('[contenteditable=true]');if(!e)return false;if((e.innerText||'').includes('LoomGate phase08 synthetic request preparation probe. Do not answer.')){e.innerHTML=window.__loomgatePhase08Original||'';e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContent'}));delete window.__loomgatePhase08Original;delete window.__loomgatePhase08Touched;return true}return false}"""
-            try: call('Runtime.evaluate',{'expression':'('+restore+')()','returnByValue':True})
-            except Exception: pass
+            restore=Path(__file__).with_name('probe_cleanup.js').read_text(encoding='utf-8')
+            try:
+                value=call('Runtime.evaluate',{'expression':'('+restore+')('+json.dumps(owner)+')','awaitPromise':True,'returnByValue':True}).get('result',{}).get('value')
+                if not isinstance(value,dict) or value.get('ok') is not True: cleanup_failed=True
+            except Exception: cleanup_failed=True
+        while pending:
+            event=pending.pop(0)
+            if event.get('method')=='Fetch.requestPaused':
+                try: stop_paused(event)
+                except Exception: cleanup_failed=True
         if enabled:
-            try: call('Fetch.disable')
-            except Exception: pass
+            if request_ids:
+                cleanup_failed=True
+                # Do not release uncertain paused requests by Fetch.disable.
+                try: call('Page.stopLoading')
+                except Exception: pass
+            else:
+                try: call('Fetch.disable')
+                except Exception: cleanup_failed=True
+        if cleanup_failed: failure=BridgeError('desktop_cleanup_uncertain')
     if failure: raise failure
     return result
 
 
-def execute(request):
+def execute(request,canceled=None):
     validate(request)
     from websockets.sync.client import connect
     script = Path(__file__).with_name('runtime.js').read_text(encoding='utf-8')
@@ -206,11 +270,16 @@ def execute(request):
             nonlocal seq, signed
             seq += 1
             ws.send(json.dumps({'id':seq, 'method':method, 'params':params or {}}))
+            rpc_deadline=min(getattr(call,'cleanup_deadline',deadline),time.monotonic()+getattr(call,'cleanup_rpc_timeout',10))
             while True:
-                remaining = deadline-time.monotonic()
+                remaining = rpc_deadline-time.monotonic()
                 if remaining <= 0:
                     raise BridgeError('desktop_timeout')
-                event = json.loads(ws.recv(timeout=remaining))
+                if canceled and canceled.is_set() and not hasattr(call,'cleanup_deadline'):raise BridgeError('desktop_canceled')
+                try:event = json.loads(ws.recv(timeout=min(.2,remaining) if canceled else remaining))
+                except TimeoutError:
+                    if canceled:continue
+                    raise
                 if event.get('method') == 'Network.requestWillBeSent':
                     u = urlsplit(event.get('params', {}).get('request', {}).get('url', ''))
                     if u.hostname == 'www.doubao.com' and u.path == CATALOG_PATH and parse_qs(u.query).get('a_bogus'):
@@ -222,7 +291,14 @@ def execute(request):
                 if event.get('method') == 'Fetch.requestPaused':
                     pending.append(event)
         if request['operation'] == 'prepare_completion':
-            return prepare_completion_transaction(ws, call, request, deadline, pending)
+            return prepare_completion_transaction(ws, call, request, deadline, pending,canceled)
+        if request['operation'] in ('prepare_text','release_text','authorize_async'):
+            source=Path(__file__).with_name('stream_runtime.js').read_text(encoding='utf-8')
+            result=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+',('+script+'))','awaitPromise':True,'returnByValue':True})
+            if result.get('exceptionDetails'):raise BridgeError('desktop_protocol_invalid')
+            value=result.get('result',{}).get('value')
+            if not isinstance(value,dict):raise BridgeError('desktop_protocol_invalid')
+            return value
         call('Network.enable')
         result = call('Runtime.evaluate', {'expression':'('+script+')('+json.dumps(request)+')', 'awaitPromise':True, 'returnByValue':True})
         if 'exceptionDetails' in result:
@@ -239,10 +315,26 @@ def execute(request):
 
 def main():
     try:
-        raw = sys.stdin.buffer.read(4097)
-        if len(raw) > 4096:
+        raw = sys.stdin.buffer.readline((1<<20)+1)
+        if len(raw) > 1<<20:
             raise BridgeError('desktop_protocol_invalid')
-        result = execute(json.loads(raw))
+        request=json.loads(raw)
+        validate(request)
+        if request['operation']=='stream_text':
+            import importlib.util
+            spec=importlib.util.spec_from_file_location('loomgate_stream_bridge',Path(__file__).with_name('stream_bridge.py'))
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            module.pipe(request,target)
+            return
+        canceled=None
+        if request['operation']=='prepare_completion':
+            import threading
+            canceled=threading.Event()
+            def watch_parent():
+                sys.stdin.buffer.readline(128)
+                canceled.set()
+            threading.Thread(target=watch_parent,daemon=True).start()
+        result = execute(request,canceled)
     except BridgeError as e:
         result = {'ok':False, 'error':str(e)}
     except TimeoutError:

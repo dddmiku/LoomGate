@@ -60,11 +60,15 @@ func NewDesktopRuntime(python, helper string, port int) (*CommandRuntime, error)
 }
 
 type runtimeRequest struct {
-	Operation string `json:"operation"`
-	Port      int    `json:"port"`
-	Identity  string `json:"identity,omitempty"`
-	BotID     string `json:"bot_id,omitempty"`
-	Prompt    string `json:"prompt,omitempty"`
+	Operation string          `json:"operation"`
+	Port      int             `json:"port"`
+	Identity  string          `json:"identity,omitempty"`
+	BotID     string          `json:"bot_id,omitempty"`
+	Prompt    string          `json:"prompt,omitempty"`
+	Model     string          `json:"model,omitempty"`
+	Lease     string          `json:"lease,omitempty"`
+	TaskID    string          `json:"task_id,omitempty"`
+	Scene     json.RawMessage `json:"scene,omitempty"`
 }
 type runtimeReply struct {
 	OK       bool            `json:"ok"`
@@ -119,7 +123,7 @@ func (r *CommandRuntime) PrepareCompletion(ctx context.Context, b RuntimeBinding
 // child stderr and process arguments are never included in errors or logs.
 func runtimeError(code string) error {
 	switch code {
-	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected", "desktop_binding_invalid":
+	case "desktop_unavailable", "desktop_version_unsupported", "desktop_identity_mismatch", "desktop_login_required", "desktop_timeout", "desktop_busy", "desktop_protocol_invalid", "desktop_upstream_rejected", "desktop_binding_invalid", "desktop_cleanup_uncertain", "desktop_ownership_lost", "composer_not_empty", "desktop_model_unavailable", "desktop_native_tools_unsupported", "desktop_origin_rejected", "desktop_submission_uncertain", "desktop_response_rejected", "desktop_canceled", "desktop_stream_limit", "desktop_stream_interrupted":
 		return &APIError{Kind: code}
 	default:
 		return &APIError{Kind: "desktop_protocol_invalid"}
@@ -147,9 +151,13 @@ func (r *CommandRuntime) run(ctx context.Context, request runtimeRequest) (runti
 	case <-ctx.Done():
 		return runtimeReply{}, ctx.Err()
 	}
+	return r.invoke(ctx, request)
+}
+func (r *CommandRuntime) invoke(ctx context.Context, request runtimeRequest) (runtimeReply, error) {
 	if ctx.Err() != nil {
 		return runtimeReply{}, ctx.Err()
 	}
+	if request.Operation=="prepare_completion"{return r.invokeProbe(ctx,request)}
 	raw, _ := json.Marshal(request)
 	cmd := exec.CommandContext(ctx, r.command[0], r.command[1:]...)
 	configureDesktopProcess(cmd)

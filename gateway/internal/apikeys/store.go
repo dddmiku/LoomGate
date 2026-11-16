@@ -43,8 +43,8 @@ const MaxBoundModels = 64
 var (
 	ErrNotFound      = errors.New("密钥不存在或已删除")
 	ErrInvalid       = errors.New("名称需为 1—64 字，备注不超过 256 字，且不能包含控制字符")
-	ErrInvalidModels = errors.New("模型绑定需为 1—64 个字符、不含空白或控制字符，且不能重复，最多 64 项")
-	ErrBindingRealm  = errors.New("模型绑定必须填完整模型名（带 cn: 或 global: 前缀），请从模型列表中选择")
+	ErrInvalidModels = errors.New("模型绑定需为完整模型标识，最多 256 字节、不含空白或控制字符，且不能重复，最多 64 项")
+	ErrBindingRealm  = errors.New("模型绑定必须包含平台前缀与模型标识，请从实时模型目录中选择完整名称")
 	ErrInvalidExpiry = errors.New("有效期需为将来时间，且不超过 10 年；留空表示无限制")
 	ErrLimit         = errors.New("密钥数量已达上限，请先删除不再使用的密钥")
 	ErrInvalidLimits = errors.New("限流设置无效：每分钟0—60000次、并发0—256、排队0—30秒；0表示不限或不排队")
@@ -309,7 +309,11 @@ func validModels(models []string) bool {
 	}
 	seen := make(map[string]bool, len(models))
 	for _, model := range models {
-		if model != strings.TrimSpace(model) || model == "" || utf8.RuneCountInString(model) > 64 {
+		maxChars := 64
+		if realm, id := splitRealm(model); realm != "" && id != "" {
+			maxChars = 256
+		}
+		if model != strings.TrimSpace(model) || model == "" || utf8.RuneCountInString(model) > maxChars || len(model) > 256 {
 			return false
 		}
 		for _, r := range model {
@@ -357,18 +361,19 @@ func fullModelNames(models []string) bool {
 	return true
 }
 
-// splitRealm 只做字面前缀识别，不参与任何解析或补全：前缀不是已知 realm 时
-// 返回空 realm，调用方据此判定「这不是一个完整模型名」。
-//
-// trae 是第三个域（2026-10-11 接入）。绑定校验与 resolveModel 必须用同一套前缀集合，
-// 否则从 /v1/models 选出来的 trae: 模型会被绑定校验拒掉。
+// Provider namespaces are syntax, not a fixed platform table. Binding remains
+// an exact full-ID comparison; an unregistered namespace cannot generate.
 func splitRealm(model string) (realm, bare string) {
-	for _, candidate := range []string{"cn:", "global:", "trae:"} {
-		if strings.HasPrefix(model, candidate) {
-			return strings.TrimSuffix(candidate, ":"), model[len(candidate):]
+	prefix, id, ok := strings.Cut(model, ":")
+	if !ok || len(prefix) == 0 || len(prefix) > 32 || prefix[0] < 'a' || prefix[0] > 'z' {
+		return "", model
+	}
+	for _, c := range prefix {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return "", model
 		}
 	}
-	return "", model
+	return prefix, id
 }
 
 // Authenticate 只判断密钥是否可用；需要密钥策略时用 Resolve。

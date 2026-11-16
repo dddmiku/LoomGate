@@ -39,11 +39,12 @@ type Provider struct {
 	ErrorCode    string `json:"error_code,omitempty"`
 }
 type Options struct {
-	Accounts     Accounts
-	Doubao       DoubaoCatalog
-	LegacyCounts func() map[string]Count
-	Timeout      time.Duration
-	Concurrency  int
+	Accounts        Accounts
+	Doubao          DoubaoCatalog
+	LegacyCounts    func() map[string]Count
+	Timeout         time.Duration
+	Concurrency     int
+	DoubaoInference bool
 }
 type Service struct {
 	opts  Options
@@ -128,7 +129,7 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 				db.Enabled++
 			}
 		}
-		out := []Provider{{ID: "workbuddy", Name: "WorkBuddy", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["workbuddy"]}, {ID: "trae", Name: "Trae", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["trae"]}, {ID: "doubao", Name: "豆包工作", CatalogScope: "account", Accounts: db}}
+		out := []Provider{{ID: "workbuddy", Name: "WorkBuddy", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["workbuddy"]}, {ID: "trae", Name: "Trae", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["trae"]}, {ID: "doubao", Name: "豆包工作", CatalogScope: "account", Accounts: db, Inference: s.opts.DoubaoInference}}
 		if err != nil {
 			out[2].ErrorCode = "accounts_unavailable"
 		}
@@ -316,6 +317,9 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 	}
 	if len(snapshot.Models) > 0 {
 		row.Models = snapshot.Models
+		if s.opts.DoubaoInference && snapshot.RuntimeBound {
+			row.RoutingStatus = "single_turn_text"
+		}
 	}
 	if err != nil || snapshot.Stale || snapshot.ErrorCode != "" {
 		row.ErrorCode = "catalog_failed"
@@ -325,7 +329,7 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		var apiErr *doubao.APIError
 		if errors.As(err, &apiErr) {
 			switch apiErr.Kind {
-			case "login_required", "desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected":
+			case "login_required", "desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected", "desktop_cleanup_uncertain", "desktop_ownership_lost", "desktop_submission_uncertain", "composer_not_empty":
 				row.ErrorCode = apiErr.Kind
 			}
 		}
@@ -339,5 +343,8 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		return
 	}
 	row.Status = "ready"
+	for i := range row.Models {
+		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound && !row.Models[i].NativeTools
+	}
 	return
 }

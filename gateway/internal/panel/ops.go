@@ -429,7 +429,7 @@ func modelBindingError(value any) string {
 	seen := map[string]bool{}
 	for _, item := range items {
 		name, ok := item.(string)
-		if !ok || name == "" || len(name) > 64 || strings.TrimSpace(name) != name {
+		if !ok || name == "" || len(name) > 256 || strings.TrimSpace(name) != name {
 			return "模型绑定需为最多 64 个不重复的模型名"
 		}
 		if hasSpaceOrControl(name) {
@@ -441,13 +441,13 @@ func modelBindingError(value any) string {
 		seen[name] = true
 		// 前缀后必须还有模型名：`cn:` / `global:` 这种只有前缀的写法同样匹配不上。
 		if !modelNameRe.MatchString(name) {
-			return "模型绑定必须选完整模型名（cn: / global: / trae: 开头），请从模型列表添加"
+			return "模型绑定必须包含平台前缀与模型标识，请从实时模型目录中选择完整名称"
 		}
 	}
 	return ""
 }
 
-var modelNameRe = regexp.MustCompile(`^(cn|global|trae):.+`)
+var modelNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}:.+$`)
 
 func hasSpaceOrControl(text string) bool {
 	for _, r := range text {

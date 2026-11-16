@@ -27,6 +27,13 @@ func (Request) GoString() string { return "doubao.stream.Request[redacted]" }
 type Opener interface {
 	Open(context.Context, Request) (io.ReadCloser, error)
 }
+
+// Permanent transport failures (identity, policy, limits) must never resume.
+type permanentError struct{ error }
+
+func NoResume(err error) error          { return &permanentError{err} }
+func (e *permanentError) Unwrap() error { return e.error }
+
 type HTTP struct {
 	Client  *http.Client
 	Prepare func(context.Context, Request) (*http.Request, error)
@@ -85,6 +92,7 @@ type Options struct {
 type Report struct {
 	Events, Replayed, Messages, Handoffs, Attempts int
 	ProtocolComplete, NativeContent                bool
+	Acknowledged                                   bool
 }
 type Runner struct {
 	Opener  Opener
@@ -118,6 +126,15 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	state := NewState(o.Limits)
+	var ownership struct {
+		Meta struct {
+			Local string `json:"local_conversation_id"`
+		} `json:"client_meta"`
+		Messages []struct {
+			Local string `json:"local_message_id"`
+		} `json:"messages"`
+	}
+	_ = json.Unmarshal(initial, &ownership)
 	budget := &byteBudget{remaining: limits(o.Limits).TotalBytes}
 	report := Report{}
 	finish := func(err error) (Report, error) {
@@ -169,26 +186,60 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 						}
 						break
 					}
+					if event.Name == "SSE_ACK" && !async && ownership.Meta.Local != "" && len(ownership.Messages) > 0 {
+						var ack struct {
+							Queries []struct {
+								Local string `json:"local_message_id"`
+							} `json:"query_list"`
+							Meta struct {
+								Local string `json:"local_conversation_id"`
+							} `json:"ack_client_meta"`
+						}
+						valid := json.Unmarshal(event.Data, &ack) == nil && ack.Meta.Local == ownership.Meta.Local && len(ack.Queries) == len(ownership.Messages)
+						seen := map[string]bool{}
+						for _, q := range ack.Queries {
+							seen[q.Local] = true
+						}
+						for _, m := range ownership.Messages {
+							valid = valid && m.Local != "" && seen[m.Local]
+						}
+						if !valid {
+							err = NoResume(errors.New("doubao_stream_ownership_mismatch"))
+							break
+						}
+					}
 					if err = state.Apply(cursor, event, emit); err != nil {
 						break
+					}
+					if cursor.Acknowledged {
+						report.Acknowledged = true
 					}
 					if cursor.Terminal {
 						break
 					}
 				}
 				onCancel()
-				body.Close()
+				if closeErr := body.Close(); closeErr != nil {
+					err = NoResume(closeErr)
+				}
 			}
 			stop()
+			if observer, ok := r.Opener.(interface{ ObserveAttempt(error) }); ok {
+				observer.ObserveAttempt(err)
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err == nil && cursor.Terminal {
 				return nil
 			}
+			var permanent *permanentError
+			if errors.As(err, &permanent) {
+				return err
+			}
 			// Only a known incomplete read is recoverable. HTTP/signature/provider
 			// failures and unsupported actions are surfaced without a hidden retry.
-			incomplete := readFailure && (errors.Is(err, io.EOF) || errors.Is(err, ErrIncomplete) || errors.Is(err, context.DeadlineExceeded))
+			incomplete := readFailure && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrIncomplete) || errors.Is(err, context.DeadlineExceeded))
 			if !incomplete {
 				return err
 			}
@@ -202,6 +253,13 @@ func (r Runner) Run(ctx context.Context, initial json.RawMessage, emit func(Upda
 	}
 	for i := 0; i < len(state.Handoffs); i++ {
 		h := state.Handoffs[i]
+		if authorizer, ok := r.Opener.(interface {
+			AuthorizeHandoff(context.Context, Handoff) error
+		}); ok {
+			if err := authorizer.AuthorizeHandoff(ctx, h); err != nil {
+				return finish(err)
+			}
+		}
 		body, err := json.Marshal(map[string]any{"task_id": h.Key, "seq_start": 0, "append_scene": h.Scene, "ext": map[string]any{}})
 		if err != nil {
 			return finish(ErrMalformed)

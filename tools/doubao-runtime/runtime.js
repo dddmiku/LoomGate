@@ -38,6 +38,8 @@ async (input) => {
     if (!before) return fail('desktop_login_required');
     if (input.operation === 'identity') return {ok:true,identity:before};
     if (before !== input.identity) return fail('desktop_identity_mismatch');
+    const bot=req('WMy').mainConvBotIdSelector(req('WMy').useFeedStore.getState());
+    if(typeof bot!=='string'||!bot)return fail('desktop_version_unsupported');
     const api = req('uui').createRequest().apiContext;
     if (!api || typeof api.httpClient !== 'function' || api.getBaseURL() !== 'https://www.doubao.com') return fail('desktop_version_unsupported');
     let result;
@@ -46,7 +48,7 @@ async (input) => {
         url:'https://www.doubao.com/alice/slot/action_bar_v3/brief_list',method:'POST',
         params:await api.getCommonParams(),
         headers:{...await api.getCommonHeaders(),...req('Pp').Y()},
-        data:{bot_id:input.bot_id,language_code:'zh'}
+        data:{bot_id:bot,language_code:'zh'}
       });
     } catch { return fail('desktop_upstream_rejected'); }
     let after;

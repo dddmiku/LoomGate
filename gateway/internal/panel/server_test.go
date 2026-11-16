@@ -1124,7 +1124,7 @@ func TestKeysUpdateStripsIDAndValidates(t *testing.T) {
 		if recorder.Code != 400 {
 			t.Fatalf("裸模型名必须被拒，实际 %d：%s", recorder.Code, recorder.Body.String())
 		}
-		if got := messageOf(t, recorder); got != "模型绑定必须选完整模型名（cn: / global: / trae: 开头），请从模型列表添加" {
+		if got := messageOf(t, recorder); got != "模型绑定必须包含平台前缀与模型标识，请从实时模型目录中选择完整名称" {
 			t.Fatalf("文案不对：%q", got)
 		}
 	})

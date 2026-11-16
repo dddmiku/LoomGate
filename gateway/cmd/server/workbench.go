@@ -11,6 +11,7 @@ import (
 	"time"
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/authflow"
+	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/providercatalog"
 	"workbuddy2api/internal/providers/doubao"
@@ -20,9 +21,17 @@ import (
 )
 
 type workbenchRuntime struct {
-	engine *taskengine.Engine
-	vault  *accountvault.Vault
-	doubao *doubao.Client
+	engine    *taskengine.Engine
+	vault     *accountvault.Vault
+	doubao    *doubao.Client
+	inference map[string]inference.Provider
+}
+
+func workbenchInference(w *workbenchRuntime) map[string]inference.Provider {
+	if w == nil {
+		return nil
+	}
+	return w.inference
 }
 
 func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
@@ -132,8 +141,11 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		return nil, nil, err
 	}
 	workbench := &workbenchRuntime{engine: e, vault: vault, doubao: client}
+	if runtime, ok := desktop.(*doubao.CommandRuntime); ok {
+		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime}}
+	}
 	base := e.Handler()
-	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, LegacyCounts: func() map[string]providercatalog.Count {
+	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, LegacyCounts: func() map[string]providercatalog.Count {
 		counts := map[string]providercatalog.Count{}
 		for _, a := range p.List() {
 			id := "workbuddy"

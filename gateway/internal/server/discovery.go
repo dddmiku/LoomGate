@@ -31,10 +31,16 @@ func (h *Handler) withDiscoveryAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) visibleModels(r *http.Request) []map[string]any {
+	rows, _ := h.visibleModelsWithIssues(r)
+	return rows
+}
+func (h *Handler) visibleModelsWithIssues(r *http.Request) ([]map[string]any, []map[string]string) {
 	list := h.modelList()
+	providers, issues := h.providerModels(r.Context())
+	list = append(list, providers...)
 	info, restricted := requestKeyInfo(r)
 	if !restricted || len(info.Models) == 0 {
-		return list
+		return list, issues
 	}
 	filtered := make([]map[string]any, 0, len(list))
 	for _, entry := range list {
@@ -43,7 +49,7 @@ func (h *Handler) visibleModels(r *http.Request) []map[string]any {
 			filtered = append(filtered, entry)
 		}
 	}
-	return filtered
+	return filtered, issues
 }
 
 func (h *Handler) model(w http.ResponseWriter, r *http.Request) {

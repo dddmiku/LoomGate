@@ -11,7 +11,7 @@ function fixture({users=['synthetic-user','synthetic-user'],badVersion=false,rej
     if(hold)await new Promise(resolve=>{release=resolve});
     return {code:rejected?7:0,data:{private_fixture:'not-exported',entry_list:[{active_switch_conf:{menu_conf_v2:{use_mode_model_list:true,mode_list:{item_list:[{mode_id:'mode-dynamic',name:'Synthetic mode',model_list:{item_list:[{model_item_key:'dynamic-new-model',name:'Fresh model',icon_url:'https://example.invalid/?secret=synthetic',model_extra_params:{total_window_size:'64000'}}]}}]}}}}]}};
   }}})},Pp:{Y:()=>({})}};
-  const req=id=>modules[id];req.m=Object.fromEntries(Object.keys(modules).map(id=>[id,()=>id]));
+  const req=id=>id==='WMy'?{mainConvBotIdSelector:s=>s.bot,useFeedStore:{getState:()=>({bot:'synthetic-bot'})}}:modules[id];req.m=Object.fromEntries(Object.keys(modules).map(id=>[id,()=>id]));
   // Unique factory sentinels are synthetic; all identity hashes remain real.
   for(const id of Object.keys(modules))req.m[id]=new Function('return '+JSON.stringify(id));
   const bySource=Object.fromEntries(Object.entries(req.m).map(([id,fn])=>[String(fn),fingerprint[id]]));

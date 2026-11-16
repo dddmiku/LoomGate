@@ -21,7 +21,7 @@ type accountList struct {
 }
 
 func TestDesktopErrorsRemainActionableWithoutRawDetails(t *testing.T) {
-	for _, code := range []string{"desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected"} {
+	for _, code := range []string{"desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected","desktop_cleanup_uncertain","desktop_ownership_lost","desktop_submission_uncertain"} {
 		t.Run(code, func(t *testing.T) {
 			s := New(Options{Accounts: accountList{rows: []accountvault.Account{acct("synthetic", true)}}, Doubao: fetchFunc(func(context.Context, string, bool) (doubao.Catalog, error) {
 				return doubao.Catalog{}, &doubao.APIError{Kind: code}

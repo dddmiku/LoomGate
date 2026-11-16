@@ -47,6 +47,7 @@ type APIError struct {
 func (e *APIError) Error() string {
 	return fmt.Sprintf("doubao %s (http=%d, code=%d)", e.Kind, e.HTTPStatus, e.Code)
 }
+func (e *APIError) PublicCode() string { return e.Kind }
 func New(s Sessions, transport http.RoundTripper) *Client {
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -131,10 +132,16 @@ func (c *Client) callSession(ctx context.Context, s Session, path string, body a
 // signed request without sending it. It never exposes cookies or signed values.
 func (c *Client) PrepareCompletion(ctx context.Context, account, prompt string) (json.RawMessage, error) {
 	s, err := c.sessions.Session(ctx, account)
-	if err != nil { return nil, &APIError{Kind: "login_required"} }
-	if s.Runtime == nil || c.runtime == nil { return nil, &APIError{Kind: "desktop_unavailable"} }
+	if err != nil {
+		return nil, &APIError{Kind: "login_required"}
+	}
+	if s.Runtime == nil || c.runtime == nil {
+		return nil, &APIError{Kind: "desktop_unavailable"}
+	}
 	preparer, ok := c.runtime.(CompletionPreparer)
-	if !ok { return nil, &APIError{Kind: "desktop_unavailable"} }
+	if !ok {
+		return nil, &APIError{Kind: "desktop_unavailable"}
+	}
 	return preparer.PrepareCompletion(ctx, *s.Runtime, s.BotID, prompt)
 }
 func contextFailure(ctx context.Context, err error) error {

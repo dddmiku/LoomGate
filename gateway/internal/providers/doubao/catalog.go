@@ -15,28 +15,30 @@ type Effort struct {
 	Name  string `json:"name"`
 }
 type Model struct {
-	ID            string   `json:"id"`
-	UpstreamID    string   `json:"upstream_id"`
-	ItemID        int64    `json:"item_id"`
-	Name          string   `json:"name"`
-	ModeID        string   `json:"mode_id"`
-	ModeName      string   `json:"mode_name"`
-	DefaultMode   string   `json:"default_mode"`
-	ContextWindow int64    `json:"context_length,omitempty"`
-	MemoryProfile string   `json:"memory_profile,omitempty"`
-	NativeTools   bool     `json:"native_tools"`
-	Efforts       []Effort `json:"reasoning_efforts,omitempty"`
-	DefaultEffort int      `json:"default_effort,omitempty"`
-	Tiers         []string `json:"tiers,omitempty"`
-	NeedLogin     bool     `json:"need_login"`
+	ID                 string   `json:"id"`
+	UpstreamID         string   `json:"upstream_id"`
+	ItemID             int64    `json:"item_id"`
+	Name               string   `json:"name"`
+	ModeID             string   `json:"mode_id"`
+	ModeName           string   `json:"mode_name"`
+	DefaultMode        string   `json:"default_mode"`
+	ContextWindow      int64    `json:"context_length,omitempty"`
+	MemoryProfile      string   `json:"memory_profile,omitempty"`
+	NativeTools        bool     `json:"native_tools"`
+	Efforts            []Effort `json:"reasoning_efforts,omitempty"`
+	DefaultEffort      int      `json:"default_effort,omitempty"`
+	Tiers              []string `json:"tiers,omitempty"`
+	NeedLogin          bool     `json:"need_login"`
+	InferenceAvailable bool     `json:"inference_available"`
 }
 type Catalog struct {
-	Models    []Model   `json:"models"`
-	FetchedAt time.Time `json:"fetched_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Stale     bool      `json:"stale"`
-	ErrorCode string    `json:"error_code,omitempty"`
-	RetryAt   time.Time `json:"retry_at,omitempty"`
+	Models       []Model   `json:"models"`
+	FetchedAt    time.Time `json:"fetched_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Stale        bool      `json:"stale"`
+	ErrorCode    string    `json:"error_code,omitempty"`
+	RetryAt      time.Time `json:"retry_at,omitempty"`
+	RuntimeBound bool      `json:"-"`
 }
 type catalogCache struct {
 	snapshot Catalog
@@ -210,7 +212,7 @@ func (c *Client) Catalog(ctx context.Context, account string, force bool) (Catal
 		}
 		c.mu.Lock()
 		if fetchErr == nil {
-			entry.snapshot = Catalog{Models: models, FetchedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(5 * time.Minute)}
+			entry.snapshot = Catalog{Models: models, FetchedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(5 * time.Minute), RuntimeBound: session.Runtime != nil}
 			entry.lastErr = nil
 			entry.retryAt = time.Time{}
 		} else if errors.Is(fetchErr, context.Canceled) || errors.Is(fetchErr, context.DeadlineExceeded) {
