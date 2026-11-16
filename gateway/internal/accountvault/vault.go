@@ -41,24 +41,41 @@ type Vault struct {
 }
 
 func Open(dir string) (*Vault, error) {
+	if err := ProtectDirectory(dir); err != nil {
+		return nil, err
+	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, errors.New("vault_path_invalid")
 	}
+	return openProtected(abs)
+}
+
+// ProtectDirectory applies the vault's path and access protections to private
+// official-client profiles without creating or changing their credentials.
+func ProtectDirectory(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return errors.New("vault_path_invalid")
+	}
 	if abs == filepath.Dir(abs) {
-		return nil, errors.New("vault_path_invalid")
+		return errors.New("vault_path_invalid")
 	}
 	for path := abs; ; path = filepath.Dir(path) {
 		if isLink(path) {
-			return nil, errors.New("vault_link_rejected")
+			return errors.New("vault_link_rejected")
 		}
 		if filepath.Dir(path) == path {
 			break
 		}
 	}
 	if err = secureDirectory(abs); err != nil {
-		return nil, err
+		return err
 	}
+	return nil
+}
+
+func openProtected(abs string) (*Vault, error) {
 	keyPath := filepath.Join(abs, "master.key")
 	if isLink(keyPath) || isLink(filepath.Join(abs, "owner.lock")) {
 		return nil, errors.New("vault_link_rejected")

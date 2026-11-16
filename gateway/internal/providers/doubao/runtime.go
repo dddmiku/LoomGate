@@ -39,6 +39,7 @@ type CommandRuntime struct {
 	command []string
 	port    int
 	slot    chan struct{}
+	managed ManagedClient
 }
 
 func NewCommandRuntime(command []string, port int) (*CommandRuntime, error) {
@@ -57,6 +58,24 @@ func NewDesktopRuntime(python, helper string, port int) (*CommandRuntime, error)
 		return nil, errors.New("desktop_configuration_invalid")
 	}
 	return NewCommandRuntime([]string{python, "-I", "-B", helper}, port)
+}
+
+func NewManagedDesktopRuntime(python, helper string, managed ManagedClient) (*CommandRuntime, error) {
+	if managed == nil {
+		return nil, errors.New("desktop_configuration_invalid")
+	}
+	r, err := NewDesktopRuntime(python, helper, 1)
+	if err != nil {
+		return nil, err
+	}
+	r.managed = managed
+	return r, nil
+}
+func (r *CommandRuntime) endpoint(ctx context.Context) (int, error) {
+	if r.managed != nil {
+		return r.managed.Endpoint(ctx, false)
+	}
+	return r.port, nil
 }
 
 type runtimeRequest struct {
@@ -165,6 +184,11 @@ func (r *CommandRuntime) invoke(ctx context.Context, request runtimeRequest) (ru
 	if ctx.Err() != nil {
 		return runtimeReply{}, ctx.Err()
 	}
+	port, err := r.endpoint(ctx)
+	if err != nil {
+		return runtimeReply{}, err
+	}
+	request.Port = port
 	if request.Operation == "prepare_completion" {
 		return r.invokeProbe(ctx, request)
 	}
@@ -176,7 +200,7 @@ func (r *CommandRuntime) invoke(ctx context.Context, request runtimeRequest) (ru
 	cmd.WaitDelay = 500 * time.Millisecond
 	var output boundedOutput
 	cmd.Stdout = &output
-	err := cmd.Run()
+	err = cmd.Run()
 	if ctx.Err() != nil {
 		return runtimeReply{}, ctx.Err()
 	}

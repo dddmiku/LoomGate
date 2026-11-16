@@ -40,7 +40,15 @@ func (a *Doubao) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, ke
 		}
 		activity, err := a.Client.Activities(ctx, account.ID)
 		if err != nil {
-			result.Issues = append(result.Issues, taskengine.DiscoveryIssue{ProviderID: "doubao", AccountID: account.ID, ModuleID: "activities", ErrorCode: "module_discovery_failed"})
+			code := "module_discovery_failed"
+			var upstream *doubao.APIError
+			if errors.As(err, &upstream) {
+				switch upstream.Kind {
+				case "desktop_activity_unavailable", "desktop_identity_mismatch", "desktop_login_required":
+					code = upstream.Kind
+				}
+			}
+			result.Issues = append(result.Issues, taskengine.DiscoveryIssue{ProviderID: "doubao", AccountID: account.ID, ModuleID: "activities", ErrorCode: code})
 			continue
 		}
 		for _, t := range append(append([]doubao.Task{}, activity.Tasks...), activity.Milestones...) {

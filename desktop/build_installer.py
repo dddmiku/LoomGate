@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Build a local Windows acceptance installer; never signs or publishes releases."""
-import argparse,hashlib,importlib.util,json,os,re,subprocess
+import argparse,hashlib,importlib.util,json,os,re,subprocess,shutil
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-PAYLOAD=('LoomGate.exe','wb2api.exe','login.exe','credit.exe','fission_bin.exe','release-signing.pub','manifest.json','README.txt','LICENSE')
+RUNTIME_FILES=('bridge.py','managed.py','stream_bridge.py','runtime.js','tasks_runtime.js','stream_runtime.js','probe_runtime.js','probe_cleanup.js','requirements.txt')
+PAYLOAD=('LoomGate.exe','wb2api.exe','login.exe','credit.exe','fission_bin.exe','release-signing.pub','manifest.json','README.txt','LICENSE')+tuple('doubao-runtime/'+name for name in RUNTIME_FILES)
 PROGRAMS={'LoomGate.exe':'desktop','wb2api.exe':'server','login.exe':'login','credit.exe':'credit','fission_bin.exe':'fission'}
 
 def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def verify_payload(path):
-    if any(p.is_symlink() or not p.is_file() for p in path.iterdir()) or {p.name for p in path.iterdir()}!=set(PAYLOAD):
+    entries=list(path.rglob('*'))
+    if any(p.is_symlink() or (hasattr(p,'is_junction') and p.is_junction()) for p in entries) or {p.relative_to(path).as_posix() for p in entries if p.is_file()}!=set(PAYLOAD) or any(p.is_dir() and p.relative_to(path).as_posix()!='doubao-runtime' for p in entries):
         raise ValueError('installer_payload_not_allowlisted')
     manifest=json.loads((path/'manifest.json').read_text(encoding='utf-8'))
+    if set(manifest['files'])!=set(PAYLOAD)-{'manifest.json'}:raise ValueError('installer_manifest_incomplete')
     for name,expected in manifest['files'].items():
         if name not in PAYLOAD or digest(path/name)!=expected:raise ValueError('installer_payload_hash_mismatch')
 
@@ -49,6 +52,8 @@ def build(output,compiler,label):
         report['commands'].append({'program':name,'build_exit_code':0,'go_metadata_verified':True})
     (payload/'release-signing.pub').write_bytes((ROOT/'gateway/release-signing.pub').read_bytes())
     (payload/'LICENSE').write_bytes((ROOT/'LICENSE').read_bytes())
+    (payload/'doubao-runtime').mkdir()
+    for name in RUNTIME_FILES:shutil.copyfile(ROOT/'tools/doubao-runtime'/name,payload/'doubao-runtime'/name)
     (payload/'README.txt').write_text('LoomGate '+label+'\n\nDevelopment acceptance build. No production release or automatic migration.\nStart program/LoomGate.exe. The new task engine is enabled; no legacy scheduler is started.\nData lives in workspace/ next to program/, or WB2A_DESKTOP_ROOT when explicitly set.\nRepair, upgrade and uninstall preserve workspace. Do not share workspace; it contains credentials.\nUpdates retain the existing release verification public key and are disabled by default.\nBefore production migration, use the offline migration dry-run and obtain independent acceptance.\n',encoding='utf-8')
     manifest={'brand':'LoomGate','label':label,'base_commit':commit,'source_dirty':report['source_dirty'],'files':{name:digest(payload/name) for name in PAYLOAD if name!='manifest.json'}}
     (payload/'manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8');verify_payload(payload)

@@ -211,6 +211,10 @@ func (s *TextSession) Open(ctx context.Context, req stream.Request) (io.ReadClos
 	if req.Path != "/chat/completion" && req.Path != "/chat/async/chunk_stream" {
 		return nil, runtimeError("desktop_origin_rejected")
 	}
+	port, err := s.runtime.endpoint(ctx)
+	if err != nil {
+		return nil, err
+	}
 	payload := struct {
 		Operation string          `json:"operation"`
 		Port      int             `json:"port"`
@@ -219,7 +223,7 @@ func (s *TextSession) Open(ctx context.Context, req stream.Request) (io.ReadClos
 		Path      string          `json:"path"`
 		Body      json.RawMessage `json:"body"`
 		Resume    bool            `json:"resume"`
-	}{"stream_text", s.runtime.port, s.binding.Identity, s.Lease, req.Path, req.Body, req.Resume}
+	}{"stream_text", port, s.binding.Identity, s.Lease, req.Path, req.Body, req.Resume}
 	raw, err := json.Marshal(payload)
 	if err != nil || len(raw) > 1<<20 {
 		return nil, runtimeError("desktop_protocol_invalid")

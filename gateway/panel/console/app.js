@@ -57,7 +57,7 @@
   async function api(path, {body, signal=state.controller?.signal} = {}) {
     const controller=new AbortController(), abort=()=>controller.abort();
     if(signal?.aborted) controller.abort(); else signal?.addEventListener('abort',abort,{once:true});
-    const timer=setTimeout(()=>controller.abort(),18000);
+    const timer=setTimeout(()=>controller.abort(),path==='connections/start'?40000:18000);
     try {
       const response=await fetch('api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',signal:controller.signal,headers:body===undefined?{}:{'Content-Type':'application/json','X-Admin-Request':'1'},body:body===undefined?undefined:JSON.stringify(body)});
       const data=await response.json();
@@ -185,6 +185,7 @@
     const data=await api('workbench/catalog?'+query);if(generation!==state.version)return;state.tasks=data.tasks||[];
     const issues=data.issues||[];
     if(issues.length){const box=document.createElement('div');box.className='notice warn';box.setAttribute('role','status');box.dataset.discoveryIssues=String(issues.length);box.textContent=`${issues.length} 项账号任务目录未能读取：`+issues.map(x=>`${x.account_id} / ${x.module_id}`).join('、')+'。可用任务仍可执行，全部执行会保留部分失败记录。';$('#task-list').before(box);}
+    if(issues.some(x=>x.error_code==='desktop_activity_unavailable'))$('#task-list').before(Object.assign(document.createElement('p'),{className:'notice warn',textContent:'官方响应未提供积分活动。请确认选择的是豆包账号；“飞书个人版”不能作为本次积分任务账号。活动资格以此账号的官方任务目录为准。'}));
     $('#task-list').className='';
     $('#task-list').innerHTML=state.tasks.length?`<div id="task-browser" class="browser-workspace"><div class="selection-pane"><p class="selection-caption">${state.tasks.length} 项可发现的工作</p><div role="listbox" aria-label="任务列表">${state.tasks.map((t,i)=>`<button class="selection-row" role="option" aria-selected="false" data-task="${esc(t.key)}" data-action="select-task" data-index="${i}"><span><strong>${esc(t.name)}</strong><small>${esc(t.account_id)}${t.manual_only?' / 需要你操作':''}</small></span><span class="selection-arrow" aria-hidden="true">›</span></button>`).join('')}</div></div><section id="task-detail" class="detail-pane" tabindex="-1" aria-label="任务详情"></section></div>`:empty('未发现可用任务','请确认账号已启用，并在需要时完成官方客户端登录。');
     if(state.tasks.length)selectTask(0,false);

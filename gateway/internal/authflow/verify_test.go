@@ -3,10 +3,64 @@ package authflow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type heldCancelDriver struct {
+	readVerifierStub
+	entered, release chan struct{}
+}
+
+func (d *heldCancelDriver) Cancel(context.Context, Flow) error {
+	close(d.entered)
+	<-d.release
+	return nil
+}
+func TestCancelKeepsIdentityWhenAnotherStartPrunesOldFlows(t *testing.T) {
+	d := &heldCancelDriver{entered: make(chan struct{}), release: make(chan struct{})}
+	s, _, _, now := testService(t, d)
+	rows := make([]Flow, 16)
+	for i := range rows {
+		rows[i] = Flow{View: View{ID: fmt.Sprintf("synthetic-%d", i), Request: Request{Provider: "synthetic", Method: "qr"}, Status: "succeeded", ExpiresAt: now.Add(time.Hour), Revision: 1}}
+	}
+	rows[15].Status = "waiting_scan"
+	rows[15].Secret = json.RawMessage(`{"synthetic":true}`)
+	if err := s.save(rows); err != nil {
+		t.Fatal(err)
+	}
+	s.opts.Drivers["other"] = &driverStub{}
+	done := make(chan error, 1)
+	go func() { _, err := s.Step(context.Background(), "synthetic-15", "cancel", Input{}); done <- err }()
+	<-d.entered
+	newFlow, err := s.Start(context.Background(), Request{Provider: "other", Method: "qr"})
+	if err != nil {
+		close(d.release)
+		t.Fatal(err)
+	}
+	close(d.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	views, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, f := range views {
+		if f.ID == newFlow.ID && f.Status != newFlow.Status {
+			t.Fatal("cancellation overwrote new flow")
+		}
+		if f.ID == "synthetic-15" {
+			found = f.Status == "canceled"
+		}
+	}
+	if !found {
+		t.Fatal("cancellation lost its original flow")
+	}
+}
 
 type readVerifierStub struct {
 	driverStub
@@ -91,6 +145,10 @@ func TestCanceledCommitCannotOverlapVerificationOrClaimNoSave(t *testing.T) {
 	result, err := s.Step(context.Background(), f.ID, "cancel", Input{})
 	if err != nil || result.Status != "uncertain" {
 		t.Fatal("in-flight commit was falsely canceled")
+	}
+	result, err = s.Step(context.Background(), f.ID, "cancel", Input{})
+	if err != nil || result.Status != "uncertain" {
+		t.Fatal("repeated cancel cleared an active unknown operation")
 	}
 	views, _ := s.List()
 	if views[0].CanVerify {

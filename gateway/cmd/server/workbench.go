@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 	"workbuddy2api/internal/accountvault"
@@ -27,6 +30,7 @@ type workbenchRuntime struct {
 	doubao     *doubao.Client
 	inference  map[string]inference.Provider
 	connection *doubao.DesktopConnection
+	managed    *doubao.ManagedCommand
 }
 
 func workbenchInference(w *workbenchRuntime) map[string]inference.Provider {
@@ -95,6 +99,9 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 		}
 	}
 	if w.connection != nil {
+		if w.managed != nil {
+			return map[string]authflow.Driver{"doubao": &doubao.ManagedConnection{Binding: w.connection, Client: w.managed}}
+		}
 		w.connection.Fallback = driver
 		return map[string]authflow.Driver{"doubao": w.connection}
 	}
@@ -105,16 +112,54 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 // scheduler is stopped. Production remains on the released legacy runtime.
 func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
 	var desktop doubao.CatalogRuntime
-	if python, helper, port := os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PYTHON"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_HELPER"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PORT"); python != "" || helper != "" || port != "" {
-		portNumber, err := strconv.Atoi(port)
-		if err != nil {
-			return nil, nil, errors.New("desktop_configuration_invalid")
+	var managed *doubao.ManagedCommand
+	python, helper, port := os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PYTHON"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_HELPER"), os.Getenv("LOOMGATE_DOUBAO_DESKTOP_PORT")
+	if runtime.GOOS == "windows" && python == "" && helper == "" && port == "" {
+		binary, _ := os.Executable()
+		for _, dir := range []string{os.Getenv("WB2API_RUNTIME_DIR"), filepath.Dir(binary)} {
+			if dir == "" {
+				continue
+			}
+			candidate := filepath.Join(dir, "doubao-runtime", "bridge.py")
+			if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+				helper = candidate
+				break
+			}
 		}
-		bridge, err := doubao.NewDesktopRuntime(python, helper, portNumber)
-		if err != nil {
-			return nil, nil, err
+		if helper != "" {
+			python = os.Getenv("WB2A_PYTHON")
+			if python == "" {
+				python, _ = exec.LookPath("python.exe")
+			}
+			if python == "" {
+				helper = ""
+			}
 		}
-		desktop = bridge
+	}
+	if python != "" || helper != "" || port != "" {
+		if port == "" {
+			root := filepath.Join(stateDir, "official-client")
+			var err error
+			managed, err = doubao.NewManagedCommand(python, filepath.Join(filepath.Dir(helper), "managed.py"), root, os.Getenv("LOOMGATE_DOUBAO_EXECUTABLE"))
+			if err != nil {
+				return nil, nil, err
+			}
+			bridge, err := doubao.NewManagedDesktopRuntime(python, helper, managed)
+			if err != nil {
+				return nil, nil, err
+			}
+			desktop = bridge
+		} else {
+			portNumber, err := strconv.Atoi(port)
+			if err != nil {
+				return nil, nil, errors.New("desktop_configuration_invalid")
+			}
+			bridge, err := doubao.NewDesktopRuntime(python, helper, portNumber)
+			if err != nil {
+				return nil, nil, err
+			}
+			desktop = bridge
+		}
 	}
 	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json")})
 	if err != nil {
@@ -162,7 +207,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		vault.Close()
 		return nil, nil, err
 	}
-	workbench := &workbenchRuntime{engine: e, vault: vault, taskVault: taskVault, doubao: client}
+	workbench := &workbenchRuntime{engine: e, vault: vault, taskVault: taskVault, doubao: client, managed: managed}
 	workbench.connection = &doubao.DesktopConnection{Vault: vault}
 	if runtime, ok := desktop.(*doubao.CommandRuntime); ok {
 		workbench.connection.Runtime = runtime
@@ -205,5 +250,31 @@ func runWorkbench(ctx context.Context, w *workbenchRuntime) error {
 	}
 	defer w.vault.Close()
 	defer w.engine.Close()
+	if w.managed != nil {
+		recoveryCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			rows, err := w.vault.List()
+			if err != nil {
+				return
+			}
+			for _, account := range rows {
+				if account.Provider != "doubao" || !account.Enabled {
+					continue
+				}
+				// Starting an owned profile restores the official client's own
+				// session. It never creates a login flow or sends a code/QR.
+				bounded, stop := context.WithTimeout(recoveryCtx, 25*time.Second)
+				_, err := w.managed.Endpoint(bounded, true)
+				stop()
+				if err != nil && recoveryCtx.Err() == nil {
+					log.Print("[doubao] official client recovery unconfirmed; inspect connection status")
+				}
+				return
+			}
+		}()
+		defer func() { cancel(); <-done }()
+	}
 	return w.engine.Run(ctx)
 }

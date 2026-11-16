@@ -44,18 +44,20 @@ func (Input) GoString() string { return "authflow.Input[redacted]" }
 type View struct {
 	ID string `json:"id"`
 	Request
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	NextPollAt   time.Time `json:"next_poll_at"`
-	RetryAt      time.Time `json:"retry_at"`
-	ActionURL    string    `json:"action_url,omitempty"`
-	QRURL        string    `json:"qr_url,omitempty"`
-	ErrorCode    string    `json:"error_code,omitempty"`
-	UpstreamCode *int64    `json:"upstream_code,omitempty"`
-	Notice       string    `json:"notice,omitempty"`
-	Revision     uint64    `json:"revision"`
-	CanVerify    bool      `json:"can_verify,omitempty"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	NextPollAt     time.Time `json:"next_poll_at"`
+	RetryAt        time.Time `json:"retry_at"`
+	ActionURL      string    `json:"action_url,omitempty"`
+	QRURL          string    `json:"qr_url,omitempty"`
+	ErrorCode      string    `json:"error_code,omitempty"`
+	UpstreamCode   *int64    `json:"upstream_code,omitempty"`
+	Notice         string    `json:"notice,omitempty"`
+	Revision       uint64    `json:"revision"`
+	CanVerify      bool      `json:"can_verify,omitempty"`
+	InputMode      string    `json:"input_mode,omitempty"`
+	Authentication string    `json:"authentication,omitempty"`
 }
 
 // Flow is private storage. Only View may be serialized into management responses.
@@ -70,6 +72,8 @@ func (Flow) String() string   { return "authflow.Flow[redacted]" }
 func (Flow) GoString() string { return "authflow.Flow[redacted]" }
 
 type Result struct {
+	Authentication                                         string
+	InputMode                                              string
 	UpstreamCode                                           *int64
 	Status, ActionURL, QRURL, ErrorCode, Notice, AccountID string
 	Secret                                                 json.RawMessage
@@ -84,6 +88,16 @@ type Driver interface {
 	Methods() []Method
 	Start(context.Context, Request) (Result, error)
 	Step(context.Context, Flow, string, Input) (Result, error)
+}
+
+// PreparedStarter persists the provider intent before any external side effect.
+// PrepareStart must only inspect local state, never perform network operations.
+type PreparedStarter interface {
+	PrepareStart(Request) (json.RawMessage, error)
+	StartPrepared(context.Context, Flow) (Result, error)
+}
+type Canceler interface {
+	Cancel(context.Context, Flow) error
 }
 
 // Verifier permits only an explicit read-only recovery. It must not send codes,
@@ -238,9 +252,11 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 		return View{}, ErrInvalid
 	}
 	allowed := false
+	inputMode := ""
 	for _, m := range d.Methods() {
 		if m.ID == r.Method && m.Available {
 			allowed = true
+			inputMode = m.InputMode
 		}
 	}
 	if !allowed {
@@ -281,6 +297,16 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 	}
 	now := s.opts.Now()
 	f := Flow{View: View{ID: hex.EncodeToString(b), Request: r, Status: "working", CreatedAt: now, ExpiresAt: now.Add(s.opts.Lifetime), Revision: 1}, Action: "start"}
+	f.InputMode = inputMode
+	prepared, hasPrepared := d.(PreparedStarter)
+	if hasPrepared {
+		secret, err := prepared.PrepareStart(r)
+		if err != nil {
+			s.mu.Unlock()
+			return View{}, ErrInvalid
+		}
+		f.Secret = secret
+	}
 	rows = append(rows, f)
 	if err := s.save(rows); err != nil {
 		s.mu.Unlock()
@@ -289,6 +315,9 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 	bounded, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	s.active[f.ID] = cancel
 	s.mu.Unlock()
+	if hasPrepared {
+		return s.call(bounded, cancel, f, func() (Result, error) { return prepared.StartPrepared(bounded, f) })
+	}
 	return s.call(bounded, cancel, f, func() (Result, error) { return d.Start(bounded, r) })
 }
 func validRealm(r Request) bool {
@@ -299,8 +328,10 @@ func validRealm(r Request) bool {
 }
 func allowed(status, action string) bool {
 	switch action {
+	case "resume":
+		return status == "uncertain" || status == "manual_action" || status == "waiting_authorization"
 	case "poll":
-		return status == "waiting_scan" || status == "scanned" || status == "verifying" || status == "waiting_authorization"
+		return status == "waiting_scan" || status == "scanned" || status == "verifying" || status == "waiting_authorization" || status == "waiting_phone" || status == "waiting_code"
 	case "send_code":
 		return status == "waiting_phone" || status == "waiting_code"
 	case "submit_code":
@@ -333,7 +364,12 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 		return View{}, ErrMissing
 	}
 	f := rows[idx]
+	if f.InputMode == "official" && (input.Phone != "" || input.Code != "" || input.Callback != "" || action == "send_code" || action == "submit_code") {
+		s.mu.Unlock()
+		return f.View, ErrInvalid
+	}
 	if action == "cancel" {
+		original := f
 		if cancel := s.active[id]; cancel != nil {
 			cancel()
 		}
@@ -341,13 +377,62 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 			s.mu.Unlock()
 			return f.View, nil
 		}
+		if canceler, ok := s.opts.Drivers[f.Provider].(Canceler); ok && original.Status != "working" && s.active[id] == nil {
+			f.Status = "uncertain"
+			f.ErrorCode = "cancellation_unconfirmed"
+			f.Notice = "正在关闭官方登录窗口；关闭结果核验前请勿重新开始。"
+			f.Revision++
+			rows[idx] = f
+			if err := s.save(rows); err != nil {
+				s.mu.Unlock()
+				return View{}, err
+			}
+			bounded, cancel := context.WithTimeout(ctx, 6*time.Second)
+			s.active[id] = cancel
+			s.mu.Unlock()
+			_, cancelErr := safeCall(func() (Result, error) { return Result{}, canceler.Cancel(bounded, original) })
+			cancel()
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			delete(s.active, id)
+			rows = append([]Flow(nil), s.flows...)
+			idx = -1
+			for i := range rows {
+				if rows[i].ID == id {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return View{}, ErrMissing
+			}
+			if rows[idx].Revision != f.Revision {
+				return rows[idx].View, nil
+			}
+			if cancelErr == nil {
+				f.Status = "canceled"
+				f.ErrorCode = ""
+				f.Secret = nil
+				f.Notice = "此次登录已取消。"
+			} else {
+				f.Notice = "官方窗口关闭未确认，请先核对官方状态；不会自动重发登录。"
+			}
+			f.QRURL = ""
+			f.ActionURL = ""
+			f.Revision++
+			rows[idx] = f
+			return f.View, s.save(rows)
+		}
 		f.Status = "canceled"
-		if rows[idx].Status == "working" {
+		if rows[idx].Status == "working" || s.active[id] != nil {
 			f.Status = "uncertain"
 			f.Notice = "取消请求已发出，进行中的外部操作可能已经执行，请先核验官方状态。"
 			f.ErrorCode = "cancellation_unconfirmed"
 		}
 		f.Secret = nil
+		if f.Status == "uncertain" {
+			f.Secret = original.Secret
+		}
 		f.QRURL = ""
 		f.ActionURL = ""
 		f.Revision++
@@ -464,6 +549,10 @@ func (s *Service) call(ctx context.Context, cancel context.CancelFunc, f Flow, f
 		f.ErrorCode = result.ErrorCode
 		f.UpstreamCode = result.UpstreamCode
 		f.Notice = result.Notice
+		f.InputMode = result.InputMode
+		if result.Authentication != "" {
+			f.Authentication = result.Authentication
+		}
 		f.ActionURL = result.ActionURL
 		f.QRURL = result.QRURL
 		if result.AccountID != "" {

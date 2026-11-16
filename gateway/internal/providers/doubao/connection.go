@@ -355,7 +355,7 @@ func (d *DesktopConnection) Status(ctx context.Context) (ConnectionStatus, error
 	}
 	current := ""
 	if d.Runtime != nil {
-		ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
 		binding, err := d.Runtime.Bind(ctx)
 		if err == nil && !identityDigest.MatchString(binding.Identity) {

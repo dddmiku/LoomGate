@@ -45,6 +45,15 @@ Source: "{#PayloadDir}\release-signing.pub"; DestDir: "{app}\program"; Flags: ig
 Source: "{#PayloadDir}\manifest.json"; DestDir: "{app}\program"; Flags: ignoreversion
 Source: "{#PayloadDir}\README.txt"; DestDir: "{app}\program"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}\program"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\bridge.py"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\managed.py"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\stream_bridge.py"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\tasks_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\stream_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\probe_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\probe_cleanup.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\requirements.txt"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\LoomGate"; Filename: "{app}\program\LoomGate.exe"; WorkingDir: "{app}\program"

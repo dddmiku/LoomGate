@@ -58,6 +58,7 @@ HELPERS = ("login", "credit", "signin_bin", "trial_bin", "activity_bin", "fissio
 # 脚本：面板的部分任务会调 scripts/*.py（native 模式直接跑 python）。
 SCRIPTS = ("global_region.py", "task_common.py", "task_runner.py",
            "school_open_day_2026.py", "growth_center.py")
+DOUBAO_RUNTIME = ("bridge.py", "managed.py", "stream_bridge.py", "runtime.js", "tasks_runtime.js", "stream_runtime.js", "probe_runtime.js", "probe_cleanup.js", "requirements.txt")
 
 
 def version() -> str:
@@ -231,6 +232,8 @@ def stage_common(target: Path, goos: str, goarch: str, tag: str) -> None:
     scripts_dir.mkdir(exist_ok=True)
     for name in SCRIPTS:
         shutil.copyfile(GATEWAY / "scripts" / name, scripts_dir / name)
+    bridge_dir=target/'doubao-runtime';bridge_dir.mkdir(exist_ok=True)
+    for name in DOUBAO_RUNTIME:shutil.copyfile(BASE/'tools/doubao-runtime'/name,bridge_dir/name)
 
 
 # 自更新资产名：桌面端的热更新按 GOOS 选资产（见 internal/hotupdate/release.go
@@ -305,6 +308,8 @@ def build_windows_single_exe(staging: Path, goarch: str, tag: str) -> None:
         scripts_dir.mkdir(exist_ok=True)
         for name in SCRIPTS:
             shutil.copyfile(GATEWAY / "scripts" / name, scripts_dir / name)
+        bridge_dir=EMBED_DIR/'doubao-runtime';bridge_dir.mkdir(exist_ok=True)
+        for name in DOUBAO_RUNTIME:shutil.copyfile(staging/'doubao-runtime'/name,bridge_dir/name)
         go_build("desktop", DIST / ("workbuddy2api-single-%s%s" % (goarch, exe)),
                  "windows", goarch, "-s -w -X main.version=%s" % tag)
     finally:

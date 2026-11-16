@@ -8,7 +8,8 @@ class InstallerGuards(unittest.TestCase):
   root=Path(os.environ.get('LOOMGATE_TEST_TMP','D:/LoomGate-work/tmp/buildtests' if os.name=='nt' else str(ROOT.parent/'LoomGate-work/tmp/buildtests')));root.mkdir(parents=True,exist_ok=True)
   self.temp=tempfile.TemporaryDirectory(dir=root);self.addCleanup(self.temp.cleanup);self.path=Path(self.temp.name)
  def seed(self):
-  for name in build.PAYLOAD:(self.path/name).write_bytes(b'synthetic-build')
+  for name in build.PAYLOAD:
+   (self.path/name).parent.mkdir(parents=True,exist_ok=True);(self.path/name).write_bytes(b'synthetic-build')
   (self.path/'manifest.json').write_text(json.dumps({'files':{name:build.digest(self.path/name) for name in build.PAYLOAD if name!='manifest.json'}}))
  def test_payload_accepts_only_verified_runtime_files(self):
   self.seed();build.verify_payload(self.path);(self.path/'auths').mkdir()
