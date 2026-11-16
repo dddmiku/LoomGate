@@ -30,6 +30,23 @@ def shape(value, depth=0):
     if value is None: return 'null'
     return '<value>'
 
+def completion_body_valid(value, bot_id):
+    if not isinstance(value, dict) or not isinstance(value.get('client_meta'), dict) or not isinstance(value.get('messages'), list) or not value['messages']:
+        return False
+    meta = value['client_meta']
+    if meta.get('bot_id') != bot_id or not isinstance(meta.get('local_conversation_id'), str):
+        return False
+    option = value.get('option')
+    if not isinstance(option, dict) or not isinstance(option.get('unique_key'), str) or not option['unique_key']:
+        return False
+    if not isinstance(option.get('start_seq'), int) or option['start_seq'] < 0:
+        return False
+    opts = option.get('sse_recv_event_options')
+    if not isinstance(opts, dict) or opts.get('support_chunk_delta') is not True:
+        return False
+    message = value['messages'][0]
+    return isinstance(message, dict) and isinstance(message.get('content_block'), list) and bool(message['content_block'])
+
 
 def validate(request):
     if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt'}:
@@ -73,6 +90,108 @@ def target(port):
         raise BridgeError('desktop_unavailable')
     return ws
 
+def prepare_completion_transaction(ws, call, request, deadline, pending):
+    request_ids = set()
+    editor = {'original': None, 'modified': False}
+    identity = ''
+    result = None
+    failure = None
+    enabled = False
+
+    def receive():
+        remaining = deadline-time.monotonic()
+        if remaining <= 0: raise BridgeError('desktop_timeout')
+        return json.loads(ws.recv(timeout=remaining))
+
+    def evaluate(expression, await_promise=False):
+        response = call('Runtime.evaluate', {'expression':expression,'awaitPromise':await_promise,'returnByValue':True})
+        if response.get('exceptionDetails'): raise BridgeError('desktop_version_unsupported')
+        value = response.get('result',{}).get('value')
+        if value is None: raise BridgeError('desktop_version_unsupported')
+        return value
+
+    def stop_paused(event):
+        params=event.get('params',{});rid=params.get('requestId')
+        if not rid: raise BridgeError('desktop_protocol_invalid')
+        request_ids.add(rid)
+        call('Fetch.failRequest',{'requestId':rid,'errorReason':'BlockedByClient'})
+        request_ids.discard(rid)
+
+    try:
+        c=Symbol=None
+        identity_script="""async()=>{const c=window['chunk_@flow-web/desktop'];if(!c)return {error:'desktop_version_unsupported'};const e=document.querySelector('[contenteditable=true]');if(!e)return {error:'desktop_version_unsupported'};const k=Symbol.for('loomgate.phase08.require');let r=window[k];if(typeof r!=='function'){r=await new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(Error('timeout')),3000);c.push([['phase08-identity'],{},x=>{clearTimeout(t);resolve(x)}])});if(typeof r!=='function')return {error:'desktop_version_unsupported'};window[k]=r}const sdk=await r('z5').getFlowAccount().passportApi.getPassportSDK();const u=await sdk.login.checkLogin({});const id=String(u?.user_id_str||u?.user_id||'');if(!id)return {error:'desktop_login_required'};const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id));return {identity:Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join(''),composerEmpty:!(e.innerText||'').trim()}}"""
+        ident=evaluate('('+identity_script+')()',True)
+        if ident.get('error'): raise BridgeError(ident['error'])
+        if ident.get('composerEmpty') is not True: raise BridgeError('composer_not_empty')
+        identity=ident.get('identity','')
+        if identity!=request['identity']: raise BridgeError('desktop_identity_mismatch')
+
+        call('Fetch.enable',{'patterns':[{'urlPattern':'https://www.doubao.com/chat/completion*','requestStage':'Request'}]})
+        enabled=True
+        prepare_script="""(prompt)=>{const e=document.querySelector('[contenteditable=true]');if(!e||(e.innerText||'').trim())return {error:'composer_not_empty'};window.__loomgatePhase08Original=e.innerHTML;window.__loomgatePhase08Touched=false;e.innerText=prompt;const b=document.querySelector('[data-testid=chat_input_send_button]');if(!b)return {error:'desktop_version_unsupported'};window.__loomgatePhase08Touched=true;b.click();return {ok:true}}"""
+        started=evaluate('('+prepare_script+')('+json.dumps(request['prompt'])+')')
+        if started.get('error'): raise BridgeError(started['error'])
+        editor['modified']=True
+        captured=None
+        while time.monotonic()<deadline:
+            event=pending.pop(0) if pending else receive()
+            if event.get('method')!='Fetch.requestPaused':
+                continue
+            params=event.get('params',{});u=urlsplit(params.get('request',{}).get('url',''))
+            request_ids.add(params.get('requestId'))
+            if u.scheme!='https' or u.hostname!='www.doubao.com' or u.path!=COMPLETION_PATH or params.get('request',{}).get('method')!='POST':
+                stop_paused(event);continue
+            raw=params.get('request',{}).get('postData','') or ''
+            try: body=json.loads(raw)
+            except Exception: body=None
+            if not completion_body_valid(body,request['bot_id']):
+                stop_paused(event);continue
+            if request['prompt'] not in raw:
+                stop_paused(event);continue
+            query=parse_qs(u.query)
+            if not query.get('a_bogus') or not query.get('msToken'):
+                stop_paused(event);continue
+            captured={'host':u.hostname,'path':u.path,'method':'POST','query_keys':sorted(query),'header_keys':sorted((params.get('request',{}).get('headers') or {}).keys()),'body_shape':shape(body),'body_sha256':__import__('hashlib').sha256(raw.encode()).hexdigest(),'network_sent':False,'mutations':0,'conversation_bound':True,'identity_bound':identity}
+            stop_paused(event)
+            result={'ok':True,'identity':identity,'data':captured,'signed':True}
+            break
+        if result is None: raise BridgeError('desktop_timeout')
+    except BridgeError as e:
+        failure=e
+    except Exception:
+        failure=BridgeError('desktop_unavailable')
+    finally:
+        # Drain every currently paused matching request before detaching Fetch.
+        # Paused requests from other origins are outside this probe and untouched.
+        drain_end=time.monotonic()+1.5
+        while pending:
+            event=pending.pop(0)
+            if event.get('method')!='Fetch.requestPaused': continue
+            params=event.get('params',{});u=urlsplit(params.get('request',{}).get('url',''))
+            if u.scheme=='https' and u.hostname=='www.doubao.com' and u.path in (COMPLETION_PATH,ASYNC_PATH):
+                try: stop_paused(event)
+                except Exception: pass
+        while enabled and time.monotonic()<drain_end:
+            try: event=json.loads(ws.recv(timeout=max(.05,drain_end-time.monotonic())))
+            except Exception: break
+            if event.get('method')!='Fetch.requestPaused': continue
+            params=event.get('params',{});u=urlsplit(params.get('request',{}).get('url',''))
+            if u.scheme=='https' and u.hostname=='www.doubao.com' and u.path in (COMPLETION_PATH,ASYNC_PATH):
+                try: stop_paused(event)
+                except Exception: pass
+        for rid in list(request_ids):
+            try: call('Fetch.failRequest',{'requestId':rid,'errorReason':'BlockedByClient'})
+            except Exception: pass
+        if editor['modified']:
+            restore="""()=>{const e=document.querySelector('[contenteditable=true]');if(!e)return false;if((e.innerText||'').includes('LoomGate phase08 synthetic request preparation probe. Do not answer.')){e.innerHTML=window.__loomgatePhase08Original||'';e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContent'}));delete window.__loomgatePhase08Original;delete window.__loomgatePhase08Touched;return true}return false}"""
+            try: call('Runtime.evaluate',{'expression':'('+restore+')()','returnByValue':True})
+            except Exception: pass
+        if enabled:
+            try: call('Fetch.disable')
+            except Exception: pass
+    if failure: raise failure
+    return result
+
 
 def execute(request):
     validate(request)
@@ -102,34 +221,9 @@ def execute(request):
                     return event.get('result', {})
                 if event.get('method') == 'Fetch.requestPaused':
                     pending.append(event)
-        call('Network.enable')
         if request['operation'] == 'prepare_completion':
-            call('Fetch.enable', {'patterns':[{'urlPattern':'https://www.doubao.com/chat/completion*','requestStage':'Request'},{'urlPattern':'https://www.doubao.com/chat/async/chunk_stream*','requestStage':'Request'}]})
-            identity_script = """async()=>{const c=window['chunk_@flow-web/desktop'];const k=Symbol.for('loomgate.phase08.require');let r=window[k];if(typeof r!=='function'){r=await new Promise(resolve=>c.push([['phase08-identity'],{},x=>resolve(x)]));if(typeof r!=='function')throw Error('require_unavailable');window[k]=r}const sdk=await r('z5').getFlowAccount().passportApi.getPassportSDK();const u=await sdk.login.checkLogin({});const id=String(u?.user_id_str||u?.user_id||'');const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(id));return Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('')}"""
-            identity = call('Runtime.evaluate', {'expression':'('+identity_script+')()','awaitPromise':True,'returnByValue':True}).get('result',{}).get('value','')
-            if identity != request['identity']:
-                raise BridgeError('desktop_identity_mismatch')
-            expr = """(prompt)=>{const e=document.querySelector('[contenteditable=true]');if(!e) return {ok:false,error:'desktop_version_unsupported'};e.focus();e.innerHTML='<p>'+prompt.replace(/[&<>]/g,'')+'</p>';e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt}));const b=document.querySelector('[data-testid=chat_input_send_button]');if(!b) return {ok:false,error:'desktop_version_unsupported'};b.click();return {ok:true}}"""
-            started = call('Runtime.evaluate', {'expression':'('+expr+')('+json.dumps(request['prompt'])+')','returnByValue':True}).get('result',{}).get('value',{})
-            if not started.get('ok'):
-                raise BridgeError(started.get('error','desktop_protocol_invalid'))
-            captured = None
-            while time.monotonic() < deadline:
-                remaining = deadline-time.monotonic()
-                if remaining <= 0: break
-                event = pending.pop(0) if pending else json.loads(ws.recv(timeout=remaining))
-                if event.get('method') != 'Fetch.requestPaused': continue
-                p = event.get('params',{});u = urlsplit(p.get('request',{}).get('url',''))
-                if u.hostname != 'www.doubao.com' or u.path not in (COMPLETION_PATH,ASYNC_PATH):
-                    call('Fetch.failRequest', {'requestId':p.get('requestId'),'errorReason':'BlockedByClient'}); continue
-                body = p.get('request',{}).get('postData','') or ''
-                try: parsed=json.loads(body)
-                except Exception: parsed=None
-                captured={'host':u.hostname,'path':u.path,'query_keys':sorted(parse_qs(u.query).keys()),'method':p.get('request',{}).get('method'),'header_keys':sorted((p.get('request',{}).get('headers') or {}).keys()),'body_shape':shape(parsed),'body_sha256':__import__('hashlib').sha256(body.encode()).hexdigest() if body else None,'network_sent':False,'mutations':0}
-                call('Fetch.failRequest', {'requestId':p.get('requestId'),'errorReason':'BlockedByClient'})
-                break
-            if captured is None: raise BridgeError('desktop_timeout')
-            return {'ok':True,'identity':identity,'data':captured,'signed':('a_bogus' in captured['query_keys'] and 'msToken' in captured['query_keys'])}
+            return prepare_completion_transaction(ws, call, request, deadline, pending)
+        call('Network.enable')
         result = call('Runtime.evaluate', {'expression':'('+script+')('+json.dumps(request)+')', 'awaitPromise':True, 'returnByValue':True})
         if 'exceptionDetails' in result:
             raise BridgeError('desktop_protocol_invalid')
