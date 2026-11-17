@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/authflow"
@@ -110,6 +111,36 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 
 // The isolated reconstruction runtime mounts this service while the legacy
 // scheduler is stopped. Production remains on the released legacy runtime.
+// resolveManagedPython returns the absolute interpreter path required by the
+// managed bridge. A launcher may inherit a bare "python"/"python3"/"py" name
+// from its own environment; that must be resolved here instead of failing
+// desktop startup with desktop_configuration_invalid.
+func resolveManagedPython(configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured != "" {
+		if filepath.IsAbs(configured) {
+			return configured
+		}
+		if resolved, err := exec.LookPath(configured); err == nil {
+			if absolute, err := filepath.Abs(resolved); err == nil {
+				return absolute
+			}
+		}
+		return ""
+	}
+	python, _ := exec.LookPath("python.exe")
+	if python == "" {
+		python, _ = exec.LookPath("python3")
+	}
+	if python == "" {
+		python, _ = exec.LookPath("python")
+	}
+	if absolute, err := filepath.Abs(python); err == nil {
+		return absolute
+	}
+	return ""
+}
+
 func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
 	var desktop doubao.CatalogRuntime
 	var managed *doubao.ManagedCommand
@@ -127,10 +158,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 			}
 		}
 		if helper != "" {
-			python = os.Getenv("WB2A_PYTHON")
-			if python == "" {
-				python, _ = exec.LookPath("python.exe")
-			}
+			python = resolveManagedPython(os.Getenv("WB2A_PYTHON"))
 			if python == "" {
 				helper = ""
 			}
