@@ -452,6 +452,10 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": message})
 		return
 	}
+	if path == "/api/migration/preflight" {
+		s.migrationPreflight(w, r, body)
+		return
+	}
 	if path == "/api/auth/login" {
 		s.authLogin(w, r, body)
 		return
@@ -656,12 +660,14 @@ var actionShapes = map[string][]string{
 	"/api/credit":                  {},
 	"/api/models/refresh":          {},
 	"/api/features/reasoning-loop": {"stop_only"},
+	"/api/migration/preflight":     {"source", "destination"},
 }
 
 // stringFields 是必须为字符串的字段。
 var stringFields = map[string]bool{
 	"username": true, "password": true, "current": true, "confirm": true,
 	"realm": true, "uid": true, "key": true, "callback": true, "model": true,
+	"source": true, "destination": true,
 }
 
 var loginIDRe = regexp.MustCompile(`^[a-f0-9]{32}$`)

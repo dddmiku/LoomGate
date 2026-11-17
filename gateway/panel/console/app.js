@@ -295,10 +295,35 @@
       (unavailable?notice('迁移状态读取失败：'+unavailable+'。界面不会把它当作未迁移或已迁移。','error'):'')+
       (marker?`<section class="panel"><div class="panel-title"><div><h2>当前工作区迁移标记</h2></div>${badge('ready','已迁移')}</div>${table(['项目','值'],[['标记版本',esc(marker.format??'—')],['文件数量',number(marker.file_count)],['清单摘要',`<code>${esc(marker.inventory_sha256||'未记录')}</code>`],['源配置摘要',`<code>${esc(marker.source_config_sha256||'未记录')}</code>`],['目标绑定',`<code>${esc(marker.destination_binding||'未记录')}</code>`]])}${notice('标记只说明本工作区由离线复制产生；它不证明旧生产已经切换。','warn')}</section>`:
         (unavailable?'':`<section class="panel"><div class="panel-title"><div><h2>当前工作区</h2></div>${badge('manual_action','未发现迁移标记')}</div><p>当前数据目录没有迁移标记。新部署通常不需要迁移；从旧版切换请先做离线预检、复制和回滚演练。</p></section>`))+
-      `<section class="panel"><div class="panel-title"><div><h2>离线迁移工具</h2></div>${toolAvailable?badge('ready','可用'):badge('disabled','未随此包提供')}</div><p>${esc(data.tool?.message||'迁移在离线状态下完成；不会在网关运行中覆盖当前库。')}</p>`+(toolAvailable?`<p class="muted">在命令窗口运行以下步骤（先预检，再加 --apply --offline-confirmed）：</p><pre class="code">python -I -X utf8 tools/migration/migrate.py copy --source &lt;旧工作区&gt; --destination &lt;新工作区&gt;
+      `<section class="panel"><div class="panel-title"><div><h2>离线迁移工具</h2></div>${toolAvailable?badge('ready','可用'):badge('disabled','未随此包提供')}</div><p>${esc(data.tool?.message||'迁移在离线状态下完成；不会在网关运行中覆盖当前库。')}</p>`+(toolAvailable?`<p class="muted">离线执行顺序：先预检，再加 --apply --offline-confirmed；回滚也要求离线确认。</p><pre class="code">python -I -X utf8 tools/migration/migrate.py copy --source &lt;旧工作区&gt; --destination &lt;新工作区&gt;
 python -I -X utf8 tools/migration/migrate.py copy --source &lt;旧工作区&gt; --destination &lt;新工作区&gt; --apply --offline-confirmed
 python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工作区&gt; --offline-confirmed</pre>`:'')+`</section>`+
+      (toolAvailable?`<section class="panel"><div class="panel-title"><div><h2>本机只读预检</h2></div>${badge('ready','dry-run')}</div><p>选择一个明确的旧工作区与一个尚不存在的新目录。预检只读源目录并报告数量与摘要，不创建目标目录、不输出账号或密钥。</p><form id="migration-preflight-form" class="form"><label>旧工作区（绝对路径）<input name="source" required maxlength="4096" autocomplete="off" spellcheck="false" placeholder="例如 D:/old-workbuddy"></label><label>新目录（绝对路径，必须不存在）<input name="destination" required maxlength="4096" autocomplete="off" spellcheck="false" placeholder="例如 D:/LoomGate-data-new"></label><p id="migration-preflight-message" class="notice" role="status" hidden></p><div class="actions"><button type="submit" class="primary">运行只读预检</button></div></form></section>`:'')+
       `<section class="panel"><div class="panel-title"><div><h2>边界</h2></div></div><ul class="muted"><li>只复制配置、账号、密钥、用量、计划和 unknown 状态；旧运行文件与诊断目录显式排除并计数。</li><li>导入的计划全部为停用，自动派发关闭，需在新工作区显式启用。</li><li>迁移不提供任意文件浏览或下载，也不输出密钥明文。</li></ul></section>`;
+    const preflightForm=$('#migration-preflight-form');
+    if(preflightForm){
+      preflightForm.onsubmit=e=>{
+        e.preventDefault();
+        const form=new FormData(preflightForm);
+        const message=$('#migration-preflight-message');
+        const submit=preflightForm.querySelector('button[type=submit]');
+        message.hidden=false;message.className='notice';message.textContent='正在执行只读预检…';submit.disabled=true;
+        api('migration/preflight',{body:{source:String(form.get('source')||'').trim(),destination:String(form.get('destination')||'').trim()},signal:null})
+          .then(result=>{
+            const r=result.report||{};
+            const counts=Object.entries(r.categories||{}).map(([k,v])=>`${k} ${v.files} 个文件`).join('，');
+            message.className='notice';
+            message.textContent=`预检通过：${r.file_count??0} 个文件，${counts||'无持久化文件'}。未创建目标目录。实际复制必须在离线确认后执行。`;
+            if(preflightForm.isConnected)submit.disabled=false;
+          })
+          .catch(err=>{
+            if(!preflightForm.isConnected)return;
+            message.className='notice error';
+            message.textContent=err instanceof APIError?err.message:'预检结果未确认，请检查路径后重试。';
+            submit.disabled=false;
+          });
+      };
+    }
   }
   function passwordDialog() {
     openDialog('修改管理账号',`<form id="password-form" class="form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>用户名<input name="username" autocomplete="username" required pattern="[A-Za-z0-9_.-]{3,32}"></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>再次输入新密码<input name="confirm" type="password" autocomplete="new-password" required></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);
