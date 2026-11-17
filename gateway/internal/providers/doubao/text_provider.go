@@ -54,9 +54,6 @@ func (p *TextProvider) Models(ctx context.Context) ([]inference.Model, error) {
 	}
 	models := []inference.Model{}
 	for _, m := range c.Models {
-		if m.NativeTools {
-			continue
-		}
 		models = append(models, inference.Model{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow, Incremental: true, MultiTurn: p.Dialogues != nil})
 	}
 	return models, nil

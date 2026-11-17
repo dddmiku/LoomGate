@@ -75,7 +75,7 @@ func TestRealCatalogClientToManagementHTTPPreservesRuntimeCapabilities(t *testin
 					t.Fatal("stream capability differs from runtime availability")
 				}
 				for _, model := range row.Models {
-					if model.InferenceAvailable != (bound && !model.NativeTools) {
+					if model.InferenceAvailable != bound {
 						t.Fatalf("%s wrong inference capability", phase)
 					}
 				}

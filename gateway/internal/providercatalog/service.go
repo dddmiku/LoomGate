@@ -352,7 +352,7 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		row.StreamingMode = "incremental"
 	}
 	for i := range row.Models {
-		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound && !row.Models[i].NativeTools
+		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound
 		row.Models[i].SupportsMultiTurn = row.Models[i].InferenceAvailable && s.opts.DoubaoMultiTurn
 	}
 	return

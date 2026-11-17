@@ -43,12 +43,15 @@ async (input, catalogRuntime) => {
         let chosen;
         for(const e of catalog.data.entry_list){const m=e.active_switch_conf?.menu_conf_v2;if(!m)continue;for(const mode of m.use_mode_model_list?m.mode_list.item_list:[{mode_id:'default',model_list:m.model_list}])for(const item of mode.model_list.item_list){const id='doubao:'+mode.mode_id+':'+item.model_item_key;if(id===input.model)chosen={...item,mode_id:mode.mode_id};}}
         if(!chosen)return fail('desktop_model_unavailable');
-        if((chosen.show_task_tools===1)!==lease.native)return fail('desktop_native_tools_unsupported');
+        // Tool visibility selects the official cloud transport, not whether a
+        // model can answer text. Only explicit, task-bound work uses preparers.
+        lease.cloud=chosen.show_task_tools===1;
+        if(lease.native&&!lease.cloud)return fail('desktop_native_tools_unsupported');
         if(input.conversation!==undefined&&(!/^[A-Za-z0-9_-]{1,128}$/.test(input.conversation)))return fail('desktop_protocol_invalid');
         const message={local_message_id:crypto.randomUUID(),...(input.conversation?{conversation_id:input.conversation}:{local_conversation_id:r('WMy').createLocalConversationId()}),bot_id:bot,create_time:Date.now(),status:r('ntm').G.Available,content_blocks_v2:[r('S6').N(input.prompt)],ext:{model_item_key:chosen.model_item_key,mode_id:chosen.mode_id,conversation_mode:'chat',model_extra_params:JSON.stringify(chosen.model_extra_params||{}),reasoning_effort:String(chosen.reasoning_effort_config.default_level)}};
-        if(lease.native){
+        if(lease.cloud){
           const cloud=r('QG').rC$?.RuntimeType_Cloud_VM;
-          if(cloud!==1||typeof messageService.prepareExternalMessageRequest!=='function')return fail('desktop_version_unsupported');
+          if(cloud!==1||(lease.native&&typeof messageService.prepareExternalMessageRequest!=='function'))return fail('desktop_version_unsupported');
           message.ext.conversation_mode='office';message.ext.general_task_param=JSON.stringify({runtime_type:cloud,agent_task_param:{runtime_type:cloud}});
           if(input.work_task){
             // Re-read eligibility and the official task-to-skill mapping before
@@ -83,6 +86,13 @@ async (input, catalogRuntime) => {
           if(body.option.general_task_param.client_option?.workspace||body.option.general_task_param.client_option?.sandbox_id)return fail('desktop_native_tools_unsupported');
           if(lease.skill&&(!body.option.general_task_param.selected_skills?.includes(lease.skill)||!body.option.general_task_param.skill_selections?.some(s=>s.name===lease.skill)))return fail('desktop_task_manual');
         }else body=await uplink.createChatQueryUplinkBody({messages,sessionId});
+        if(lease.cloud){
+          const cloudParams=body?.option?.general_task_param;
+          if(cloudParams?.runtime_type!==1||cloudParams.agent_task_param?.runtime_type!==1)return fail('desktop_native_tools_unsupported');
+          // Plain inference never acquires a local workspace, task skill or
+          // arbitrary execution surface through the official builder.
+          if(!lease.native&&canonical(cloudParams)!==canonical({runtime_type:1,agent_task_param:{runtime_type:1}}))return fail('desktop_native_tools_unsupported');
+        }
         if(body.option?.unique_key!==sessionId||body.option.model_config?.model_item_key!==chosen.model_item_key||body.messages?.length!==1||body.client_meta?.bot_id!==bot)return fail('desktop_protocol_invalid');
         if(input.conversation&&(body.client_meta?.conversation_id!==input.conversation||body.option?.need_create_conversation===true))return fail('desktop_protocol_invalid');
         if(await identity()!==input.identity)return fail('desktop_identity_mismatch');

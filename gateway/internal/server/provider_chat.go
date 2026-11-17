@@ -96,6 +96,10 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			st.status = 400
 			writeOpenAIError(w, 400, "provider_tools_unsupported", "official work tools are distinct from caller-defined functions; caller tools are not supported by this provider")
 			return
+		case "max_tokens", "max_completion_tokens", "max_output_tokens":
+			st.status = 400
+			writeOpenAIError(w, 400, "provider_output_budget_unsupported", "the signed official chat request has no verified output-token limit field; the request was not sent upstream")
+			return
 		default:
 			st.status = 400
 			writeOpenAIError(w, 400, "provider_parameter_unsupported", "the request contains a parameter that the official provider cannot honor")
@@ -128,6 +132,14 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	parsed := []inference.Message{}
 	total := 0
 	for i, m := range messages {
+		// System instructions have no verified carrier in the signed official
+		// chat builder. Reject them explicitly instead of flattening them into
+		// user text and pretending the model received a system prompt.
+		if m.Role == "system" || m.Role == "developer" {
+			st.status = 400
+			writeOpenAIError(w, 400, "provider_system_instructions_unsupported", "this provider cannot carry a separate system instruction through the official client; the request was not sent upstream")
+			return
+		}
 		expected := "user"
 		if i%2 == 1 {
 			expected = "assistant"
