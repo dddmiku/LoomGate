@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,12 +44,25 @@ import (
 )
 
 func main() {
+	// Native network self-check must run before configuration, accounts or any
+	// persistent state is touched: it is a read-only proof of the resolver/TLS
+	// path used by this very binary (Android delivery gate).
+	if runNetworkCheckIfRequested(os.Args[1:]) {
+		return
+	}
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
 	// 安卓端：目录与首次运行的配置必须在读配置之前准备好（见 BootstrapAndroidLayout）。
 	if err := BootstrapAndroidLayout(*cfgPath); err != nil {
 		log.Fatalf("prepare android layout: %v", err)
+	}
+	// Android 交付门：同签名覆盖升级前后各打一份持久化清单（仅数量与摘要），
+	// 用来证明配置/账号/密钥/计划/unknown 没有被安装过程清掉。
+	if strings.TrimSpace(os.Getenv("WB2API_ANDROID")) == "1" {
+		if absolute, err := filepath.Abs(*cfgPath); err == nil {
+			logDataInventory(filepath.Dir(filepath.Dir(absolute)))
+		}
 	}
 
 	cfg, err := loadConfigOrEnv(*cfgPath)
@@ -669,6 +683,11 @@ func main() {
 		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
 	}
 	log.Printf("workbuddy2api 已开始监听 %s（密钥鉴权=%v）", cfg.Listen, cfg.APIKey != "")
+	// Android 交付门：由 App 实际拉起的这个网关进程自己证明 bionic DNS 与系统
+	// 根证书 TLS 可用。异步执行，不拖慢就绪与 /healthz。
+	if strings.TrimSpace(os.Getenv("WB2API_ANDROID")) == "1" {
+		go logNetworkCheck(backgroundCtx)
+	}
 	// 先起 accept 循环再通知就绪：父进程收到通知后会立刻停止接受新连接，
 	// 如果这时本进程还没开始 accept，连接会压在队列里直到本进程接管（不影响正确性，
 	// 但排队越短越好）。

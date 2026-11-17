@@ -197,6 +197,22 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(m.MigrationError, "link_or_junction"):
             m.migrate(self.source, self.dest)
 
+    def test_runtime_diagnostics_are_excluded_and_reported(self):
+        # Bulk diagnostic output inside data/ must not enter the migration copy,
+        # but its exclusion has to be counted and visible in the report.
+        (self.source / "data/channel-dumps").mkdir(parents=True)
+        (self.source / "data/channel-dumps/sample.bin").write_bytes(b"diagnostic")
+        (self.source / "data/logs").mkdir()
+        (self.source / "data/logs/gateway.log").write_text("log line", encoding="utf-8")
+        report = m.migrate(self.source, self.dest)
+        self.assertEqual(report["excluded"]["runtime_diagnostics"], 2)
+        self.assertEqual(report["excluded"]["runtime_diagnostic_files"], 2)
+        self.assertGreater(report["excluded"]["runtime_diagnostic_bytes"], 0)
+        m.migrate(self.source, self.dest, apply=True, offline=True)
+        self.assertFalse((self.dest / "data/channel-dumps").exists())
+        self.assertFalse((self.dest / "data/logs").exists())
+        self.assertTrue((self.dest / "data/state.json").is_file())
+
     def test_dry_run_has_no_writes_and_redacts_names(self):
         before = {p.relative_to(self.source): p.read_bytes() for p in self.source.rglob("*") if p.is_file()}
         report = m.migrate(self.source, self.dest)

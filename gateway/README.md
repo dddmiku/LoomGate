@@ -68,8 +68,8 @@ docker compose up -d
 ### 方式二：从源码构建
 
 ```bash
-git clone https://github.com/dddmiku/workbuddy2api-maintenance.git workbuddy2api
-cd workbuddy2api
+git clone https://github.com/dddmiku/LoomGate.git loomgate
+cd loomgate
 
 sudo install -d -o 10001 -g 10001 -m 700 config auths auths-trash data panel-data
 sudo install -o 10001 -g 10001 -m 600 config.example.json config/config.json

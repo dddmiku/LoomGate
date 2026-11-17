@@ -9,8 +9,17 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
-import runtime_bundle
+# `python -I` (used by every verification entry point here) removes the script
+# directory from sys.path. Load the sibling packager by explicit path so the
+# build gate behaves identically under isolation and inside CI.
+import importlib.util as _importlib_util
+
+_runtime_spec = _importlib_util.spec_from_file_location(
+    "runtime_bundle", Path(__file__).with_name("runtime_bundle.py"))
+runtime_bundle = _importlib_util.module_from_spec(_runtime_spec)
+_runtime_spec.loader.exec_module(runtime_bundle)
 
 GATEWAY = Path(__file__).resolve().parents[1]
 MANIFEST = GATEWAY / "scripts" / "release-targets.json"
@@ -133,6 +142,17 @@ def verify_runtime_identity(path, public_key, version):
 BINARY_PLATFORMS = {}
 
 
+def runtime_identity_status(path, public_key, version):
+    """Return verified_on_host or deferred_to_target_runner; never fake a pass."""
+    try:
+        verify_runtime_identity(path, public_key, version)
+    except ValueError as error:
+        if "cross_compiled_identity_requires_target_runner" not in str(error):
+            raise
+        return "deferred_to_target_runner"
+    return "verified_on_host"
+
+
 def build_target(data, ident, work_root, commit):
     if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
         raise ValueError("a full source commit is required for build attribution")
@@ -173,7 +193,10 @@ def build_target(data, ident, work_root, commit):
                  "-o", str(path), "./cmd/" + package], cwd=GATEWAY, env=env, timeout=1200)
         verify_platform(go, path, target)
         BINARY_PLATFORMS[str(path)] = (target["goos"], target["goarch"])
-    verify_runtime_identity(stage / "wb2api", public_key, version)
+    # A cross-compiled artifact cannot execute here. Recording the deferred
+    # state keeps CI honest: the report says exactly which target runner still
+    # has to execute --loomgate-build-info before the asset can be released.
+    identity = runtime_identity_status(stage / "wb2api", public_key, version)
     artifacts = [target["update_asset"]]
     shutil.copyfile(stage / "wb2api", out / target["update_asset"])
     if target.get("runtime_asset"):
@@ -192,6 +215,7 @@ def build_target(data, ident, work_root, commit):
     report = {"schema_version": 1, "target": ident, "commit": commit, "version": version,
               "public_key_sha256": hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
               "artifacts": sums, "release_signature": "NOT GENERATED", "published": False,
+              "runtime_identity": identity,
               "apk_builds": "NOT RUN; existing APK signing identity required"}
     (out / "build-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

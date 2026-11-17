@@ -171,3 +171,26 @@ class ReleaseTargetsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class RuntimeIdentityStatusTests(unittest.TestCase):
+    """Cross-compiled CI artifacts record a deferred identity, never a fake pass."""
+
+    def test_cross_compiled_artifact_is_deferred(self):
+        with patch.object(build, "verify_runtime_identity",
+                          side_effect=ValueError("cross_compiled_identity_requires_target_runner")):
+            self.assertEqual(
+                build.runtime_identity_status(Path("artifact"), "11" * 32, "v1.0.0-dev"),
+                "deferred_to_target_runner")
+
+    def test_host_artifact_is_verified(self):
+        with patch.object(build, "verify_runtime_identity"):
+            self.assertEqual(
+                build.runtime_identity_status(Path("artifact"), "11" * 32, "v1.0.0-dev"),
+                "verified_on_host")
+
+    def test_other_identity_failures_are_not_deferred(self):
+        with patch.object(build, "verify_runtime_identity", side_effect=ValueError("key digest mismatch")):
+            with self.assertRaisesRegex(ValueError, "key digest"):
+                build.runtime_identity_status(Path("artifact"), "11" * 32, "v1.0.0-dev")

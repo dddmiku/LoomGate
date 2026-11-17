@@ -26,6 +26,12 @@ _legacy_spec.loader.exec_module(legacy_schedule)
 FORMAT = 2
 MARKER = ".loomgate-migration.json"
 CATEGORIES = ("config", "auths", "auths-trash", "data", "panel-data")
+# Known diagnostic output inside the runtime data directory. These can be large
+# (the production export contains hundreds of MB of upstream samples and logs)
+# and are not runtime state; the caller keeps them in the full offline backup.
+# Excluding them from the migration inventory is explicit and reported, never
+# silent: a changed diagnostic file cannot block or abort the state copy.
+DIAGNOSTIC_PATHS = ("data/channel-dumps", "data/logs", "data/task-logs")
 PATH_FIELDS = ("auth_dir", "api_keys_file", "api_keys_socket", "usage_file", "state_file")
 NESTED_PATH_FIELDS = (("prompt", "file", True), ("upstream", "device_token_file", True),
                       ("upstream", "channel_dump_dir", False))
@@ -71,6 +77,9 @@ def runtime_socket(path: Path) -> bool:
 
 def socket_path(value: str, source: Path) -> Path:
     path = Path(value)
+    if path.is_absolute():
+        mapped = mapped_path(value, source)
+        path = source / mapped[2:]
     candidate = path if path.is_absolute() else source / path
     reject_links(candidate.parent)
     # AF_UNIX is a Windows reparse tag, but it has no link target to follow.
@@ -143,24 +152,56 @@ def guarded_root(path: Path, exists: bool) -> Path:
     return resolved
 
 
-def mapped_path(value: str, source: Path, *, required: bool = False) -> str:
-    """Only paths inside the selected root can become portable relative paths."""
+def relative_config_path(value: str, source: Path) -> Path:
+    """Translate one configured path to a path relative to the export root.
+
+    Accepted forms are relative paths inside the root, absolute paths inside the
+    root, and container-view paths rooted at ``/app/<category>/...``. Anything
+    else is refused instead of silently re-rooted.
+    """
     path = Path(value)
-    # Foreign absolute paths require an explicit source-side export first.
     if (len(value) > 1 and value[1] == ":") and os.name != "nt":
         raise MigrationError("foreign_absolute_path_requires_export")
-    candidate = path if path.is_absolute() else source / path
-    reject_links(candidate)
-    resolved = candidate.resolve()
+    if path.is_absolute():
+        try:
+            relative = path.relative_to(source)
+        except ValueError:
+            parts = path.parts
+            if "app" in parts:
+                relative = Path(*parts[parts.index("app") + 1:])
+            else:
+                raise MigrationError("external_config_path_requires_export") from None
+    else:
+        relative = path
+    candidate = source / relative
     try:
-        relative = resolved.relative_to(source)
+        resolved = candidate.resolve()
+        resolved.relative_to(source)
     except ValueError:
         raise MigrationError("external_config_path_requires_export") from None
-    if not relative.parts or relative.parts[0] not in CATEGORIES:
+    portable = Path(*resolved.relative_to(source).parts) if resolved != source else Path()
+    if not portable.parts or portable.parts[0] not in CATEGORIES:
         raise MigrationError("config_path_outside_migration_categories")
-    if required and not resolved.is_file():
+    return portable
+
+
+def mapped_path(value: str, source: Path, *, required: bool = False) -> str:
+    """Only paths inside the selected root can become portable relative paths."""
+    relative = relative_config_path(value, source)
+    candidate = source / relative
+    reject_links(candidate)
+    if required and not candidate.resolve().is_file():
         raise MigrationError("configured_data_path_missing")
     return "./" + relative.as_posix()
+
+
+def socket_path(value: str, source: Path) -> Path:
+    relative = relative_config_path(value, source)
+    candidate = source / relative
+    # AF_UNIX endpoints are reparse points on Windows but have no link target;
+    # verify the parent only, then canonicalize it without resolving the leaf.
+    reject_links(candidate.parent)
+    return candidate.parent.resolve() / candidate.name
 
 
 def validate_registry(doc: dict) -> list[dict]:
@@ -241,7 +282,14 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         raise MigrationError("destination_must_not_exist")
     files: list[tuple[Path, Path, str]] = []
     counts = {name: {"files": 0, "bytes": 0} for name in CATEGORIES}
-    excluded = {"runtime_updates": 0, "transient_files": 0, "runtime_sockets": 0}
+    # Only the five persistent categories are migrated. Loose runtime binaries
+    # and docker files at the export root are reported, never copied; the new
+    # runtime bundle comes from the candidate build instead of the old image.
+    excluded = {"runtime_updates": 0, "transient_files": 0, "runtime_sockets": 0,
+                "root_runtime_entries": 0,
+                "runtime_diagnostics": 0, "runtime_diagnostic_files": 0,
+                "runtime_diagnostic_bytes": 0}
+    diagnostic_roots = {(source / relative).resolve() for relative in DIAGNOSTIC_PATHS}
     config_candidates = (source / "config/config.json", source / "config.json")
     for candidate in config_candidates:
         reject_links(candidate)
@@ -259,6 +307,7 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
     endpoint = socket_path(endpoint_value, source)
     mapped = dict(config)
     remapped = []
+    mapped_from_absolute = []
     for field in PATH_FIELDS:
         value = config.get(field)
         if value is not None and not isinstance(value, str):
@@ -269,6 +318,8 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
                           else mapped_path(value, source))
             if next_value != value:
                 remapped.append(field)
+                if Path(value).is_absolute() and not Path(value).is_relative_to(source):
+                    mapped_from_absolute.append(field)
             mapped[field] = next_value
     for section, field, required in NESTED_PATH_FIELDS:
         parent = config.get(section)
@@ -277,10 +328,13 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         if isinstance(parent, dict) and parent.get(field) is not None and not isinstance(parent[field], str):
             raise MigrationError("invalid_configuration_path")
         if isinstance(parent, dict) and isinstance(parent.get(field), str) and parent[field].strip():
-            value = mapped_path(parent[field], source, required=required)
+            original = parent[field]
+            value = mapped_path(original, source, required=required)
             mapped[section] = {**mapped.get(section, {}), field: value}
-            if value != parent[field]:
+            if value != original:
                 remapped.append(section + "." + field)
+                if Path(original).is_absolute() and not Path(original).is_relative_to(source):
+                    mapped_from_absolute.append(section + "." + field)
     update = config.get("update")
     update_roots = {source / "data/updates"}
     if isinstance(update, dict):
@@ -324,6 +378,17 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
             for name in list(dirs):
                 entry = current_path / name
                 reject_links(entry)
+                if entry.resolve() in diagnostic_roots:
+                    dirs.remove(name)
+                    excluded["runtime_diagnostics"] += 1
+                    for diag_current, _, diag_names in os.walk(entry, followlinks=False):
+                        for diag_name in diag_names:
+                            diag_path = Path(diag_current) / diag_name
+                            info = diag_path.lstat()
+                            excluded["runtime_diagnostic_files"] += 1
+                            if stat.S_ISREG(info.st_mode):
+                                excluded["runtime_diagnostic_bytes"] += info.st_size
+                    continue
                 if entry in update_roots:
                     dirs.remove(name)
                     excluded["runtime_updates"] += 1
@@ -347,6 +412,10 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
                 files.append((entry, relative, digest(entry)))
                 counts[category]["files"] += 1
                 counts[category]["bytes"] += entry.stat().st_size
+    for entry in source.iterdir() if source.is_dir() else []:
+        if entry.name in CATEGORIES or entry.name.startswith("."):
+            continue
+        excluded["root_runtime_entries"] += 1
     if config_path.parent == source:
         files.append((config_path, Path("config/config.json"), digest(config_path)))
         counts["config"]["files"] += 1
@@ -373,6 +442,7 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
         raise MigrationError(str(error)) from None
     report = {"format": FORMAT, "mode": "dry-run", "source_unchanged": True,
               "categories": counts, "excluded": excluded, "mapped_fields": sorted(remapped),
+              "mapped_from_container_absolute": sorted(mapped_from_absolute),
               "automatic_update_disabled": True, "encrypted_key_records": encrypted_count,
               "inventory_sha256": inventory.hexdigest(), "file_count": len(files),
               "source_config_sha256": digest(config_path),

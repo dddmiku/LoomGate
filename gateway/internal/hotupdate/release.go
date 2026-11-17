@@ -33,7 +33,9 @@ import (
 
 const (
 	// DefaultRepo 默认发布仓库（可用 config update.repo 覆盖）。
-	DefaultRepo = "dddmiku/workbuddy2api-maintenance"
+	// LoomGate 1.x 起统一从现有 LoomGate 仓库取发布资产；旧维护仓库只保留历史
+	// Release 作为回滚来源，不再作为默认更新源。资产名与环境变量保持兼容。
+	DefaultRepo = "dddmiku/LoomGate"
 	// defaultAPIBase GitHub API 根地址；测试用它指向本地假服务。
 	defaultAPIBase = "https://api.github.com"
 	// maxReleaseBytes 单个下载对象上限，防超大文件把磁盘写满。

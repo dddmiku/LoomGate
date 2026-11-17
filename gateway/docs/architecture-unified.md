@@ -49,7 +49,7 @@ v2.4.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历
 
 `.github/workflows/client-compatibility.yml` 是持续测试入口，相关源码变更与手动运行均限制在已核验的公开发布仓库。官方 SDK 在 Windows/Linux 测试，另执行常规全包测试、vet 和面板回归；race 由维护流程在服务器隔离副本执行。CI 仅使用合成请求和假上游，不使用真实模型或生产凭据，不发送评论；上传证据也仅限合成测试结果。ai 治理继续关闭。
 
-`.github/workflows/build.yml` 仅允许 `dddmiku/workbuddy2api-maintenance`（repository ID `1386246860`），同时检查仓库身份和 GitHub API 的当前公开状态。入口只有手动运行和版本 tag。每次上传产物前再次检查目标身份与可见性；权限仅为仓库内容读取，不拥有包或 Release 发布权限。
+`.github/workflows/build.yml` 是手动触发的构建验收流程，只产出 Actions artifact，不写 Release；权限仅为仓库内容读取。正式 Release 由单独的签名发布流程创建并上传完整资产。
 
 | 阶段 | 检查或产物 |
 |---|---|

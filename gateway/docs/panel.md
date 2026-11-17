@@ -84,7 +84,7 @@ Cookie 使用 `HttpOnly`、`SameSite=Lax` 和根路径，可信 HTTPS 请求设�
 
 1. 记录旧镜像、Compose、代理、实际版本及运行文件摘要。保留 `2.1.29` Release 和旧镜像作为回滚来源。
 2. 等在途请求收尾，停止旧网关与旧面板，取得一致备份：原配置、五个持久化目录和 `data/updates/current`；密钥库与 `.enc-key` 必须一起保留。
-3. 将旧根目录 `config.json` 复制到新 `config/config.json`，保留原设置，确认 `update.repo` 使用公开发布源 `dddmiku/workbuddy2api-maintenance`；已有同名设置无需修改，公开下载时 `update.token` 可留空。只对这些明确目录校准 `10001:10001` 权限，不重新初始化账号、密钥或管理员。
+3. 将旧根目录 `config.json` 复制到新 `config/config.json`，保留原设置，确认 `update.repo` 使用公开发布源 `dddmiku/LoomGate`（旧值 `dddmiku/workbuddy2api-maintenance` 仅作为历史回滚源保留）；公开下载时 `update.token` 可留空。只对这些明确目录校准 `10001:10001` 权限，不重新初始化账号、密钥或管理员。
 4. 用单服务 Compose 启动完整镜像。统一入口会忽略缺少 manifest 的旧裸二进制更新指针；仍需核对 `/healthz` 和实际进程文件，不能只看镜像标签。
 5. 管理代理由 `7864` 改成 `7863` 并保留 `/admin/`。确认登录、账号、密钥复制、权限、日志、累计用量、任务和真实客户端请求，再停用旧面板发布端口。
 
