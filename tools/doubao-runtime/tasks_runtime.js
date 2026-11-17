@@ -67,6 +67,29 @@ async input=>{
           }
         }
         changed=true;operationStatus='submitted';
+      }else if(input.operation==='task_start'){
+        // Official completion for a work task begins with a campaign_task_click
+        // event that returns the instance task_id. Without it the task stays
+        // Created even when the generated artifact exists.
+        if(!['WorkTaskMode','GenWord','GenExcel','GenPPT','ScheduleSkill'].includes(task.campaign_type))return fail('desktop_task_manual');
+        if(task.task_status===2||task.task_status===3){operationStatus='already_started';}
+        else{
+          if(task.task_status!==1)return fail('desktop_task_not_claimable');
+          const reported=await call('/alice/ug/event/report',{scene:'campaign_task_click',campaign_item_code:task.campaign_code,params:{campaign_group_code:group}});
+          if(!reported||typeof reported!=='object')return fail('desktop_protocol_invalid');
+          changed=true;operationStatus='submitted';
+        }
+      }else if(input.operation==='task_fact'){
+        // The signed message id proves this account's own generated turn. Never
+        // accept an id that is not bound to the exact task instance.
+        if(typeof input.message!=='string'||!/^[A-Za-z0-9_-]{1,128}$/.test(input.message))return fail('desktop_protocol_invalid');
+        if(!['WorkTaskMode','GenWord','GenExcel','GenPPT','ScheduleSkill'].includes(task.campaign_type))return fail('desktop_task_manual');
+        if(task.task_status===3){operationStatus='already_done';}
+        else{
+          const reported=await call('/alice/ug/event/report',{scene:task.campaign_type,campaign_item_code:task.campaign_code,message_id:input.message,params:{campaign_group_code:group}});
+          if(!reported||typeof reported!=='object')return fail('desktop_protocol_invalid');
+          changed=true;operationStatus='submitted';
+        }
       }else return fail('desktop_protocol_invalid');
       if(changed)detail=await read();
     }

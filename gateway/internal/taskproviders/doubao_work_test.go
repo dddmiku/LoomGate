@@ -17,7 +17,8 @@ import (
 
 type workFixture struct {
 	mu                        sync.Mutex
-	status, generated, claims int
+	status, starts, generated, claims, facts int
+	dropMessageID                           bool
 	withhold, fail            bool
 	records                   []doubao.RewardRecord
 }
@@ -36,14 +37,39 @@ func (f *workFixture) Activities(context.Context, doubao.RuntimeBinding) (doubao
 func (f *workFixture) TaskAction(_ context.Context, _ doubao.RuntimeBinding, op, group, task, instance string) (doubao.Activity, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if op != "task_claim" || group != "synthetic-group" || task != "synthetic-sheet" || instance != "synthetic-instance" || f.status != 2 {
-		return doubao.Activity{}, errors.New("wrong_action")
+	switch op {
+	case "task_start":
+		if group != "synthetic-group" || task != "synthetic-sheet" || f.status != 1 {
+			return doubao.Activity{}, errors.New("wrong_start")
+		}
+		f.starts++
+		f.status = 4
+		a := f.snapshot()
+		a.OperationStatus = "submitted"
+		return a, nil
+	case "task_claim":
+		if group != "synthetic-group" || task != "synthetic-sheet" || instance != "synthetic-instance" || f.status != 2 {
+			return doubao.Activity{}, errors.New("wrong_action")
+		}
+		f.claims++
+		f.status = 3
+		if !f.withhold {
+			f.records = append(f.records, doubao.RewardRecord{ID: "new-record", TaskCode: task, Amount: "100", Unit: "points", CreatedMS: time.Now().UnixMilli()})
+		}
+		a := f.snapshot()
+		a.OperationStatus = "submitted"
+		return a, nil
 	}
-	f.claims++
-	f.status = 3
-	if !f.withhold {
-		f.records = append(f.records, doubao.RewardRecord{ID: "new-record", TaskCode: task, Amount: "100", Unit: "points", CreatedMS: time.Now().UnixMilli()})
+	return doubao.Activity{}, errors.New("wrong_action")
+}
+func (f *workFixture) TaskFact(_ context.Context, _ doubao.RuntimeBinding, group, task, instance, message string) (doubao.Activity, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if group != "synthetic-group" || task != "synthetic-sheet" || instance != "synthetic-instance" || message != "synthetic-message" || f.status != 4 {
+		return doubao.Activity{}, errors.New("wrong_fact")
 	}
+	f.facts++
+	f.status = 2
 	a := f.snapshot()
 	a.OperationStatus = "submitted"
 	return a, nil
@@ -67,8 +93,12 @@ func (f *workFixture) CompleteTask(_ context.Context, q doubao.TaskWorkRequest) 
 	if f.fail {
 		return inference.Result{Attempted: true}, errors.New("synthetic_unknown")
 	}
-	f.status = 2
-	return inference.Result{Text: "Synthetic output", Attempted: true, Acknowledged: true, Complete: true, ConversationRef: "dialog-synthetic"}, nil
+	f.status = 4
+	messageID := "synthetic-message"
+	if f.dropMessageID {
+		messageID = ""
+	}
+	return inference.Result{Text: "Synthetic output", Attempted: true, Acknowledged: true, Complete: true, ConversationRef: "dialog-synthetic", MessageID: messageID}, nil
 }
 func workAdapter(t *testing.T) (*Doubao, *workFixture) {
 	t.Helper()
@@ -178,5 +208,60 @@ func TestDoubaoUnknownGenerationIsNotReplayedOrMistakenForReward(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.generated != 1 || f.claims != 0 {
 		t.Fatal("unknown replayed or claimed")
+	}
+}
+
+func TestDoubaoWorkStartsOfficialTaskBeforeGenerationAndReportsSignedFactAfter(t *testing.T) {
+	a, f := workAdapter(t)
+	e := workEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := submitWork(t, e); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("work result %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.starts != 1 || f.generated != 1 || f.facts != 1 {
+		t.Fatalf("ordering incomplete starts=%d generated=%d facts=%d", f.starts, f.generated, f.facts)
+	}
+}
+
+func TestDoubaoWorkStatusOrderingRejectsFactBeforeGeneration(t *testing.T) {
+	a, f := workAdapter(t)
+	e := workEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	// The fixture only accepts task_start while the task is Created and only
+	// accepts a fact report after generation completed.
+	f.mu.Lock()
+	f.status = 2
+	f.mu.Unlock()
+	run := submitWork(t, e)
+	f.mu.Lock()
+	starts, generated := f.starts, f.generated
+	f.mu.Unlock()
+	if starts != 0 || generated != 0 {
+		t.Fatalf("pre-existing completed status still started/generated %s", run.Status)
+	}
+}
+
+func TestDoubaoWorkMissingSignedMessageIdIsUncertainNotReplayed(t *testing.T) {
+	a, f := workAdapter(t)
+	f.mu.Lock()
+	f.dropMessageID = true
+	f.mu.Unlock()
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	e := workEngine(t, a, path)
+	if run := submitWork(t, e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("missing signed message id was reported %s", run.Status)
+	}
+	e.Close()
+	e = workEngine(t, a, path)
+	defer e.Close()
+	if run := submitWork(t, e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("missing signed message id was replayed %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.generated != 1 || f.facts != 0 {
+		t.Fatalf("replayed generation or invented fact facts=%d generated=%d", f.facts, f.generated)
 	}
 }

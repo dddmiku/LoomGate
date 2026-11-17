@@ -73,9 +73,12 @@ def validate(request):
         for key in ['conversation']+(['session','message'] if 'session' in request or 'message'in request else []):
             if not isinstance(request.get(key),str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}',request[key]):raise BridgeError('desktop_protocol_invalid')
         return
-    if isinstance(request,dict) and request.get('operation') in ('activities','reward_records','task_checkin','task_claim'):
+    if isinstance(request,dict) and request.get('operation') in ('activities','reward_records','task_checkin','task_claim','task_start','task_fact'):
         if set(request)-{'operation','port','identity','group','task','instance'} or type(request.get('port')) is not int or not 1<=request['port']<=65535 or not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
         if request['operation'] in ('activities','reward_records') and set(request)!={'operation','port','identity'}:raise BridgeError('desktop_protocol_invalid')
+        if request['operation']=='task_fact':
+            if set(request)-{'operation','port','identity','group','task','instance','message'} or not isinstance(request.get('message'),str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}',request['message']):raise BridgeError('desktop_protocol_invalid')
+        elif request['operation']=='task_start' and set(request)-{'operation','port','identity','group','task','instance'}:raise BridgeError('desktop_protocol_invalid')
         if request['operation'] not in ('activities','reward_records'):
             for field in ('group','task'):
                 if not isinstance(request.get(field),str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',request[field]):raise BridgeError('desktop_protocol_invalid')
@@ -314,7 +317,7 @@ def execute(request,canceled=None):
                     pending.append(event)
         if request['operation'] == 'prepare_completion':
             return prepare_completion_transaction(ws, call, request, deadline, pending,canceled)
-        if request['operation'] in ('activities','reward_records','task_checkin','task_claim'):
+        if request['operation'] in ('activities','reward_records','task_checkin','task_claim','task_start','task_fact'):
             source=Path(__file__).with_name('tasks_runtime.js').read_text(encoding='utf-8')
             value=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+')','awaitPromise':True,'returnByValue':True})
             if value.get('exceptionDetails'):raise BridgeError('desktop_protocol_invalid')

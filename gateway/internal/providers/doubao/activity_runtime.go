@@ -3,6 +3,7 @@ package doubao
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -11,11 +12,33 @@ type ActivityRuntime interface {
 	TaskAction(context.Context, RuntimeBinding, string, string, string, string) (Activity, error)
 }
 
+// TaskFactRuntime reports the signed id of this attempt's own user message.
+type TaskFactRuntime interface {
+	TaskFact(context.Context, RuntimeBinding, string, string, string, string) (Activity, error)
+}
+
 func (r *CommandRuntime) Activities(ctx context.Context, b RuntimeBinding) (Activity, error) {
 	return r.taskOperation(ctx, b, "activities", "", "", "")
 }
+
+// TaskFact reports the signed id of this attempt's own user message. It is the
+// only official attribution that can move a started work task to completed.
+func (r *CommandRuntime) TaskFact(ctx context.Context, b RuntimeBinding, group, task, instance, message string) (Activity, error) {
+	if !identityDigest.MatchString(b.Identity) || strings.TrimSpace(group) == "" || strings.TrimSpace(task) == "" || !regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`).MatchString(message) {
+		return Activity{}, runtimeError("desktop_binding_invalid")
+	}
+	reply, err := r.run(ctx, runtimeRequest{Operation: "task_fact", Port: r.port, Identity: b.Identity, Group: group, Task: task, Instance: instance, Message: message})
+	if err != nil {
+		return Activity{}, err
+	}
+	var activity Activity
+	if reply.Identity != b.Identity || json.Unmarshal(reply.Data, &activity) != nil || activity.Group == "" || activity.Tasks == nil {
+		return Activity{}, runtimeError("desktop_protocol_invalid")
+	}
+	return activity, nil
+}
 func (r *CommandRuntime) TaskAction(ctx context.Context, b RuntimeBinding, operation, group, task, instance string) (Activity, error) {
-	if operation != "task_checkin" && operation != "task_claim" {
+	if operation != "task_checkin" && operation != "task_claim" && operation != "task_start" {
 		return Activity{}, runtimeError("desktop_protocol_invalid")
 	}
 	if strings.TrimSpace(group) == "" || strings.TrimSpace(task) == "" {
@@ -45,6 +68,27 @@ func (r *CommandRuntime) taskOperation(ctx context.Context, b RuntimeBinding, op
 func (c *Client) TaskAction(ctx context.Context, account, operation string, t Task) (Activity, error) {
 	return c.TaskActionRevision(ctx, account, "", operation, t)
 }
+// TaskFactRevision reports the signed message id of this attempt's own turn.
+func (c *Client) TaskFactRevision(ctx context.Context, account, revision string, t Task, message string) (Activity, error) {
+	s, err := c.sessions.Session(ctx, account)
+	if err != nil {
+		return Activity{}, runtimeError("login_required")
+	}
+	if revision != "" && s.Revision != revision {
+		return Activity{}, runtimeError("desktop_binding_invalid")
+	}
+	if s.Runtime == nil {
+		return Activity{}, runtimeError("desktop_task_manual")
+	}
+	r, ok := c.runtime.(interface {
+		TaskFact(context.Context, RuntimeBinding, string, string, string, string) (Activity, error)
+	})
+	if !ok {
+		return Activity{}, runtimeError("desktop_activity_unavailable")
+	}
+	return r.TaskFact(ctx, *s.Runtime, t.Group, t.Code, t.ID, message)
+}
+
 func (c *Client) TaskActionRevision(ctx context.Context, account, revision, operation string, t Task) (Activity, error) {
 	s, err := c.sessions.Session(ctx, account)
 	if err != nil {

@@ -79,6 +79,7 @@ type workJournal struct {
 	RewardAmount    int64            `json:"reward_amount,omitempty"`
 	LegacyWork      json.RawMessage  `json:"work,omitempty"`
 	Conversation    string           `json:"conversation,omitempty"`
+	Message         string           `json:"message,omitempty"`
 }
 
 func workKey(prefix, account, key string) string {
@@ -188,9 +189,32 @@ func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.T
 	if err != nil || session.Revision != strconv.FormatUint(account.Revision, 10) {
 		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), errors.New("account_identity_changed")
 	}
+	// The official work task must be started (campaign_task_click) before the
+	// generation, otherwise it stays Created even when an artifact exists.
+	started, startErr := a.Client.TaskActionRevision(ctx, t.AccountID, session.Revision, "task_start", up)
+	if startErr != nil {
+		w.mu.Lock()
+		_, _ = w.save(t, journal, rev)
+		w.mu.Unlock()
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), startErr
+	}
+	instance := up.ID
+	for _, candidate := range append(append([]doubao.Task{}, started.Tasks...), started.Milestones...) {
+		if candidate.Code == up.Code && candidate.ID != "" {
+			instance = candidate.ID
+		}
+	}
+	journal.Instance = instance
+	w.mu.Lock()
+	rev, err = w.save(t, journal, rev)
+	w.mu.Unlock()
+	if err != nil {
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), err
+	}
 	result, err := w.Provider.CompleteTask(ctx, doubao.TaskWorkRequest{AccountID: t.AccountID, Revision: session.Revision, Model: input.Model, Instruction: input.Instruction, ActionKey: reference, Task: up})
 	journal.State = "uncertain"
 	journal.Conversation = result.ConversationRef
+	journal.Message = result.MessageID
 	if err == nil && result.Complete && result.Acknowledged {
 		journal.State = "generated"
 	}
@@ -201,8 +225,22 @@ func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.T
 		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), saveErr
 	}
 	observation := taskengine.Observation{Phase: "pending", Summary: "真实工作已提交，继续核验官方任务条件与奖励；生成结果不代表任务达标。"}
-	if journal.State == "generated" {
+	if journal.State == "generated" && journal.Message != "" {
+		fact, factErr := a.Client.TaskFactRevision(ctx, t.AccountID, session.Revision, doubao.Task{ID: journal.Instance, Group: up.Group, Code: up.Code}, journal.Message)
+		if factErr != nil {
+			return taskengine.UnknownAction(t, taskengine.StageExecute, observation), factErr
+		}
+		for _, candidate := range append(append([]doubao.Task{}, fact.Tasks...), fact.Milestones...) {
+			if candidate.Code == up.Code {
+				if candidate.Status == 2 || candidate.Status == 3 {
+					return taskengine.Accepted(t, taskengine.StageExecute, taskengine.Observation{Phase: "done", Summary: "官方已确认任务事实，奖励进入核验。"}), nil
+				}
+			}
+		}
 		return taskengine.Accepted(t, taskengine.StageExecute, observation), nil
+	}
+	if journal.State == "generated" && journal.Message == "" {
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "生成已完成但缺少可核验的消息标识，保留待核验，不重发。"}), err
 	}
 	return taskengine.UnknownAction(t, taskengine.StageExecute, observation), err
 }

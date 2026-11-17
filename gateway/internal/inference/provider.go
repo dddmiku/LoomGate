@@ -21,6 +21,7 @@ type Result struct {
 	UsageReported   bool
 	AttemptRecords  []Attempt
 	ConversationRef string
+	MessageID       string
 	Recovery        []byte `json:"-"`
 }
 

@@ -56,3 +56,46 @@ test('work capability uses a fresh official directory and fails closed on missin
   const result=await fn({operation:'activities',identity});assert.equal(result.ok,true);assert.equal(result.data.tasks[0].work_capability.available,mode==='present');assert.equal(reads,1);
  }
 });
+
+test('work task start uses the official click event and binds the returned instance',async()=>{
+ let calls=[],group='g',taskStatus=1,instance='';
+ const task=()=>({campaign_code:'work-doc',campaign_group_code:group,campaign_type:'GenWord',task_kind:'chat_activity',title:'Synthetic doc',task_status:taskStatus,task_id:instance||undefined});
+ const api={getBaseURL:()=> 'https://www.doubao.com',getCommonParams:async()=>({}),getCommonHeaders:async()=>({}),httpClient:async req=>{
+  const path=new URL(req.url).pathname;calls.push({path,data:req.data});
+  if(path==='/alice/basic/launch')return {code:0,data:{ug_campaign_info:{campaign_group_code:group}}};
+  if(path==='/alice/ug/event/report'){if(req.data.scene==='campaign_task_click'){taskStatus=4;instance='synthetic-instance'}return {code:0,data:{task_id:'synthetic-instance',task_status:4}};}
+  if(path==='/alice/ug/campaign/v3/detail/')return {code:0,data:{campaign_code:group,tasks:[task()],milestones:[],progress:{total_amount:0}}};
+  throw Error('unexpected');
+ }};
+ const modules={z5:{getFlowAccount:()=>({passportApi:{getPassportSDK:async()=>({login:{checkLogin:async()=>({user_id_str:'synthetic-account'})}})}})},uui:{createRequest:()=>({apiContext:api})},Pp:{Y:()=>({})},aT:{Kn:{System:2}},isL:{ph:()=> 'synthetic-skill'},wWT:{skillsFacadeApiService:{AGWListUserAndFeaturedSkills:async()=>({code:0,data:{skills:[{name:'synthetic-skill',type:2,visible:true}]}})}}};
+ const window={'chunk_@flow-web/desktop':{push:x=>x[2](id=>modules[id])}};
+ const fn=vm.runInNewContext('('+source+')',{window,crypto:webcrypto,TextEncoder,setTimeout,clearTimeout});
+ const before=await fn({operation:'activities',identity});assert.equal(before.ok,true);assert.equal(before.data.tasks[0].task_status,1);
+ const r=await fn({operation:'task_start',identity,group,task:'work-doc'});
+ assert.equal(r.ok,true);assert.equal(r.data.operation_status,'submitted');
+ const report=calls.filter(x=>x.path==='/alice/ug/event/report');
+ assert.equal(report.length,1);assert.equal(report[0].data.scene,'campaign_task_click');assert.equal(report[0].data.campaign_item_code,'work-doc');assert.equal(report[0].data.params.campaign_group_code,group);
+ assert.equal(r.data.tasks[0].task_id,'synthetic-instance');assert.equal(r.data.tasks[0].task_status,4);
+});
+
+test('message fact report requires the signed message id and never invents one',async()=>{
+ let calls=[],group='g',status=4;
+ const task=()=>({campaign_code:'work-doc',campaign_group_code:group,campaign_type:'GenWord',task_kind:'chat_activity',title:'Synthetic doc',task_status:status,task_id:'synthetic-instance'});
+ const api={getBaseURL:()=> 'https://www.doubao.com',getCommonParams:async()=>({}),getCommonHeaders:async()=>({}),httpClient:async req=>{
+  const path=new URL(req.url).pathname;calls.push({path,data:req.data});
+  if(path==='/alice/basic/launch')return {code:0,data:{ug_campaign_info:{campaign_group_code:group}}};
+  if(path==='/alice/ug/event/report'){assert.equal(req.data.scene,'GenWord');assert.equal(req.data.message_id,'synthetic-message');assert.equal(req.data.campaign_item_code,'work-doc');status=2;return {code:0,data:{}};}
+  if(path==='/alice/ug/campaign/v3/detail/')return {code:0,data:{campaign_code:group,tasks:[task()],milestones:[],progress:{total_amount:0}}};
+  throw Error('unexpected');
+ }};
+ const modules={z5:{getFlowAccount:()=>({passportApi:{getPassportSDK:async()=>({login:{checkLogin:async()=>({user_id_str:'synthetic-account'})}})}})},uui:{createRequest:()=>({apiContext:api})},Pp:{Y:()=>({})},aT:{Kn:{System:2}},isL:{ph:()=> 'synthetic-skill'},wWT:{skillsFacadeApiService:{AGWListUserAndFeaturedSkills:async()=>({code:0,data:{skills:[{name:'synthetic-skill',type:2,visible:true}]}})}}};
+ const window={'chunk_@flow-web/desktop':{push:x=>x[2](id=>modules[id])}};
+ const fn=vm.runInNewContext('('+source+')',{window,crypto:webcrypto,TextEncoder,setTimeout,clearTimeout});
+ for(const bad of ['',null,'has space','x'.repeat(129)]){
+  const r=await fn({operation:'task_fact',identity,group,task:'work-doc',message:bad,instance:'synthetic-instance'});
+  assert.equal(r.ok,false);assert.equal(r.error,'desktop_protocol_invalid');
+ }
+ assert.equal(calls.filter(x=>x.path==='/alice/ug/event/report').length,0);
+ const r=await fn({operation:'task_fact',identity,group,task:'work-doc',message:'synthetic-message',instance:'synthetic-instance'});
+ assert.equal(r.ok,true);assert.equal(r.data.operation_status,'submitted');assert.equal(r.data.tasks[0].task_status,2);
+});

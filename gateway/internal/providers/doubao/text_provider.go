@@ -159,6 +159,7 @@ func (p *TextProvider) completeConversation(ctx context.Context, model, text, co
 	report, err := (stream.Runner{Opener: prepared, Options: options}).RunObserved(ctx, prepared.Body, progress.apply)
 
 	result.RequestDigest = prepared.RequestDigest
+	result.MessageID = report.MessageID
 	result.Attempted = result.Attempted || prepared.Submitted
 	result.Acknowledged = report.Acknowledged
 	result.Complete = report.ProtocolComplete

@@ -95,6 +95,9 @@ type Report struct {
 	ProtocolComplete, NativeContent                bool
 	Acknowledged                                   bool
 	ConversationID                                 string `json:"-"`
+	// MessageID is the signed server id of this attempt's own user message. It
+	// is the only id accepted by the official task fact report.
+	MessageID string `json:"-"`
 }
 
 func (Report) String() string   { return "doubao.stream.Report[redacted]" }
@@ -207,7 +210,8 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 					if event.Name == "SSE_ACK" && !async && (ownership.Meta.Local != "" || ownership.Meta.Remote != "") && len(ownership.Messages) > 0 {
 						var ack struct {
 							Queries []struct {
-								Local string `json:"local_message_id"`
+								Local    string `json:"local_message_id"`
+								Question string `json:"question_id"`
 							} `json:"query_list"`
 							Meta struct {
 								Local  string `json:"local_conversation_id"`
@@ -221,8 +225,12 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 							valid = valid && ack.Meta.Local == ownership.Meta.Local
 						}
 						seen := map[string]bool{}
+						question := ""
 						for _, q := range ack.Queries {
 							seen[q.Local] = true
+							if q.Local != "" && q.Question != "" {
+								question = q.Question
+							}
 						}
 						for _, m := range ownership.Messages {
 							valid = valid && m.Local != "" && seen[m.Local]
@@ -236,6 +244,9 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 							break
 						}
 						report.ConversationID = ack.Meta.Remote
+						if len(ack.Queries) == 1 && question != "" && len(question) <= 128 {
+							report.MessageID = question
+						}
 					}
 					priorEvents := state.Events
 					if err = state.Apply(cursor, event, emit); err != nil {
