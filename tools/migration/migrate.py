@@ -110,9 +110,15 @@ def object_file(path: Path) -> dict:
 def digest(path: Path) -> str:
     regular_file(path)
     h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(chunk)
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                h.update(chunk)
+    except PermissionError:
+        # A live official client holds Chromium's profile lock and other files.
+        # Migration is an offline operation; say so instead of a generic OS
+        # failure that hides the required action ("close the client").
+        raise MigrationError("source_in_use_close_the_gateway_and_client") from None
     return h.hexdigest()
 
 

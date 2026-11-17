@@ -332,3 +332,18 @@ class MigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LiveSourceMessageTests(unittest.TestCase):
+    def test_locked_file_reports_offline_requirement(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "profile" / "lockfile"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"")
+            original = Path.open
+            def denied(self, *args, **kwargs):
+                if self == path:
+                    raise PermissionError(13, "locked")
+                return original(self, *args, **kwargs)
+            with patch.object(Path, "open", denied), self.assertRaises(m.MigrationError) as raised:
+                m.digest(path)
+            self.assertEqual(str(raised.exception), "source_in_use_close_the_gateway_and_client")
