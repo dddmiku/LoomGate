@@ -393,6 +393,9 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 	case path == "/api/features/reasoning-loop":
 		s.gatewayAdmin(w, r, http.MethodGet, "/features/reasoning-loop", nil)
 		return
+	case path == "/api/migration":
+		s.migrationStatus(w, r)
+		return
 	case path == "/api/models":
 		writeJSON(w, http.StatusOK, modelsPayload(s.gateway.Get(ctx, "/v1/models")))
 		return

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/accountvault"
+	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
@@ -252,12 +253,24 @@ func main() {
 			panic("fixture_seed_failed")
 		}
 	}
-	gateway := server.NewHandler(server.Config{Pool: p, Usage: ledger, Requests: journal})
+	keyStore, err := apikeys.Open(filepath.Join(*root, "data", "api_keys.json"), "")
+	if err != nil {
+		panic("fixture_keys_failed")
+	}
+	gateway := server.NewHandler(server.Config{Pool: p, Usage: ledger, Requests: journal, APIKeys: keyStore})
 	connection := &doubao.DesktopConnection{Vault: vault}
 	if *desktop || *managedLogin {
 		connection.Runtime = &syntheticDesktop{fixture: fixture}
 	}
+	keyAdmin := keyStore.AdminHandler(true)
 	management := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The panel forwards key CRUD to the management channel, which in the
+		// real process mounts the API key store. Mirror that mount here so the
+		// console key lifecycle is exercised against the real store code.
+		if r.URL.Path == "/keys" || strings.HasPrefix(r.URL.Path, "/keys/") {
+			keyAdmin.ServeHTTP(w, r)
+			return
+		}
 		if connection.Route(w, r) {
 			return
 		}

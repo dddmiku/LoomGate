@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_wait import wait_run
 from console_actions import choose_provider, choose_account, choose_capability, reveal_filter, select_task, plan_timing, plan_times, plan_review, sidebar_action
 
@@ -48,7 +49,7 @@ def main():
             if not page.locator('#navigation').is_visible():
                 page.locator('#navigation-toggle').click()
             page.locator('#navigation a[href="#'+route+'"]').click()
-            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','schedules':'计划','runs':'执行记录','usage':'用量','logs':'请求记录','settings':'设置'}[route]).wait_for(state='attached')
+            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','schedules':'计划','runs':'执行记录','usage':'用量','logs':'请求记录','keys':'访问密钥','migration':'迁移','settings':'设置'}[route]).wait_for(state='attached')
         def shot(name):
             if page.locator('#toast').count() and page.locator('#toast').is_visible():
                 page.locator('#toast').wait_for(state='hidden',timeout=7000)
@@ -239,7 +240,7 @@ def main():
         page.locator('[data-action=logs-prev]').click();page.get_by_text('synthetic-request-30',exact=True).wait_for();done('real_usage_and_request_stores_with_pagination')
         stage='mobile'
         page.set_viewport_size({'width':390,'height':844})
-        for route in ['overview','providers','accounts','models','tasks','schedules','runs','usage','logs','settings']:
+        for route in ['overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings']:
             nav(route)
             page.locator('#view > .loading').wait_for(state='detached')
             if route=='models':models_settled()
@@ -248,8 +249,36 @@ def main():
                 shot('console-'+route+'-mobile.png')
             if route=='models':
                 assert page.locator('#model-account').bounding_box()['width']>=240
-        done('ten_mobile_routes_and_usable_filter_widths')
+        done('twelve_mobile_routes_and_usable_filter_widths')
+        stage='key-lifecycle'
+        page.set_viewport_size({'width':1440,'height':1000})
+        nav('keys')
+        page.locator('[data-action="key-new"]').click()
+        page.locator('#key-form input[name="name"]').fill('synthetic-browser-key')
+        page.locator('#key-form button[type=submit]').click()
+        page.locator('#dialog textarea[readonly]').wait_for()
+        secret = page.locator('#dialog textarea[readonly]').input_value()
+        assert secret.startswith('wbk_') and len(secret) > 20
+        page.locator('#dialog [data-action=close]').click()
+        page.locator('[data-action="key-edit"]').wait_for()
+        assert page.locator('text=synthetic-browser-key').count() == 1
+        assert page.locator('code', has_text='wbk_').count() >= 1
+        done('key_create_shows_secret_only_in_dialog_and_lists_masked')
+        page.locator('[data-action="key-toggle"]').first.click()
+        page.locator('[data-status=disabled]').first.wait_for(timeout=10000)
+        done('key_disable_persists_and_reads_back')
+        page.locator('[data-action="key-edit"]').first.click()
+        page.locator('#key-form input[name="note"]').fill('synthetic note')
+        page.locator('#key-form button[type=submit]').click()
+        page.locator('text=synthetic note').wait_for(timeout=10000)
+        done('key_edit_reads_back')
+        stage='migration-page'
+        nav('migration')
+        page.locator('text=离线迁移工具').first.wait_for()
+        page.locator('#view').get_by_text('当前工作区', exact=True).first.wait_for()
+        done('migration_page_reports_no_marker_without_claiming_migration')
         stage='dark-and-settings'
+        nav('settings')
         sidebar_action(page,'#theme');assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')
         page.locator('[data-action=password]').click();page.locator('#password-form').wait_for();page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
         sidebar_action(page,'#theme');done('theme_persistence_settings_and_keyboard_dialog')
