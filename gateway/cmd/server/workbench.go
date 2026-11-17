@@ -161,7 +161,7 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 			desktop = bridge
 		}
 	}
-	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json")})
+	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json"), AllowTaskTimeout: true})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -202,7 +202,8 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 		return nil, nil, err
 	}
 	client := doubao.NewWithRuntime(doubao.VaultSessions{Vault: vault}, desktop)
-	if err = e.Register("doubao", &taskproviders.Doubao{Vault: vault, Client: client}); err != nil {
+	doubaoTasks := &taskproviders.Doubao{Vault: vault, Client: client}
+	if err = e.Register("doubao", doubaoTasks); err != nil {
 		e.Close()
 		vault.Close()
 		return nil, nil, err
@@ -211,10 +212,11 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 	workbench.connection = &doubao.DesktopConnection{Vault: vault}
 	if runtime, ok := desktop.(*doubao.CommandRuntime); ok {
 		workbench.connection.Runtime = runtime
-		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime}}
+		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime, Dialogues: &doubao.DialogueStore{Vault: taskVault}}}
+		doubaoTasks.Work = &taskproviders.DoubaoWork{Vault: taskVault, Provider: workbench.inference["doubao"].(*doubao.TextProvider)}
 	}
 	base := e.Handler()
-	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, LegacyCounts: func() map[string]providercatalog.Count {
+	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, DoubaoMultiTurn: len(workbench.inference) > 0, LegacyCounts: func() map[string]providercatalog.Count {
 		counts := map[string]providercatalog.Count{}
 		for _, a := range p.List() {
 			id := "workbuddy"

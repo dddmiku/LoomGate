@@ -20,6 +20,8 @@ type Options struct {
 	Timeout     time.Duration
 	PollMin     time.Duration
 	PollMax     time.Duration
+	// Explicit opt-in permits a trusted adapter to request a bounded work budget.
+	AllowTaskTimeout bool
 }
 type Engine struct {
 	mu       sync.Mutex
@@ -496,7 +498,11 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 			case <-ctx.Done():
 				return StatusCanceled, ctx.Err()
 			}
-			bounded, cancel := context.WithTimeout(ctx, e.opts.Timeout)
+			budget := e.opts.Timeout
+			if e.opts.AllowTaskTimeout && t.TimeoutSeconds > 0 && t.TimeoutSeconds <= 900 {
+				budget = time.Duration(t.TimeoutSeconds) * time.Second
+			}
+			bounded, cancel := context.WithTimeout(ctx, budget)
 			defer cancel()
 			return e.runTask(bounded, r.ID, t, a)
 		}()

@@ -18,20 +18,45 @@ type DailyCheckin struct {
 	RewardStatus int    `json:"reward_status,omitempty"`
 }
 type Task struct {
-	ID              string        `json:"task_id,omitempty"`
-	Code            string        `json:"campaign_code"`
-	Group           string        `json:"campaign_group_code"`
-	Kind            string        `json:"task_kind"`
-	Title           string        `json:"title"`
-	Subtitle        string        `json:"subtitle"`
-	Description     string        `json:"description"`
-	Type            string        `json:"campaign_type"`
-	Recommendations []string      `json:"recommend_prompts,omitempty"`
-	Status          int           `json:"task_status"`
-	RewardMode      int           `json:"reward_mode"`
-	Daily           *DailyCheckin `json:"daily_checkin,omitempty"`
-	Rewards         []Reward      `json:"reward_summaries,omitempty"`
-	Threshold       int64         `json:"milestone_threshold,omitempty"`
+	ID              string          `json:"task_id,omitempty"`
+	Code            string          `json:"campaign_code"`
+	Group           string          `json:"campaign_group_code"`
+	Kind            string          `json:"task_kind"`
+	Title           string          `json:"title"`
+	Subtitle        string          `json:"subtitle"`
+	Description     string          `json:"description"`
+	Type            string          `json:"campaign_type"`
+	Recommendations []string        `json:"recommend_prompts,omitempty"`
+	Status          int             `json:"task_status"`
+	RewardMode      int             `json:"reward_mode"`
+	Daily           *DailyCheckin   `json:"daily_checkin,omitempty"`
+	Rewards         []Reward        `json:"reward_summaries,omitempty"`
+	Threshold       int64           `json:"milestone_threshold,omitempty"`
+	Progress        *TaskProgress   `json:"progress,omitempty"`
+	Work            *WorkCapability `json:"work_capability,omitempty"`
+}
+type WorkCapability struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason"`
+}
+type TaskProgress struct {
+	Current int64 `json:"current"`
+	Target  int64 `json:"target"`
+}
+type RewardRecord struct {
+	ID        string `json:"record_id"`
+	TaskCode  string `json:"task_code"`
+	Amount    string `json:"amount"`
+	Unit      string `json:"unit"`
+	CreatedMS int64  `json:"create_time_ms"`
+}
+
+func (RewardRecord) String() string   { return "doubao.RewardRecord[redacted]" }
+func (RewardRecord) GoString() string { return "doubao.RewardRecord[redacted]" }
+
+type RewardPage struct {
+	Records []RewardRecord `json:"records"`
+	HasMore bool           `json:"has_more"`
 }
 
 // Checkin only accepts a group discovered for this account in the current

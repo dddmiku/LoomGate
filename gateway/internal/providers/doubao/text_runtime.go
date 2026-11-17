@@ -27,6 +27,7 @@ type TextSession struct {
 	RequestDigest string
 	Submitted     bool
 	Attempts      []inference.Attempt
+	Native        bool
 	once          sync.Once
 	closed        chan struct{}
 	closeErr      error
@@ -36,6 +37,12 @@ func (*TextSession) String() string   { return "doubao.TextSession[redacted]" }
 func (*TextSession) GoString() string { return "doubao.TextSession[redacted]" }
 
 func (r *CommandRuntime) PrepareText(ctx context.Context, b RuntimeBinding, model, prompt string) (*TextSession, error) {
+	return r.prepareDialogue(ctx, b, model, prompt, "")
+}
+func (r *CommandRuntime) prepareDialogue(ctx context.Context, b RuntimeBinding, model, prompt, conversation string) (*TextSession, error) {
+	return r.prepareWork(ctx, b, model, prompt, conversation, false)
+}
+func (r *CommandRuntime) prepareWork(ctx context.Context, b RuntimeBinding, model, prompt, conversation string, native bool, task ...*taskAction) (*TextSession, error) {
 	if !identityDigest.MatchString(b.Identity) || !strings.HasPrefix(model, "doubao:") || len(model) > 256 || len(prompt) == 0 || len(prompt) > 65536 {
 		return nil, runtimeError("desktop_binding_invalid")
 	}
@@ -50,22 +57,27 @@ func (r *CommandRuntime) PrepareText(ctx context.Context, b RuntimeBinding, mode
 			<-r.slot
 		}
 	}()
-	ctx, cancel := context.WithTimeout(ctx, 11*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	reply, err := r.invoke(ctx, runtimeRequest{Operation: "prepare_text", Port: r.port, Identity: b.Identity, Model: model, Prompt: prompt})
+	var workTask *taskAction
+	if len(task) > 0 {
+		workTask = task[0]
+	}
+	reply, err := r.invoke(ctx, runtimeRequest{Operation: "prepare_text", Port: r.port, Identity: b.Identity, Model: model, Prompt: prompt, Conversation: conversation, Work: native, WorkTask: workTask})
 	if err != nil {
 		return nil, err
 	}
 	var data struct {
-		Lease string          `json:"lease"`
-		Body  json.RawMessage `json:"body"`
-		Model string          `json:"model"`
+		Lease  string          `json:"lease"`
+		Body   json.RawMessage `json:"body"`
+		Model  string          `json:"model"`
+		Native bool            `json:"native"`
 	}
-	if json.Unmarshal(reply.Data, &data) != nil || reply.Identity != b.Identity || len(data.Lease) != 36 || data.Model != model || len(data.Body) == 0 || !json.Valid(data.Body) {
+	if json.Unmarshal(reply.Data, &data) != nil || reply.Identity != b.Identity || len(data.Lease) != 36 || data.Model != model || data.Native != native || len(data.Body) == 0 || !json.Valid(data.Body) {
 		return nil, runtimeError("desktop_protocol_invalid")
 	}
 	success = true
-	return &TextSession{runtime: r, binding: b, Lease: data.Lease, Body: data.Body, Model: model, closed: make(chan struct{})}, nil
+	return &TextSession{runtime: r, binding: b, Lease: data.Lease, Body: data.Body, Model: model, Native: native, closed: make(chan struct{})}, nil
 }
 func (s *TextSession) Close() error {
 	s.once.Do(func() {
@@ -223,7 +235,8 @@ func (s *TextSession) Open(ctx context.Context, req stream.Request) (io.ReadClos
 		Path      string          `json:"path"`
 		Body      json.RawMessage `json:"body"`
 		Resume    bool            `json:"resume"`
-	}{"stream_text", port, s.binding.Identity, s.Lease, req.Path, req.Body, req.Resume}
+		Work      bool            `json:"work,omitempty"`
+	}{"stream_text", port, s.binding.Identity, s.Lease, req.Path, req.Body, req.Resume, s.Native}
 	raw, err := json.Marshal(payload)
 	if err != nil || len(raw) > 1<<20 {
 		return nil, runtimeError("desktop_protocol_invalid")

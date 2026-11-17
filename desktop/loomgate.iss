@@ -50,6 +50,7 @@ Source: "{#PayloadDir}\doubao-runtime\managed.py"; DestDir: "{app}\program\douba
 Source: "{#PayloadDir}\doubao-runtime\stream_bridge.py"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 Source: "{#PayloadDir}\doubao-runtime\runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 Source: "{#PayloadDir}\doubao-runtime\tasks_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
+Source: "{#PayloadDir}\doubao-runtime\work_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 Source: "{#PayloadDir}\doubao-runtime\stream_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 Source: "{#PayloadDir}\doubao-runtime\probe_runtime.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion
 Source: "{#PayloadDir}\doubao-runtime\probe_cleanup.js"; DestDir: "{app}\program\doubao-runtime"; Flags: ignoreversion

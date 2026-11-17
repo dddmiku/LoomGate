@@ -4,7 +4,7 @@ import argparse,hashlib,importlib.util,json,os,re,subprocess,shutil
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-RUNTIME_FILES=('bridge.py','managed.py','stream_bridge.py','runtime.js','tasks_runtime.js','stream_runtime.js','probe_runtime.js','probe_cleanup.js','requirements.txt')
+RUNTIME_FILES=('bridge.py','managed.py','stream_bridge.py','runtime.js','tasks_runtime.js','work_runtime.js','stream_runtime.js','probe_runtime.js','probe_cleanup.js','requirements.txt')
 PAYLOAD=('LoomGate.exe','wb2api.exe','login.exe','credit.exe','fission_bin.exe','release-signing.pub','manifest.json','README.txt','LICENSE')+tuple('doubao-runtime/'+name for name in RUNTIME_FILES)
 PROGRAMS={'LoomGate.exe':'desktop','wb2api.exe':'server','login.exe':'login','credit.exe':'credit','fission_bin.exe':'fission'}
 

@@ -42,6 +42,20 @@ func TestWorkbenchHTTPRejectsUnknownAndTrailingJSONBeforeMutation(t *testing.T) 
 	}
 }
 
+func TestWorkbenchDoesNotExposeGeneralDoubaoWorkProduct(t *testing.T) {
+	e := openBehaviorEngine(t, taskengine.Options{})
+	for _, path := range []string{"/workbench/doubao/works", "/workbench/doubao/work-status", "/workbench/doubao/artifact", "/workbench/doubao/work-input"} {
+		for _, method := range []string{"GET", "POST"} {
+			if response := workbenchHTTP(t, e, method, path, `{}`); response.Code != 404 {
+				t.Fatal("general work route remains exposed", response.Code)
+			}
+		}
+	}
+	if len(e.Runs()) != 0 {
+		t.Fatal("unsupported route dispatched work")
+	}
+}
+
 func TestWorkbenchHTTPOnlyAcceptsJSONObjectsForCommands(t *testing.T) {
 	for _, path := range []string{"/workbench/run", "/workbench/cancel", "/workbench/schedule", "/workbench/schedule/delete"} {
 		t.Run(path, func(t *testing.T) {

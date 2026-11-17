@@ -108,6 +108,7 @@ func main() {
 	design := flag.Bool("design-preview", false, "use clearly labeled fictional models for visual comparison")
 	desktop := flag.Bool("desktop-connection", false, "use real binding driver with synthetic official runtime")
 	managedLogin := flag.Bool("managed-login", false, "exercise managed login with synthetic official state only")
+	doubaoWork := flag.Bool("doubao-work", false, "exercise real Doubao task adapter with synthetic work/rewards")
 	traeTasks := flag.Bool("trae-tasks", false, "use real Trae lifecycle modules with synthetic transport")
 	keepalive := flag.Bool("keepalive-modules", false, "use official refresh adapters with synthetic transport and encrypted recovery")
 	flag.Parse()
@@ -148,7 +149,11 @@ func main() {
 	}
 	client := doubao.New(fixture, fixture)
 	catalog := providercatalog.New(providercatalog.Options{Accounts: fixture, Doubao: client, Timeout: 3 * time.Second})
-	engine, err := taskengine.Open(taskengine.Options{Path: filepath.Join(*root, "data", "synthetic-tasks.json"), PollMin: 25 * time.Millisecond, PollMax: 50 * time.Millisecond, Timeout: 30 * time.Second})
+	taskTimeout := 30 * time.Second
+	if *doubaoWork {
+		taskTimeout = 1500 * time.Millisecond
+	}
+	engine, err := taskengine.Open(taskengine.Options{Path: filepath.Join(*root, "data", "synthetic-tasks.json"), PollMin: 25 * time.Millisecond, PollMax: 50 * time.Millisecond, Timeout: taskTimeout})
 	if err != nil {
 		panic("fixture_engine_failed")
 	}
@@ -159,6 +164,18 @@ func main() {
 	var traeAdapter taskengine.Adapter
 	var traeFixture *traeTaskFixture
 	var refreshFixture *keepaliveFixture
+	var doubaoAdapter *taskproviders.Doubao
+	var workFixture *doubaoWorkFixture
+	if *doubaoWork {
+		var state *accountvault.Vault
+		doubaoAdapter, workFixture, state, err = newDoubaoWorkFixture(*root, vault)
+		if err != nil {
+			panic("synthetic_work_failed")
+		}
+		defer state.Close()
+		client = doubaoAdapter.Client
+		catalog = providercatalog.New(providercatalog.Options{Accounts: fixture, Doubao: client, DoubaoInference: true, DoubaoMultiTurn: true})
+	}
 	if *keepalive {
 		refreshVault, err := accountvault.Open(filepath.Join(*root, "data", "refresh-state"))
 		if err != nil {
@@ -204,6 +221,9 @@ func main() {
 		}
 		if id == "trae" && traeAdapter != nil {
 			adapter = traeAdapter
+		}
+		if id == "doubao" && doubaoAdapter != nil {
+			adapter = doubaoAdapter
 		}
 		if err = engine.Register(id, adapter); err != nil {
 			panic("fixture_adapter_failed")
@@ -287,6 +307,41 @@ func main() {
 	}
 	defer admin.Close()
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__fixture/work-stats", func(w http.ResponseWriter, r *http.Request) {
+		if workFixture == nil {
+			w.WriteHeader(404)
+			return
+		}
+		workFixture.mu.Lock()
+		defer workFixture.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"generated": workFixture.state.Generated, "claims": workFixture.state.Claims, "reward_records": len(workFixture.state.Records), "status": workFixture.state.Status})
+	})
+	mux.HandleFunc("POST /__fixture/work-mode/{mode}", func(w http.ResponseWriter, r *http.Request) {
+		if workFixture == nil {
+			w.WriteHeader(404)
+			return
+		}
+		workFixture.mu.Lock()
+		defer workFixture.mu.Unlock()
+		switch r.PathValue("mode") {
+		case "withhold":
+			workFixture.withhold = true
+		case "publish":
+			if workFixture.state.Claims != 1 || len(workFixture.state.Records) != 0 {
+				w.WriteHeader(409)
+				return
+			}
+			workFixture.state.Records = append(workFixture.state.Records, doubao.RewardRecord{ID: "synthetic-delayed-record", TaskCode: "synthetic-work-task", Amount: "100", Unit: "points", CreatedMS: time.Now().UnixMilli()})
+			if workFixture.save() != nil {
+				w.WriteHeader(500)
+				return
+			}
+		default:
+			w.WriteHeader(400)
+			return
+		}
+		w.WriteHeader(204)
+	})
 	mux.HandleFunc("GET /__fixture/refresh-stats", func(w http.ResponseWriter, r *http.Request) {
 		if refreshFixture == nil {
 			w.WriteHeader(404)

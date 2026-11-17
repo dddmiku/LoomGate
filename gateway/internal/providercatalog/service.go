@@ -45,6 +45,7 @@ type Options struct {
 	Timeout         time.Duration
 	Concurrency     int
 	DoubaoInference bool
+	DoubaoMultiTurn bool
 }
 type Service struct {
 	opts  Options
@@ -320,6 +321,9 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		row.Models = snapshot.Models
 		if s.opts.DoubaoInference && snapshot.RuntimeBound {
 			row.RoutingStatus = "single_turn_text"
+			if s.opts.DoubaoMultiTurn {
+				row.RoutingStatus = "verified_conversation"
+			}
 		}
 	}
 	if err != nil || snapshot.Stale || snapshot.ErrorCode != "" {
@@ -349,6 +353,7 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 	}
 	for i := range row.Models {
 		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound && !row.Models[i].NativeTools
+		row.Models[i].SupportsMultiTurn = row.Models[i].InferenceAvailable && s.opts.DoubaoMultiTurn
 	}
 	return
 }

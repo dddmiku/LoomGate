@@ -88,12 +88,18 @@ type Options struct {
 	Limits                           Limits
 	Timeout, AttemptTimeout, Backoff time.Duration
 	MaxResumes                       int
+	TaskWork                         bool
 }
 type Report struct {
 	Events, Replayed, Messages, Handoffs, Attempts int
 	ProtocolComplete, NativeContent                bool
 	Acknowledged                                   bool
+	ConversationID                                 string `json:"-"`
 }
+
+func (Report) String() string   { return "doubao.stream.Report[redacted]" }
+func (Report) GoString() string { return "doubao.stream.Report[redacted]" }
+
 type Runner struct {
 	Opener  Opener
 	Options Options
@@ -136,9 +142,11 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	state := NewState(o.Limits)
+	state.allowTaskWork = o.TaskWork
 	var ownership struct {
 		Meta struct {
-			Local string `json:"local_conversation_id"`
+			Local  string `json:"local_conversation_id"`
+			Remote string `json:"conversation_id"`
 		} `json:"client_meta"`
 		Messages []struct {
 			Local string `json:"local_message_id"`
@@ -196,16 +204,22 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 						}
 						break
 					}
-					if event.Name == "SSE_ACK" && !async && ownership.Meta.Local != "" && len(ownership.Messages) > 0 {
+					if event.Name == "SSE_ACK" && !async && (ownership.Meta.Local != "" || ownership.Meta.Remote != "") && len(ownership.Messages) > 0 {
 						var ack struct {
 							Queries []struct {
 								Local string `json:"local_message_id"`
 							} `json:"query_list"`
 							Meta struct {
-								Local string `json:"local_conversation_id"`
+								Local  string `json:"local_conversation_id"`
+								Remote string `json:"conversation_id"`
 							} `json:"ack_client_meta"`
 						}
-						valid := json.Unmarshal(event.Data, &ack) == nil && ack.Meta.Local == ownership.Meta.Local && len(ack.Queries) == len(ownership.Messages)
+						valid := json.Unmarshal(event.Data, &ack) == nil && len(ack.Queries) == len(ownership.Messages)
+						if ownership.Meta.Remote != "" {
+							valid = valid && ack.Meta.Remote == ownership.Meta.Remote
+						} else {
+							valid = valid && ack.Meta.Local == ownership.Meta.Local
+						}
 						seen := map[string]bool{}
 						for _, q := range ack.Queries {
 							seen[q.Local] = true
@@ -217,6 +231,11 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 							err = NoResume(errors.New("doubao_stream_ownership_mismatch"))
 							break
 						}
+						if report.ConversationID != "" && ack.Meta.Remote != report.ConversationID {
+							err = NoResume(ErrMalformed)
+							break
+						}
+						report.ConversationID = ack.Meta.Remote
 					}
 					priorEvents := state.Events
 					if err = state.Apply(cursor, event, emit); err != nil {

@@ -30,6 +30,7 @@ type Model struct {
 	Tiers              []string `json:"tiers,omitempty"`
 	NeedLogin          bool     `json:"need_login"`
 	InferenceAvailable bool     `json:"inference_available"`
+	SupportsMultiTurn  bool     `json:"supports_multi_turn"`
 }
 type Catalog struct {
 	Models       []Model   `json:"models"`

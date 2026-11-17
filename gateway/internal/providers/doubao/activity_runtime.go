@@ -43,9 +43,15 @@ func (r *CommandRuntime) taskOperation(ctx context.Context, b RuntimeBinding, op
 	return activity, nil
 }
 func (c *Client) TaskAction(ctx context.Context, account, operation string, t Task) (Activity, error) {
+	return c.TaskActionRevision(ctx, account, "", operation, t)
+}
+func (c *Client) TaskActionRevision(ctx context.Context, account, revision, operation string, t Task) (Activity, error) {
 	s, err := c.sessions.Session(ctx, account)
 	if err != nil {
 		return Activity{}, runtimeError("login_required")
+	}
+	if revision != "" && s.Revision != revision {
+		return Activity{}, runtimeError("desktop_binding_invalid")
 	}
 	if s.Runtime != nil {
 		r, ok := c.runtime.(ActivityRuntime)

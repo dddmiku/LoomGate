@@ -13,6 +13,7 @@ import (
 type Doubao struct {
 	Vault  *accountvault.Vault
 	Client *doubao.Client
+	Work   *DoubaoWork
 }
 
 func (a *Doubao) Discover(ctx context.Context, scope taskengine.Scope) ([]taskengine.Task, error) {
@@ -83,7 +84,25 @@ func (a *Doubao) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, ke
 				}
 			}
 			state := doubaoObservation(t, activity.TotalAmount)
-			definition.ManualOnly = t.Daily == nil && t.Kind != "points_milestone" && state.Phase != "done" && state.Phase != "claimable"
+			if a.Work != nil && state.Phase != "done" && state.Phase != "claimable" {
+				pending := taskengine.Task{Definition: definition, Target: taskengine.Target{AccountID: account.ID}}
+				if j, _, e := a.Work.journal(pending); e == nil && j.Period == definition.PeriodKey {
+					state.Phase = "pending"
+					state.Summary = "已有操作等待官方任务与奖励核验，不会重新提交。"
+				}
+			}
+			if a.Work != nil && supportedWork(t.Type) {
+				definition.TimeoutSeconds = 660
+			}
+			candidate := taskengine.Task{Definition: definition, Target: taskengine.Target{AccountID: account.ID}}
+			if state.Phase == "manual" && a.workReady(candidate, t) {
+				state.Phase = "ready"
+				state.Summary = "已配置真实工作内容，执行后核验官方任务与奖励。"
+			}
+			definition.ManualOnly = t.Daily == nil && t.Kind != "points_milestone" && state.Phase != "done" && state.Phase != "claimable" && state.Phase != "pending"
+			if state.Phase == "ready" && supportedWork(t.Type) {
+				definition.ManualOnly = false
+			}
 			if state.Phase == "manual" {
 				definition.Description = strings.TrimSpace(definition.Description + " " + state.Summary)
 			}
@@ -99,6 +118,9 @@ func (a *Doubao) find(ctx context.Context, t taskengine.Task) (doubao.Task, doub
 	}
 	for _, x := range append(append([]doubao.Task{}, activity.Tasks...), activity.Milestones...) {
 		if x.Group+":"+x.Code == t.Key {
+			if strings.HasPrefix(t.PeriodKey, "instance:") && t.PeriodKey != "instance:"+x.ID {
+				return doubao.Task{}, activity, errors.New("doubao_task_expired")
+			}
 			return x, activity, nil
 		}
 	}
@@ -106,6 +128,10 @@ func (a *Doubao) find(ctx context.Context, t taskengine.Task) (doubao.Task, doub
 }
 func doubaoObservation(t doubao.Task, total int64) taskengine.Observation {
 	o := taskengine.Observation{Phase: "manual", Summary: "请在官方豆包左侧“免费用豆包工作”完成此项真实工作，然后刷新状态。"}
+	if t.Progress != nil {
+		o.Current = t.Progress.Current
+		o.Total = t.Progress.Target
+	}
 	if t.Status == 3 && t.Daily == nil {
 		o.Phase = "done"
 		o.Summary = "上游已确认奖励领取完成。"
@@ -149,14 +175,41 @@ func doubaoObservation(t doubao.Task, total int64) taskengine.Observation {
 	if t.Type == "select_work_fields" {
 		o.Summary = "请在官方任务页选择你真实的工作领域，再刷新状态；网关不会代填个人资料。"
 	}
+	if t.Work != nil && !t.Work.Available {
+		o.Summary = "当前账号的云端目录缺少此任务所需的官方技能。请从豆包左侧“免费用豆包工作”进入此项任务，按官方要求完成；网关可继续读取进度和核验奖励。"
+		if t.Work.Reason == "capability_unavailable" {
+			o.Summary = "官方技能目录暂时无法核验，请刷新后重试；尚未提交工作。"
+		}
+	}
 	return o
 }
 func (a *Doubao) Inspect(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
+	if t.PendingVerification {
+		if err := a.reconcileWork(ctx, t); err != nil {
+			return taskengine.Observation{Phase: "pending"}, err
+		}
+	}
 	current, activity, err := a.find(ctx, t)
 	if err != nil {
 		return taskengine.Observation{}, err
 	}
-	return doubaoObservation(current, activity.TotalAmount), nil
+	state := doubaoObservation(current, activity.TotalAmount)
+	if a.Work != nil && state.Phase != "done" && state.Phase != "claimable" {
+		if j, _, e := a.Work.journal(t); e == nil && j.Period == t.PeriodKey {
+			state.Phase = "pending"
+			state.Summary = "已有操作等待官方任务与奖励核验，不会重新提交。"
+		}
+	}
+	if state.Phase == "manual" && a.workReady(t, current) {
+		if journal, _, err := a.Work.journal(t); err == nil && journal.Period == t.PeriodKey {
+			state.Phase = "pending"
+			state.Summary = "已有真实工作记录，等待官方核验，不重复生成。"
+		} else {
+			state.Phase = "ready"
+			state.Summary = "已配置真实工作内容。"
+		}
+	}
+	return a.verifyReward(ctx, t, current, state)
 }
 func (a *Doubao) Execute(ctx context.Context, t taskengine.Task) (taskengine.Observation, error) {
 	current, activity, err := a.find(ctx, t)
@@ -164,8 +217,14 @@ func (a *Doubao) Execute(ctx context.Context, t taskengine.Task) (taskengine.Obs
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), err
 	}
 	state := doubaoObservation(current, activity.TotalAmount)
+	if state.Phase == "manual" && a.workReady(t, current) {
+		return a.executeWork(ctx, t, current)
+	}
 	if state.Phase != "ready" || current.Daily == nil {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, state), nil
+	}
+	if a.Work != nil {
+		return a.rewardAction(ctx, t, current, taskengine.StageExecute)
 	}
 	_, err = a.Client.TaskAction(ctx, t.AccountID, "task_checkin", current)
 	return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), err
@@ -178,6 +237,9 @@ func (a *Doubao) Claim(ctx context.Context, t taskengine.Task) (taskengine.Obser
 	state := doubaoObservation(current, activity.TotalAmount)
 	if state.Phase != "claimable" {
 		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), nil
+	}
+	if a.Work != nil {
+		return a.rewardAction(ctx, t, current, taskengine.StageClaim)
 	}
 	_, err = a.Client.TaskAction(ctx, t.AccountID, "task_claim", current)
 	return taskengine.UnknownAction(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending"}), err

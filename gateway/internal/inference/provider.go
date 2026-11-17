@@ -11,14 +11,38 @@ type Model struct {
 	ID, Name      string
 	ContextWindow int64
 	Incremental   bool
+	MultiTurn     bool
 }
 type Result struct {
 	Text, AccountRef, RequestDigest   string
 	Attempted, Acknowledged, Complete bool
 	Events, Attempts                  int
 	// Missing usage remains unknown; providers must not estimate billed tokens.
-	UsageReported  bool
-	AttemptRecords []Attempt
+	UsageReported   bool
+	AttemptRecords  []Attempt
+	ConversationRef string
+	Recovery        []byte `json:"-"`
+}
+
+// Dialogue contains caller roles, never a flattened prompt. Owner is an opaque
+// authenticated caller scope; upstream conversation identifiers are not public.
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+type Dialogue struct {
+	Model, Owner, ConversationRef string
+	AccountID, AccountRevision    string
+	Messages                      []Message
+	IdempotencyKey                string
+}
+
+func (Dialogue) String() string   { return "inference.Dialogue[redacted]" }
+func (Dialogue) GoString() string { return "inference.Dialogue[redacted]" }
+
+type DialogueProvider interface {
+	Provider
+	CompleteDialogue(context.Context, Dialogue, func(string) error) (Result, error)
 }
 type Attempt struct {
 	StartedAt, FinishedAt time.Time

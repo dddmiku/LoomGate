@@ -67,28 +67,40 @@ def message_text(value):
 
 
 def validate(request):
-    if isinstance(request,dict) and request.get('operation') in ('activities','task_checkin','task_claim'):
+    if isinstance(request,dict) and request.get('operation')=='work_read':
+        if set(request)-{'operation','port','identity','conversation','session','message'} or type(request.get('port')) is not int or not 1<=request['port']<=65535:raise BridgeError('desktop_protocol_invalid')
+        if not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
+        for key in ['conversation']+(['session','message'] if 'session' in request or 'message'in request else []):
+            if not isinstance(request.get(key),str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}',request[key]):raise BridgeError('desktop_protocol_invalid')
+        return
+    if isinstance(request,dict) and request.get('operation') in ('activities','reward_records','task_checkin','task_claim'):
         if set(request)-{'operation','port','identity','group','task','instance'} or type(request.get('port')) is not int or not 1<=request['port']<=65535 or not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
-        if request['operation']=='activities' and set(request)!={'operation','port','identity'}:raise BridgeError('desktop_protocol_invalid')
-        if request['operation']!='activities':
+        if request['operation'] in ('activities','reward_records') and set(request)!={'operation','port','identity'}:raise BridgeError('desktop_protocol_invalid')
+        if request['operation'] not in ('activities','reward_records'):
             for field in ('group','task'):
                 if not isinstance(request.get(field),str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',request[field]):raise BridgeError('desktop_protocol_invalid')
             if request.get('instance') and (not isinstance(request['instance'],str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',request['instance'])):raise BridgeError('desktop_protocol_invalid')
         return
-    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt', 'model', 'lease', 'path', 'body', 'resume','task_id','scene'}:
+    if not isinstance(request, dict) or set(request) - {'operation', 'port', 'identity', 'bot_id', 'prompt', 'model', 'lease', 'path', 'body', 'resume','task_id','scene','conversation','work','work_task'}:
         raise BridgeError('desktop_protocol_invalid')
     if type(request.get('port')) is not int or not 1 <= request['port'] <= 65535:
         raise BridgeError('desktop_protocol_invalid')
     if request.get('operation') in ('prepare_text','release_text','stream_text','authorize_async'):
         if not isinstance(request.get('identity'),str) or not re.fullmatch('[a-f0-9]{64}',request['identity']):raise BridgeError('desktop_protocol_invalid')
         if request['operation']=='prepare_text':
-            if set(request)!={'operation','port','identity','model','prompt'} or not isinstance(request.get('model'),str) or not request['model'].startswith('doubao:') or len(request['model'])>256 or not isinstance(request.get('prompt'),str) or not 1<=len(request['prompt'].encode())<=65536:raise BridgeError('desktop_protocol_invalid')
+            if set(request)-{'operation','port','identity','model','prompt','conversation','work','work_task'} or not isinstance(request.get('model'),str) or not request['model'].startswith('doubao:') or len(request['model'])>256 or not isinstance(request.get('prompt'),str) or not 1<=len(request['prompt'].encode())<=65536 or type(request.get('work',False)) is not bool:raise BridgeError('desktop_protocol_invalid')
+            if 'work_task' in request:
+                task=request['work_task']
+                if request.get('work') is not True or not isinstance(task,dict) or set(task)!={'group','task','instance'}:raise BridgeError('desktop_protocol_invalid')
+                if any(not isinstance(task.get(k),str) or not re.fullmatch('[A-Za-z0-9._:-]{1,128}',task[k]) for k in ['group','task']):raise BridgeError('desktop_protocol_invalid')
+                if not isinstance(task['instance'],str) or task['instance'] and not re.fullmatch('[A-Za-z0-9._:-]{1,128}',task['instance']):raise BridgeError('desktop_protocol_invalid')
+            if 'conversation' in request and (not isinstance(request['conversation'],str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}',request['conversation'])):raise BridgeError('desktop_protocol_invalid')
         else:
             if not isinstance(request.get('lease'),str) or not re.fullmatch('[a-f0-9-]{36}',request['lease']):raise BridgeError('desktop_protocol_invalid')
             if request['operation']=='release_text' and set(request)!={'operation','port','identity','lease'}:raise BridgeError('desktop_protocol_invalid')
             if request['operation']=='authorize_async' and (set(request)!={'operation','port','identity','lease','task_id','scene'} or not isinstance(request.get('task_id'),str) or not 1<=len(request['task_id'])<=512):raise BridgeError('desktop_protocol_invalid')
             if request['operation']=='stream_text':
-                if set(request)-{'operation','port','identity','lease','path','body','resume'} or request.get('path') not in (COMPLETION_PATH,ASYNC_PATH) or not isinstance(request.get('body'),dict) or type(request.get('resume',False)) is not bool:raise BridgeError('desktop_protocol_invalid')
+                if set(request)-{'operation','port','identity','lease','path','body','resume','work'} or request.get('path') not in (COMPLETION_PATH,ASYNC_PATH) or not isinstance(request.get('body'),dict) or type(request.get('resume',False)) is not bool or type(request.get('work',False)) is not bool:raise BridgeError('desktop_protocol_invalid')
         return
     if set(request)-{'operation','port','identity','bot_id','prompt'}:raise BridgeError('desktop_protocol_invalid')
     if request.get('operation') == 'identity':
@@ -271,7 +283,7 @@ def execute(request,canceled=None):
     validate(request)
     from websockets.sync.client import connect
     script = Path(__file__).with_name('runtime.js').read_text(encoding='utf-8')
-    deadline = time.monotonic()+(20 if request['operation'] in ('activities','task_checkin','task_claim') else 10)
+    deadline = time.monotonic()+(20 if request['operation'] in ('activities','task_checkin','task_claim') or request.get('work') else 10)
     with connect(target(request['port']), open_timeout=2, close_timeout=.1, max_size=LIMIT) as ws:
         seq = 0
         signed = False
@@ -302,8 +314,15 @@ def execute(request,canceled=None):
                     pending.append(event)
         if request['operation'] == 'prepare_completion':
             return prepare_completion_transaction(ws, call, request, deadline, pending,canceled)
-        if request['operation'] in ('activities','task_checkin','task_claim'):
+        if request['operation'] in ('activities','reward_records','task_checkin','task_claim'):
             source=Path(__file__).with_name('tasks_runtime.js').read_text(encoding='utf-8')
+            value=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+')','awaitPromise':True,'returnByValue':True})
+            if value.get('exceptionDetails'):raise BridgeError('desktop_protocol_invalid')
+            result=value.get('result',{}).get('value')
+            if not isinstance(result,dict):raise BridgeError('desktop_protocol_invalid')
+            return result
+        if request['operation']=='work_read':
+            source=Path(__file__).with_name('work_runtime.js').read_text(encoding='utf-8')
             value=call('Runtime.evaluate',{'expression':'('+source+')('+json.dumps(request)+')','awaitPromise':True,'returnByValue':True})
             if value.get('exceptionDetails'):raise BridgeError('desktop_protocol_invalid')
             result=value.get('result',{}).get('value')

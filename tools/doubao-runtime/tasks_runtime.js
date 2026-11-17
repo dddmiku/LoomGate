@@ -21,6 +21,16 @@ async input=>{
       if(value?.code!==0&&value?.code!==200){const error=Error('desktop_upstream_rejected');if(Number.isSafeInteger(value?.code))error.safeCode=value.code;throw error;}
       if(!value.data||typeof value.data!=='object')throw Error('desktop_protocol_invalid');return value.data;
     };
+    if(input.operation==='reward_records'){
+      const records=await call('/alice/ug/campaign/quota/records/',{cursor:'',page_size:100});
+      if(!Array.isArray(records.records)||records.records.length>100||typeof records.has_more!=='boolean')return fail('desktop_protocol_invalid');
+      const rows=[];for(const x of records.records){
+        if(typeof x.record_id!=='string'||!x.record_id||x.record_id.length>128||typeof x.task_code!=='string'||!x.task_code||x.task_code.length>128||typeof x.amount!=='string'||!/^\d{1,15}$/.test(x.amount)||!Number.isSafeInteger(x.create_time_ms)||x.create_time_ms<=0||typeof x.unit!=='string'||x.unit.length>32)return fail('desktop_protocol_invalid');
+        rows.push({record_id:x.record_id,task_code:x.task_code,amount:x.amount,unit:x.unit,create_time_ms:x.create_time_ms});
+      }
+      if(await identity()!==before)return fail('desktop_identity_mismatch');
+      return {ok:true,identity:before,data:{records:rows,has_more:records.has_more}};
+    }
     const basic=await call('/alice/basic/launch',{}),group=basic.ug_campaign_info?.campaign_group_code;
     if(typeof group!=='string'||!group||group.length>128)return fail('desktop_activity_unavailable');
     const read=async()=>{
@@ -60,13 +70,26 @@ async input=>{
       }else return fail('desktop_protocol_invalid');
       if(changed)detail=await read();
     }
+    const support={};
+    const workTasks=detail.tasks.filter(t=>['WorkTaskMode','GenWord','GenExcel','GenPPT','ScheduleSkill'].includes(t.campaign_type));
+    if(workTasks.length){
+      try{
+        const directory=await r('wWT').skillsFacadeApiService.AGWListUserAndFeaturedSkills({runtime_type:1});
+        if(directory?.code!==0||!Array.isArray(directory.data?.skills)||directory.data.skills.length>4096)throw Error('invalid_directory');
+        const official=r('aT').Kn.System;
+        for(const task of workTasks){const name=r('isL').ph(task.campaign_type),matches=directory.data.skills.filter(s=>s.name===name&&s.visible!==false&&s.type===official);
+          const available=task.campaign_type==='WorkTaskMode'||typeof name==='string'&&matches.length===1;
+          support[task.campaign_code]={available,reason:available?'available':'official_skill_missing'};
+        }
+      }catch{for(const task of workTasks)support[task.campaign_code]={available:false,reason:'capability_unavailable'};}
+    }
     if(await identity()!==before)return fail('desktop_identity_mismatch');
-    const project=t=>({task_id:str(t.task_id),campaign_code:str(t.campaign_code),campaign_group_code:group,task_kind:str(t.task_kind),title:str(t.title),subtitle:str(t.subtitle),description:str(t.description),campaign_type:str(t.campaign_type),task_status:num(t.task_status),reward_mode:num(t.reward_mode),milestone_threshold:num(t.milestone_threshold),reward_summaries:Array.isArray(t.reward_summaries)?t.reward_summaries.slice(0,32).map(reward):[],...(t.daily_checkin?{daily_checkin:{checked_in_today:t.daily_checkin.checked_in_today,last_checkin_date:str(t.daily_checkin.last_checkin_date),reward:reward(t.daily_checkin.reward),reward_status:num(t.daily_checkin.reward_status)}}:{})});
+    const project=t=>({task_id:str(t.task_id),campaign_code:str(t.campaign_code),campaign_group_code:group,task_kind:str(t.task_kind),title:str(t.title),subtitle:str(t.subtitle),description:str(t.description),campaign_type:str(t.campaign_type),task_status:num(t.task_status),reward_mode:num(t.reward_mode),milestone_threshold:num(t.milestone_threshold),reward_summaries:Array.isArray(t.reward_summaries)?t.reward_summaries.slice(0,32).map(reward):[],...(support[t.campaign_code]?{work_capability:support[t.campaign_code]}:{}),...(t.progress&&Number.isSafeInteger(t.progress.current)&&Number.isSafeInteger(t.progress.target)&&t.progress.current>=0&&t.progress.target>=0?{progress:{current:t.progress.current,target:t.progress.target}}:{}),...(t.daily_checkin?{daily_checkin:{checked_in_today:t.daily_checkin.checked_in_today,last_checkin_date:str(t.daily_checkin.last_checkin_date),reward:reward(t.daily_checkin.reward),reward_status:num(t.daily_checkin.reward_status)}}:{})});
     return {ok:true,identity:before,data:{group,tasks:detail.tasks.slice(0,256).map(project),milestones:detail.milestones.slice(0,64).map(project),total_amount:num(detail.progress?.total_amount),operation_status:operationStatus}};
   };
   try{
     const pending=run().finally(()=>{if(window[key]===lease)delete window[key];});
-    return await Promise.race([pending,new Promise(resolve=>{timer=setTimeout(()=>resolve(fail(input.operation==='activities'?'desktop_timeout':'desktop_submission_uncertain')),18000);})]);
+    return await Promise.race([pending,new Promise(resolve=>{timer=setTimeout(()=>resolve(fail(['activities','reward_records'].includes(input.operation)?'desktop_timeout':'desktop_submission_uncertain')),18000);})]);
   }catch(e){return fail(['desktop_identity_mismatch','desktop_upstream_rejected','desktop_protocol_invalid'].includes(e?.message)?e.message:'desktop_activity_failed',e?.safeCode);}
   finally{clearTimeout(timer);}
 }

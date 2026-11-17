@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,10 @@ func providerErrorCode(err error) string {
 	if errors.As(err, &coded) {
 		switch code := coded.PublicCode(); code {
 		case "desktop_unavailable", "desktop_login_required", "desktop_identity_mismatch", "desktop_model_unavailable", "desktop_busy", "desktop_timeout", "desktop_submission_uncertain", "desktop_native_tools_unsupported", "desktop_ownership_lost", "desktop_cleanup_uncertain", "desktop_response_rejected", "desktop_version_unsupported", "desktop_protocol_invalid", "desktop_canceled":
+			return code
+		case "provider_context_unsupported", "provider_conversation_invalid", "provider_conversation_unavailable", "provider_conversation_ambiguous", "provider_context_mismatch", "provider_conversation_capacity", "provider_conversation_account_changed", "provider_turn_uncertain", "provider_conversation_limit", "provider_conversation_save_uncertain":
+			return code
+		case "provider_idempotency_invalid", "provider_idempotency_required", "provider_idempotency_conflict", "provider_request_already_processed":
 			return code
 		}
 	}
@@ -65,7 +70,7 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 			continue
 		}
 		for _, m := range models {
-			entry := map[string]any{"id": m.ID, "object": "model", "created": 0, "owned_by": id, "name": m.Name, "supports_tool_call": false, "supports_images": false, "single_turn_text_only": true}
+			entry := map[string]any{"id": m.ID, "object": "model", "created": 0, "owned_by": id, "name": m.Name, "supports_tool_call": false, "supports_images": false, "single_turn_text_only": !m.MultiTurn, "supports_multi_turn": m.MultiTurn}
 			entry["streaming_mode"] = "buffered"
 			if m.Incremental {
 				entry["streaming_mode"] = "incremental"
@@ -87,9 +92,13 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	for key := range fields {
 		switch key {
 		case "model", "messages", "stream", "stream_options", "n":
+		case "tools", "tool_choice", "functions", "function_call", "parallel_tool_calls":
+			st.status = 400
+			writeOpenAIError(w, 400, "provider_tools_unsupported", "official work tools are distinct from caller-defined functions; caller tools are not supported by this provider")
+			return
 		default:
 			st.status = 400
-			writeOpenAIError(w, 400, "provider_parameter_unsupported", "this provider currently supports one ordinary text message; the request contains an unsupported field")
+			writeOpenAIError(w, 400, "provider_parameter_unsupported", "the request contains a parameter that the official provider cannot honor")
 			return
 		}
 	}
@@ -114,15 +123,75 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		return
 	}
 	var text string
-	if json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 1 || messages[0].Role != "user" || json.Unmarshal(messages[0].Content, &text) != nil || strings.TrimSpace(text) == "" || len(text) > 65536 {
+	dialogueProvider, hasDialogue := provider.(inference.DialogueProvider)
+	validMessages := json.Unmarshal(fields["messages"], &messages) == nil && len(messages) > 0 && len(messages) <= 101 && len(messages)%2 == 1
+	parsed := []inference.Message{}
+	total := 0
+	for i, m := range messages {
+		expected := "user"
+		if i%2 == 1 {
+			expected = "assistant"
+		}
+		var value string
+		contentErr := json.Unmarshal(m.Content, &value)
+		if contentErr != nil {
+			var parts []map[string]json.RawMessage
+			if json.Unmarshal(m.Content, &parts) == nil && len(parts) > 0 {
+				value = ""
+				contentErr = nil
+				for _, part := range parts {
+					var kind, text string
+					if len(part) != 2 || json.Unmarshal(part["type"], &kind) != nil || kind != "text" || json.Unmarshal(part["text"], &text) != nil {
+						contentErr = errors.New("content_not_text")
+						break
+					}
+					value += text
+				}
+			}
+		}
+		if m.Role != expected || contentErr != nil || strings.TrimSpace(value) == "" || len(value) > 65536 {
+			validMessages = false
+		}
+		total += len(value)
+		parsed = append(parsed, inference.Message{Role: m.Role, Content: value})
+		text = value
+	}
+	if !validMessages || total > 1<<20 || (!hasDialogue && len(messages) != 1) {
 		st.status = 400
-		writeOpenAIError(w, 400, "provider_input_unsupported", "this provider currently requires exactly one user message containing text (up to 65536 bytes)")
+		writeOpenAIError(w, 400, "provider_input_unsupported", "expected alternating user and assistant text messages ending with user; unsupported roles, content or size")
 		return
 	}
 	var result inference.Result
 	var err error
 	var sink *providerStreamSink
-	if progressive, ok := provider.(inference.StreamingProvider); streaming && ok {
+	if hasDialogue {
+		owner := fmt.Sprintf("%x", sha256.Sum256([]byte(r.Header.Get("Authorization"))))
+		if info, ok := requestKeyInfo(r); ok {
+			owner = fmt.Sprintf("%x", sha256.Sum256([]byte("api-key-id:"+info.ID)))
+		} else {
+			credential := r.Header.Get("Authorization")
+			if credential == "" {
+				credential = r.Header.Get("X-Api-Key")
+			}
+			if credential == "" {
+				credential = r.Header.Get("X-Goog-Api-Key")
+			}
+			if credential == "" {
+				credential = r.URL.Query().Get("key")
+			}
+			owner = fmt.Sprintf("%x", sha256.Sum256([]byte("credential:"+credential)))
+		}
+		q := inference.Dialogue{Model: model, Owner: owner, ConversationRef: r.Header.Get("X-LoomGate-Conversation"), Messages: parsed, IdempotencyKey: r.Header.Get("Idempotency-Key")}
+		var emit func(string) error
+		if streaming {
+			sink = newProviderStreamSink(w, r, model, st)
+			emit = sink.emit
+		}
+		result, err = providerDialogueSafely(r.Context(), dialogueProvider, q, emit)
+		if err == nil && sink != nil && result.Complete && result.Acknowledged {
+			err = sink.validate(result)
+		}
+	} else if progressive, ok := provider.(inference.StreamingProvider); streaming && ok {
 		sink = newProviderStreamSink(w, r, model, st)
 		result, err = providerStreamSafely(r.Context(), progressive, model, text, sink.emit)
 		if err == nil && result.Complete && result.Acknowledged {
@@ -130,6 +199,9 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		}
 	} else {
 		result, err = providerCompleteSafely(r.Context(), provider, model, text)
+	}
+	if result.ConversationRef != "" {
+		w.Header().Set("X-LoomGate-Conversation", result.ConversationRef)
 	}
 	st.upstreamStarted = result.Attempted
 	st.uid = result.AccountRef
@@ -156,6 +228,18 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	if err != nil || !result.Complete || !result.Acknowledged {
 		st.status = 502
 		code := providerErrorCode(err)
+		if strings.HasPrefix(code, "provider_context_") || code == "provider_conversation_invalid" {
+			st.status = 400
+		}
+		if code == "provider_idempotency_invalid" || code == "provider_idempotency_required" {
+			st.status = 400
+		}
+		if code == "provider_idempotency_conflict" || code == "provider_request_already_processed" {
+			st.status = 409
+		}
+		if code == "provider_turn_uncertain" || code == "provider_conversation_account_changed" || code == "provider_conversation_ambiguous" {
+			st.status = 409
+		}
 		if errors.Is(err, context.Canceled) {
 			st.status = 499
 			return
@@ -185,12 +269,20 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	}
 	id := "chatcmpl-" + requestID(r)
 	created := time.Now().Unix()
+	if result.ConversationRef != "" {
+		w.Header().Set("X-LoomGate-Conversation", result.ConversationRef)
+	}
 	w.Header().Set("X-Gateway-Usage-Status", "not-reported")
 	w.Header().Set("X-Gateway-Upstream-Complete", "true")
 	w.Header().Set("X-Gateway-Upstream-Ack", "true")
 	w.Header().Set("X-Gateway-Upstream-Request-Digest", result.RequestDigest)
 	if !streaming {
-		err = writeJSON(w, 200, map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]string{"role": "assistant", "content": result.Text}, "finish_reason": "stop"}}})
+		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]string{"role": "assistant", "content": result.Text}, "finish_reason": "stop"}}}
+		if result.ConversationRef != "" {
+			response["loomgate_conversation"] = result.ConversationRef
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(response)
 	} else {
 		// Editable upstream blocks may replace/delete prior text. Buffer until
 		// the full reply terminates, so append-only OpenAI consumers never see

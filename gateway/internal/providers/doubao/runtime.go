@@ -79,18 +79,23 @@ func (r *CommandRuntime) endpoint(ctx context.Context) (int, error) {
 }
 
 type runtimeRequest struct {
-	Operation string          `json:"operation"`
-	Port      int             `json:"port"`
-	Identity  string          `json:"identity,omitempty"`
-	BotID     string          `json:"bot_id,omitempty"`
-	Prompt    string          `json:"prompt,omitempty"`
-	Model     string          `json:"model,omitempty"`
-	Lease     string          `json:"lease,omitempty"`
-	TaskID    string          `json:"task_id,omitempty"`
-	Scene     json.RawMessage `json:"scene,omitempty"`
-	Group     string          `json:"group,omitempty"`
-	Task      string          `json:"task,omitempty"`
-	Instance  string          `json:"instance,omitempty"`
+	Operation    string          `json:"operation"`
+	WorkTask     *taskAction     `json:"work_task,omitempty"`
+	Port         int             `json:"port"`
+	Identity     string          `json:"identity,omitempty"`
+	BotID        string          `json:"bot_id,omitempty"`
+	Prompt       string          `json:"prompt,omitempty"`
+	Model        string          `json:"model,omitempty"`
+	Lease        string          `json:"lease,omitempty"`
+	TaskID       string          `json:"task_id,omitempty"`
+	Scene        json.RawMessage `json:"scene,omitempty"`
+	Group        string          `json:"group,omitempty"`
+	Task         string          `json:"task,omitempty"`
+	Instance     string          `json:"instance,omitempty"`
+	Conversation string          `json:"conversation,omitempty"`
+	Work         bool            `json:"work,omitempty"`
+	Session      string          `json:"session,omitempty"`
+	Message      string          `json:"message,omitempty"`
 }
 type runtimeReply struct {
 	OK       bool            `json:"ok"`

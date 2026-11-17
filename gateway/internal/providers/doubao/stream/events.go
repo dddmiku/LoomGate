@@ -245,6 +245,7 @@ type State struct {
 	NativeContent             bool
 	Events, Replayed, Unknown int
 	limits                    Limits
+	allowTaskWork             bool
 }
 
 func (State) String() string   { return "doubao.stream.State[redacted]" }
@@ -557,7 +558,9 @@ func (s *State) applyBlocks(msg *Message, blocks []Block, outer int, emit func(U
 		}
 		if b.Type == 10016 || b.Type == 10024 {
 			s.NativeContent = true
-			return ErrNativeAction
+			if !s.allowTaskWork {
+				return ErrNativeAction
+			}
 		}
 		if b.Type == 10019 {
 			s.NativeContent = true

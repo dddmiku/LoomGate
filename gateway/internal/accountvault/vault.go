@@ -19,6 +19,7 @@ import (
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var ErrConflict = errors.New("account_revision_conflict")
+var ErrNotFound = errors.New("account_unavailable")
 
 type Account struct {
 	ID        string    `json:"id"`
@@ -156,6 +157,9 @@ func (v *Vault) load(id string) (sealed, error) {
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return s, ErrNotFound
+		}
 		return s, errors.New("account_unavailable")
 	}
 	if len(b) > 2<<20 || json.Unmarshal(b, &s) != nil || s.Account.ID != id {

@@ -47,3 +47,12 @@ test('malformed nested claim error is explicit protocol failure',async()=>{
   const r=await f.run('task_claim',{group:'dynamic-group',task:'dynamic-milestone'});assert.equal(r.error,'desktop_protocol_invalid');assert.ok(!JSON.stringify(r).includes('PRIVATE_SYNTHETIC_REASON'));
  }
 });
+
+test('work capability uses a fresh official directory and fails closed on missing or duplicate skills',async()=>{
+ for(const mode of ['present','missing','duplicate','unavailable']){
+  let reads=0;const task={campaign_group_code:'group',campaign_code:'dynamic-doc',campaign_type:'GenWord',task_status:1};
+  const modules={z5:{getFlowAccount:()=>({passportApi:{getPassportSDK:async()=>({login:{checkLogin:async()=>({user_id_str:'synthetic-account'})}})}})},Pp:{Y:()=>({})},aT:{Kn:{System:2}},isL:{ph:()=> 'synthetic-dynamic-skill'},wWT:{skillsFacadeApiService:{AGWListUserAndFeaturedSkills:async q=>{reads++;assert.equal(q.runtime_type,1);return {code:mode==='unavailable'?1:0,data:{skills:Array(mode==='duplicate'?2:mode==='missing'?0:1).fill({name:'synthetic-dynamic-skill',type:2,visible:true})}}}}},uui:{createRequest:()=>({apiContext:{getBaseURL:()=> 'https://www.doubao.com',getCommonParams:async()=>({}),getCommonHeaders:async()=>({}),httpClient:async q=>{if(q.url.endsWith('/launch'))return {code:0,data:{ug_campaign_info:{campaign_group_code:'group'}}};assert.ok(q.url.endsWith('/detail/'));return {code:0,data:{campaign_code:'group',tasks:[task],milestones:[]}}}}})}};
+  const window={'chunk_@flow-web/desktop':{push:x=>x[2](id=>modules[id])}},fn=vm.runInNewContext('('+source+')',{window,crypto:webcrypto,TextEncoder,setTimeout,clearTimeout});
+  const result=await fn({operation:'activities',identity});assert.equal(result.ok,true);assert.equal(result.data.tasks[0].work_capability.available,mode==='present');assert.equal(reads,1);
+ }
+});

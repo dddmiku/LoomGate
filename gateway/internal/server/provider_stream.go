@@ -77,7 +77,7 @@ func (s *providerStreamSink) emit(delta string) error {
 		s.w.Header().Set("X-Gateway-Streaming", "incremental")
 		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
 		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
-		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status")
+		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
 		s.started = true
 	}
 	content := map[string]string{"content": delta}
@@ -108,7 +108,12 @@ func (s *providerStreamSink) fail(code string) {
 	_ = s.frame(map[string]any{"error": map[string]string{"type": "upstream_error", "code": code, "message": "provider stream did not complete; discard the incomplete answer and inspect status before resubmitting"}})
 }
 func (s *providerStreamSink) finish(result inference.Result) error {
-	if err := s.frame(s.chunk(map[string]string{}, "stop")); err != nil {
+	last := s.chunk(map[string]string{}, "stop")
+	if result.ConversationRef != "" {
+		last["loomgate_conversation"] = result.ConversationRef
+	}
+
+	if err := s.frame(last); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprint(s.w, "data: [DONE]\n\n"); err != nil {
@@ -122,5 +127,8 @@ func (s *providerStreamSink) finish(result inference.Result) error {
 	s.w.Header().Set("X-Gateway-Upstream-Complete", "true")
 	s.w.Header().Set("X-Gateway-Upstream-Request-Digest", result.RequestDigest)
 	s.w.Header().Set("X-Gateway-Stream-Status", "complete")
+	if result.ConversationRef != "" {
+		s.w.Header().Set("X-LoomGate-Conversation", result.ConversationRef)
+	}
 	return nil
 }

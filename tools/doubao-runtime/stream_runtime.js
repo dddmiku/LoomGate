@@ -23,14 +23,16 @@ async (input, catalogRuntime) => {
       if(await identity()!==input.identity)return fail('desktop_identity_mismatch');
       const lease={id:crypto.randomUUID(),identity:input.identity,touched:Date.now(),created:Date.now(),active:false,submitted:false,queue:[],bytes:0,total:0,handoffs:new Map()};
       window[key]=lease;
-      lease.watchdog=setInterval(()=>{if(Date.now()-lease.touched>15000||Date.now()-lease.created>180000)release(lease);},1000);
+      lease.native=input.work===true;
+      if(lease.native&&!input.work_task){release(lease);return fail('desktop_task_manual');}
+      lease.watchdog=setInterval(()=>{if(Date.now()-lease.touched>15000||Date.now()-lease.created>(lease.native?660000:180000))release(lease);},1000);
       try {
         const im=await r('Z9').K('chatIMService');
         if(!im||im.getTaskService().checkpointService.getIncompleteMainTasks().length||im.getTaskService().checkpointService.getIncompleteSubTasks?.().length)return fail('desktop_busy');
 	    // Message construction is lazy-loaded by the official service. Requiring
 	    // an absent chunk first can cache empty exports for the client lifetime.
 	    if(typeof im.getMessageService!=='function')return fail('desktop_version_unsupported');
-	    await im.getMessageService();
+	    const messageService=await im.getMessageService();
 	    if(typeof r.m?.WdY!=='function'||typeof r.m?.Kk!=='function')return fail('desktop_version_unsupported');
 	    const uplink=r('WdY'),contextModule=r('Kk');
 	    if(typeof uplink.createChatQueryUplinkBody!=='function'||typeof contextModule.P!=='function')return fail('desktop_version_unsupported');
@@ -41,16 +43,53 @@ async (input, catalogRuntime) => {
         let chosen;
         for(const e of catalog.data.entry_list){const m=e.active_switch_conf?.menu_conf_v2;if(!m)continue;for(const mode of m.use_mode_model_list?m.mode_list.item_list:[{mode_id:'default',model_list:m.model_list}])for(const item of mode.model_list.item_list){const id='doubao:'+mode.mode_id+':'+item.model_item_key;if(id===input.model)chosen={...item,mode_id:mode.mode_id};}}
         if(!chosen)return fail('desktop_model_unavailable');
-        if(chosen.show_task_tools===1)return fail('desktop_native_tools_unsupported');
-        const message={local_message_id:crypto.randomUUID(),local_conversation_id:r('WMy').createLocalConversationId(),bot_id:bot,create_time:Date.now(),status:r('ntm').G.Available,content_blocks_v2:[r('S6').N(input.prompt)],ext:{model_item_key:chosen.model_item_key,mode_id:chosen.mode_id,conversation_mode:'chat',model_extra_params:JSON.stringify(chosen.model_extra_params||{}),reasoning_effort:String(chosen.reasoning_effort_config.default_level)}};
+        if((chosen.show_task_tools===1)!==lease.native)return fail('desktop_native_tools_unsupported');
+        if(input.conversation!==undefined&&(!/^[A-Za-z0-9_-]{1,128}$/.test(input.conversation)))return fail('desktop_protocol_invalid');
+        const message={local_message_id:crypto.randomUUID(),...(input.conversation?{conversation_id:input.conversation}:{local_conversation_id:r('WMy').createLocalConversationId()}),bot_id:bot,create_time:Date.now(),status:r('ntm').G.Available,content_blocks_v2:[r('S6').N(input.prompt)],ext:{model_item_key:chosen.model_item_key,mode_id:chosen.mode_id,conversation_mode:'chat',model_extra_params:JSON.stringify(chosen.model_extra_params||{}),reasoning_effort:String(chosen.reasoning_effort_config.default_level)}};
+        if(lease.native){
+          const cloud=r('QG').rC$?.RuntimeType_Cloud_VM;
+          if(cloud!==1||typeof messageService.prepareExternalMessageRequest!=='function')return fail('desktop_version_unsupported');
+          message.ext.conversation_mode='office';message.ext.general_task_param=JSON.stringify({runtime_type:cloud,agent_task_param:{runtime_type:cloud}});
+          if(input.work_task){
+            // Re-read eligibility and the official task-to-skill mapping before
+            // preparation. Never fabricate attribution reports or skill IDs.
+            const api=r('uui').createRequest().apiContext;
+            if(api.getBaseURL()!=='https://www.doubao.com')return fail('desktop_origin_rejected');
+            const read=async(path,data)=>{const reply=await api.httpClient({url:'https://www.doubao.com'+path,method:'POST',params:await api.getCommonParams(),headers:{...await api.getCommonHeaders(),...r('Pp').Y()},data});if(reply?.code!==0)throw Error('task_read_failed');return reply.data;};
+            const basic=await read('/alice/basic/launch',{}),group=basic?.ug_campaign_info?.campaign_group_code;
+            if(group!==input.work_task.group)return fail('desktop_task_expired');
+            const activity=await read('/alice/ug/campaign/v3/detail/',{campaign_group_code:group});
+            const matches=(activity?.tasks||[]).filter(t=>t.campaign_group_code===group&&t.campaign_code===input.work_task.task);
+            if(matches.length!==1)return fail('desktop_task_expired');
+            const task=matches[0];if((task.task_id||'')!==input.work_task.instance||task.task_status!==1)return fail('desktop_task_expired');
+            const name=r('isL').ph(task.campaign_type);
+            if(name){
+              const directory=await r('wWT').skillsFacadeApiService.AGWListUserAndFeaturedSkills({runtime_type:cloud});
+              if(directory?.code!==0||!Array.isArray(directory.data?.skills))return fail('desktop_task_manual');
+              const matches=directory.data.skills.filter(s=>s.visible!==false&&s.type===r('aT').Kn.System&&s.name===name);
+              if(matches.length!==1)return fail('desktop_task_manual');
+              lease.skill=name;
+              message.ext.general_task_param=JSON.stringify({runtime_type:cloud,agent_task_param:{runtime_type:cloud},selected_skills:[name],skill_selections:[{name}]});
+            }else if(task.campaign_type!=='WorkTaskMode')return fail('desktop_task_manual');
+          }
+        }
+        if(input.work_task&&!lease.native)return fail('desktop_native_tools_unsupported');
         const sessionId=crypto.randomUUID();
-        const body=await uplink.createChatQueryUplinkBody({messages:[message],sessionId});
+        let messages=[message],body;
+        if(lease.native){
+          const prepared=await messageService.prepareExternalMessageRequest({messages,session:{reportParams:{}},sessionId});
+          body=prepared.requestBody;messages=prepared.messages;
+          if(body?.option?.general_task_param?.runtime_type!==1||body.option.general_task_param?.agent_task_param?.runtime_type!==1)return fail('desktop_native_tools_unsupported');
+          if(body.option.general_task_param.client_option?.workspace||body.option.general_task_param.client_option?.sandbox_id)return fail('desktop_native_tools_unsupported');
+          if(lease.skill&&(!body.option.general_task_param.selected_skills?.includes(lease.skill)||!body.option.general_task_param.skill_selections?.some(s=>s.name===lease.skill)))return fail('desktop_task_manual');
+        }else body=await uplink.createChatQueryUplinkBody({messages,sessionId});
         if(body.option?.unique_key!==sessionId||body.option.model_config?.model_item_key!==chosen.model_item_key||body.messages?.length!==1||body.client_meta?.bot_id!==bot)return fail('desktop_protocol_invalid');
+        if(input.conversation&&(body.client_meta?.conversation_id!==input.conversation||body.option?.need_create_conversation===true))return fail('desktop_protocol_invalid');
         if(await identity()!==input.identity)return fail('desktop_identity_mismatch');
         lease.im=im;lease.body=JSON.parse(JSON.stringify(body));
-        lease.context={messages:{[message.local_message_id]:contextModule.P({message,sessionId,conversationId:message.local_conversation_id})}};
+        lease.context={messages:{[message.local_message_id]:contextModule.P({message:messages[0],sessionId,conversationId:message.conversation_id||message.local_conversation_id})}};
         lease.touched=Date.now();lease.prepared=true;
-        return {ok:true,identity:input.identity,data:{lease:lease.id,body:lease.body,model:input.model}};
+        return {ok:true,identity:input.identity,data:{lease:lease.id,body:lease.body,model:input.model,native:lease.native}};
       } finally {if(!lease.prepared)release(lease);}
     }
     const lease=window[key];

@@ -58,7 +58,7 @@ HELPERS = ("login", "credit", "signin_bin", "trial_bin", "activity_bin", "fissio
 # 脚本：面板的部分任务会调 scripts/*.py（native 模式直接跑 python）。
 SCRIPTS = ("global_region.py", "task_common.py", "task_runner.py",
            "school_open_day_2026.py", "growth_center.py")
-DOUBAO_RUNTIME = ("bridge.py", "managed.py", "stream_bridge.py", "runtime.js", "tasks_runtime.js", "stream_runtime.js", "probe_runtime.js", "probe_cleanup.js", "requirements.txt")
+DOUBAO_RUNTIME = ("bridge.py", "managed.py", "stream_bridge.py", "runtime.js", "tasks_runtime.js", "work_runtime.js", "stream_runtime.js", "probe_runtime.js", "probe_cleanup.js", "requirements.txt")
 
 
 def version() -> str:

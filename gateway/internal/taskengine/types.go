@@ -42,20 +42,21 @@ var (
 var IDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 type Definition struct {
-	Key         string  `json:"key"`
-	ProviderID  string  `json:"provider_id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	Stages      []Stage `json:"stages"`
-	ManualOnly  bool    `json:"manual_only"`
-	OncePerDay  bool    `json:"once_per_day"`
-	Once        bool    `json:"once"`
-	SideEffect  bool    `json:"side_effect"`
-	Idempotent  bool    `json:"idempotent"`
-	MaxAttempts int     `json:"max_attempts"`
-	PeriodKey   string  `json:"period_key,omitempty"`
-	Reward      string  `json:"reward,omitempty"`
-	ActionURL   string  `json:"action_url,omitempty"`
+	Key            string  `json:"key"`
+	ProviderID     string  `json:"provider_id"`
+	Name           string  `json:"name"`
+	Description    string  `json:"description"`
+	Stages         []Stage `json:"stages"`
+	ManualOnly     bool    `json:"manual_only"`
+	OncePerDay     bool    `json:"once_per_day"`
+	Once           bool    `json:"once"`
+	SideEffect     bool    `json:"side_effect"`
+	Idempotent     bool    `json:"idempotent"`
+	MaxAttempts    int     `json:"max_attempts"`
+	PeriodKey      string  `json:"period_key,omitempty"`
+	Reward         string  `json:"reward,omitempty"`
+	ActionURL      string  `json:"action_url,omitempty"`
+	TimeoutSeconds int     `json:"timeout_seconds,omitempty"`
 }
 
 type Scope struct {

@@ -23,7 +23,7 @@ def pipe(request,target):
     catalog=Path(__file__).with_name('runtime.js').read_text(encoding='utf-8')
     sequence=0;signed=False;opened=False
     cleanup_ok=False
-    deadline=time.monotonic()+40
+    deadline=time.monotonic()+(130 if request.get('work') else 40)
     base={'identity':request['identity'],'lease':request['lease']}
     try:
         with connect(target(request['port']),open_timeout=2,close_timeout=.1,max_size=LIMIT) as ws:
