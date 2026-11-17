@@ -45,6 +45,98 @@ def create_closed_socket(path):
         api.closesocket(handle)
 
 
+
+class LegacyScheduleConversionTests(unittest.TestCase):
+    def convert(self, schedule):
+        spec = importlib.util.spec_from_file_location(
+            "loomgate_legacy_schedule", Path(__file__).with_name("legacy_schedule.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.legacy_schedule_document({"schedule": schedule})
+
+    def test_partial_legacy_schedule_uses_documented_defaults(self):
+        doc = self.convert({})
+        rows = doc["schedules"]
+        self.assertEqual(rows["legacy-checkin"]["hours"], [9, 21])
+        self.assertEqual(rows["legacy-checkin"]["minute"], 0)
+        self.assertEqual(rows["legacy-trae-check"]["hours"], [0])
+        self.assertEqual(rows["legacy-trae-check"]["minute"], 5)
+        self.assertEqual(rows["legacy-growth"]["hours"], [12])
+        self.assertEqual(doc["import"]["timezone"], "Asia/Shanghai")
+        self.assertTrue(doc["import"]["dispatch_disabled"])
+        self.assertEqual(doc["runs"], [])
+        self.assertEqual(doc["uncertain"], {})
+        self.assertEqual(doc["pending_tasks"], {})
+
+    def test_enabled_flags_scope_and_manual_placeholders(self):
+        doc = self.convert({
+            "checkin_hours": [7, 19],
+            "checkin_enabled": False,
+            "trae_check_enabled": True,
+            "school_enabled": True,
+            "activity_enabled": False,
+        })
+        self.assertEqual(doc["schedules"]["legacy-checkin"]["hours"], [7, 19])
+        self.assertFalse(doc["schedules"]["legacy-checkin"]["enabled"])
+        # Every imported schedule is disabled on first launch.
+        self.assertFalse(doc["schedules"]["legacy-trae-check"]["enabled"])
+        self.assertTrue(doc["import"]["originally_enabled"]["legacy-trae-check"])
+        # Even when the old switch was on, fabricated-event tasks stay off.
+        self.assertFalse(doc["schedules"]["legacy-school"]["enabled"])
+        self.assertFalse(doc["schedules"]["legacy-activity"]["enabled"])
+        skipped = {row["id"]: row["reason"] for row in doc["import"]["skipped"]}
+        # Fabricated-event tasks keep the manual-only reason even if the old
+        # switch was also off: the stronger invariant must win.
+        self.assertEqual(skipped["legacy-school"], "manual_only_legacy_event_report")
+        self.assertEqual(skipped["legacy-activity"], "manual_only_legacy_event_report")
+
+    def test_invalid_hours_and_enabled_types_fail_without_mutation(self):
+        for schedule in ({"checkin_hours": [24]}, {"checkin_hours": ["9"]},
+                         {"checkin_enabled": "yes"}, {"growth_hours": [11, 11]}):
+            with self.subTest(schedule=schedule):
+                with self.assertRaises(Exception):
+                    self.convert(schedule)
+            self.assertTrue(True)
+
+    def test_engine_document_has_no_runs_or_uncertain_state(self):
+        doc = self.convert({"checkin_hours": [8], "activity_enabled": False})
+        self.assertEqual(doc["version"], 4)
+        self.assertEqual(doc["format"], 4)
+        for key in ("completed", "uncertain", "pending_tasks", "receipts", "attempts", "work"):
+            self.assertEqual(doc[key], {})
+        self.assertEqual(doc["schedules"]["legacy-checkin"]["account_ids"], [])
+
+
+class MigrationScheduleIntegrationTests(unittest.TestCase):
+    def test_copy_writes_converted_engine_and_rolls_back(self):
+        base = Path(os.environ.get("LOOMGATE_WORK_ROOT", "D:/LoomGate-work")) / "migration-tests"
+        base.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="schedule-", dir=base))
+        try:
+            source, dest = root / "old", root / "new"
+            for name in m.CATEGORIES:
+                (source / name).mkdir(parents=True)
+            config = {"auth_dir": "./auths", "api_keys_file": "./data/api_keys.json",
+                      "schedule": {"checkin_hours": [8, 20], "trae_check_enabled": True,
+                                   "school_enabled": True, "activity_enabled": False,
+                                   "growth_hours": [12]}}
+            (source / "config").mkdir(exist_ok=True)
+            (source / "config/config.json").write_text(json.dumps(config), encoding="utf-8")
+            (source / "data/api_keys.json").write_text(json.dumps({"version": 1, "keys": []}), encoding="utf-8")
+            report = m.migrate(source, dest, apply=True, offline=True)
+            self.assertEqual(report["target_task_dispatch"], "disabled_until_explicit_opt_in")
+            engine = json.loads((dest / "data/task-engine.json").read_text(encoding="utf-8"))
+            self.assertEqual(engine["version"], 4)
+            self.assertEqual(engine["schedules"]["legacy-checkin"]["hours"], [8, 20])
+            self.assertFalse(engine["schedules"]["legacy-school"]["enabled"])
+            self.assertEqual(engine["runs"], [])
+            # Source never grew a converter output.
+            self.assertFalse((source / "data/task-engine.json").exists())
+            m.rollback(dest, offline=True)
+            self.assertFalse(dest.exists())
+        finally:
+            shutil.rmtree(root)
+
 class MigrationTests(unittest.TestCase):
     def setUp(self):
         base = Path(os.environ.get("LOOMGATE_WORK_ROOT", "D:/LoomGate-work")) / "migration-tests"

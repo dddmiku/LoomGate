@@ -13,6 +13,16 @@ import stat
 import subprocess
 import sys
 
+# The migration is always run with `python -I`, which omits the script
+# directory from sys.path. Load the sibling converter by explicit path so the
+# offline tool does not depend on the caller's working directory.
+import importlib.util as _importlib_util
+
+_legacy_spec = _importlib_util.spec_from_file_location(
+    "loomgate_legacy_schedule", Path(__file__).with_name("legacy_schedule.py"))
+legacy_schedule = _importlib_util.module_from_spec(_legacy_spec)
+_legacy_spec.loader.exec_module(legacy_schedule)
+
 FORMAT = 2
 MARKER = ".loomgate-migration.json"
 CATEGORIES = ("config", "auths", "auths-trash", "data", "panel-data")
@@ -357,20 +367,32 @@ def inspect(source: Path, destination: Path) -> tuple[dict, list[tuple[Path, Pat
     inventory = hashlib.sha256()
     for _, relative, checksum in sorted(files, key=lambda item: item[1].as_posix()):
         inventory.update(relative.as_posix().encode("utf-8") + b"\0" + checksum.encode("ascii") + b"\n")
+    try:
+        legacy_plan = legacy_schedule.legacy_schedule_document(config)
+    except legacy_schedule.LegacyScheduleError as error:
+        raise MigrationError(str(error)) from None
     report = {"format": FORMAT, "mode": "dry-run", "source_unchanged": True,
               "categories": counts, "excluded": excluded, "mapped_fields": sorted(remapped),
               "automatic_update_disabled": True, "encrypted_key_records": encrypted_count,
               "inventory_sha256": inventory.hexdigest(), "file_count": len(files),
               "source_config_sha256": digest(config_path),
+              "legacy_plan": {
+                  "schedules": len(legacy_plan["schedules"]),
+                  "enabled": sum(1 for row in legacy_plan["schedules"].values() if row["enabled"]),
+                  "disabled_manual_placeholders": [row["id"] for row in legacy_plan["import"]["skipped"]],
+                  "dispatch_disabled": True,
+                  "timezone": legacy_plan["import"]["timezone"],
+              },
+              "target_task_dispatch": "disabled_until_explicit_opt_in",
               "runtime_validation": "NOT RUN", "secret_decryption_validation": "NOT RUN"}
-    return report, files, mapped
+    return report, files, mapped, legacy_plan
 
 
 def migrate(source: Path, destination: Path, *, apply: bool = False, offline: bool = False) -> dict:
     if apply and not offline:
         raise MigrationError("apply_requires_offline_confirmed")
     source, destination = guarded_root(source, True), guarded_root(destination, False)
-    report, files, config = inspect(source, destination)
+    report, files, config, legacy_plan = inspect(source, destination)
     if not apply:
         return report
     stage = destination.with_name(destination.name + ".migration-staging")
@@ -393,7 +415,7 @@ def migrate(source: Path, destination: Path, *, apply: bool = False, offline: bo
             if digest(target) != checksum or digest(origin) != checksum:
                 raise MigrationError("source_changed_or_copy_verification_failed")
         # Verify the entire source again before committing, not only each file's copy window.
-        refreshed, _, _ = inspect(source, destination)
+        refreshed, _, _, _ = inspect(source, destination)
         if refreshed["inventory_sha256"] != report["inventory_sha256"]:
             raise MigrationError("source_changed_during_copy")
         target_config = stage / "config/config.json"
@@ -402,6 +424,13 @@ def migrate(source: Path, destination: Path, *, apply: bool = False, offline: bo
         target_config.with_suffix(".json.pre-migration").chmod(0o600)
         target_config.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         target_config.chmod(0o600)
+        # The imported schedules start disabled and contain no runs, completed
+        # markers or uncertain operations. Automatic dispatch stays off until
+        # an operator explicitly enables a plan in the new workspace.
+        engine_path = stage / "data/task-engine.json"
+        engine_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        engine_path.write_text(json.dumps(legacy_plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        engine_path.chmod(0o600)
         report["mode"] = "copied"
         write_marker(stage, report, destination, "copied")
         # Windows os.rename refuses overwriting; Unix guard plus empty target requirement.
