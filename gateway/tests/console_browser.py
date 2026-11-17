@@ -277,6 +277,24 @@ def main():
         page.locator('text=离线迁移工具').first.wait_for()
         page.locator('#view').get_by_text('当前工作区', exact=True).first.wait_for()
         done('migration_page_reports_no_marker_without_claiming_migration')
+        stage='migration-preflight-ui'
+        old_root = runtime.parent / 'migration-ui-old'
+        new_root = runtime.parent / 'migration-ui-new'
+        import shutil as _shutil
+        _shutil.rmtree(old_root, ignore_errors=True)
+        _shutil.rmtree(new_root, ignore_errors=True)
+        (old_root / 'config').mkdir(parents=True)
+        (old_root / 'auths').mkdir()
+        (old_root / 'auths-trash').mkdir()
+        (old_root / 'data').mkdir()
+        (old_root / 'panel-data').mkdir()
+        (old_root / 'config' / 'config.json').write_text('{"auth_dir":"./auths","api_keys_file":"./data/api_keys.json"}', encoding='utf-8')
+        page.locator('#migration-preflight-form input[name=source]').fill(str(old_root).replace(chr(92),'/'))
+        page.locator('#migration-preflight-form input[name=destination]').fill(str(new_root).replace(chr(92),'/'))
+        page.locator('#migration-preflight-form button[type=submit]').click()
+        page.locator('#migration-preflight-message[data-preflight=passed]').wait_for(timeout=60000)
+        assert not new_root.exists(), 'dry-run must not create the destination'
+        done('migration_preflight_runs_real_tool_without_creating_target')
         stage='dark-and-settings'
         nav('settings')
         sidebar_action(page,'#theme');assert page.locator('html').get_attribute('data-theme')=='dark';shot('console-settings-dark-mobile.png')

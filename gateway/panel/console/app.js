@@ -313,7 +313,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
             const r=result.report||{};
             const counts=Object.entries(r.categories||{}).map(([k,v])=>`${k} ${v.files} 个文件`).join('，');
             message.className='notice';
-            message.textContent=`预检通过：${r.file_count??0} 个文件，${counts||'无持久化文件'}。未创建目标目录。实际复制必须在离线确认后执行。`;
+            message.dataset.preflight='passed';message.textContent=`预检通过：${r.file_count??0} 个文件，${counts||'无持久化文件'}。未创建目标目录。实际复制必须在离线确认后执行。`;
             if(preflightForm.isConnected)submit.disabled=false;
           })
           .catch(err=>{

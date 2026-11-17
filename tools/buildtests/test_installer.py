@@ -18,7 +18,7 @@ class InstallerGuards(unittest.TestCase):
   self.seed();(self.path/'wb2api.exe').write_bytes(b'changed')
   with self.assertRaises(ValueError):build.verify_payload(self.path)
  def test_installer_never_registers_workspace_for_removal(self):
-  source=(ROOT/'desktop/loomgate.iss').read_text();self.assertNotIn('[UninstallDelete]',source);self.assertNotIn('recursesubdirs',source.lower());self.assertNotIn('DestDir: "{app}\\workspace',source);self.assertIn('PrivilegesRequired=lowest',source)
+  source=(ROOT/'desktop/loomgate.iss').read_text(encoding='utf-8');self.assertNotIn('[UninstallDelete]',source);self.assertNotIn('recursesubdirs',source.lower());self.assertNotIn('DestDir: "{app}\\workspace',source);self.assertIn('PrivilegesRequired=lowest',source)
  def test_builder_cannot_overwrite_checkout_or_populated_workspace(self):
   with self.assertRaises(ValueError):build.build(ROOT/'dist',Path('unused'),'dev-test')
   (self.path/'keep.txt').write_text('preserve')
