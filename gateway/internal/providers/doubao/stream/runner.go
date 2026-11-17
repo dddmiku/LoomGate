@@ -226,9 +226,20 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 						}
 						seen := map[string]bool{}
 						question := ""
+						questions := map[string]bool{}
 						for _, q := range ack.Queries {
+							if q.Local == "" || seen[q.Local] {
+								// Duplicate local ownership is ambiguous attribution.
+								valid = false
+								break
+							}
 							seen[q.Local] = true
-							if q.Local != "" && q.Question != "" {
+							if q.Question != "" {
+								if questions[q.Question] {
+									valid = false
+									break
+								}
+								questions[q.Question] = true
 								question = q.Question
 							}
 						}
@@ -244,7 +255,13 @@ func (r Runner) run(ctx context.Context, initial json.RawMessage, emit func(Upda
 							break
 						}
 						report.ConversationID = ack.Meta.Remote
+						// Only a single locally owned turn can carry the signed id of
+						// this submission. A recovered ACK that changes it is a conflict.
 						if len(ack.Queries) == 1 && question != "" && len(question) <= 128 {
+							if report.MessageID != "" && report.MessageID != question {
+								err = NoResume(errors.New("doubao_stream_message_conflict"))
+								break
+							}
 							report.MessageID = question
 						}
 					}

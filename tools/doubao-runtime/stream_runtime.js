@@ -64,7 +64,10 @@ async (input, catalogRuntime) => {
             const activity=await read('/alice/ug/campaign/v3/detail/',{campaign_group_code:group});
             const matches=(activity?.tasks||[]).filter(t=>t.campaign_group_code===group&&t.campaign_code===input.work_task.task);
             if(matches.length!==1)return fail('desktop_task_expired');
-            const task=matches[0];if((task.task_id||'')!==input.work_task.instance||task.task_status!==1)return fail('desktop_task_expired');
+            const task=matches[0];if((task.task_id||'')!==input.work_task.instance)return fail('desktop_task_expired');
+            // task_start already moved a fresh task to InProgress(4); Created(1)
+            // and InProgress are the only states where generation may begin.
+            if(task.task_status!==1&&task.task_status!==4)return fail('desktop_task_expired');
             const name=r('isL').ph(task.campaign_type);
             if(name){
               const directory=await r('wWT').skillsFacadeApiService.AGWListUserAndFeaturedSkills({runtime_type:cloud});

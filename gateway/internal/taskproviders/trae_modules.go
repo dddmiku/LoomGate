@@ -22,7 +22,10 @@ type AccountsOptions struct {
 	TraeClient   TraeTaskAPI
 	Now          func() time.Time
 	RefreshVault *accountvault.Vault
-	Refresh      func(context.Context, *auth.Auth) (auth.TokenUpdate, error)
+	// SpendVault stores durable lottery/Buddy attempt journals. It is a
+	// separate option so reward modules do not implicitly enable keepalive.
+	SpendVault *accountvault.Vault
+	Refresh    func(context.Context, *auth.Auth) (auth.TokenUpdate, error)
 }
 
 func newTraeModules(a *Accounts, defs map[string]taskengine.Definition) ([]Module, error) {

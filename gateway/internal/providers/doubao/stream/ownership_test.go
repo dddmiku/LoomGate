@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestACKMustMatchPreparedConversationAndMessage(t *testing.T) {
@@ -30,6 +31,42 @@ func TestACKMustMatchPreparedConversationAndMessage(t *testing.T) {
 		} else if err != nil || !report.Acknowledged || !report.ProtocolComplete {
 			t.Fatal("matching ACK rejected")
 		}
+	}
+}
+
+
+func TestACKRejectsDuplicateLocalOrSharedQuestionOwnership(t *testing.T) {
+	initial := json.RawMessage(`{"client_meta":{"local_conversation_id":"synthetic-conversation"},"messages":[{"local_message_id":"synthetic-message"}],"option":{}}`)
+	cases := []string{
+		`{"query_list":[{"local_message_id":"synthetic-message","question_id":"synthetic-q1"},{"local_message_id":"synthetic-message","question_id":"synthetic-q2"}],"ack_client_meta":{"local_conversation_id":"synthetic-conversation"}}`,
+		`{"query_list":[{"local_message_id":"synthetic-message","question_id":"synthetic-q"},{"local_message_id":"synthetic-message-2","question_id":"synthetic-q"}],"ack_client_meta":{"local_conversation_id":"synthetic-conversation"}}`,
+	}
+	for _, payload := range cases {
+		r := Runner{Opener: openFunc(func(context.Context, Request) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(frame("SSE_ACK", 1, payload) + frame("SSE_REPLY_END", 2, `{"end_type":3}`))), nil
+		}), Options: Options{MaxResumes: 3}}
+		report, err := r.Run(context.Background(), initial, nil)
+		if err == nil || report.Acknowledged || report.ProtocolComplete || report.MessageID != "" {
+			t.Fatalf("ambiguous ACK accepted: %+v", report)
+		}
+	}
+}
+
+func TestRecoveredACKCannotChangeTheSignedMessageID(t *testing.T) {
+	initial := json.RawMessage(`{"client_meta":{"local_conversation_id":"synthetic-conversation"},"messages":[{"local_message_id":"synthetic-message"}],"option":{"unique_key":"synthetic-id","recovery_option":{"req_create_time_sec":123}}}`)
+	calls := 0
+	r := Runner{Options: Options{MaxResumes: 2, Backoff: time.Millisecond}, Opener: openFunc(func(context.Context, Request) (io.ReadCloser, error) {
+		calls++
+		switch calls {
+		case 1:
+			return io.NopCloser(strings.NewReader(frame("SSE_ACK", 1, `{"query_list":[{"local_message_id":"synthetic-message","question_id":"first-q"}],"ack_client_meta":{"local_conversation_id":"synthetic-conversation"}}`))), nil
+		default:
+			return io.NopCloser(strings.NewReader(frame("SSE_ACK", 1, `{"query_list":[{"local_message_id":"synthetic-message","question_id":"changed-q"}],"ack_client_meta":{"local_conversation_id":"synthetic-conversation"}}`) + frame("SSE_REPLY_END", 2, `{"end_type":3}`))), nil
+		}
+	})}
+	report, err := r.Run(context.Background(), initial, nil)
+	if err == nil || report.ProtocolComplete || report.MessageID != "first-q" || calls != 2 {
+		t.Fatalf("changed ACK id accepted: err=%v calls=%d report=%+v", err, calls, report)
 	}
 }
 

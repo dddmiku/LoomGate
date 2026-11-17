@@ -2,8 +2,11 @@ package upstream
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -31,7 +34,9 @@ func (c *Client) doTaskJSON(req *http.Request) (json.RawMessage, error) {
 		return nil, errors.New("task_response_invalid")
 	}
 	if response.StatusCode != 200 {
-		return nil, errors.New("task_http_rejected")
+		// Preserve the HTTP status and a bounded body marker so callers can
+		// distinguish an explicit business refusal from an unknown write.
+		return nil, &Error{Kind: Classify(response.StatusCode, string(raw)), Status: response.StatusCode, Msg: truncate(string(raw), 200)}
 	}
 	var envelope struct {
 		Code *int            `json:"code"`
@@ -41,7 +46,11 @@ func (c *Client) doTaskJSON(req *http.Request) (json.RawMessage, error) {
 		return nil, errors.New("task_business_code_missing")
 	}
 	if *envelope.Code != 0 {
-		return nil, errors.New("task_business_rejected")
+		kind := Classify(response.StatusCode, string(raw))
+		if kind == ErrNone {
+			kind = ErrClient
+		}
+		return nil, &Error{Kind: kind, Status: response.StatusCode, Msg: truncate(fmt.Sprintf("code=%d %s", *envelope.Code, string(raw)), 200)}
 	}
 	return envelope.Data, nil
 }
@@ -232,6 +241,64 @@ func (c *Client) TaskResources(ctx context.Context, a *auth.Auth) (TaskResources
 	}
 	result.Energy, result.Chances = energy.Balance, chances.Balance
 	return result, nil
+}
+
+func jsonObject(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return len(trimmed) > 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+}
+
+// TaskLotteryDraw performs one strict, context-bound official lottery draw.
+// The returned receipt digest binds the exact response to the attempt; an
+// empty envelope is not proof of a prize.
+func (c *Client) TaskLotteryDraw(ctx context.Context, a *auth.Auth, clientToken string) (*GrowthLotteryDrawResult, string, error) {
+	if clientToken == "" {
+		return nil, "", errors.New("task_client_token_missing")
+	}
+	raw, err := c.taskGrowthWrite(ctx, a, lotteryDrawPath, map[string]any{"client_token": clientToken})
+	if err != nil {
+		return nil, "", err
+	}
+	if !jsonObject(raw) {
+		return nil, "", errors.New("task_receipt_missing")
+	}
+	var result GrowthLotteryDrawResult
+	if err = json.Unmarshal(raw, &result); err != nil {
+		return nil, "", errors.New("task_receipt_invalid")
+	}
+	sum := sha256.Sum256(raw)
+	return &result, hex.EncodeToString(sum[:]), nil
+}
+
+// TaskBuddyOpen performs one strict, context-bound official Buddy box open.
+func (c *Client) TaskBuddyOpen(ctx context.Context, a *auth.Auth, count int, clientToken string) (string, string, error) {
+	if clientToken == "" || count != 1 {
+		return "", "", errors.New("task_client_token_missing")
+	}
+	raw, err := c.taskGrowthWrite(ctx, a, growthBuddyOpenPath, map[string]any{"count": count, "client_token": clientToken})
+	if err != nil {
+		return "", "", err
+	}
+	if !jsonObject(raw) {
+		return "", "", errors.New("task_receipt_missing")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return "", "", errors.New("task_receipt_invalid")
+	}
+	name := ""
+	for _, key := range []string{"buddy", "name", "buddies"} {
+		value, ok := fields[key]
+		if !ok {
+			continue
+		}
+		if json.Unmarshal(value, &name) == nil && name != "" {
+			break
+		}
+		name = ""
+	}
+	sum := sha256.Sum256(raw)
+	return name, hex.EncodeToString(sum[:]), nil
 }
 
 type TaskCompensation struct {

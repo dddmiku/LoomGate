@@ -33,7 +33,7 @@ func (a *Doubao) reconcileWork(ctx context.Context, t taskengine.Task) error {
 	if err != nil {
 		return nil
 	}
-	if j.Period != t.PeriodKey || j.Stage != taskengine.StageExecute || j.Conversation == "" || j.State != "uncertain" && j.State != "attempting" {
+	if j.Period != t.PeriodKey || j.Stage != taskengine.StageExecute || j.Conversation == "" || !workGenerationPending(j.State) {
 		return nil
 	}
 	if !w.referenceMatches(t, j) {
@@ -51,10 +51,22 @@ func (a *Doubao) reconcileWork(ctx context.Context, t taskengine.Task) error {
 		return nil
 	}
 	j.State = "generated"
+	if j.Generate != nil && j.Generate.State == "unknown" {
+		j.Generate.State = "accepted"
+		j.Generate.Updated = time.Now().UTC()
+	}
 	w.mu.Lock()
 	_, err = w.save(t, j, rev)
 	w.mu.Unlock()
 	return err
+}
+
+func workGenerationPending(state string) bool {
+	switch state {
+	case "uncertain", "attempting", "generate_unknown", "generated", "fact_attempting", "fact_unknown":
+		return true
+	}
+	return false
 }
 
 type workInput struct {
@@ -64,7 +76,22 @@ type workInput struct {
 	Instruction string `json:"instruction"`
 	Enabled     bool   `json:"enabled"`
 }
+
+// workStep records one non-idempotent sub-operation of a work task. The
+// attempt is the engine-issued ActionReference for the enclosing stage; the
+// state is written before the request and only authoritative provider
+// evidence may advance it.
+type workStep struct {
+	Attempt      string    `json:"attempt,omitempty"`
+	State        string    `json:"state"`
+	Instance     string    `json:"instance,omitempty"`
+	Message      string    `json:"message,omitempty"`
+	Conversation string    `json:"conversation,omitempty"`
+	Updated      time.Time `json:"updated,omitempty"`
+}
+
 type workJournal struct {
+	Version         int              `json:"version,omitempty"`
 	Account         string           `json:"account"`
 	Task            string           `json:"task"`
 	Period          string           `json:"period"`
@@ -80,6 +107,10 @@ type workJournal struct {
 	LegacyWork      json.RawMessage  `json:"work,omitempty"`
 	Conversation    string           `json:"conversation,omitempty"`
 	Message         string           `json:"message,omitempty"`
+	Start           *workStep        `json:"start,omitempty"`
+	Generate        *workStep        `json:"generate,omitempty"`
+	Fact            *workStep        `json:"fact,omitempty"`
+	Claim           *workStep        `json:"claim,omitempty"`
 }
 
 func workKey(prefix, account, key string) string {
@@ -119,6 +150,7 @@ func (w *DoubaoWork) journal(t taskengine.Task) (workJournal, uint64, error) {
 	return value, a.Revision, nil
 }
 func (w *DoubaoWork) save(t taskengine.Task, v workJournal, rev uint64) (uint64, error) {
+	v.Version = 2
 	b, _ := json.Marshal(v)
 	a, err := w.Vault.Put(accountvault.Account{ID: workKey("dw-action-", t.AccountID, t.Key), Provider: "doubao-work", Enabled: true}, b, rev)
 	return a.Revision, err
@@ -141,6 +173,15 @@ func supportedWork(kind string) bool {
 	return false
 }
 
+func findActivityTask(activity doubao.Activity, code string) (doubao.Task, bool) {
+	for _, candidate := range append(append([]doubao.Task{}, activity.Tasks...), activity.Milestones...) {
+		if candidate.Code == code {
+			return candidate, true
+		}
+	}
+	return doubao.Task{}, false
+}
+
 func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.Task) (taskengine.Observation, error) {
 	w := a.Work
 	if w == nil || w.Provider == nil || !supportedWork(up.Type) || up.Work == nil || !up.Work.Available {
@@ -153,7 +194,7 @@ func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.T
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{Phase: "manual", Summary: "请先填写此任务的真实工作内容。"}), nil
 	}
 	old, rev, readErr := w.journal(t)
-	if readErr == nil && old.Period == t.PeriodKey {
+	if readErr == nil && old.Period == t.PeriodKey && old.State != "not_submitted" {
 		w.mu.Unlock()
 		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "已有工作尝试，只读取结果，不重新生成。"}), taskengine.ErrUncertain
 	}
@@ -166,12 +207,23 @@ func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.T
 		w.mu.Unlock()
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), errors.New("account_disabled")
 	}
+	session, err := (doubao.VaultSessions{Vault: a.Vault}).Session(ctx, t.AccountID)
+	if err != nil || session.Revision != strconv.FormatUint(account.Revision, 10) {
+		w.mu.Unlock()
+		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{Phase: "blocked"}), errors.New("account_identity_changed")
+	}
 	reference := taskengine.ActionReference(t, taskengine.StageExecute)
 	if reference == "" {
 		w.mu.Unlock()
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), taskengine.ErrInvalid
 	}
-	journal := workJournal{Account: t.AccountID, Task: t.Key, Period: t.PeriodKey, Attempt: reference, Stage: taskengine.StageExecute, AccountRevision: account.Revision, Instance: up.ID, Started: time.Now(), State: "attempting"}
+	now := time.Now().UTC()
+	journal := workJournal{
+		Account: t.AccountID, Task: t.Key, Period: t.PeriodKey, Attempt: reference,
+		Stage: taskengine.StageExecute, AccountRevision: account.Revision, Instance: up.ID,
+		Started: now, State: "attempting",
+		Start: &workStep{Attempt: reference, State: "attempting", Instance: up.ID, Updated: now},
+	}
 	before, err := a.Client.RewardRecords(ctx, t.AccountID)
 	if err != nil {
 		w.mu.Unlock()
@@ -180,69 +232,143 @@ func (a *Doubao) executeWork(ctx context.Context, t taskengine.Task, up doubao.T
 	for _, record := range before.Records {
 		journal.Before = append(journal.Before, record.ID)
 	}
-	rev, err = w.save(t, journal, rev)
-	w.mu.Unlock()
-	if err != nil {
+	if rev, err = w.save(t, journal, rev); err != nil {
+		w.mu.Unlock()
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), err
 	}
-	session, err := (doubao.VaultSessions{Vault: a.Vault}).Session(ctx, t.AccountID)
-	if err != nil || session.Revision != strconv.FormatUint(account.Revision, 10) {
-		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), errors.New("account_identity_changed")
-	}
-	// The official work task must be started (campaign_task_click) before the
-	// generation, otherwise it stays Created even when an artifact exists.
+	w.mu.Unlock()
+	// task_start is the first upstream mutation. The journal above is durable
+	// before it leaves the process, so every later failure is unknown, never
+	// NotSubmitted.
 	started, startErr := a.Client.TaskActionRevision(ctx, t.AccountID, session.Revision, "task_start", up)
 	if startErr != nil {
 		w.mu.Lock()
+		journal.State = "start_unknown"
+		if journal.Start != nil {
+			journal.Start.State = "unknown"
+			journal.Start.Updated = time.Now().UTC()
+		}
 		_, _ = w.save(t, journal, rev)
 		w.mu.Unlock()
-		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), startErr
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "任务开始请求结果未知，保留待核验，不重新开始或生成。"}), startErr
 	}
-	instance := up.ID
-	for _, candidate := range append(append([]doubao.Task{}, started.Tasks...), started.Milestones...) {
-		if candidate.Code == up.Code && candidate.ID != "" {
-			instance = candidate.ID
+	candidate, ok := findActivityTask(started, up.Code)
+	if !ok || candidate.Status != 4 || candidate.ID == "" {
+		w.mu.Lock()
+		journal.State = "start_unknown"
+		if journal.Start != nil {
+			journal.Start.State = "unknown"
+			journal.Start.Updated = time.Now().UTC()
 		}
+		_, _ = w.save(t, journal, rev)
+		w.mu.Unlock()
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "任务开始回执未显示进行中实例，保留待核验。"}), errors.New("work_start_unconfirmed")
 	}
-	journal.Instance = instance
+	journal.Instance = candidate.ID
+	up.ID = candidate.ID
+	journal.State = "started"
+	journal.Start.State = "accepted"
+	journal.Start.Instance = candidate.ID
+	journal.Start.Updated = time.Now().UTC()
 	w.mu.Lock()
 	rev, err = w.save(t, journal, rev)
 	w.mu.Unlock()
 	if err != nil {
-		return taskengine.NotSubmitted(t, taskengine.StageExecute, taskengine.Observation{}), err
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "任务已开始但实例未能安全保存，保留待核验。"}), err
 	}
-	result, err := w.Provider.CompleteTask(ctx, doubao.TaskWorkRequest{AccountID: t.AccountID, Revision: session.Revision, Model: input.Model, Instruction: input.Instruction, ActionKey: reference, Task: up})
-	journal.State = "uncertain"
+	result, genErr := w.Provider.CompleteTask(ctx, doubao.TaskWorkRequest{AccountID: t.AccountID, Revision: session.Revision, Model: input.Model, Instruction: input.Instruction, ActionKey: reference, Task: up})
+	now = time.Now().UTC()
 	journal.Conversation = result.ConversationRef
 	journal.Message = result.MessageID
-	if err == nil && result.Complete && result.Acknowledged {
+	journal.Generate = &workStep{Attempt: reference, State: "unknown", Instance: candidate.ID, Message: result.MessageID, Conversation: result.ConversationRef, Updated: now}
+	journal.State = "generate_unknown"
+	if genErr == nil && result.Attempted && result.Acknowledged && result.Complete {
+		journal.Generate.State = "accepted"
 		journal.State = "generated"
 	}
 	w.mu.Lock()
-	_, saveErr := w.save(t, journal, rev)
+	var saveErr error
+	rev, saveErr = w.save(t, journal, rev)
 	w.mu.Unlock()
 	if saveErr != nil {
-		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), saveErr
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "生成结果未能安全保存，保留待核验。"}), saveErr
 	}
 	observation := taskengine.Observation{Phase: "pending", Summary: "真实工作已提交，继续核验官方任务条件与奖励；生成结果不代表任务达标。"}
-	if journal.State == "generated" && journal.Message != "" {
-		fact, factErr := a.Client.TaskFactRevision(ctx, t.AccountID, session.Revision, doubao.Task{ID: journal.Instance, Group: up.Group, Code: up.Code}, journal.Message)
-		if factErr != nil {
-			return taskengine.UnknownAction(t, taskengine.StageExecute, observation), factErr
-		}
-		for _, candidate := range append(append([]doubao.Task{}, fact.Tasks...), fact.Milestones...) {
-			if candidate.Code == up.Code {
-				if candidate.Status == 2 || candidate.Status == 3 {
-					return taskengine.Accepted(t, taskengine.StageExecute, taskengine.Observation{Phase: "done", Summary: "官方已确认任务事实，奖励进入核验。"}), nil
-				}
-			}
-		}
-		return taskengine.Accepted(t, taskengine.StageExecute, observation), nil
+	if journal.State != "generated" {
+		return taskengine.UnknownAction(t, taskengine.StageExecute, observation), genErr
 	}
-	if journal.State == "generated" && journal.Message == "" {
-		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "生成已完成但缺少可核验的消息标识，保留待核验，不重发。"}), err
+	if journal.Message == "" {
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "生成已完成但缺少可核验的消息标识，保留待核验，不重发。"}), errors.New("work_message_id_missing")
 	}
-	return taskengine.UnknownAction(t, taskengine.StageExecute, observation), err
+	// A fact report is its own non-idempotent operation. Persist it before the
+	// request so a lost response can never cause a second report.
+	now = time.Now().UTC()
+	journal.Fact = &workStep{Attempt: reference, State: "attempting", Instance: journal.Instance, Message: journal.Message, Conversation: journal.Conversation, Updated: now}
+	journal.State = "fact_attempting"
+	w.mu.Lock()
+	rev, saveErr = w.save(t, journal, rev)
+	w.mu.Unlock()
+	if saveErr != nil {
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "事实上报尝试未能持久化，未发送上报，保留待核验。"}), saveErr
+	}
+	fact, factErr := a.Client.TaskFactRevision(ctx, t.AccountID, session.Revision, doubao.Task{ID: journal.Instance, Group: up.Group, Code: up.Code}, journal.Message)
+	if factErr != nil {
+		w.mu.Lock()
+		journal.State = "fact_unknown"
+		journal.Fact.State = "unknown"
+		journal.Fact.Updated = time.Now().UTC()
+		_, _ = w.save(t, journal, rev)
+		w.mu.Unlock()
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "任务事实上报结果未知，保留待核验，不重复上报。"}), factErr
+	}
+	confirmed, ok := findActivityTask(fact, up.Code)
+	if !ok || (confirmed.ID != "" && confirmed.ID != journal.Instance) || (confirmed.Status != 2 && confirmed.Status != 3) {
+		w.mu.Lock()
+		journal.State = "fact_unknown"
+		journal.Fact.State = "unknown"
+		journal.Fact.Updated = time.Now().UTC()
+		_, _ = w.save(t, journal, rev)
+		w.mu.Unlock()
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "事实上报未获权威完成状态，保留待核验，不重复上报。"}), errors.New("work_fact_unconfirmed")
+	}
+	journal.State = "fact_accepted"
+	journal.Fact.State = "accepted"
+	journal.Fact.Updated = time.Now().UTC()
+	w.mu.Lock()
+	_, saveErr = w.save(t, journal, rev)
+	w.mu.Unlock()
+	if saveErr != nil {
+		return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "官方已确认任务事实，但本地状态未能保存，保留待核验。"}), saveErr
+	}
+	return taskengine.Accepted(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "官方已确认任务事实，奖励进入核验。"}), nil
+}
+
+// resolveFact accepts an unconfirmed fact attempt only when the official task
+// state itself proves completion for the same instance. No event is invented
+// or re-sent.
+func (a *Doubao) resolveFact(t taskengine.Task, current doubao.Task) error {
+	w := a.Work
+	if w == nil {
+		return nil
+	}
+	j, rev, err := w.journal(t)
+	if err != nil || j.Period != t.PeriodKey || j.Fact == nil || j.Fact.State == "accepted" || j.Start == nil || j.Start.State != "accepted" {
+		return nil
+	}
+	if current.Status != 2 && current.Status != 3 {
+		return nil
+	}
+	if current.ID != "" && j.Instance != "" && current.ID != j.Instance {
+		return nil
+	}
+	j.State = "fact_accepted"
+	j.Fact.State = "accepted"
+	j.Fact.Instance = current.ID
+	j.Fact.Updated = time.Now().UTC()
+	w.mu.Lock()
+	_, err = w.save(t, j, rev)
+	w.mu.Unlock()
+	return err
 }
 
 func (a *Doubao) rewardAction(ctx context.Context, t taskengine.Task, up doubao.Task, stage taskengine.Stage) (taskengine.Observation, error) {
@@ -272,23 +398,48 @@ func (a *Doubao) rewardAction(ctx context.Context, t taskengine.Task, up doubao.
 		w.mu.Unlock()
 		return taskengine.NotSubmitted(t, stage, taskengine.Observation{}), readErr
 	}
-	journal := workJournal{Account: t.AccountID, Task: t.Key, Period: t.PeriodKey, Attempt: reference, Stage: stage, AccountRevision: account.Revision, Instance: up.ID, Started: time.Now(), State: "attempting", LegacyWork: old.LegacyWork, Conversation: old.Conversation}
+	now := time.Now().UTC()
+	journal := workJournal{
+		Account: t.AccountID, Task: t.Key, Period: t.PeriodKey, Attempt: reference,
+		Stage: stage, AccountRevision: account.Revision, Instance: up.ID, Started: now,
+		State: "attempting", LegacyWork: old.LegacyWork, Conversation: old.Conversation,
+		Start: old.Start, Generate: old.Generate, Fact: old.Fact,
+	}
+	if stage == taskengine.StageClaim {
+		journal.Claim = &workStep{Attempt: reference, State: "attempting", Instance: up.ID, Updated: now}
+	}
 	for _, r := range before.Records {
 		journal.Before = append(journal.Before, r.ID)
 	}
-	rev, err = w.save(t, journal, rev)
-	w.mu.Unlock()
-	if err != nil {
+	if rev, err = w.save(t, journal, rev); err != nil {
+		w.mu.Unlock()
 		return taskengine.NotSubmitted(t, stage, taskengine.Observation{}), err
 	}
+	w.mu.Unlock()
 	operation := "task_claim"
 	if stage == taskengine.StageExecute {
 		operation = "task_checkin"
 	}
 	result, err := a.Client.TaskActionRevision(ctx, t.AccountID, strconv.FormatUint(account.Revision, 10), operation, up)
+	now = time.Now().UTC()
 	journal.State = "uncertain"
 	if err == nil && result.OperationStatus == "submitted" {
 		journal.State = "accepted"
+	}
+	step := journal.Claim
+	if stage == taskengine.StageExecute {
+		if journal.Start == nil {
+			journal.Start = &workStep{Attempt: reference, Instance: up.ID, Updated: now}
+		}
+		step = journal.Start
+	}
+	if step != nil {
+		step.Updated = now
+		if journal.State == "accepted" {
+			step.State = "accepted"
+		} else {
+			step.State = "unknown"
+		}
 	}
 	w.mu.Lock()
 	_, saveErr := w.save(t, journal, rev)

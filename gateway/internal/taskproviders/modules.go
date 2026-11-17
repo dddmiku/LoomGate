@@ -67,7 +67,12 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	}
 	modules := []Module{check, &balanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"cn", "global"}}, definition: defs["balance"]}, owner: a}, &growthModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "growth", Key: "growth/", Prefix: true, Realms: []string{"cn"}}, definition: defs["growth"]}, up: a.Upstream}}
 	modules = append(modules, newLifecycleModules(a.Upstream, defs)...)
-	modules = append(modules, newRewardModules(a.Upstream, defs)...)
+	// Single-shot spends require a durable attempt journal. Without a spend
+	// vault, offering the task would permit an unprovable replay after a
+	// restart, so the modules are not registered at all.
+	if a.options.SpendVault != nil {
+		modules = append(modules, newRewardModules(a, defs)...)
+	}
 	if a.options.RefreshVault != nil {
 		modules = append(modules, newKeepaliveModule(a, defs["keepalive"]))
 	}

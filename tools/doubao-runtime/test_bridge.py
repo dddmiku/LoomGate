@@ -21,6 +21,35 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(bridge.BridgeError):
                 bridge.validate(value)
 
+    def test_task_fact_message_survives_the_outer_whitelist(self):
+        base = {'operation': 'task_fact', 'port': 1234, 'identity': 'a' * 64,
+                'group': 'synthetic-group', 'task': 'synthetic-task', 'instance': 'synthetic-instance'}
+        bridge.validate(dict(base, message='synthetic_message-1'))
+        for change in ({'message': ''}, {'message': 'bad/../value'}, {'message': 1},
+                       {'message': None}, {'extra': 'not-allowed'},
+                       {'operation': 'task_start', 'message': 'synthetic_message-1'}):
+            request = dict(base, message='synthetic_message-1')
+            request.update(change)
+            with self.subTest(change=change), self.assertRaises(bridge.BridgeError):
+                bridge.validate(request)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.validate(dict(base))
+
+    def test_task_fact_message_survives_the_outer_whitelist(self):
+        base = {'operation': 'task_fact', 'port': 1234, 'identity': 'a' * 64,
+                'group': 'synthetic-group', 'task': 'synthetic-task', 'instance': 'synthetic-instance'}
+        bridge.validate(dict(base, message='synthetic_message-1'))
+        for change in ({'message': ''}, {'message': 'bad/../value'}, {'message': 1},
+                       {'message': None}, {'extra': 'not-allowed'},
+                       {'operation': 'task_start', 'message': 'synthetic_message-1'}):
+            request = dict(base, message='synthetic_message-1')
+            request.update(change)
+            with self.subTest(change=change), self.assertRaises(bridge.BridgeError):
+                bridge.validate(request)
+        missing = dict(base)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.validate(missing)
+
     def test_target_restricts_origin_port_and_unique_page(self):
         target = {'type':'page','url':'doubao://doubao-chat/chat'}
         class Handler(BaseHTTPRequestHandler):

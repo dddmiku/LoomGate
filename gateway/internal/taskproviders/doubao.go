@@ -193,6 +193,11 @@ func (a *Doubao) Inspect(ctx context.Context, t taskengine.Task) (taskengine.Obs
 	if err != nil {
 		return taskengine.Observation{}, err
 	}
+	// A fact report whose response was lost can only be closed by the official
+	// task state for the same instance. This never sends a second event.
+	if err = a.resolveFact(t, current); err != nil {
+		return taskengine.Observation{Phase: "pending"}, err
+	}
 	state := doubaoObservation(current, activity.TotalAmount)
 	if a.Work != nil && state.Phase != "done" && state.Phase != "claimable" {
 		if j, _, e := a.Work.journal(t); e == nil && j.Period == t.PeriodKey {

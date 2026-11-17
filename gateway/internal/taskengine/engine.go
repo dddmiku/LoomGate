@@ -662,6 +662,11 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			return StatusManual, nil
 		case "blocked":
 			return StatusFailed, errors.New("task_unavailable")
+		case "skipped":
+			// A truthful no-op: the provider confirmed there is nothing to do
+			// this run (for example zero chances), so no completion is recorded
+			// and a later grant is not hidden.
+			return StatusSkipped, nil
 		case "ready":
 			if executed {
 				return StatusUncertain, ErrUncertain

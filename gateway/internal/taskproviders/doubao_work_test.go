@@ -19,7 +19,9 @@ type workFixture struct {
 	mu                        sync.Mutex
 	status, starts, generated, claims, facts int
 	dropMessageID                           bool
-	withhold, fail            bool
+	withhold, fail, failStart bool
+	startInstance             string
+	startStatus               int
 	records                   []doubao.RewardRecord
 }
 
@@ -27,7 +29,11 @@ func (f *workFixture) Catalog(context.Context, doubao.RuntimeBinding, string) (j
 	return nil, errors.New("unused_catalog")
 }
 func (f *workFixture) snapshot() doubao.Activity {
-	return doubao.Activity{Group: "synthetic-group", Tasks: []doubao.Task{{Code: "synthetic-sheet", Group: "synthetic-group", ID: "synthetic-instance", Type: "GenExcel", Work: &doubao.WorkCapability{Available: true, Reason: "available"}, Kind: "chat_activity", Title: "Synthetic workbook", Status: f.status, RewardMode: 1, Rewards: []doubao.Reward{{Amount: 100, Type: "quota_grant"}}}}, Milestones: []doubao.Task{}}
+	instance := "synthetic-instance"
+	if f.startInstance != "" {
+		instance = f.startInstance
+	}
+	return doubao.Activity{Group: "synthetic-group", Tasks: []doubao.Task{{Code: "synthetic-sheet", Group: "synthetic-group", ID: instance, Type: "GenExcel", Work: &doubao.WorkCapability{Available: true, Reason: "available"}, Kind: "chat_activity", Title: "Synthetic workbook", Status: f.status, RewardMode: 1, Rewards: []doubao.Reward{{Amount: 100, Type: "quota_grant"}}}}, Milestones: []doubao.Task{}}
 }
 func (f *workFixture) Activities(context.Context, doubao.RuntimeBinding) (doubao.Activity, error) {
 	f.mu.Lock()
@@ -43,12 +49,22 @@ func (f *workFixture) TaskAction(_ context.Context, _ doubao.RuntimeBinding, op,
 			return doubao.Activity{}, errors.New("wrong_start")
 		}
 		f.starts++
+		if f.failStart {
+			return doubao.Activity{}, errors.New("synthetic_start_unknown")
+		}
 		f.status = 4
+		if f.startStatus != 0 {
+			f.status = f.startStatus
+		}
 		a := f.snapshot()
 		a.OperationStatus = "submitted"
 		return a, nil
 	case "task_claim":
-		if group != "synthetic-group" || task != "synthetic-sheet" || instance != "synthetic-instance" || f.status != 2 {
+		want := "synthetic-instance"
+		if f.startInstance != "" {
+			want = f.startInstance
+		}
+		if group != "synthetic-group" || task != "synthetic-sheet" || instance != want || f.status != 2 {
 			return doubao.Activity{}, errors.New("wrong_action")
 		}
 		f.claims++
@@ -65,7 +81,13 @@ func (f *workFixture) TaskAction(_ context.Context, _ doubao.RuntimeBinding, op,
 func (f *workFixture) TaskFact(_ context.Context, _ doubao.RuntimeBinding, group, task, instance, message string) (doubao.Activity, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if group != "synthetic-group" || task != "synthetic-sheet" || instance != "synthetic-instance" || message != "synthetic-message" || f.status != 4 {
+	want := "synthetic-instance"
+	if f.startInstance != "" {
+		want = f.startInstance
+	}
+	// Fact reports are also accepted after a completed generation has moved
+	// the fixture to status 4 (InProgress), which is the production chain.
+	if group != "synthetic-group" || task != "synthetic-sheet" || instance != want || message != "synthetic-message" || f.status != 4 {
 		return doubao.Activity{}, errors.New("wrong_fact")
 	}
 	f.facts++
@@ -208,6 +230,71 @@ func TestDoubaoUnknownGenerationIsNotReplayedOrMistakenForReward(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.generated != 1 || f.claims != 0 {
 		t.Fatal("unknown replayed or claimed")
+	}
+}
+
+
+func TestDoubaoWorkPersistsStartBeforeMutationAndNeverClearsUnknownOnFailure(t *testing.T) {
+	a, f := workAdapter(t)
+	f.mu.Lock()
+	f.failStart = true
+	f.mu.Unlock()
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	e := workEngine(t, a, path)
+	if run := submitWork(t, e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("lost task_start response reported %s", run.Status)
+	}
+	e.Close()
+	e = workEngine(t, a, path)
+	defer e.Close()
+	if run := submitWork(t, e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("restart cleared task_start unknown %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.starts != 1 || f.generated != 0 || f.facts != 0 {
+		t.Fatalf("start/generation replayed starts=%d generated=%d facts=%d", f.starts, f.generated, f.facts)
+	}
+}
+
+func TestDoubaoWorkUsesTheStartedInstanceForGenerationAndFact(t *testing.T) {
+	a, f := workAdapter(t)
+	f.mu.Lock()
+	f.startInstance = "synthetic-rotated-instance"
+	f.mu.Unlock()
+	e := workEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := submitWork(t, e); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("rotated instance work result %s", run.Status)
+	}
+	var journal workJournal
+	a.Work.mu.Lock()
+	journal, _, _ = a.Work.journal(taskengine.Task{Definition: taskengine.Definition{ProviderID: "doubao", Key: "synthetic-group:synthetic-sheet"}, Target: taskengine.Target{AccountID: "synthetic-account"}})
+	a.Work.mu.Unlock()
+	if journal.Instance != "synthetic-rotated-instance" || journal.Start == nil || journal.Start.Instance != "synthetic-rotated-instance" {
+		t.Fatalf("journal kept the stale instance %q", journal.Instance)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.starts != 1 || f.generated != 1 || f.facts != 1 {
+		t.Fatalf("stale instance prevented the chain starts=%d generated=%d facts=%d", f.starts, f.generated, f.facts)
+	}
+}
+
+func TestDoubaoWorkStartWithoutInProgressInstanceStaysUnknown(t *testing.T) {
+	a, f := workAdapter(t)
+	f.mu.Lock()
+	f.startStatus = 1
+	f.mu.Unlock()
+	e := workEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := submitWork(t, e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("unconfirmed start instance reported %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.generated != 0 || f.facts != 0 {
+		t.Fatalf("unconfirmed start still generated facts=%d generated=%d", f.facts, f.generated)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/taskengine"
@@ -22,9 +23,11 @@ type lifecycleFixture struct {
 	day, travel, tier, offerEnd                        string
 	record                                             int64
 	daily, claimed, noBuddy, reject, silent, malformed bool
+	refuseDrawOnce                                     bool
 	cards                                              int
 	chances, buddyAffordable                           int
 	made                                               []string
+	afterWrite                                         func()
 	counts                                             map[string]int
 	writeBodies                                        map[string]map[string]any
 }
@@ -91,6 +94,11 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 		data = map[string]any{"balance": f.chances}
 	case "/activity/growth/lottery/draw":
 		if !f.silent {
+			if f.refuseDrawOnce {
+				f.refuseDrawOnce = false
+				http.Error(w, `{"code":400,"msg":"insufficient lottery chance balance"}`, 400)
+				return
+			}
 			if f.chances <= 0 {
 				http.Error(w, `{"code":400,"msg":"insufficient lottery chance balance"}`, 400)
 				return
@@ -109,8 +117,8 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			f.buddyAffordable--
+			data = map[string]any{"buddy": "合成Buddy"}
 		}
-		data = map[string]any{"buddy": "合成Buddy"}
 	case "/billing/meter/compensation-status":
 		data = map[string]any{"active": true, "claimed": f.claimed, "credit_num": 31, "end_time": f.offerEnd}
 	case "/billing/meter/claim-compensation":
@@ -125,6 +133,10 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 	if f.malformed && !mutation {
 		data = map[string]any{}
 	}
+	if mutation && f.afterWrite != nil {
+		f.afterWrite()
+		f.afterWrite = nil
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": data})
 }
@@ -135,6 +147,11 @@ func lifecycleSetup(t *testing.T) (*Accounts, *lifecycleFixture, *pool.Pool) {
 	t.Cleanup(s.Close)
 	p := pool.New("")
 	t.Cleanup(p.Close)
+	state, err := accountvault.Open(filepath.Join(t.TempDir(), "task-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
 	for _, realm := range []string{"cn", "global", "trae"} {
 		raw, _ := json.Marshal(map[string]any{"uid": "synthetic-" + realm, "realm": realm, "domain": map[string]string{"cn": "copilot.tencent.com", "global": "www.workbuddy.ai", "trae": "api.trae.cn"}[realm], "accessToken": "synthetic-only", "expiresAt": time.Now().Add(time.Hour).Unix()})
 		a, e := auth.Parse(raw)
@@ -144,7 +161,7 @@ func lifecycleSetup(t *testing.T) (*Accounts, *lifecycleFixture, *pool.Pool) {
 		p.Add(a)
 	}
 	up := &upstream.Client{HTTP: s.Client(), ChatBaseCN: s.URL, BillingBaseCN: s.URL}
-	a, e := NewAccounts(p, up, "workbuddy", time.Hour)
+	a, e := NewAccounts(p, up, "workbuddy", time.Hour, AccountsOptions{SpendVault: state})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -523,6 +540,171 @@ func TestAcceptedTravelReceiptPersistsUntilDelayedSettlement(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.counts["/activity/growth/buddy/travel/claim"] != 1 {
 		t.Fatal("settled receipt replayed claim")
+	}
+}
+
+
+// spendJournalForTest reads the durable spend record through the registered
+// production module, proving the test exercises the real vault path.
+func spendJournalForTest(t *testing.T, a *Accounts, uid, kind string) spendJournal {
+	t.Helper()
+	for _, m := range a.Modules {
+		var base *spendRewardModule
+		switch x := m.(type) {
+		case *lotteryModule:
+			base = &x.spendRewardModule
+		case *buddyBoxModule:
+			base = &x.spendRewardModule
+		}
+		if base != nil && base.Spec().Key == kind {
+			auth := a.Pool.AuthByUID(uid).Snapshot()
+			j, _, err := base.loadSpend(auth, kind)
+			if err != nil {
+				t.Fatalf("load spend journal: %v", err)
+			}
+			return j
+		}
+	}
+	t.Fatalf("spend module %s not registered", kind)
+	return spendJournal{}
+}
+
+
+func TestRewardModuleExplicitRefusalDoesNotBlockLaterChance(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	f.mu.Lock()
+	f.chances = 1
+	f.refuseDrawOnce = true
+	f.mu.Unlock()
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	first := runLifecycle(t, e, "lottery")
+	if first.Status != taskengine.StatusSkipped {
+		t.Fatalf("explicit refusal reported %s", first.Status)
+	}
+	f.mu.Lock()
+	f.chances = 2
+	f.mu.Unlock()
+	if run := runLifecycle(t, e, "lottery"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("refused attempt blocked a later chance: %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts["/activity/growth/lottery/draw"] != 2 {
+		t.Fatalf("expected one refused and one accepted draw, got %d", f.counts["/activity/growth/lottery/draw"])
+	}
+}
+
+func TestRewardModulesBindStableTokenAndPersistAcceptedBaseline(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := runLifecycle(t, e, "lottery"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("lottery result %s", run.Status)
+	}
+	f.mu.Lock()
+	token, _ := f.writeBodies["/activity/growth/lottery/draw"]["client_token"].(string)
+	f.mu.Unlock()
+	if !strings.HasPrefix(token, "lottery-") || len(token) != len("lottery-")+32 {
+		t.Fatalf("client_token not bound to the attempt: %q", token)
+	}
+	j := spendJournalForTest(t, a, "synthetic-cn", "lottery")
+	if j.State != "accepted" || j.ClientToken != token || j.After != j.Before-1 || j.Reference == "" {
+		t.Fatalf("durable receipt incomplete: %+v", j)
+	}
+}
+
+func TestRewardModuleLostResponseSurvivesRestartWithoutReplay(t *testing.T) {
+	for _, key := range []string{"lottery", "buddy_box"} {
+		t.Run(key, func(t *testing.T) {
+			a, f, _ := lifecycleSetup(t)
+			f.silent = true
+			path := filepath.Join(t.TempDir(), "tasks.json")
+			e := lifecycleEngine(t, a, path)
+			if run := runLifecycle(t, e, key); run.Status != taskengine.StatusUncertain {
+				t.Fatalf("lost response reported %s", run.Status)
+			}
+			e.Close()
+			e = lifecycleEngine(t, a, path)
+			defer e.Close()
+			if run := runLifecycle(t, e, key); run.Status != taskengine.StatusUncertain {
+				t.Fatalf("restart cleared unknown %s", run.Status)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.counts["/activity/growth/lottery/draw"] != 1 && key == "lottery" {
+				t.Fatalf("lottery replayed %d times", f.counts["/activity/growth/lottery/draw"])
+			}
+			if f.counts["/activity/growth/buddy/open"] != 1 && key == "buddy_box" {
+				t.Fatalf("buddy box replayed %d times", f.counts["/activity/growth/buddy/open"])
+			}
+		})
+	}
+}
+
+func TestRewardModuleNoChanceDoesNotPersistACompletedDay(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	f.mu.Lock()
+	f.chances = 0
+	f.mu.Unlock()
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := runLifecycle(t, e, "lottery"); run.Status == taskengine.StatusSucceeded {
+		t.Fatal("no-chance state reported completed")
+	}
+	if _, _, err := func() (spendJournal, uint64, error) {
+		for _, m := range a.Modules {
+			if x, ok := m.(*lotteryModule); ok {
+				return x.loadSpend(a.Pool.AuthByUID("synthetic-cn").Snapshot(), "lottery")
+			}
+		}
+		return spendJournal{}, 0, nil
+	}(); err == nil {
+		t.Fatal("no-chance run persisted a durable spend attempt")
+	}
+	f.mu.Lock()
+	f.chances = 2
+	f.mu.Unlock()
+	if run := runLifecycle(t, e, "lottery"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("later chance was blocked by the earlier read-only run %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts["/activity/growth/lottery/draw"] != 1 {
+		t.Fatal("later chance did not draw exactly once")
+	}
+}
+
+func TestRewardModulePostSuccessSaveFailureStaysUnknown(t *testing.T) {
+	for _, key := range []string{"lottery", "buddy_box"} {
+		t.Run(key, func(t *testing.T) {
+			a, f, _ := lifecycleSetup(t)
+			e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+			defer e.Close()
+			// Close the state vault after the fixture accepted the spend: the
+			// accepted receipt cannot be saved, so the outcome must stay unknown
+			// and the next run must only inspect.
+			for _, m := range a.Modules {
+				var base *spendRewardModule
+				switch x := m.(type) {
+				case *lotteryModule:
+					base = &x.spendRewardModule
+				case *buddyBoxModule:
+					base = &x.spendRewardModule
+				}
+				if base != nil && base.Spec().Key == key {
+					f.afterWrite = func() { base.vault.Close() }
+				}
+			}
+			if run := runLifecycle(t, e, key); run.Status != taskengine.StatusUncertain {
+				t.Fatalf("save failure reported %s", run.Status)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.counts["/activity/growth/lottery/draw"]+f.counts["/activity/growth/buddy/open"] != 1 {
+				t.Fatal("save failure replayed the spend")
+			}
+		})
 	}
 }
 

@@ -21,7 +21,9 @@ type Result struct {
 	UsageReported   bool
 	AttemptRecords  []Attempt
 	ConversationRef string
-	MessageID       string
+	// MessageID is private attribution metadata for a bound work task. It must
+	// never appear in a public provider response.
+	MessageID string `json:"-"`
 	Recovery        []byte `json:"-"`
 }
 

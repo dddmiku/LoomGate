@@ -105,6 +105,7 @@ test('task work selects only a fresh matching official skill and rejects unavail
  const f=await fixture({native:true});const prepared=await f.invoke('prepare_text',request);assert.equal(prepared.ok,true);
  assert.equal(prepared.data.body.option.general_task_param.selected_skills[0],'synthetic-official-skill');assert.equal(f.requests.length,0);await f.invoke('release_text',{lease:prepared.data.lease});
  for(const options of [{skill:false},{taskStatus:2},{taskStatus:3}]){const f=await fixture({native:true,...options});const result=await f.invoke('prepare_text',request);assert.equal(result.ok,false);assert.equal(f.requests.length,0);}
+ const started=await fixture({native:true,taskStatus:4});const startedPrep=await started.invoke('prepare_text',request);assert.equal(startedPrep.ok,true);assert.equal(started.requests.length,0);await started.invoke('release_text',{lease:startedPrep.data.lease});
 });
 
 test('dynamic cloud-backed model accepts ordinary text without an activity or local tool runtime',async()=>{
