@@ -258,12 +258,20 @@ class BuildGuardTests(unittest.TestCase):
             android.verify_jnilibs("go", self.clang, "arm64-v8a", TAG)
 
     def test_version_code_never_falls_back_or_overflows_segments(self):
-        self.assertEqual(android.version_code(TAG), 3_016_001)
-        self.assertGreater(android.version_code("v3.17.0"), android.version_code(TAG))
-        for tag in ("dev", "v3.16", "v3.16.1-rc1", "v3.016.1", "v3.16.-1", "v3.16.0",
+        # LoomGate generation offset: 1.0.0 must outrank the legacy 3.16.1 code.
+        self.assertEqual(android.version_code("v1.0.0"), 5_000_000)
+        self.assertGreater(android.version_code("v1.0.0"), android.LEGACY_VERSION_CODE)
+        self.assertGreater(android.version_code("v1.0.1"), android.version_code("v1.0.0"))
+        self.assertGreater(android.version_code("v1.1.0"), android.version_code("v1.0.99"))
+        self.assertEqual(android.version_code("v3.16.1"), 4_000_000 + 3_016_001)
+        for tag in ("dev", "v3.16", "v3.16.1-rc1", "v3.016.1", "v3.16.-1",
                     "v2.1000.0", "v3.15.1001", "v9999.0.0", "v3.16.1 extra"):
             with self.subTest(tag=tag), self.assertRaises(SystemExit):
                 android.version_code(tag)
+        # 0.x is a legal pre-release line inside the new generation: it still
+        # produces a code above the legacy install line but below 1.0.0.
+        self.assertGreater(android.version_code("v0.9.9"), android.LEGACY_VERSION_CODE)
+        self.assertLess(android.version_code("v0.9.9"), android.version_code("v1.0.0"))
 
     def test_missing_version_file_does_not_become_dev(self):
         (self.gateway / "VERSION").unlink()
@@ -316,7 +324,7 @@ class BuildGuardTests(unittest.TestCase):
         verify.assert_called_once()
         self.assertEqual(output.parent, dist)
         self.assertEqual(output.read_bytes(), apk.read_bytes())
-        self.assertIn("-PversionCode=3016001", commands[0])
+        self.assertIn("-PversionCode=%d" % android.version_code(TAG), commands[0])
         self.assertIn("-PjniLibsDir=" + str(self.jnilibs.resolve()), commands[0])
         self.assertIn("-PbuildOutputDir=" + str(gradle_output.resolve()), commands[0])
 

@@ -98,8 +98,12 @@ TARGETS = {
 }
 DEFAULT_ABI = "arm64-v8a"
 ANDROID_API = 24
-# v3.16.1 既有安装链路的下限；重构期间不能退成 versionCode=1。
+# v3.16.1 既有安装链路的最高已发行 code；重构期间不能低于它。
 LEGACY_VERSION_CODE = 3_016_001
+# LoomGate 1.x uses its own generation offset so 1.0.0 outranks the legacy 3.x
+# line without inventing a fake 4.x product version. Same formula is mirrored
+# in Gradle, and both are covered by boundary tests.
+LOOMGATE_GENERATION = 4_000_000
 ANDROID_VERSION_CODE_MAX = 2_100_000_000
 # 来自既有发布 APK 的公开证书，仅用于校验，不包含私钥。
 LEGACY_SIGNER_SHA256 = "44c18e220f1f6e505c2e702ff2a832cedb0e9be89e549d7874c136c0fb6fafef"
@@ -308,18 +312,19 @@ def version_code(tag):
     """把 vX.Y.Z 折成一个单调递增的整数，供安卓的 versionCode 用。
 
     安卓只认 versionCode 的大小关系，而本项目的版本号是语义化的 tag。
-    规则：major*1_000_000 + minor*1_000 + patch。这样 v2.15.5 → 2015005，
-    v2.16.0 → 2016000，单调且一眼能看出对应关系。
+    规则：LOOMGATE_GENERATION + major*1_000_000 + minor*1_000 + patch。
+    因此 1.0.0 → 5_000_000，高于旧 3.x 已安装的 3_016_001；旧产品不会把
+    新版本误判为降级，新构建也不会接受更低的安装序号。
 
-    拒绝非法版本、低于既有安装链路的版本及分段溢出，避免不可覆盖升级。
+    拒绝非法版本、低于旧安装链路上限的版本及分段溢出，避免不可覆盖升级。
     """
     match = re.fullmatch(r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", tag)
     if not match:
         raise SystemExit("Android 发行版本必须为 vX.Y.Z，不能回落 versionCode。")
     major, minor, patch = (int(part) for part in match.groups())
-    code = major * 1_000_000 + minor * 1_000 + patch
-    if minor >= 1000 or patch >= 1000 or not LEGACY_VERSION_CODE <= code <= ANDROID_VERSION_CODE_MAX:
-        raise SystemExit("Android versionCode 超出合法范围或低于既有 v3.16.1 安装版本。")
+    code = LOOMGATE_GENERATION + major * 1_000_000 + minor * 1_000 + patch
+    if minor >= 1000 or patch >= 1000 or not LEGACY_VERSION_CODE < code <= ANDROID_VERSION_CODE_MAX:
+        raise SystemExit("Android versionCode 超出合法范围或并非高于既有 v3.16.1 安装版本。")
     return code
 
 

@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import subprocess
 
@@ -72,7 +71,8 @@ def checked(command, **kwargs):
     return result.stdout
 
 
-def verify_binary(go, path, target, public_key, version):
+def build_metadata(go, path):
+    """Read the Go build metadata; never rely on -ldflags being recorded."""
     text = checked([go, "version", "-m", str(path)], timeout=60)
     settings = {}
     for line in text.splitlines():
@@ -80,19 +80,57 @@ def verify_binary(go, path, target, public_key, version):
         if len(parts) == 2 and parts[0] == "build" and "=" in parts[1]:
             key, value = parts[1].split("=", 1)
             settings[key] = json.loads(value) if value.startswith('"') else value
-    flags = shlex.split(settings.get("-ldflags", ""))
-    injections = {}
-    for index, flag in enumerate(flags):
-        assignment = flags[index + 1] if flag == "-X" and index + 1 < len(flags) else flag[3:] if flag.startswith("-X=") else ""
-        if "=" in assignment:
-            key, value = assignment.split("=", 1)
-            injections[key] = value
+    return settings
+
+
+def verify_platform(go, path, target):
+    settings = build_metadata(go, path)
     if any(settings.get(name) != target[name.lower()] for name in ("GOOS", "GOARCH")):
         raise ValueError("compiled artifact does not match the target platform")
     if settings.get("CGO_ENABLED") != "0" or (target.get("goarm") and settings.get("GOARM", "").split(",")[0] != target["goarm"]):
         raise ValueError("compiled artifact has unexpected CGO/ARM ABI settings")
-    if injections.get("workbuddy2api/internal/version.ReleaseKey") != public_key or injections.get("workbuddy2api/internal/version.Version") != version:
-        raise ValueError("compiled artifact lacks the pinned release verifier or CI version identity")
+    return settings
+
+
+def host_platform():
+    import platform
+    goos = "windows" if os.name == "nt" else "linux"
+    goarch = {"AMD64": "amd64", "ARM64": "arm64", "X86": "386", "I386": "386"}.get(
+        platform.machine().upper(), platform.machine().lower())
+    return goos, goarch
+
+
+def verify_runtime_identity(path, public_key, version):
+    """Execute the artifact's own self-check for version/commit/key digest.
+
+    This runs the actual built binary, before any account or network startup.
+    Cross-compiled outputs cannot run here; the release gate requires executing
+    this same entry point on the target platform or runner. This CI function
+    therefore supports only a host-matching artifact, and raises an explicit
+    marker otherwise rather than substituting a string scan.
+    """
+    goos, goarch = host_platform()
+    expected = (goos, goarch)
+    actual = (BINARY_PLATFORMS.get(str(path), expected))
+    if actual != expected:
+        raise ValueError("cross_compiled_identity_requires_target_runner")
+    result = subprocess.run([str(path), "--loomgate-build-info"], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise ValueError("artifact build-info self-check failed")
+    try:
+        document = json.loads(result.stdout)
+    except ValueError:
+        raise ValueError("artifact build-info self-check returned malformed data") from None
+    if document.get("version") != version or document.get("goos") != goos or document.get("goarch") != goarch:
+        raise ValueError("artifact build-info identity mismatch")
+    if document.get("verification_enabled") is not True:
+        raise ValueError("artifact build-info reports no release verifier")
+    expected_digest = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+    if document.get("release_key_sha256") != expected_digest:
+        raise ValueError("artifact verifier key digest mismatch")
+
+
+BINARY_PLATFORMS = {}
 
 
 def build_target(data, ident, work_root, commit):
@@ -133,7 +171,9 @@ def build_target(data, ident, work_root, commit):
         path = stage / output
         checked([go, "build", "-p=1", "-mod=readonly", "-buildvcs=false", "-trimpath", "-ldflags", flags,
                  "-o", str(path), "./cmd/" + package], cwd=GATEWAY, env=env, timeout=1200)
-        verify_binary(go, path, target, public_key, version)
+        verify_platform(go, path, target)
+        BINARY_PLATFORMS[str(path)] = (target["goos"], target["goarch"])
+    verify_runtime_identity(stage / "wb2api", public_key, version)
     artifacts = [target["update_asset"]]
     shutil.copyfile(stage / "wb2api", out / target["update_asset"])
     if target.get("runtime_asset"):

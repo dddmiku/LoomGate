@@ -80,10 +80,12 @@ class ReleaseTargetsTests(unittest.TestCase):
         stage.mkdir(parents=True)
         (stage / "config.json").write_text("not part of the package")
         with patch.object(build, "checked", side_effect=self.fake_compile) as checked, \
-                patch.object(build, "verify_binary") as verify:
+                patch.object(build, "verify_platform") as verify, \
+                patch.object(build, "verify_runtime_identity") as identity:
             report = build.build_target(self.data, "linux-amd64", work, "a" * 40)
         self.assertEqual(checked.call_count, len(build.PROGRAMS))
         self.assertEqual(verify.call_count, len(build.PROGRAMS))
+        identity.assert_called_once()
         out = work / "artifacts" / "linux-amd64"
         self.assertTrue((out / "wb2api-linux-amd64").is_file())
         with tarfile.open(out / "wb2api-runtime-linux-amd64.tar.gz") as archive:
@@ -96,11 +98,60 @@ class ReleaseTargetsTests(unittest.TestCase):
 
     def test_windows_ci_asset_is_the_updater_binary_not_a_false_complete_desktop_package(self):
         work = self.root / "work"
-        with patch.object(build, "checked", side_effect=self.fake_compile) as checked, patch.object(build, "verify_binary"):
+        with patch.object(build, "checked", side_effect=self.fake_compile) as checked, \
+                patch.object(build, "verify_platform"), patch.object(build, "verify_runtime_identity"):
             report = build.build_target(self.data, "windows-amd64", work, "b" * 40)
         self.assertEqual(checked.call_count, 1)
         self.assertEqual(set(report["artifacts"]), {"wb2api-windows-amd64"})
         self.assertEqual(checked.call_args.kwargs["env"]["GOOS"], "windows")
+
+
+    def test_runtime_identity_check_executes_the_artifact_not_metadata_strings(self):
+        # A crafted artifact with the right strings in metadata is not enough:
+        # the self-check compares real execution output with expected values.
+        output = self.root / "selfcheck"
+        output.mkdir()
+        binary = output / "wb2api"
+        binary.write_bytes(b"synthetic binary placeholder")
+        fake = type("Result", (), {"returncode": 0, "stdout": json.dumps({
+            "version": "v1.0.0-dev", "commit": "a" * 40, "goos": "linux", "goarch": "amd64",
+            "verification_enabled": True,
+            "release_key_sha256": "zzz"})})
+        with patch.object(build, "host_platform", return_value=("linux", "amd64")), \
+                patch.object(build, "BINARY_PLATFORMS", {str(binary): ("linux", "amd64")}), \
+                patch.object(build.subprocess, "run", return_value=fake) as run:
+            with self.assertRaisesRegex(ValueError, "key digest"):
+                build.verify_runtime_identity(binary, "11" * 32, "v1.0.0-dev")
+        self.assertEqual(run.call_args.args[0], [str(binary), "--loomgate-build-info"])
+
+    def test_cross_compiled_artifact_refuses_identity_probe_instead_of_string_scan(self):
+        binary = self.root / "wb2api.exe"
+        binary.write_bytes(b"PE placeholder")
+        with patch.object(build, "host_platform", return_value=("linux", "amd64")), \
+                patch.object(build, "BINARY_PLATFORMS", {str(binary): ("windows", "amd64")}), \
+                patch.object(build.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "target_runner"):
+                build.verify_runtime_identity(binary, "11" * 32, "v1.0.0-dev")
+        run.assert_not_called()
+
+    def test_platform_metadata_does_not_require_ldflags(self):
+        binary = self.root / "wb2api-metadata"
+        binary.write_bytes(b"fixture")
+        metadata = "fixture: go1.26.8\n\tbuild\tGOOS=linux\n\tbuild\tGOARCH=amd64\n\tbuild\tCGO_ENABLED=0\n"
+        with patch.object(build, "checked", return_value=metadata):
+            build.verify_platform("go", binary, {"goos": "linux", "goarch": "amd64"})
+        self.assertNotIn("-ldflags", metadata)
+
+    def test_platform_metadata_rejects_wrong_platform_or_abi(self):
+        binary = self.root / "wb2api-metadata-bad"
+        binary.write_bytes(b"fixture")
+        for metadata in (
+                "fixture: go1.26.8\n\tbuild\tGOOS=windows\n\tbuild\tGOARCH=amd64\n\tbuild\tCGO_ENABLED=0\n",
+                "fixture: go1.26.8\n\tbuild\tGOOS=linux\n\tbuild\tGOARCH=amd64\n\tbuild\tCGO_ENABLED=1\n",
+                "fixture: go1.26.8\n\tbuild\tGOOS=linux\n\tbuild\tGOARCH=arm\n\tbuild\tGOARM=6\n\tbuild\tCGO_ENABLED=0\n"):
+            with self.subTest(metadata=metadata), patch.object(build, "checked", return_value=metadata), \
+                    self.assertRaises(ValueError):
+                build.verify_platform("go", binary, {"goos": "linux", "goarch": "arm", "goarm": "5"})
 
     def test_unknown_artifact_files_are_preserved_and_block_upload_staging(self):
         out = self.root / "work" / "artifacts" / "linux-amd64"
