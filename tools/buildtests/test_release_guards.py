@@ -27,11 +27,16 @@ android = load_script("loomgate_android_build", "android/build.py")
 
 
 def metadata(goos="android", goarch="arm64", cgo="1", tag=TAG, key=PUBLIC_KEY, tags=""):
-    flags = ("-s -w -X workbuddy2api/internal/version.Version=" + tag
-             + " -X workbuddy2api/internal/version.ReleaseKey=" + key)
+    # Go 1.26 does not record -ldflags here; the release key and tag are checked
+    # in the artifact bytes instead.
     settings = {"GOOS": goos, "GOARCH": goarch, "CGO_ENABLED": cgo,
-                "-ldflags": json.dumps(flags), "-tags": json.dumps(tags)}
+                "-tags": json.dumps(tags)}
     return "fixture: go1.26.8\n" + "".join("\tbuild\t%s=%s\n" % item for item in settings.items())
+
+
+def artifact(path, tag=TAG, key=PUBLIC_KEY):
+    path.write_bytes(("fixture:" + tag + ":" + key).encode("ascii"))
+    return path
 
 
 ELF_BIONIC = """[Requesting program interpreter: /system/bin/linker64]
@@ -91,6 +96,7 @@ class BuildGuardTests(unittest.TestCase):
     def test_desktop_preserves_flags_and_injects_verified_public_key(self):
         prior = "-tags=example -p=8 -mod=mod"
         output = self.root / "wb2api.exe"
+        artifact(output)
         with patch.dict(os.environ, {"GOFLAGS": prior, "GOMAXPROCS": "8"}), \
                 patch.object(desktop.subprocess, "run", side_effect=[
                     result(), result(metadata("windows", "amd64", "0"))]) as run:
@@ -103,6 +109,13 @@ class BuildGuardTests(unittest.TestCase):
         self.assertIn("-mod=readonly", command)
         self.assertIn("ReleaseKey=" + PUBLIC_KEY, command[command.index("-ldflags") + 1])
         self.assertEqual(run.call_args_list[1].args[0][1:3], ["version", "-m"])
+
+    def test_desktop_helper_does_not_require_the_unused_release_key(self):
+        output = self.root / "login.exe"
+        output.write_bytes(b"helper without version package")
+        with patch.object(desktop.subprocess, "run",
+                          return_value=result(metadata("windows", "amd64", "0"))):
+            desktop.verify_go_binary(output, "windows", "amd64", PUBLIC_KEY, require_key=False)
 
     def test_desktop_missing_key_fails_before_compiler(self):
         (self.gateway / "release-signing.pub").unlink()
@@ -125,11 +138,19 @@ class BuildGuardTests(unittest.TestCase):
             self.assertEqual(data.read_text(), "must survive")
 
     def test_desktop_rejects_unverified_or_wrong_platform_artifact(self):
-        for raw in (metadata("windows", "amd64", "0", key="22" * 32),
-                    metadata("windows", "arm64", "0"), metadata("windows", "amd64", "1"), ""):
-            with self.subTest(raw=raw[:15]), patch.object(desktop.subprocess, "run", return_value=result(raw)), \
+        for label, raw, key in (
+                ("wrong-key", metadata("windows", "amd64", "0", key="22" * 32), "33" * 32),
+                ("wrong-arch", metadata("windows", "arm64", "0"), PUBLIC_KEY),
+                ("wrong-cgo", metadata("windows", "amd64", "1"), PUBLIC_KEY),
+                ("empty-metadata", "", PUBLIC_KEY)):
+            output = self.root / "wb2api.exe"
+            output.write_bytes(("fixture:" + TAG + ":" + key).encode("ascii"))
+            if label == "wrong-key":
+                output.write_bytes(("fixture:" + TAG + ":" + "33" * 32).encode("ascii"))
+            with self.subTest(label=label), patch.object(
+                    desktop.subprocess, "run", return_value=result(raw)), \
                     self.assertRaises(SystemExit):
-                desktop.verify_go_binary(self.root / "wb2api.exe", "windows", "amd64", PUBLIC_KEY)
+                desktop.verify_go_binary(output, "windows", "amd64", PUBLIC_KEY)
 
     def test_android_missing_ndk_preserves_existing_artifact(self):
         target = self.jnilibs / "arm64-v8a" / "libwb2gateway.so"
@@ -180,21 +201,44 @@ class BuildGuardTests(unittest.TestCase):
             self.assertIn("ReleaseKey=" + PUBLIC_KEY, command[command.index("-ldflags") + 1])
 
     def test_android_accepts_verified_bionic_artifact_without_running_it(self):
-        output = self.root / "libwb2gateway.so"
+        output = artifact(self.root / "libwb2gateway.so")
         with patch.object(android.subprocess, "run", side_effect=[result(metadata()), result(ELF_BIONIC)]) as run:
             android.verify_go_binary("go", output, self.clang, "arm64-v8a", TAG, PUBLIC_KEY)
         self.assertEqual(run.call_args_list[0].args[0][1:3], ["version", "-m"])
         self.assertEqual(Path(run.call_args_list[1].args[0][0]), self.readelf)
 
+    def test_android_accepts_artifact_when_build_metadata_omits_ldflags(self):
+        output = artifact(self.root / "libwb2gateway.so")
+        raw = metadata()
+        self.assertNotIn("-ldflags", raw)
+        with patch.object(android.subprocess, "run",
+                          side_effect=[result(raw), result(ELF_BIONIC)]) as run:
+            android.verify_go_binary("go", output, self.clang, "arm64-v8a", TAG, PUBLIC_KEY)
+        self.assertEqual(run.call_count, 2)
+
+    def test_android_rejects_gateway_missing_injected_literals(self):
+        output = self.root / "libwb2gateway.so"
+        output.write_bytes(b"no injected values here")
+        with patch.object(android.subprocess, "run",
+                          side_effect=[result(metadata()), result(ELF_BIONIC)]), self.assertRaises(SystemExit):
+            android.verify_go_binary("go", output, self.clang, "arm64-v8a", TAG, PUBLIC_KEY)
+
     def test_android_rejects_stale_or_non_bionic_build(self):
         for change in ({"cgo": "0"}, {"goarch": "amd64"}, {"goos": "linux"},
                        {"tag": "v3.16.0"}, {"key": "22" * 32}, {"tags": "netgo"}):
-            with self.subTest(change=change), \
-                    patch.object(android.subprocess, "run", return_value=result(metadata(**change))) as run, \
+            output = artifact(self.root / "libwb2gateway.so")
+            metadata_change = {k: v for k, v in change.items() if k != "key"}
+            if "key" in change:
+                output.write_bytes(("fixture:" + TAG + ":" + "33" * 32).encode("ascii"))
+            elif "tag" in change:
+                # A stale build embeds the stale tag; metadata alone no longer
+                # carries it, so the artifact bytes are the rejecting signal.
+                output.write_bytes(("fixture:" + change["tag"] + ":" + PUBLIC_KEY).encode("ascii"))
+            with self.subTest(change=change), patch.object(
+                    android.subprocess, "run",
+                    side_effect=[result(metadata(**metadata_change)), result(ELF_BIONIC)]), \
                     self.assertRaises(SystemExit):
-                android.verify_go_binary("go", self.root / "libwb2gateway.so", self.clang,
-                                         "arm64-v8a", TAG, PUBLIC_KEY)
-            self.assertEqual(run.call_count, 1)
+                android.verify_go_binary("go", output, self.clang, "arm64-v8a", TAG, PUBLIC_KEY)
 
     def test_android_rejects_elf_without_system_dns(self):
         for elf in (ELF_BIONIC.replace("getaddrinfo", "another_symbol"),
@@ -203,7 +247,7 @@ class BuildGuardTests(unittest.TestCase):
             with self.subTest(elf=elf[:30]), \
                     patch.object(android.subprocess, "run", side_effect=[result(metadata()), result(elf)]), \
                     self.assertRaises(SystemExit):
-                android.verify_go_binary("go", self.root / "libwb2gateway.so", self.clang,
+                android.verify_go_binary("go", artifact(self.root / "libwb2gateway.so"), self.clang,
                                          "arm64-v8a", TAG, PUBLIC_KEY)
 
     def test_skip_go_missing_helper_is_rejected(self):
