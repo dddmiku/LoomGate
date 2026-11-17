@@ -231,23 +231,17 @@ def verify_go_binary(go, output, clang, abi, tag, public_key):
                 raise SystemExit("Go 构建元数据无效：%s" % output.name) from None
         settings[key] = value
     reject_netgo("-tags=" + shlex.quote(settings.get("-tags", "")))
-    try:
-        flags = shlex.split(settings.get("-ldflags", ""))
-    except ValueError:
-        raise SystemExit("Go 链接元数据无效：%s" % output.name) from None
-    injected = {}
-    for index, value in enumerate(flags):
-        assignment = value[3:] if value.startswith("-X=") else ""
-        if value == "-X" and index + 1 < len(flags):
-            assignment = flags[index + 1]
-        if "=" in assignment:
-            key, value = assignment.split("=", 1)
-            injected[key] = value
     if (settings.get("GOOS") != "android" or settings.get("GOARCH") != TARGETS[abi][0]
-            or settings.get("CGO_ENABLED") != "1"
-            or injected.get("workbuddy2api/internal/version.ReleaseKey") != public_key
-            or injected.get("workbuddy2api/internal/version.Version") != tag):
-        raise SystemExit("Go 产物的 ABI、CGO、版本或发布公钥不匹配：%s" % output.name)
+            or settings.get("CGO_ENABLED") != "1"):
+        raise SystemExit("Go 产物的 ABI 或 CGO 不匹配：%s" % output.name)
+    # Go 1.26 no longer records -ldflags in build metadata. The gateway links
+    # internal/version, so the injected values must be present in its bytes;
+    # helper binaries never reference that package and the linker correctly
+    # drops unused -X targets, so they are exempt from the literal check.
+    if output.name == "libwb2gateway.so":
+        blob = output.read_bytes()
+        if (public_key.encode("ascii") not in blob or tag.encode("ascii") not in blob):
+            raise SystemExit("网关产物缺少注入的版本号或发布公钥：%s" % output.name)
     elf = subprocess.run([str(readelf), "--program-headers", "--dynamic", "--dyn-syms", str(output)],
                          capture_output=True, text=True, timeout=60)
     if (elf.returncode != 0 or "/system/bin/linker64" not in elf.stdout

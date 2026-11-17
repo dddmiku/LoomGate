@@ -76,7 +76,7 @@ def release_public_key() -> str:
     return value.lower()
 
 
-def verify_go_binary(out: Path, goos: str, goarch: str, public_key: str) -> None:
+def verify_go_binary(out: Path, goos: str, goarch: str, public_key: str, require_key: bool = True) -> None:
     """读取 Go 构建元数据验证发布参数，不执行交叉编译产物。"""
     proc = subprocess.run([GO, "version", "-m", str(out)], cwd=GATEWAY,
                           capture_output=True, text=True, timeout=60)
@@ -94,14 +94,13 @@ def verify_go_binary(out: Path, goos: str, goarch: str, public_key: str) -> None
             except (ValueError, TypeError):
                 raise SystemExit("构建元数据无效：%s" % out.name) from None
         settings[key] = value
-    try:
-        flags = shlex.split(settings.get("-ldflags", ""))
-    except ValueError:
-        raise SystemExit("链接元数据无效：%s" % out.name) from None
-    wanted = "workbuddy2api/internal/version.ReleaseKey=" + public_key
+    # Go 1.26 no longer records -ldflags in build metadata. Verify the injected
+    # public key is present in the linked artifact instead of parsing flags.
+    if require_key and public_key.encode("ascii") not in out.read_bytes():
+        raise SystemExit("产物缺少发布验签公钥，拒绝分发：%s" % out.name)
     if (settings.get("GOOS") != goos or settings.get("GOARCH") != goarch
-            or settings.get("CGO_ENABLED") != "0" or wanted not in flags):
-        raise SystemExit("产物平台或发布验签公钥不符合构建要求：%s" % out.name)
+            or settings.get("CGO_ENABLED") != "0"):
+        raise SystemExit("产物平台或 CGO 设置不符合构建要求：%s" % out.name)
 
 
 def build_env(goos: str, goarch: str) -> dict:
@@ -124,7 +123,7 @@ def go_build(pkg: str, out: Path, goos: str, goarch: str, ldflags: str = "-s -w"
                           capture_output=True, text=True)
     if proc.returncode != 0:
         raise SystemExit("构建 %s 失败：\n%s\n%s" % (pkg, proc.stdout, proc.stderr))
-    verify_go_binary(out, goos, goarch, public_key)
+    verify_go_binary(out, goos, goarch, public_key, require_key=pkg == "server")
 
 
 def write_readme(target: Path, goos: str, tag: str) -> None:
