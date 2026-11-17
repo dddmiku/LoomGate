@@ -34,8 +34,12 @@ import (
 // 优先级：显式 WB2API_PANEL_GO > 运行形态。原生形态（桌面/安卓，WB2API_RUNTIME=native）
 // 一定用 Go：那些环境里没有 CPython，Python 引擎会一直起不来并在后台反复重试。
 func useGoPanel() bool {
-	if os.Getenv("LOOMGATE_REBUILD") == "1" {
-		return true
+	// LoomGate defaults to the Go panel and console. Native builds always did;
+	// container/Linux builds now match the default product entry point. An
+	// explicit WB2API_PANEL_GO=0 remains the compatibility escape hatch, along
+	// with the legacy-scheduler mode.
+	if legacyRuntimeMode() {
+		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WB2API_PANEL_GO"))) {
 	case "1", "true", "yes", "on":
@@ -43,14 +47,14 @@ func useGoPanel() bool {
 	case "0", "false", "no", "off":
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("WB2API_RUNTIME")), "native")
+	return true
 }
 
 // goPanelOptions 由统一布局构造 Go 面板的依赖。
 func goPanelOptions(layout unifiedLayout) panel.Options {
 	opts := layout.panel
 	return panel.Options{
-		Console:         os.Getenv("LOOMGATE_REBUILD") == "1",
+		Console:         !legacyRuntimeMode(),
 		AdminDir:        opts.AdminDir,
 		AuthDir:         opts.AuthDir,
 		TrashDir:        filepath.Join(opts.BaseDir, "auths-trash"),

@@ -61,7 +61,7 @@ python -X utf8 -m unittest discover -s tools/migration -p 'test_*.py'
 python -X utf8 -m unittest discover -s tools/buildtests -p 'test_*.py'
 ```
 
-开发运行目前通过 `LOOMGATE_REBUILD=1` 选择新工作台，明确停用旧任务调度入口，避免重复派发。它仍是迁移中的开发开关；全量旧任务接入完成前不会作为正式发布方案。测试运行应使用独立配置和数据目录。
+LoomGate 默认使用新工作台、统一任务引擎与 Go 控制台，旧调度器不会并发启动。尚未迁移完成的部署可显式设置 `LOOMGATE_LEGACY_SCHEDULER=1` 暂时回到旧调度器与旧面板；该兼容模式仅允许单独运行。测试运行应使用独立配置和数据目录。
 
 新控制台与隔离验收见 [控制台验收](docs/console-acceptance.md)，豆包协议、已验证边界见 [模型传输](docs/doubao-text-transport.md) 和 [范围矩阵](docs/doubao-scope.md)。任务中的文档、表格等内容只作为官方活动要求处理，不提供独立编辑、产物管理、下载或任意工作编排接口。需要真实内容或官方技能不可用时，展示具体人工操作。
 

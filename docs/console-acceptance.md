@@ -6,7 +6,7 @@
 
 ## 开发入口
 
-隔离网关进程设置 `LOOMGATE_REBUILD=1` 和 `WB2API_PANEL_GO=1` 后，`/admin/` 使用新控制台及新登录页。默认运行模式保留旧面板，不能据此认为生产已经迁移。新控制台不依赖 `panel/build.py`，资源由 Go 直接内嵌。
+默认运行模式即使用新控制台及新登录页；`WB2API_PANEL_GO=1` 可显式固定同一行为。只有显式 `LOOMGATE_LEGACY_SCHEDULER=1` 才回到旧面板/旧调度器，且两者不会并发。新控制台不依赖 `panel/build.py`，资源由 Go 直接内嵌。
 
 ## 本阶段功能边界
 

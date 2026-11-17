@@ -386,7 +386,7 @@ func main() {
 		}
 	}
 	if deployment == "loomgate-installed" {
-		env = append(env, "LOOMGATE_REBUILD=1", "LOOMGATE_DESKTOP_CONTROL=stdin")
+		env = append(env, "LOOMGATE_DESKTOP_CONTROL=stdin")
 		if resolved, err := findPython(); err == nil {
 			env = append(env, "WB2A_PYTHON="+resolved)
 		}

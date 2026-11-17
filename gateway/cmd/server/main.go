@@ -255,7 +255,7 @@ func main() {
 	var workbench *workbenchRuntime
 	var workbenchHandler http.Handler
 	var taskController server.TaskController = sch
-	if os.Getenv("LOOMGATE_REBUILD") == "1" {
+	if useLoomGateWorkbench() {
 		workbench, workbenchHandler, err = openWorkbench(stateDirOf(cfg.StateFile), p, up, cfg.ExpiringSoonDur)
 		if err != nil {
 			log.Fatalf("open task engine: %v", err)
@@ -323,7 +323,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	// Installed desktop owns the inherited stdin pipe. This gives Windows the
 	// same graceful drain path as SIGTERM without an unauthenticated HTTP route.
-	if os.Getenv("LOOMGATE_REBUILD") == "1" && os.Getenv("LOOMGATE_DESKTOP_CONTROL") == "stdin" {
+	if !legacyRuntimeMode() && os.Getenv("LOOMGATE_DESKTOP_CONTROL") == "stdin" {
 		go func() {
 			scanner := bufio.NewScanner(os.Stdin)
 			for scanner.Scan() {
