@@ -153,9 +153,11 @@ def runtime_identity_status(path, public_key, version):
     return "verified_on_host"
 
 
-def build_target(data, ident, work_root, commit):
+def build_target(data, ident, work_root, commit, release_version=""):
     if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
         raise ValueError("a full source commit is required for build attribution")
+    if release_version and not re.fullmatch(r"v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", release_version):
+        raise ValueError("release version must be a plain vX.Y.Z tag")
     target = next((item for item in data["targets"] if item["id"] == ident), None)
     if not target or not target["ci_build"]:
         raise ValueError("target is not eligible for this unsigned CI workflow")
@@ -175,7 +177,9 @@ def build_target(data, ident, work_root, commit):
         raise ValueError("artifact output contains files outside the declared build allowlist")
     stage.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    version = "dev-" + commit[:12].lower()
+    # CI artifacts stay development builds; the official release gate passes
+    # --version so the runtime manifest matches the Release tag exactly.
+    version = release_version or ("dev-" + commit[:12].lower())
     built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flags = ("-s -w -X workbuddy2api/internal/version.Version=%s "
              "-X workbuddy2api/internal/version.Commit=%s -X workbuddy2api/internal/version.BuiltAt=%s "
@@ -230,6 +234,7 @@ def main():
     build.add_argument("--target", required=True)
     build.add_argument("--work-root", type=Path, required=True)
     build.add_argument("--commit", required=True)
+    build.add_argument("--version", default="", help="official vX.Y.Z release tag; omit for CI dev builds")
     args = parser.parse_args()
     data = load_targets()
     read_public_key(data)
@@ -240,7 +245,7 @@ def main():
                 output.write("matrix=" + matrix + "\n")
         print(matrix)
     else:
-        print(json.dumps(build_target(data, args.target, args.work_root, args.commit), indent=2))
+        print(json.dumps(build_target(data, args.target, args.work_root, args.commit, args.version), indent=2))
 
 
 if __name__ == "__main__":
