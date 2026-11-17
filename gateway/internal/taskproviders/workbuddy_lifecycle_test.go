@@ -23,6 +23,7 @@ type lifecycleFixture struct {
 	record                                             int64
 	daily, claimed, noBuddy, reject, silent, malformed bool
 	cards                                              int
+	chances, buddyAffordable                           int
 	made                                               []string
 	counts                                             map[string]int
 	writeBodies                                        map[string]map[string]any
@@ -87,9 +88,29 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case "/activity/growth/energy":
 		data = map[string]any{"balance": 11}
 	case "/activity/growth/lottery/chances":
-		data = map[string]any{"balance": 4}
+		data = map[string]any{"balance": f.chances}
+	case "/activity/growth/lottery/draw":
+		if !f.silent {
+			if f.chances <= 0 {
+				http.Error(w, `{"code":400,"msg":"insufficient lottery chance balance"}`, 400)
+				return
+			}
+			f.chances--
+			data = map[string]any{"prize_code": "synthetic-prize", "prize_name": "合成奖品", "prize_type": "credit", "credit_amount": 5}
+		} else {
+			data = map[string]any{"prize_code": "synthetic-prize"}
+		}
 	case "/activity/growth/buddy/quota":
-		data = map[string]any{"affordable": 2, "max_open_count": 1}
+		data = map[string]any{"affordable": f.buddyAffordable, "max_open_count": 1}
+	case "/activity/growth/buddy/open":
+		if !f.silent {
+			if f.buddyAffordable <= 0 {
+				http.Error(w, `{"code":400,"msg":"insufficient energy"}`, 400)
+				return
+			}
+			f.buddyAffordable--
+		}
+		data = map[string]any{"buddy": "合成Buddy"}
 	case "/billing/meter/compensation-status":
 		data = map[string]any{"active": true, "claimed": f.claimed, "credit_num": 31, "end_time": f.offerEnd}
 	case "/billing/meter/claim-compensation":
@@ -109,7 +130,7 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 }
 func lifecycleSetup(t *testing.T) (*Accounts, *lifecycleFixture, *pool.Pool) {
 	t.Helper()
-	f := &lifecycleFixture{day: "2099-01-03", travel: "idle", tier: "available", offerEnd: "2099-02-01 00:00:00", cards: 3, made: []string{}, counts: map[string]int{}, writeBodies: map[string]map[string]any{}}
+	f := &lifecycleFixture{day: "2099-01-03", travel: "idle", tier: "available", offerEnd: "2099-02-01 00:00:00", cards: 3, chances: 4, buddyAffordable: 2, made: []string{}, counts: map[string]int{}, writeBodies: map[string]map[string]any{}}
 	s := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(s.Close)
 	p := pool.New("")
@@ -155,7 +176,7 @@ func TestLifecycleModulesDynamicDiscoveryAndVerifiedMutations(t *testing.T) {
 	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
 	defer e.Close()
 	catalog, err := e.CatalogDetails(context.Background(), "workbuddy", taskengine.Scope{}, "")
-	if err != nil || len(catalog.Issues) != 0 || len(catalog.Tasks) != 6 {
+	if err != nil || len(catalog.Issues) != 0 || len(catalog.Tasks) != 8 {
 		t.Fatal("new lifecycle directory incomplete")
 	}
 	for _, task := range catalog.Tasks {
@@ -247,7 +268,7 @@ func TestLifecycleSchemaRealmAndDisableGuards(t *testing.T) {
 	a, f, p := lifecycleSetup(t)
 	f.malformed = true
 	catalog, err := a.DiscoverCatalog(context.Background(), taskengine.Scope{}, "")
-	if err != nil || len(catalog.Issues) != 5 || len(catalog.Tasks) != 0 {
+	if err != nil || len(catalog.Issues) != 7 || len(catalog.Tasks) != 0 {
 		t.Fatal("schema failure produced task eligibility")
 	}
 	f.malformed = false
@@ -502,5 +523,61 @@ func TestAcceptedTravelReceiptPersistsUntilDelayedSettlement(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.counts["/activity/growth/buddy/travel/claim"] != 1 {
 		t.Fatal("settled receipt replayed claim")
+	}
+}
+
+func TestLotteryConsumesAtMostOneOfficialChanceAndNeverInventsPrize(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := runLifecycle(t, e, "lottery"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("lottery result %s", run.Status)
+	}
+	f.mu.Lock()
+	if f.chances != 3 || f.counts["/activity/growth/lottery/draw"] != 1 {
+		t.Fatalf("lottery consumed %d chances with %d draws", 4-f.chances, f.counts["/activity/growth/lottery/draw"])
+	}
+	f.chances = 0
+	f.mu.Unlock()
+	if run := runLifecycle(t, e, "lottery"); run.Status != taskengine.StatusSkipped {
+		t.Fatalf("zero chances still submitted %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts["/activity/growth/lottery/draw"] != 1 {
+		t.Fatal("no-chance run submitted a draw")
+	}
+}
+
+func TestBuddyBoxRespectsOfficialEnergyAndUsesOneOpen(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	if run := runLifecycle(t, e, "buddy_box"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("buddy box result %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.buddyAffordable != 1 || f.counts["/activity/growth/buddy/open"] != 1 || f.writeBodies["/activity/growth/buddy/open"]["count"] != float64(1) {
+		t.Fatal("buddy box did not consume exactly one official open")
+	}
+}
+
+func TestRewardModulesNeverSubmitOnMalformedResourceState(t *testing.T) {
+	for _, key := range []string{"lottery", "buddy_box"} {
+		t.Run(key, func(t *testing.T) {
+			a, f, _ := lifecycleSetup(t)
+			f.malformed = true
+			e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+			defer e.Close()
+			if run := runLifecycle(t, e, key); run.Status == taskengine.StatusSucceeded {
+				t.Fatal("malformed resource state produced a successful draw/open")
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.counts["/activity/growth/lottery/draw"] != 0 || f.counts["/activity/growth/buddy/open"] != 0 {
+				t.Fatal("malformed state still submitted a spend")
+			}
+		})
 	}
 }

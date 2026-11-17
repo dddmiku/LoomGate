@@ -43,7 +43,7 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	if json.Unmarshal(moduleDefinitions, &defs) != nil {
 		return nil, errors.New("task_definitions_invalid")
 	}
-	for _, id := range []string{"checkin", "growth", "balance", "travel", "redemption", "makeup", "resources", "compensation"} {
+	for _, id := range []string{"checkin", "growth", "balance", "travel", "redemption", "makeup", "resources", "compensation", "lottery", "buddy_box"} {
 		if defs[id].Name == "" {
 			return nil, errors.New("task_definition_missing")
 		}
@@ -67,6 +67,7 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 	}
 	modules := []Module{check, &balanceModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "balance", Key: "balance", Realms: []string{"cn", "global"}}, definition: defs["balance"]}, owner: a}, &growthModule{moduleBase: moduleBase{spec: ModuleSpec{ID: "growth", Key: "growth/", Prefix: true, Realms: []string{"cn"}}, definition: defs["growth"]}, up: a.Upstream}}
 	modules = append(modules, newLifecycleModules(a.Upstream, defs)...)
+	modules = append(modules, newRewardModules(a.Upstream, defs)...)
 	if a.options.RefreshVault != nil {
 		modules = append(modules, newKeepaliveModule(a, defs["keepalive"]))
 	}

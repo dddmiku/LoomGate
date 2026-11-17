@@ -4,7 +4,11 @@
     "name": "账号会话保活",
     "description": "通过官方刷新接口续期，安全保存后重新读取凭据确认。仅恢复会话失效停用，人工与审核停用不会自动启用。",
     "side_effect": true,
-    "stages": ["inspect", "execute", "verify"]
+    "stages": [
+      "inspect",
+      "execute",
+      "verify"
+    ]
   },
   "checkin": {
     "key": "checkin",
@@ -88,6 +92,30 @@
     "stages": [
       "inspect",
       "claim",
+      "verify"
+    ]
+  },
+  "lottery": {
+    "key": "lottery",
+    "name": "盲盒抽奖",
+    "description": "读取官方抽奖机会，机会大于零时只抽一次，并用官方回读确认；无机会或活动未开启不提交。",
+    "once_per_day": true,
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "execute",
+      "verify"
+    ]
+  },
+  "buddy_box": {
+    "key": "buddy_box",
+    "name": "Buddy 能量盲盒",
+    "description": "读取官方能量与单次上限，按官方额度最多开一次，然后回读额度；实物奖需用户到官方成长中心填写收件信息。",
+    "once_per_day": true,
+    "side_effect": true,
+    "stages": [
+      "inspect",
+      "execute",
       "verify"
     ]
   }
