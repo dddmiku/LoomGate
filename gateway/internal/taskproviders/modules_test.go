@@ -21,16 +21,16 @@ import (
 type businessFixture struct {
 	mu                                                       sync.Mutex
 	counts                                                   map[string]int
-	checked, claimed, failGrowth, brokenBalance, slowBalance bool
+	checked, claimed, accepted, notAccepted, workDone, rejectAccept, failGrowth, brokenBalance, slowBalance bool
 }
 
 func (f *businessFixture) serve(w http.ResponseWriter, r *http.Request) {
-	io.Copy(io.Discard, r.Body)
+	raw, _ := io.ReadAll(r.Body)
 	r.Body.Close()
 	f.mu.Lock()
 	f.counts[r.URL.Path]++
 	fail, broken, slow := f.failGrowth, f.brokenBalance, f.slowBalance
-	checked, claimed := f.checked, f.claimed
+	checked, claimed, accepted, notAccepted, workDone := f.checked, f.claimed, f.accepted, f.notAccepted, f.workDone
 	f.mu.Unlock()
 	var data any
 	switch r.URL.Path {
@@ -52,10 +52,41 @@ func (f *businessFixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		state := "completed"
+		if notAccepted {
+			state = "not_accepted"
+		}
+		if accepted && !claimed {
+			state = "accepted"
+		}
 		if claimed {
 			state = "claimed"
 		}
-		data = map[string]any{"tasks": []any{map[string]any{"task_code": "synthetic-reward", "title": "合成任务", "accept_status": state, "reward_credit": 5}}}
+		current := 0
+		if workDone {
+			current = 1
+		}
+		data = map[string]any{"tasks": []any{map[string]any{"task_code": "synthetic-reward", "title": "合成任务", "accept_status": state, "reward_credit": 5, "progress": map[string]any{"current": current, "target": 1}}}}
+	case "/activity/growth/tasks/accept":
+		if f.rejectAccept {
+			http.Error(w, `{"code":503,"msg":"synthetic accept outage"}`, 503)
+			return
+		}
+		body := map[string]any{}
+		_ = json.Unmarshal(raw, &body)
+		codes, _ := body["task_codes"].([]any)
+		results := []any{}
+		for _, c := range codes {
+			code, _ := c.(string)
+			if code == "synthetic-reward" {
+				f.mu.Lock()
+				f.accepted = true
+				f.mu.Unlock()
+				results = append(results, map[string]any{"task_code": code, "status": "ok"})
+			} else {
+				results = append(results, map[string]any{"task_code": code, "status": "error", "message": "task not found"})
+			}
+		}
+		data = map[string]any{"results": results}
 	case "/activity/growth/tasks/synthetic-reward/claim":
 		f.mu.Lock()
 		f.claimed = true
@@ -189,6 +220,90 @@ func TestWildcardContinuesModulesButPersistsPartialFailure(t *testing.T) {
 		t.Fatal("raw discovery error leaked")
 	}
 }
+
+
+func TestGrowthAcceptUnknownSurvivesRestartWithoutReplay(t *testing.T) {
+	a, f, _ := setupModules(t)
+	f.mu.Lock()
+	f.notAccepted = true
+	f.rejectAccept = true
+	f.mu.Unlock()
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	open := func() *taskengine.Engine {
+		e, err := taskengine.Open(taskengine.Options{Path: path, PollMin: time.Millisecond, PollMax: 2 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = e.Register("workbuddy", a); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	submit := func(e *taskengine.Engine) taskengine.Run {
+		r, err := e.Submit(taskengine.Request{ProviderID: "workbuddy", TaskKey: "growth/accept/synthetic-reward", AccountIDs: []string{"cn-fixture"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waitModuleRun(t, e, r.ID)
+	}
+	e := open()
+	if run := submit(e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("lost accept response reported %s", run.Status)
+	}
+	e.Close()
+	e = open()
+	defer e.Close()
+	if run := submit(e); run.Status != taskengine.StatusUncertain {
+		t.Fatalf("restart cleared accept unknown %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts["/activity/growth/tasks/accept"] != 1 {
+		t.Fatalf("accept replayed after restart: %d", f.counts["/activity/growth/tasks/accept"])
+	}
+}
+
+func TestGrowthAcceptStartsTrackingButDoesNotClaimUnfinishedWork(t *testing.T) {
+	a, f, _ := setupModules(t)
+	f.mu.Lock()
+	f.notAccepted = true
+	f.mu.Unlock()
+	e, _ := taskengine.Open(taskengine.Options{Path: filepath.Join(t.TempDir(), "tasks.json"), PollMin: time.Millisecond, PollMax: time.Millisecond})
+	defer e.Close()
+	e.Register("workbuddy", a)
+	submit := func(key string) taskengine.Run {
+		r, err := e.Submit(taskengine.Request{ProviderID: "workbuddy", TaskKey: key, AccountIDs: []string{"cn-fixture"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waitModuleRun(t, e, r.ID)
+	}
+	if run := submit("growth/synthetic-reward"); run.Status != taskengine.StatusManual {
+		t.Fatalf("claim before acceptance reported %s", run.Status)
+	}
+	if run := submit("growth/accept/synthetic-reward"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("official task accept reported %s", run.Status)
+	}
+	f.mu.Lock()
+	if f.counts["/activity/growth/tasks/accept"] != 1 || f.counts["/activity/growth/tasks/synthetic-reward/claim"] != 0 {
+		f.mu.Unlock()
+		t.Fatal("accept/claim ordering violated")
+	}
+	// The official directory now reports progress 1/1 after real work while the
+	// status still says accepted; the next run may claim exactly once.
+	f.workDone = true
+	f.notAccepted = false
+	f.mu.Unlock()
+	if run := submit("growth/synthetic-reward"); run.Status != taskengine.StatusSucceeded {
+		t.Fatalf("completed growth task did not claim: %s", run.Status)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts["/activity/growth/tasks/accept"] != 1 || f.counts["/activity/growth/tasks/synthetic-reward/claim"] != 1 {
+		t.Fatalf("unexpected accept=%d claim=%d", f.counts["/activity/growth/tasks/accept"], f.counts["/activity/growth/tasks/synthetic-reward/claim"])
+	}
+}
+
 func TestGrowthClaimRequiresServerCompletionAndVerify(t *testing.T) {
 	a, f, _ := setupModules(t)
 	e, _ := taskengine.Open(taskengine.Options{Path: filepath.Join(t.TempDir(), "tasks.json"), PollMin: time.Millisecond, PollMax: time.Millisecond})
@@ -201,7 +316,7 @@ func TestGrowthClaimRequiresServerCompletionAndVerify(t *testing.T) {
 		}
 		run := waitModuleRun(t, e, r.ID)
 		if run.Status != taskengine.StatusSucceeded {
-			t.Fatal("reward readback failed")
+			t.Fatalf("reward readback failed: %s", run.Status)
 		}
 	}
 	f.mu.Lock()
