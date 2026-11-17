@@ -278,6 +278,16 @@ def main():
         page.locator('#view').get_by_text('当前工作区', exact=True).first.wait_for()
         done('migration_page_reports_no_marker_without_claiming_migration')
         stage='migration-preflight-ui'
+        # The synthetic runtime starts without the offline tool; copy the real
+        # migration scripts in so this exercises the shipped UI + tool path.
+        tool_dir = runtime / 'tools' / 'migration'
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        repo = Path(__file__).resolve().parents[2]
+        for name in ('migrate.py', 'legacy_schedule.py'):
+            (tool_dir / name).write_bytes((repo / 'tools' / 'migration' / name).read_bytes())
+        page.reload()
+        nav('migration')
+        page.locator('#migration-preflight-form').wait_for(timeout=15000)
         old_root = runtime.parent / 'migration-ui-old'
         new_root = runtime.parent / 'migration-ui-new'
         import shutil as _shutil
