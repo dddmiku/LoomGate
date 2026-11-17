@@ -317,7 +317,7 @@ func SetLANAccess(configPath string, enabled bool, allowCIDRs string) (bool, str
 		// 安全闸门：没有可用鉴权就拒绝放开监听——不写文件、不重启。
 		apiKey, _ := jsonStringOf(object, "api_key")
 		keysFile, _ := jsonStringOf(object, "api_keys_file")
-		keysExist := keysFile != "" && fileExists(keysFile)
+		keysExist := keysFile != "" && fileExists(configFilePath(configPath, keysFile))
 		if apiKey == "" && !keysExist {
 			return false, "请先在「密钥」页创建一把调用密钥，再开启局域网访问：放开监听后面板与 API 一起暴露到局域网，空密钥等于任何同网段的人都能直接调用账号池"
 		}

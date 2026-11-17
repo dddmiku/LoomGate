@@ -246,7 +246,7 @@ func lanStateOf(gateway *GatewayClient, configPath string) LANState {
 	hasKey := configString(configPath, "api_key") != ""
 	if !hasKey {
 		if keysFile := configString(configPath, "api_keys_file"); keysFile != "" {
-			hasKey = fileExists(keysFile)
+			hasKey = fileExists(configFilePath(configPath, keysFile))
 		}
 	}
 	return LANState{Enabled: enabled, Listen: listen, AllowCIDRs: cidrs, HasKey: hasKey}

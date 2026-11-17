@@ -228,6 +228,18 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// configFilePath resolves a path stored in config.json the same way the
+// gateway does: relative values are relative to the config file directory, not
+// the process working directory. Without this the panel could refuse to enable
+// LAN access for an existing key store, or misreport has_key.
+func configFilePath(configPath, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(filepath.Dir(configPath), value)
+}
+
 // errorMessage 从网关的错误信封里取出可读文案。
 //
 // 网关失败走 OpenAI 风格信封：{"error":{"code":…,"message":…}}；面板自己的接口则是

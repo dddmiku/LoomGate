@@ -70,6 +70,32 @@ func TestSetLANAccessKeyStoreCounts(t *testing.T) {
 }
 
 // TestSetLANAccessRoundTrip 开启→关闭的完整往返：端口保留、CIDR 清除。
+
+// TestSetLANAccessResolvesRelativeKeyStoreFromConfigDir reproduces a real
+// deployment layout: config.json lives in the runtime root and references
+// ./data/api_keys.json. The panel must not reject enabling LAN access just
+// because its process working directory differs from the config directory.
+func TestSetLANAccessResolvesRelativeKeyStoreFromConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data", "api_keys.json"), []byte(`{"keys":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"listen":"127.0.0.1:7864","api_keys_file":"./data/api_keys.json"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, msg := SetLANAccess(path, true, "127.0.0.0/8"); !ok {
+		t.Fatalf("relative key store rejected: %s", msg)
+	}
+	enabled, cidrs := LANAccessState(path)
+	if !enabled || cidrs != "127.0.0.0/8" {
+		t.Fatalf("saved LAN state not readable: enabled=%v cidrs=%q", enabled, cidrs)
+	}
+}
+
 func TestSetLANAccessRoundTrip(t *testing.T) {
 	path := writeTestConfig(t, `{
   "listen": "127.0.0.1:7864",

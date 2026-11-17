@@ -53,15 +53,15 @@
   function toast(text) { $('#toast').textContent = text; $('#toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(()=>$('#toast').hidden=true,6000); }
   function heading(actions='') { const r=routes[state.route]; return `<div class="page-heading"><div><h1>${r[1]}</h1><p>${r[2]}</p></div><div class="actions">${actions}</div></div>`; }
   function table(headers, rows) { return `<div class="table-wrap"><table class="responsive"><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map((cell,i)=>`<td data-label="${esc(headers[i])}"><div>${cell}</div></td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
-  class APIError extends Error { constructor(code,status) { super(errorLabels[code] || (status===403?'没有执行此操作的权限，请重新登录。':status===429?'请求过于频繁，请稍后重试。':'请求未完成，请检查服务状态后重试。')); this.code=code; this.status=status; } }
-  async function api(path, {body, signal=state.controller?.signal} = {}) {
+  class APIError extends Error { constructor(code,status,detail='') { super(detail || errorLabels[code] || (status===403?'没有执行此操作的权限，请重新登录。':status===429?'请求过于频繁，请稍后重试。':'请求未完成，请检查服务状态后重试。')); this.code=code; this.status=status; } }
+  async function api(path, {body, signal=state.controller?.signal, allowNotOK=false} = {}) {
     const controller=new AbortController(), abort=()=>controller.abort();
     if(signal?.aborted) controller.abort(); else signal?.addEventListener('abort',abort,{once:true});
     const timer=setTimeout(()=>controller.abort(),path==='connections/start'?40000:18000);
     try {
       const response=await fetch('api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',signal:controller.signal,headers:body===undefined?{}:{'Content-Type':'application/json','X-Admin-Request':'1'},body:body===undefined?undefined:JSON.stringify(body)});
       const data=await response.json();
-      if(!response.ok || data.ok===false) throw new APIError(data.error || data.error_code || 'request_failed',response.status);
+      if(!response.ok || data.ok===false && !allowNotOK) throw new APIError(data.error || data.error_code || 'request_failed',response.status,typeof data.message==='string'?data.message:'');
       $('#sync-time').textContent='同步于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
       return data;
     } catch(e) { if(e.name==='AbortError' && !signal?.aborted) throw new APIError('catalog_timeout',408); throw e; }
@@ -74,7 +74,7 @@
     const data=await api('state');
     return (data.accounts || []).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(a=>({id:a.uid,enabled:!a.disabled,expires_at:a.expiresAt,realm:a.realm}));
   }
-  function fail(e) { if(e.name==='AbortError') return; $('#view').innerHTML=heading()+notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取')+(e.status===401?' <a href="login">重新登录 →</a>':''); }
+  function fail(e) { if(e.name==='AbortError') return; $('#view').innerHTML=heading()+notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取')+(e.status===401?' <a href="login">重新登录 →</a>':''); $('#view').dataset.loadState='failed'; }
   function openDialog(title, html, style='') { $('#dialog').className=style; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
   function closeDialog() { $('#dialog').close();$('#dialog').className=''; $('#dialog-body').replaceChildren(); }
   async function mutate(key, path, body, after) {
@@ -93,7 +93,7 @@
     document.title=routes[state.route][1]+' · LoomGate';
     $('#current-page').textContent=routes[state.route][1];
     $('#view').innerHTML=heading()+`<div class="loading"><p>正在读取工作区…</p><div class="progress"></div></div>`;
-    try { await providers(); await renderers[state.route](); } catch(e) {fail(e);}
+    try { await providers(); await renderers[state.route](); $('#view').dataset.loadState='ready'; } catch(e) {fail(e);}
   }
 
   async function overview() {
@@ -140,7 +140,7 @@
         const data=await api('workbench/models?'+query);if(generation!==state.version)return;
         state.catalogs=data.catalogs;state.modelPage=data;
         state.models=data.catalogs.flatMap(c=>(c.models || []).map(m=>({...m,account_id:c.account_id,catalog_status:c.status})));
-        $('#model-notice').innerHTML=notice(p.inference_available?'普通对话模型支持单轮文本 API；工作任务模型仍需在官方服务使用。模型详情显示各自的可调用状态。':'此服务当前仅提供模型目录，尚不能通过网关 API 调用。官方工作工具不等同于 API 工具调用。',p.inference_available?'':'warn')+(data.catalogs.some(c=>c.status==='stale')?notice('上游刷新失败，正在显示旧缓存。退避时间内重复刷新不会再次请求上游。','warn'):'');
+        $('#model-notice').innerHTML=notice(p.inference_available?'普通对话模型通过网关协议调用；支持多轮与流式的能力以每个模型的上游声明为准。官方工作任务仍需在官方服务完成。模型详情显示各自的可调用状态。':'此服务当前仅提供模型目录，尚不能通过网关 API 调用。官方工作工具不等同于 API 工具调用。',p.inference_available?'':'warn')+(data.catalogs.some(c=>c.status==='stale')?notice('上游刷新失败，正在显示旧缓存。退避时间内重复刷新不会再次请求上游。','warn'):'');
         $('#model-status').innerHTML=`<details class="catalog-status" ${data.catalogs.some(c=>c.status!=='ready'&&c.status!=='disabled')?'open':''}><summary>账号目录状态 · 本页 ${data.catalogs.length} / ${data.total} · ${data.catalogs.filter(c=>c.status==='ready').length} 个已同步</summary>${data.catalogs.map(c=>`<div class="catalog-row" data-account-status="${esc(c.status)}"><div><code>${esc(c.account_id)}</code><p class="small muted">${esc(errorLabels[c.error_code] || (c.error_code?'目录暂不可用。':'最近获取 '+date(c.fetched_at)))}${c.retry_at?' · 可重试 '+esc(date(c.retry_at)):''}${c.expires_at?' · 过期 '+esc(date(c.expires_at)):''}</p></div>${badge(c.status)}</div>`).join('')}</details>`;
         $('#model-pagination').innerHTML=`<span>账号 ${data.total?data.offset+1:0}–${Math.min(data.offset+data.limit,data.total)} / ${data.total} · 能力与搜索仅筛选本页</span><div class="actions">${button('model-prev','上一页',data.offset===0?'disabled':'')}${button('model-next','下一页',!data.has_more?'disabled':'')}</div>`;
       } else {
@@ -167,7 +167,7 @@
     state.modelSelection=m.id+'|'+(m.account_id||'');
     document.querySelectorAll('[data-action=select-model]').forEach((b,i)=>b.setAttribute('aria-selected',String(i===index)));
     const c=state.catalogs.find(x=>x.account_id===m.account_id),callable=m.inference_available??p.inference_available;
-    $('#model-detail').innerHTML=`${button('model-back','返回模型列表','','detail-back')}<div class="detail-subtitle">${esc(m.mode_name||p.name)}</div><h2 class="detail-title">${esc(m.name||m.id)}</h2><p class="detail-body">${callable?(p.catalog_scope==='account'?'支持单轮普通文本 API。暂不接受文件、工具或多轮历史；实际可用性以当前账号为准。':'可通过网关调用，实际请求受上游与账号状态约束。'):'此模型目前仅提供目录，尚不能通过网关 API 调用。下列能力与档位均按上游声明展示。'}</p>${m.catalog_status==='stale'?notice('这是旧缓存，最新刷新未成功。请核对账号目录状态。','warn'):''}<dl class="detail-specs">${callable&&c?.streaming_mode==='incremental'?'<div><dt>文本流</dt><dd>支持即时输出；上游重写已发内容时明确中止，未完成的回答不可视为成功。</dd></div>':''}<div><dt>上下文窗口</dt><dd class="value-large">${m.context_length?number(m.context_length):'未声明'}</dd></div><div><dt>推理档位</dt><dd>${esc((m.reasoning_efforts||[]).map(x=>x.name||x.level).join(' / ')||'上游未声明')}</dd></div>${[['官方工作工具','native_tools'],['API 工具调用','supports_tool_call'],['图像输入','supports_images'],['推理','supports_reasoning']].filter(([,k])=>m[k]===true).map(([label])=>`<div><dt>${label}</dt><dd>上游已声明支持</dd></div>`).join('')}${m.tiers?.length?`<div><dt>档位说明</dt><dd>${esc(m.tiers.join(' / '))}</dd></div>`:''}${m.account_id?`<div><dt>所属账号</dt><dd>${esc(m.account_id)}${m.need_login?'（需登录使用）':''}</dd></div>`:''}</dl><details class="quiet-detail"><summary>查看模型标识与目录时间</summary><code>${esc(m.id)}</code><p>${c?'获取于 '+esc(date(c.fetched_at))+'，过期于 '+esc(date(c.expires_at)):'由服务级目录提供。'}</p></details>`;
+    $('#model-detail').innerHTML=`${button('model-back','返回模型列表','','detail-back')}<div class="detail-subtitle">${esc(m.mode_name||p.name)}</div><h2 class="detail-title">${esc(m.name||m.id)}</h2><p class="detail-body">${callable?(p.catalog_scope==='account'?(m.supports_multi_turn?'支持网关普通文本调用及多轮上下文；文件和调用方工具仍受协议限制。实际可用性以当前账号为准。':'支持网关普通文本调用；多轮能力未在此目录声明，以实际请求结果为准。'):'可通过网关调用，实际请求受上游与账号状态约束。'):'此模型目前仅提供目录，尚不能通过网关 API 调用。下列能力与档位均按上游声明展示。'}</p>${m.catalog_status==='stale'?notice('这是旧缓存，最新刷新未成功。请核对账号目录状态。','warn'):''}<dl class="detail-specs">${callable&&c?.streaming_mode==='incremental'?'<div><dt>文本流</dt><dd>支持即时输出；上游重写已发内容时明确中止，未完成的回答不可视为成功。</dd></div>':''}<div><dt>上下文窗口</dt><dd class="value-large">${m.context_length?number(m.context_length):'未声明'}</dd></div><div><dt>推理档位</dt><dd>${esc((m.reasoning_efforts||[]).map(x=>x.name||x.level).join(' / ')||'上游未声明')}</dd></div>${[['官方工作工具','native_tools'],['API 工具调用','supports_tool_call'],['图像输入','supports_images'],['推理','supports_reasoning']].filter(([,k])=>m[k]===true).map(([label])=>`<div><dt>${label}</dt><dd>上游已声明支持</dd></div>`).join('')}${m.tiers?.length?`<div><dt>档位说明</dt><dd>${esc(m.tiers.join(' / '))}</dd></div>`:''}${m.account_id?`<div><dt>所属账号</dt><dd>${esc(m.account_id)}${m.need_login?'（需登录使用）':''}</dd></div>`:''}</dl><details class="quiet-detail"><summary>查看模型标识与目录时间</summary><code>${esc(m.id)}</code><p>${c?'获取于 '+esc(date(c.fetched_at))+'，过期于 '+esc(date(c.expires_at)):'由服务级目录提供。'}</p></details>`;
     if(open){$('#model-browser').classList.add('detail-open');$('#model-detail').focus({preventScroll:true});}
   }
 
@@ -243,15 +243,22 @@
   }
   async function settings() {
     const session=await api('session');
-    let state=null,loop=null,update=null;
-    try{state=await api('state');}catch{}
-    try{loop=await api('features/reasoning-loop');}catch{}
-    try{update=await api('update');}catch{}
-    const lan=state?.lan||{};
+    let state=null,loop=null,update=null,stateError='',loopError='',updateError='';
+    try{state=await api('state');}catch(e){if(e.name!=='AbortError')stateError=e.message||'未能读取';}
+    try{loop=await api('features/reasoning-loop');}catch(e){if(e.name!=='AbortError')loopError=e.message||'未能读取';}
+    try{update=await api('update',{allowNotOK:true});}catch(e){if(e.name!=='AbortError')updateError=e.message||'未能读取';}
+    const lan=state?.lan;
     const loopOn=loop?.stop_only===true;
     const updateStatus=update?.status||{};
-    const updateEnabled=update?.status?.enabled===true;
-    $('#view').innerHTML=heading()+`<div class="split"><section class="panel"><div class="panel-title"><div><h2>显示与会话</h2></div></div><div class="settings-line"><div><h3>界面主题</h3><p>在此浏览器保存偏好。</p></div>${button('theme','切换主题')}</div><div class="settings-line"><div><h3>当前会话</h3><p>有效期至 ${esc(date(session.expiresAt))}</p></div>${badge('ready','已登录')}</div><div class="settings-line"><div><h3>管理账号安全</h3><p>修改密码后其他设备需重新登录。</p></div>${button('password','修改密码')}</div></section><section class="panel"><div class="panel-title"><div><h2>局域网访问</h2></div></div><div class="settings-line"><div><h3>${lan.enabled?'已启用':'仅本机'}</h3><p>监听 ${esc(lan.listen||'未读取')}${lan.allow_cidrs?'，允许 '+esc(lan.allow_cidrs):''}${lan.has_key?'':'；尚未创建调用密钥'}</p></div>${button('lan-settings',lan.enabled?'调整':'启用','','quiet')}</div></section><section class="panel"><div class="panel-title"><div><h2>重复推理保护</h2></div></div><div class="settings-line"><div><h3>${loopOn?'命中即停止':'命中后自动重发'}</h3><p>${loop?'作用于后续请求；已开始的请求沿用原语义。':'网关未返回该开关状态。'}</p></div>${loop?button('loop-toggle',loopOn?'改为自动重发':'改为命中即停','','quiet'):''}</div></section><section class="panel"><div class="panel-title"><div><h2>迁移与更新</h2></div></div>${notice(updateEnabled?'可检查官方发布并下载已签名的运行包。':'当前构建未启用热更新。','warn')}<p class="muted">${updateEnabled?'检查与下载不会自动切换生产；安装包、Android 与 Linux 交付仍待独立验收。':'配置 update.enabled=true 后重启网关才能在此操作。'}</p><div class="section-gap">${update?button('update-check','检查更新','','quiet'):''}${badge(updateStatus.state||'manual_action',updateStatus.state==='downloaded'?'已下载待交接':'待独立验收')}</div></section></div>`;
+    const updateEnabled=update?.ok===true && update?.status?.enabled===true;
+    const updateMessage=updateEnabled?'':(typeof update?.message==='string'&&update.message)||'当前构建未启用热更新。';
+    const lanTitle=!lan?'状态未读取':lan.enabled?'配置已启用':'配置为仅本机';
+    const lanDetail=!lan?notice('局域网状态读取失败：'+esc(stateError||'服务未返回状态')+'。界面不会把它当作已关闭。','error'):`监听 ${esc(lan.listen||'未声明')}${lan.allow_cidrs?'，允许 '+esc(lan.allow_cidrs):''}${lan.has_key?'':'；尚未创建调用密钥'}${lan.enabled?'<br>保存后需要重启服务才会改变实际监听。':''}`;
+    const loopTitle=!loop?'状态未读取':loopOn?'命中即停止':'命中后自动重发';
+    const loopDetail=!loop?notice('重复推理开关读取失败：'+esc(loopError||'服务未返回状态')+'。','error'):'作用于后续请求；已开始的请求沿用原语义。';
+    const updateNotice=!update?notice('更新状态读取失败：'+esc(updateError||'服务未返回状态')+'。','error'):notice(updateEnabled?'可检查官方发布并下载已签名的运行包。':updateMessage,updateEnabled?'':'warn');
+    const updateUnread=!update;
+    $('#view').innerHTML=heading()+`<div class="split"><section class="panel"><div class="panel-title"><div><h2>显示与会话</h2></div></div><div class="settings-line"><div><h3>界面主题</h3><p>在此浏览器保存偏好。</p></div>${button('theme','切换主题')}</div><div class="settings-line"><div><h3>当前会话</h3><p>有效期至 ${esc(date(session.expiresAt))}</p></div>${badge('ready','已登录')}</div><div class="settings-line"><div><h3>管理账号安全</h3><p>修改密码后其他设备需重新登录。</p></div>${button('password','修改密码')}</div></section><section class="panel"><div class="panel-title"><div><h2>局域网访问</h2></div></div><div class="settings-line"><div><h3>${lanTitle}</h3><p>${lanDetail}</p></div>${state?button('lan-settings',lan?.enabled?'调整':'启用','','quiet'):''}</div></section><section class="panel"><div class="panel-title"><div><h2>重复推理保护</h2></div></div><div class="settings-line"><div><h3>${loopTitle}</h3><p>${loopDetail}</p></div>${loop?button('loop-toggle',loopOn?'改为自动重发':'改为命中即停','','quiet'):''}</div></section><section class="panel"><div class="panel-title"><div><h2>迁移与更新</h2></div></div>${updateNotice}<p class="muted">${update?'检查与下载不会自动切换生产；安装包、Android 与 Linux 交付仍待独立验收。':'更新读取失败时不会显示已启用或已下载。'}</p><div class="section-gap">${updateEnabled?button('update-check','检查更新','','quiet'):''}${updateUnread?badge('manual_action','状态未读取'):updateEnabled?badge(updateStatus.state||'manual_action',updateStatus.state==='downloaded'?'已下载待交接':'待独立验收'):badge('disabled','未启用')}</div></section></div>`;
   }
   function passwordDialog() {
     openDialog('修改管理账号',`<form id="password-form" class="form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>用户名<input name="username" autocomplete="username" required pattern="[A-Za-z0-9_.-]{3,32}"></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>再次输入新密码<input name="confirm" type="password" autocomplete="new-password" required></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);
@@ -277,7 +284,7 @@
     }
     if(name==='model-refresh'){await loadModels(true);return;}
     if(name==='model-next' || name==='model-prev'){state.modelOffset=Math.max(0,state.modelOffset+(name==='model-next'?8:-8));await loadModels(false);return;}
-    if(name==='connection-help'){openDialog('账号接入状态',notice('现有账号已通过真实后端读取。新控制台的扫码、手机号和授权流程仍在接入，当前不会发送短信或自动开始登录。','warn')+'<p class="muted">豆包需在官方客户端完成登录；会话导入与续期界面将在后续阶段开放。</p>');return;}
+    if(name==='connection-help'){openDialog('账号接入状态',notice('账号状态来自真实后端。WorkBuddy 支持扫码/短信登录与重新连接；豆包登录基于官方客户端会话。只有在服务确认需要人工操作时才会发起对应流程。','')+'<p class="muted">登录流程需要真实扫码或验证码时，界面会显示明确步骤；不会在后台静默重试已成功的操作。</p>');return;}
     if(name==='manual-task'){const t=state.tasks[index];openDialog('所需人工操作',`<h3>${esc(t.name)}</h3><p class="section-gap">${esc(t.description)}</p>${notice('请在对应官方服务完成要求的内容或操作。完成与奖励以服务端核验为准。','warn')}`);return;}
     if(name==='run-task' || name==='run-all'){confirmRun(name==='run-task'?state.tasks[index]:null);return;}
     if(name==='review-submission'){openDialog('核对未确认的提交',`<form id="review-form" class="form"><p>请先检查执行记录和官方服务状态。解除保护不会重试或取消原请求。</p><label class="check"><input type="checkbox" required>我已核对上次提交，确认不会重复执行已有操作</label><div class="actions">${button('close','返回')}<button type="submit">解除提交保护</button></div></form>`);$('#review-form').onsubmit=e=>{e.preventDefault();sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();reload();};return;}
@@ -287,9 +294,9 @@
     if(name==='cancel-run'){const r=state.runs[index];await mutate('cancel-'+r.id,'workbench/cancel',{id:r.id},async data=>{toast(data.cancel_requested?'已发送取消请求，等待服务端确认。':'任务已结束或无法取消，请查看最新状态。');await reload();});return;}
     if(name==='run-detail'){const r=state.runs[index];openDialog('执行详情',`<p><code>${esc(r.id)}</code></p><div class="section-gap">${badge(r.status)}</div>${r.status==='uncertain'?notice('上游操作结果尚未确认，请先核验服务端状态，不要重复执行。','warn'):''}<div class="section-gap">${r.steps?.length?table(['阶段','账号','结果'],r.steps.map(s=>[esc(labels[s.stage] || s.stage),`<code>${esc(s.account_id)}</code>`,badge(s.status)+(s.error_code?`<p class="small muted">${esc(taskErrors[s.error_code]||'操作未完成')}${Number.isInteger(s.upstream_code)?'（业务码 '+s.upstream_code+'）':''}</p>`:'')])):empty('尚无执行步骤','任务可能仍在等待派发。')}</div>`);return;}
     if(name==='logs-prev' || name==='logs-next'){state.logOffset=Math.max(0,(state.logOffset || 0)+(name==='logs-next'?30:-30));await reload();return;}
-    if(name==='lan-settings'){const st=await api('state');const lan=st?.lan||{};openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">修改监听地址与允许网段；原生构建需要重启服务后生效。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.168.1.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);$('#lan-form').onsubmit=e=>{e.preventDefault();const form=new FormData(e.target);mutate('lan','lan',{enabled:form.get('enabled')==='on',allow_cidrs:String(form.get('allow_cidrs')||'').trim()},async data=>{closeDialog();toast(data.message||'设置已保存。');await reload();});};return;}
-    if(name==='loop-toggle'){const current=await api('features/reasoning-loop');await mutate('loop','features/reasoning-loop',{stop_only:!current.stop_only},async data=>{toast(data.message||'已切换。');await reload();});return;}
-    if(name==='update-check'){await mutate('update-check','update/check',{},async data=>{toast(data.ok?'已检查更新。':'检查未完成：'+(data.message||'未启用'));await reload();});return;}
+    if(name==='lan-settings'){const st=await api('state');if(!st?.lan)throw new APIError('request_failed',502);const lan=st.lan;openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">这里修改的是配置文件中的监听地址与允许网段；保存成功后仍需重启服务，实际监听不会立即改变。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>监听地址<input name="listen" value="${esc(lan.listen||'')}" readonly aria-readonly="true"></label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.168.1.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);$('#lan-form').onsubmit=e=>{e.preventDefault();const form=new FormData(e.target);const want={enabled:form.get('enabled')==='on',allow_cidrs:String(form.get('allow_cidrs')||'').trim()};mutate('lan','lan',want,async data=>{if(data.ok===false)throw new APIError('request_failed',502);const saved=(await api('state'))?.lan;if(!saved||saved.enabled!==want.enabled||String(saved.allow_cidrs||'')!==want.allow_cidrs)throw new APIError('request_failed',502);closeDialog();toast((data.message||'设置已保存。')+' 已从服务端读回配置。');await reload();});};return;}
+    if(name==='loop-toggle'){const current=await api('features/reasoning-loop');if(current?.stop_only===undefined)throw new APIError('request_failed',502);const want=!current.stop_only;await mutate('loop','features/reasoning-loop',{stop_only:want},async()=>{const saved=await api('features/reasoning-loop');if(saved?.stop_only!==want)throw new APIError('request_failed',502);toast('重复推理保护已切换，并已从服务端读回。');await reload();});return;}
+    if(name==='update-check'){await mutate('update-check','update/check',{},async data=>{if(data.ok===false)throw new APIError('request_failed',502,typeof data.message==='string'?data.message:'');const status=data.status||{};toast('已检查更新：'+(status.message||status.state||'状态未变化')+'。');await reload();});return;}
     if(name==='password')passwordDialog();
   }
   const wideNavigation=window.matchMedia('(min-width:901px)');
