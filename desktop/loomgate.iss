@@ -32,8 +32,12 @@ RestartApplications=no
 SetupLogging=yes
 LicenseFile={#PayloadDir}\LICENSE
 
+[Languages]
+Name: "chinesesimplified"; MessagesFile: "{#SourcePath}\ChineseSimplified.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
 [Tasks]
-Name: desktopicon; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+Name: desktopicon; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
 
 [Files]
 Source: "{#PayloadDir}\LoomGate.exe"; DestDir: "{app}\program"; Flags: ignoreversion
@@ -61,7 +65,7 @@ Name: "{group}\LoomGate"; Filename: "{app}\program\LoomGate.exe"; WorkingDir: "{
 Name: "{autodesktop}\LoomGate"; Filename: "{app}\program\LoomGate.exe"; WorkingDir: "{app}\program"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\program\LoomGate.exe"; Description: "Launch LoomGate"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\program\LoomGate.exe"; Description: "启动 LoomGate"; Flags: nowait postinstall skipifsilent
 
 ; No runtime data is installed or registered for removal. workspace/ is created
 ; by the launcher and deliberately survives repair, upgrade and uninstall.
@@ -71,5 +75,5 @@ procedure InitializeWizard;
 begin
   if not DirExists('D:\') then
     WizardForm.DirEdit.Text := ExpandConstant('{localappdata}\Programs\LoomGate');
-  WizardForm.FinishedLabel.Caption := 'LoomGate is installed. Account and configuration data are stored in workspace next to program. Uninstall keeps workspace. This development build is not a production release.';
+  WizardForm.FinishedLabel.Caption := 'LoomGate 已安装。账号与配置数据保存在 program 旁边的 workspace 目录，卸载会保留 workspace。这是开发验收构建，不是正式发行版。';
 end;
