@@ -96,47 +96,13 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []byte, model string, streaming bool, st *chatStat, provider inference.Provider) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(body, &fields)
-	ignoredTools := false
-	for key := range fields {
-		switch key {
-		case "model", "messages", "stream", "stream_options", "n":
-		case "reasoning_effort", "reasoningEffort":
-			// Accepted and forwarded to providers that advertise a reasoning
-			// ladder. Providers without one simply ignore it; a level the model
-			// does not publish is down-graded to its highest published level at or
-			// below the request (never a 400).
-		case "tools", "tool_choice", "functions", "function_call", "parallel_tool_calls":
-			// No verified carrier exists in the official request body, so these
-			// cannot be honored. Ignore them; the reply is plain text.
-			ignoredTools = true
-		case "max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed", "user", "metadata", "store", "logprobs", "top_logprobs", "response_format", "service_tier":
-			// No verified wire field. Ignoring a limit or a sampling hint changes
-			// only how the answer is produced, never whether it is correct, and it
-			// keeps ordinary clients usable.
-		default:
-			st.status = 400
-			writeOpenAIError(w, 400, "provider_parameter_unsupported", "the request contains a parameter that the official provider cannot honor")
-			return
-		}
-	}
-	if ignoredTools {
-		logProviderIgnoredTools(model)
-	}
-	var messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
-	var rawMessages []map[string]json.RawMessage
-	_ = json.Unmarshal(fields["messages"], &rawMessages)
-	for _, message := range rawMessages {
-		for key := range message {
-			if key != "role" && key != "content" {
-				st.status = 400
-				writeOpenAIError(w, 400, "provider_parameter_unsupported", "message contains an unsupported field")
-				return
-			}
-		}
-	}
+	// Every request has to be read for the handful of fields this provider can
+	// actually carry. Unknown or unsupported fields are IGNORED, never rejected:
+	// OpenAI-compatible clients send an open-ended set (tools, sampling knobs,
+	// reasoning switches, provider-specific extensions), and rejecting any one of
+	// them turned a reachable model into a permanent 400 for that client. The
+	// fields below are read because they change what is sent; everything else is
+	// simply not read.
 	if len(body) > 8<<20 {
 		st.status = 413
 		writeOpenAIError(w, 413, "request_body_too_large", "request body exceeds provider limit")
@@ -157,6 +123,10 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		}
 	}
 	dialogueProvider, hasDialogue := provider.(inference.DialogueProvider)
+	var messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
 	if json.Unmarshal(fields["messages"], &messages) != nil {
 		st.status = 400
 		writeOpenAIError(w, 400, "provider_input_unsupported", "messages must be an array of role and content objects")
@@ -183,29 +153,31 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			Content json.RawMessage
 		}{m.Role, m.Content})
 	}
-	validMessages := len(turns) > 0 && len(turns) <= 101 && len(turns)%2 == 1
+	// Any role sequence is accepted. The transcript is flattened into a single
+	// prompt by the provider, so a client that sends two user turns in a row, a
+	// trailing assistant prefill or an assistant-first history still works. Only
+	// empty turns and size limits are enforced.
 	parsed := []inference.Message{}
 	total := 0
 	text = ""
 	for i, m := range turns {
-		expected := "user"
-		if i%2 == 1 {
-			expected = "assistant"
-		}
 		value := textOfContent(m.Content)
-		if m.Role != expected || strings.TrimSpace(value) == "" || len(value) > 65536 {
-			validMessages = false
+		if strings.TrimSpace(value) == "" {
+			continue
 		}
 		total += len(value)
+		if total > 1<<20 {
+			break
+		}
 		if i == 0 && systemPrefix != "" {
 			value = systemPrefix + value
 		}
 		parsed = append(parsed, inference.Message{Role: m.Role, Content: value})
 		text = value
 	}
-	if !validMessages || total > 1<<20 || (!hasDialogue && len(turns) != 1) {
+	if len(parsed) == 0 || total > 1<<20 || len(parsed) > 101 || (!hasDialogue && len(parsed) != 1) {
 		st.status = 400
-		writeOpenAIError(w, 400, "provider_input_unsupported", "expected alternating user and assistant text messages ending with user; unsupported roles, content or size")
+		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
 		return
 	}
 	var result inference.Result

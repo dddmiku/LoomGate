@@ -378,7 +378,7 @@
     }
     const rows=[];
     for(const [label,items] of sections){
-      rows.push(`<tr class="task-section"><th colspan="5">${esc(label)}<span class="small muted"> · ${items.length} 项任务 · ${items[0].g.accounts.length} 个账号</span></th></tr>`);
+      rows.push(`<tr class="task-section"><th colspan="6">${esc(label)}<span class="small muted"> · ${items.length} 项任务 · ${items[0].g.accounts.length} 个账号</span></th></tr>`);
       for(const item of items){
         const g=item.g,i=item.i;
         const c=groupPhaseCounts(g);
@@ -387,15 +387,16 @@
         const sched=schedulesFor(g)[0];
         const scheduleCell=sched?`<strong>${esc(scheduleText(sched))}</strong><p class="small muted">每天 · ${esc(sched.timezone||'')}</p>`:'<span class="muted">未定时</span>';
         rows.push(`<tr data-task-group="${i}">
+          <td class="log-expander"><button type="button" data-action="task-log" data-index="${i}" aria-expanded="false" aria-label="展开最近执行日志">▸</button></td>
           <td><strong>${esc(g.name)}</strong><p class="small muted">${esc(g.once?'一次性':g.once_per_day?'每日':'按需')}${g.manual_only?' · 需要人工':''}${pending?' · 上次结果未确认':''}</p></td>
           <td><span class="small">${esc(summary)}</span></td>
           <td>${scheduleCell}</td>
           <td>${sched?badge(sched.enabled?'ready':'disabled',sched.enabled?'已启用':'已停用'):badge('neutral','—')}</td>
-          <td><div class="actions">${g.manual_only?button('select-task-group','查看要求',`data-index="${i}"`,'quiet compact'):button('run-task-group','运行',`data-index="${i}"`,'compact')}${g.manual_only?'':button('task-schedule-group',sched?'改定时':'定时',`data-index="${i}"`,'quiet compact')}${sched?button('toggle-schedule','停用',`data-index="${state.schedules.indexOf(sched)}" data-lock`,'quiet compact'):''}</div></td>
+          <td><div class="actions">${g.manual_only?button('select-task-group','查看要求',`data-index="${i}"`,'quiet compact'):button('run-task-group','运行',`data-index="${i}"`,'compact')}${g.manual_only?'':button('task-schedule-group',sched?'改定时':'定时',`data-index="${i}"`,'quiet compact')}${sched?button('toggle-schedule','停用',`data-index="${state.schedules.indexOf(sched)}" data-lock`,'quiet compact'):''}${button('task-log','日志',`data-index="${i}" data-key="${esc(g.key)}" data-realm="${esc(g.realm||'')}"`,'quiet compact')}</div></td>
         </tr>`);
       }
     }
-    $('#task-list').innerHTML=`<table class="task-table"><thead><tr><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table>`+(cached?'<p class="small muted">正在后台刷新任务目录。</p>':'');
+    $('#task-list').innerHTML=`<table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table>`+(cached?'<p class="small muted">正在后台刷新任务目录。</p>':'');
   }
   const taskErrors={provider_rejected:'官方服务拒绝了此操作',operation_unconfirmed:'操作结果未确认',account_identity_changed:'账号或绑定发生变化',authentication_required:'需要重新登录',task_expired:'任务标识已过期',operation_not_eligible:'当前尚不满足操作条件',provider_busy:'官方客户端正忙',upstream_failed:'上游操作未成功'};
   const taskPhases={ready:'待执行',pending:'上游处理中',claimable:'可领取奖励',done:'上游已完成',manual:'待完成条件',blocked:'暂不可用'};
@@ -406,6 +407,33 @@
     const c=groupPhaseCounts(g),actionable=g.accounts.filter(t=>!t.manual_only);
     $('#task-detail').innerHTML=`${button('task-back','返回任务列表','','detail-back')}<div class="detail-subtitle">${esc(providerName(g.provider_id))} / ${g.once?'一次性工作':g.once_per_day?'每日工作':'按需执行'} · ${g.accounts.length} 个账号</div><h2 class="detail-title">${esc(g.name)}</h2><p class="detail-body">${esc(g.description)}</p>${g.accounts.some(t=>t.pending_verification)?notice('上次操作结果尚未确认。系统会先核验服务端状态，并阻止重复提交。','warn'):''}<dl class="detail-specs"><div><dt>上游状态</dt><dd data-task-state="${esc(g.accounts.every(t=>t.state?.phase==='manual')?'manual':g.accounts.every(t=>t.state?.phase==='done')?'done':g.accounts.some(t=>t.state?.phase==='claimable')?'claimable':'pending')}">${esc(g.accounts.length===1&&taskPhases[g.accounts[0].state?.phase]?taskPhases[g.accounts[0].state?.phase]:'按账号核验')}</dd></div></dl><div class="phase-summary">${[['claimable','可领取',c.claimable],['ready','待执行',c.ready],['done','已完成',c.done],['manual','需人工',c.manual],['blocked','暂不可用',c.blocked]].filter(([, ,n])=>n).map(([id,label,n])=>`<span class="phase-chip" data-phase="${id}">${label} ${n}</span>`).join('')||'<span class="phase-chip">等待核验</span>'}</div><div class="actions">${actionable.length?button('run-task-group','为全部 '+actionable.length+' 个账号执行',`data-index="${index}"`,'primary'):''}${actionable.length?button('task-schedule-group','为 '+actionable.length+' 个可执行账号安排计划',`data-index="${index}"`,'quiet'):''}${button('open-runs','查看执行记录','','quiet')}</div><h3 class="section-gap">账号明细</h3><div class="account-task-list">${g.accounts.map(t=>{const ti=state.tasks.indexOf(t),phase=t.state?.phase;return `<div class="account-task-row" data-account-task="${esc(t.account_id)}"><div><strong>${esc(t.account_id)}</strong><p class="small muted">${esc(taskPhases[phase]||'待核验')}${t.state?.total?' · '+number(t.state.current||0)+' / '+number(t.state.total):''}${t.state?.summary?' · '+esc(t.state.summary):''}${t.pending_verification?' · 上次结果未确认':''}</p></div><div class="actions">${button(t.manual_only?'manual-task':'run-task',t.manual_only?'查看所需操作':t.pending_verification?'核验上次操作':phase==='claimable'?'领取奖励':phase==='done'?'再次核验':phase==='manual'?'核验进度':phase==='pending'?'核验状态':'执行任务',`data-task-index="${ti}"`,'compact')}${!t.manual_only?button('task-schedule','安排计划',`data-task-index="${ti}"`,'quiet compact'):''}</div></div>`;}).join('')}</div><p class="detail-note">${g.manual_only?'按要求提供真实内容。完成与奖励以服务端核验为准。':'任务会进入执行队列；已提交不代表已完成。结果在执行记录中保留。'}</p>`;
     if(open){$('#task-browser').classList.add('detail-open');$('#task-detail').focus({preventScroll:true});}
+  }
+  // The task log lives inside the row, not on another page: an operator checking
+  // "did today's check-in run" should not lose their place in the task list. It
+  // shows the most recent runs for this task key and region, newest first.
+  async function toggleTaskLog(index){
+    const g=state.taskGroups[index];
+    if(!g)return;
+    const row=document.querySelector(`tr[data-task-group="${index}"]`);
+    if(!row)return;
+    const existing=row.nextElementSibling;
+    if(existing?.classList.contains('task-log-row')){existing.remove();row.querySelector('[data-action=task-log]')?.setAttribute('aria-expanded','false');return;}
+    const tbody=document.createElement('tbody');
+    tbody.innerHTML=`<tr class="task-log-row"><td colspan="6"><div class="log-detail"><p class="muted small">正在读取该项任务的最近执行记录…</p></div></td></tr>`;
+    row.after(tbody.firstElementChild);
+    row.querySelector('[data-action=task-log]')?.setAttribute('aria-expanded','true');
+    try{
+      const data=await api('workbench');
+      const runs=(data.runs||[]).filter(r=>r.provider_id===g.provider_id&&(r.task_key||'')===g.key).slice(0,10);
+      const box=row.nextElementSibling?.querySelector('.log-detail');
+      if(!box)return;
+      box.innerHTML=runs.length
+        ? `<p class="small muted">最近 ${runs.length} 次执行（仅本项任务）</p>`+table(['时间','状态','账号范围','说明'],runs.map(r=>[esc(date(r.started_at)),badge(r.status),esc((r.account_ids||[]).join('、')||'全部已启用账号'),`${esc(labels[r.stage]||'')}${r.discovery_issues?.length?' · '+r.discovery_issues.length+' 项发现失败':''}${r.steps?.length?' · '+r.steps.length+' 步':''}`]))
+        : '<p class="muted">这项任务还没有执行记录。点「运行」后结果会出现在这里。</p>';
+    }catch(e){
+      const box=row.nextElementSibling?.querySelector('.log-detail');
+      if(box)box.innerHTML=`<p class="notice error">${esc(e instanceof APIError?e.message:'执行记录读取失败')}</p>`;
+    }
   }
   function taskForGroup(g){
     return {provider_id:g.provider_id,key:g.key,name:g.name,account_ids:g.accounts.filter(t=>!t.manual_only).map(t=>t.account_id),realm:g.realm};
@@ -509,67 +537,162 @@
       else $('#run-poll').textContent='自动同步已达到 90 秒上限。任务仍在服务端运行，可点击刷新继续查看。';
     } else state.pollStarted=0;
   }
+  // Usage follows the shape of a metering dashboard rather than a single total:
+  // KPI tiles, then a breakdown by model / key / day so an operator can see where
+  // the tokens actually went. Every number is what the ledger recorded; a missing
+  // observation stays "—" and is never shown as zero.
   async function usage() {
-    const data=await api('usage'), totals=data.totals;
+    const data=await api('usage'),totals=data.totals;
     if(!totals)throw new APIError('request_failed',503);
-    $('#view').innerHTML=heading(button('reload','刷新用量','','quiet'))+`<div class="usage-summary"><strong data-total-requests>${number(totals.requests)}</strong> 次请求已记入账本，${number(totals.failed_requests)} 次失败。</div><dl class="usage-breakdown"><div><dt>Token 总量</dt><dd>${number(totals.total_tokens)}</dd></div><div><dt>已报告消耗</dt><dd>${number(totals.credit)}</dd></div><div><dt>未报告用量的请求</dt><dd>${number(totals.unreported_requests)}</dd></div></dl>`+notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。`)+(data.days?.length?table(['日期','请求','Token','消耗'],data.days.slice(0,30).map(d=>[esc(d.day),number(d.totals.requests),number(d.totals.total_tokens),number(d.totals.credit)])):empty('暂无每日用量','网关收到实际调用后将写入用量账本。'));
+    const days=(data.days||[]).slice(0,30);
+    const keys=data.keys||[];
+    // Aggregate per model across the key dimension; the store keeps models under
+    // each key, so the same model from two keys sums here.
+    const byModel=new Map();
+    for(const key of keys){
+      for(const m of (key.models||[])){
+        const row=byModel.get(m.model)||{requests:0,prompt:0,completion:0,cached:0,credit:0};
+        row.requests+=m.totals.requests||0;
+        row.prompt+=m.totals.prompt_tokens||0;
+        row.completion+=m.totals.completion_tokens||0;
+        row.cached+=m.totals.cached_tokens||0;
+        row.credit+=m.totals.credit||0;
+        byModel.set(m.model,row);
+      }
+    }
+    const models=[...byModel.entries()].sort((a,b)=>(b[1].prompt+b[1].completion)-(a[1].prompt+a[1].completion));
+    const maxDayTokens=Math.max(1,...days.map(d=>d.totals.total_tokens||0));
+    const pct=(n,total)=>total>0?Math.round(n/total*1000)/10:0;
+    const donut=(segments)=>{
+      let offset=0;
+      const stops=segments.filter(s=>s.value>0).map(s=>{
+        const start=offset;offset+=s.value;
+        return `${s.color} ${start}% ${offset}%`;
+      });
+      return `conic-gradient(${stops.join(',')||'var(--line) 0 100%'})`;
+    };
+    const palette=['#4f7df3','#3bb273','#e8a33d','#c85fd0','#38a4c9','#9b8cf0','#e0644f'];
+    const modelSegments=models.slice(0,6).map((entry,i)=>({label:entry[0],value:entry[1].prompt+entry[1].completion,color:palette[i%palette.length]}));
+    const rest=models.slice(6).reduce((n,e)=>n+e[1].prompt+e[1].completion,0);
+    if(rest>0)modelSegments.push({label:'其他',value:rest,color:palette[6]});
+    const modelTotal=modelSegments.reduce((n,s)=>n+s.value,0);
+
+    const tile=(label,value,detail)=>`<article class="usage-tile"><span>${esc(label)}</span><strong>${value}</strong>${detail?`<p>${detail}</p>`:''}</article>`;
+
+    $('#view').innerHTML=heading(button('reload','刷新用量','','quiet'))+
+      `<div class="usage-tiles">
+        ${tile('总请求',number(totals.requests),`${number(totals.failed_requests)} 次失败 · ${number(totals.unreported_requests)} 次未报告用量`)}
+        ${tile('总 Token',number(totals.total_tokens),`输入 ${number(totals.prompt_tokens)} / 输出 ${number(totals.completion_tokens)}${totals.cached_tokens?` / 缓存 ${number(totals.cached_tokens)}`:''}`)}
+        ${tile('已报告消耗',number(totals.credit),'只累计上游明确报告的数值')}
+        ${tile('账本跨度',`${number(days.length)} 天`,`自 ${date(data.since)} 起`)}
+      </div>`+
+      `<div class="usage-grid">
+        <section class="usage-card">
+          <div class="usage-card-head"><h2>模型分布</h2><span class="small muted">按 Token</span></div>
+          ${modelSegments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(modelSegments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
+        </section>
+        <section class="usage-card">
+          <div class="usage-card-head"><h2>调用方分布</h2><span class="small muted">按 Token</span></div>
+          ${keys.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(keys.slice(0,6).map((k,i)=>({value:k.totals?.total_tokens||0,color:palette[i%palette.length]})))}"></div><table class="donut-legend"><thead><tr><th>调用方</th><th>请求</th><th>Token</th></tr></thead><tbody>${keys.slice(0,8).map(k=>`<tr><td>${esc(k.name||k.masked_key||k.key_id||'未命名')}</td><td>${number(k.totals?.requests||0)}</td><td>${number(k.totals?.total_tokens||0)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无调用方用量','按调用密钥统计。')}
+        </section>
+      </div>`+
+      `<section class="usage-card">
+        <div class="usage-card-head"><h2>每日用量</h2><span class="small muted">最近 ${number(days.length)} 天</span></div>
+        ${days.length?`<div class="usage-bars">${days.slice().reverse().map(d=>{
+          const tokens=d.totals.total_tokens||0,width=Math.max(1,Math.round(tokens/maxDayTokens*100));
+          return `<div class="usage-bar-row"><time>${esc(d.day)}</time><div class="usage-bar"><span style="width:${width}%"></span></div><span class="usage-bar-value">${number(tokens)}</span><span class="small muted">${number(d.totals.requests)} 次 · ${number(d.totals.credit)}</span></div>`;
+        }).join('')}</div>`:empty('暂无每日用量','网关收到实际调用后将写入用量账本。')}
+      </section>`+
+      `<section class="usage-card">
+        <div class="usage-card-head"><h2>按模型明细</h2></div>
+        ${models.length?table(['模型','请求','输入','输出','缓存','消耗'],[...models].map(e=>[`<code>${esc(e[0])}</code>`,number(e[1].requests),number(e[1].prompt),number(e[1].completion),number(e[1].cached),number(e[1].credit)])):empty('暂无明细','')}
+      </section>`+
+      notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。`,'');
   }
-  // One row per request, with the fields an operator actually needs at a glance.
-  // Everything else (attempts, decisions, token usage, timing breakdown, error
-  // codes) is fetched from /requests/{id} only when the row is opened, so the
-  // list stays readable and the detail is never truncated.
+
+  // The request log follows the shape operators know from other gateways: one
+  // wide table with every column visible, and an inline expander on the left of
+  // each row. Opening a row reveals the detail in place — nothing navigates away.
   const protocolNames={chat_completions:'Chat Completions',responses:'Responses',anthropic_messages:'Anthropic Messages',gemini_generate_content:'Gemini'};
   const protocolName=value=>protocolNames[value]||value||'—';
   const statusTone=value=>['success','ok'].includes(value)?'ready':['rejected','failed','error'].includes(value)?'failed':'manual_action';
-  function requestRow(r){
-    const tone=statusTone(r.status);
-    return [`<code>${esc(r.request_id||'—')}</code>`,`<strong>${esc(r.model||'—')}</strong><p class="small muted">${esc(protocolName(r.protocol))}${r.stream?' · 流式':''}</p>`,badge(tone,r.status||'未知'),r.duration_ms!=null?number(r.duration_ms)+' ms':'—',date(r.started_at)];
+  function tokensCell(r){
+    const input=r.input_tokens==null?'—':number(r.input_tokens);
+    const output=r.output_tokens==null?'—':number(r.output_tokens);
+    return `<span class="tok">↓ ${input}</span> <span class="tok">↑ ${output}</span>`;
   }
-  async function requestDetail(id){
-    openDialog('请求详情','<p class="muted">正在读取该请求的明细…</p>');
-    try{
-      const data=await api('requests/'+encodeURIComponent(id),{signal:null});
-      const r=data.record||{};
-      const k=(name,value)=>['<dt>'+esc(name)+'</dt>','<dd>'+(value??'—')+'</dd>'];
-      const usage=(r.attempts||[]).map(a=>[a.number??'—',a.account_name||a.account_id||'—',a.model||'—',a.status||'—',a.input_tokens==null?'—':number(a.input_tokens),a.output_tokens==null?'—':number(a.output_tokens),a.cached_tokens==null?'—':number(a.cached_tokens),a.credit==null?'—':String(a.credit),a.error_code||'—']);
-      const decisions=(r.decisions||[]).map(d=>[d.attempt??'—',d.phase||d.mode||'—',d.reason_code||'—',d.account_name||d.account_id||'—']);
-      $('#dialog-body').innerHTML=`<div class="form request-detail">
-        <div class="actions"><button data-action="close">关闭</button></div>
-        <dl class="detail-specs">
-          ${k('请求标识','<code>'+esc(r.request_id||'—')+'</code>')}
-          ${k('协议','<code>'+esc(protocolName(r.protocol))+'</code>')}
-          ${k('模型','<code>'+esc(r.model||'—')+'</code>')}
-          ${k('状态',badge(statusTone(r.status),r.status||'未知')+(r.http_status?' · HTTP '+esc(r.http_status):''))}
-          ${k('错误码',r.error_code?'<code>'+esc(r.error_code)+'</code>':'—')}
-          ${k('密钥',esc(r.key_name||r.key_id||'—'))}
-          ${k('流式',r.stream?'是':'否')}
-          ${k('开始时间',date(r.started_at))}
-          ${k('结束时间',r.finished_at?date(r.finished_at):'—')}
-          ${k('总耗时',r.duration_ms!=null?number(r.duration_ms)+' ms':'—')}
-          ${k('排队耗时',r.queue_ms!=null?number(r.queue_ms)+' ms':'—')}
-          ${k('首字节',r.ttfb_ms!=null?number(r.ttfb_ms)+' ms':'—')}
-          ${k('结束原因',esc(r.finish_reason||'—'))}
-          ${k('上游已启动',r.upstream_started?'是':'否')}
-          ${k('尝试次数',number(r.attempt_count)+(r.attempts_truncated?'（已截断）':''))}
-          ${k('决策次数',number(r.decision_count)+(r.decisions_truncated?'（已截断）':''))}
-        </dl>
-        <h3 class="section-gap">上游尝试</h3>
-        ${usage.length?table(['#','账号','模型','状态','输入','输出','缓存','积分','错误'],usage):'<p class="muted">没有上游尝试记录。</p>'}
-        <h3 class="section-gap">调度决策</h3>
-        ${decisions.length?table(['#','阶段','原因','账号'],decisions):'<p class="muted">没有调度决策记录。</p>'}
-        <p class="detail-note">只记录请求元数据；消息内容与凭据不在留存量中。</p></div>`;
-      $('#dialog-body [data-action=close]').onclick=closeDialog;
-    }catch(e){closeDialog();toast(e instanceof APIError?e.message:'请求明细读取失败');}
+  function requestRow(r,i,open){
+    const tone=statusTone(r.status);
+    return `<tr class="log-row" data-request-row="${i}">
+      <td class="log-expander"><button type="button" data-action="request-expand" data-index="${i}" aria-expanded="${open?'true':'false'}" aria-label="展开日志详情">${open?'▾':'▸'}</button></td>
+      <td><time>${esc(date(r.started_at))}</time></td>
+      <td><code>${esc(r.key_name||r.key_id||'—')}</code></td>
+      <td><span class="small">${esc(providerName((r.model||'').split(':')[0])||'—')}</span></td>
+      <td><span class="small">${esc(protocolName(r.protocol))}</span></td>
+      <td><strong>${esc(r.model||'—')}</strong></td>
+      <td>${tokensCell(r)}</td>
+      <td>${r.duration_ms!=null?number(r.duration_ms)+' ms':'—'}${r.stream?'<span class="log-stream">流</span>':''}</td>
+      <td>${badge(tone,r.status||'未知')}${r.error_code?`<p class="small muted">${esc(r.error_code)}</p>`:''}</td>
+      <td>${r.credit==null?'—':String(r.credit)}</td>
+      <td><code class="small">${esc(r.request_id||'—')}</code></td>
+    </tr>`+(open?`<tr class="log-detail-row"><td colspan="11">${requestDetailHtml(r)}</td></tr>`:'');
+  }
+  // Detail is rendered from the list row itself, which already carries attempts
+  // and timing. The expanded panel only ever shows metadata — never message text.
+  function requestDetailHtml(r){
+    const k=(name,value)=>`<div><dt>${esc(name)}</dt><dd>${value??'—'}</dd></div>`;
+    return `<div class="log-detail">
+      <dl class="log-specs">
+        ${k('请求标识',`<code>${esc(r.request_id||'—')}</code>`)}
+        ${k('协议',`<code>${esc(protocolName(r.protocol))}</code>`)}
+        ${k('模型',`<code>${esc(r.model||'—')}</code>`)}
+        ${k('状态',badge(statusTone(r.status),r.status||'未知')+(r.http_status?' · HTTP '+esc(r.http_status):''))}
+        ${k('错误码',r.error_code?`<code>${esc(r.error_code)}</code>`:'—')}
+        ${k('调用密钥',esc(r.key_name||r.key_id||'—'))}
+        ${k('流式',r.stream?'是':'否')}
+        ${k('开始时间',esc(date(r.started_at)))}
+        ${k('结束时间',r.finished_at?esc(date(r.finished_at)):'—')}
+        ${k('总耗时',r.duration_ms!=null?number(r.duration_ms)+' ms':'—')}
+        ${k('排队',r.queue_ms!=null?number(r.queue_ms)+' ms':'—')}
+        ${k('首字节',r.ttfb_ms!=null?number(r.ttfb_ms)+' ms':'—')}
+        ${k('结束原因',esc(r.finish_reason||'—'))}
+        ${k('上游已启动',r.upstream_started?'是':'否')}
+        ${k('尝试次数',number(r.attempt_count))}
+        ${k('决策次数',number(r.decision_count))}
+      </dl>
+      <p class="small muted">展开只显示请求元数据；消息内容与凭据不在留存量中。</p>
+    </div>`;
   }
   async function logs() {
-    const data=await api('requests?limit=30&offset='+String(state.logOffset || 0));
+    const data=await api('requests?limit=50&offset='+String(state.logOffset || 0));
     const rows=data.items || data.requests || data.rows;
     if(!Array.isArray(rows))throw new APIError('request_failed',503);
     state.requestRows=rows;
+    state.logOpen=new Set();
+    const head=['','时间','调用方','服务','协议','模型','Token','用时','状态','花费','请求 ID'];
     $('#view').innerHTML=heading(button('reload','刷新记录','','quiet'))+
-      (rows.length?`<div class="request-table">${table(['请求','模型 / 协议','状态','耗时','时间',''],rows.map((r,i)=>[...requestRow(r),button('request-detail','详情',`data-index="${i}"`,'quiet compact')]))}</div>`:empty('暂无请求记录','记录由网关真实请求生成，不包括面板的目录读取。'))+
-      `<div class="pagination"><span>共 ${number(data.total)} 条</span><div class="actions">${button('logs-prev','上一页',!state.logOffset?'disabled':'')}${button('logs-next','下一页',(state.logOffset || 0)+30>=data.total?'disabled':'')}</div></div>`;
+      (rows.length?`<div class="log-table-wrap"><table class="log-table"><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map((r,i)=>requestRow(r,i,false)).join('')}</tbody></table></div>`:empty('暂无请求记录','记录由网关真实请求生成，不包括面板的目录读取。'))+
+      `<div class="pagination"><span>共 ${number(data.total)} 条</span><div class="actions">${button('logs-prev','上一页',!state.logOffset?'disabled':'')}${button('logs-next','下一页',(state.logOffset || 0)+50>=data.total?'disabled':'')}</div></div>`;
   }
+  // Toggle one row in place. Re-rendering the single row keeps scroll position and
+  // avoids refetching the page for what is already in the DOM.
+  function toggleRequestRow(index){
+    const rows=state.requestRows||[],r=rows[index];
+    if(!r)return;
+    state.logOpen=state.logOpen||new Set();
+    const open=!state.logOpen.has(index);
+    if(open)state.logOpen.add(index);else state.logOpen.delete(index);
+    const current=document.querySelector(`tr[data-request-row="${index}"]`);
+    if(!current)return;
+    const next=document.createElement('tbody');
+    next.innerHTML=requestRow(r,index,open);
+    const nodes=[...next.children];
+    const detailRow=current.nextElementSibling;
+    if(detailRow?.classList.contains('log-detail-row'))detailRow.remove();
+    if(open)nodes[1]&&current.after(nodes[1]);
+    current.replaceWith(nodes[0]);
+  }
+
   // /api/update 的信封有五种真实形态，控制台必须逐一说实话：
   //   ok=false                      → 未启用（带服务端原因）
   //   enabled=true + unavailable_reason → 不可用（私有仓库/可见性未确认）
@@ -747,6 +870,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='run-task' || name==='run-all'){confirmRun(name==='run-task'?state.tasks[index]:null);return;}
     if(name==='open-runs'){location.hash='runs';return;}
     if(name==='run-task-group'){const g=state.taskGroups[index];if(!g)return;confirmRun(taskForGroup(g));return;}
+    if(name==='task-log'){await toggleTaskLog(index);return;}
     if(name==='review-submission'){openDialog('核对未确认的提交',`<form id="review-form" class="form"><p>请先检查执行记录和官方服务状态。解除保护不会重试或取消原请求。</p><label class="check"><input type="checkbox" required>我已核对上次提交，确认不会重复执行已有操作</label><div class="actions">${button('close','返回')}<button type="submit">解除提交保护</button></div></form>`);$('#review-form').onsubmit=e=>{e.preventDefault();sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();reload();};return;}
     if(name==='new-schedule'){location.hash='tasks';return;}if(name==='edit-schedule' || name==='task-schedule'){await scheduleEditor(name==='edit-schedule'?state.schedules[index]:null,name==='task-schedule'?state.tasks[index]:null);return;}
     if(name==='task-schedule-group'){const g=state.taskGroups[index];if(!g)return;await scheduleEditor(null,taskForGroup(g));return;}
@@ -756,7 +880,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='run-detail'){const r=state.runs[index];openDialog('执行详情',`<h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p class="muted">${esc(providerName(r.provider_id))} · ${esc(r.account_ids?.join('、')||'全部已启用账号')}</p><p class="small muted"><code>${esc(r.id)}</code></p><div class="section-gap">${badge(r.status)}</div>${r.status==='uncertain'?notice('上游操作结果尚未确认，请先核验服务端状态，不要重复执行。','warn'):''}${runDiscoveryIssues(r.discovery_issues)}<div class="section-gap">${r.steps?.length?(()=>{const columns=runStepColumns(r.steps),withTask=columns.length===4;return table(columns,r.steps.map(s=>runStepCells(s,withTask)));})():empty('尚无执行步骤','任务可能仍在等待派发。')}</div>`);return;}
     if(name==='copy-endpoint'){const value=element.dataset.value||'';try{await navigator.clipboard.writeText(value);toast('接入地址已复制。');}catch{const box=document.getElementById('endpoint-base');if(box){const range=document.createRange();range.selectNodeContents(box);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);}toast('已选中地址，请按 Ctrl+C 复制。');}return;}
     if(name==='logs-prev' || name==='logs-next'){state.logOffset=Math.max(0,(state.logOffset || 0)+(name==='logs-next'?30:-30));await reload();return;}
-    if(name==='request-detail'){const r=state.requestRows?.[index];if(r?.request_id)await requestDetail(r.request_id);return;}
+    if(name==='request-expand'){toggleRequestRow(index);return;}
     if(name==='lan-settings'){const st=await api('state');if(!st?.lan)throw new APIError('request_failed',502);const lan=st.lan;openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">这里修改的是配置文件中的监听地址与允许网段；保存成功后仍需重启服务，实际监听不会立即改变。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>监听地址<input name="listen" value="${esc(lan.listen||'')}" readonly aria-readonly="true"></label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.168.1.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);$('#lan-form').onsubmit=e=>{e.preventDefault();const form=new FormData(e.target);const want={enabled:form.get('enabled')==='on',allow_cidrs:String(form.get('allow_cidrs')||'').trim()};mutate('lan','lan',want,async data=>{if(data.ok===false)throw new APIError('request_failed',502);const saved=(await api('state'))?.lan;if(!saved||saved.enabled!==want.enabled||String(saved.allow_cidrs||'')!==want.allow_cidrs)throw new APIError('request_failed',502);closeDialog();toast((data.message||'设置已保存。')+' 已从服务端读回配置。');await reload();});};return;}
     if(name==='loop-toggle'){const current=await api('features/reasoning-loop');if(current?.stop_only===undefined)throw new APIError('request_failed',502);const want=!current.stop_only;await mutate('loop','features/reasoning-loop',{stop_only:want},async()=>{const saved=await api('features/reasoning-loop');if(saved?.stop_only!==want)throw new APIError('request_failed',502);toast('重复推理保护已切换，并已从服务端读回。');await reload();});return;}
     if(name==='update-check'){await mutate('update-check','update/check',{},async data=>{if(data.ok===false)throw new APIError('request_failed',502,typeof data.message==='string'?data.message:'');const status=data.status||{};toast('已检查更新：'+(status.message||status.state||'状态未变化')+'。');await reload();});return;}

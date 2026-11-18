@@ -62,17 +62,20 @@ func validateDialogue(q inference.Dialogue) error {
 	if _, err := hex.DecodeString(q.Owner); err != nil {
 		return dialogueError("provider_context_unsupported")
 	}
-	if len(q.Owner) != 64 || len(q.Messages) == 0 || len(q.Messages) > 101 || len(q.Messages)%2 != 1 {
+	// Role order is not constrained: the transcript is flattened into one prompt,
+	// so an assistant prefill, two consecutive user turns or an assistant-first
+	// history are all representable. Only empty turns, unknown roles and sizes are
+	// rejected.
+	if len(q.Owner) != 64 || len(q.Messages) == 0 || len(q.Messages) > 101 {
 		return dialogueError("provider_context_unsupported")
 	}
 	total := 0
-	for i, m := range q.Messages {
-		expected := "user"
-		if i%2 == 1 {
-			expected = "assistant"
+	for _, m := range q.Messages {
+		if m.Role != "user" && m.Role != "assistant" {
+			return dialogueError("provider_context_unsupported")
 		}
 		total += len(m.Content)
-		if m.Role != expected || strings.TrimSpace(m.Content) == "" || len(m.Content) > 65536 || total > 1<<20 {
+		if strings.TrimSpace(m.Content) == "" || len(m.Content) > 65536 || total > 1<<20 {
 			return dialogueError("provider_context_unsupported")
 		}
 	}

@@ -94,10 +94,24 @@ func TestDialogueNoSubmissionCanResumeButStaleCompletionCannotOverwrite(t *testi
 }
 func TestDialogueRejectsInventedToolRolesAndMalformedHistory(t *testing.T) {
 	_, q := dialogueFixture(t)
-	for _, messages := range [][]inference.Message{nil, {{Role: "system", Content: "x"}}, {{Role: "tool", Content: "invented"}}, {{Role: "user", Content: "x"}, {Role: "assistant", Content: "y"}}, {{Role: "user", Content: "x"}, {Role: "user", Content: "y"}, {Role: "user", Content: "z"}}} {
+	// A flattened transcript can represent any order of user/assistant turns, and
+	// a trailing assistant prefill is a legitimate client pattern. What remains
+	// unsupported is an empty history, a role the official body has no meaning for,
+	// and empty content.
+	for _, messages := range [][]inference.Message{nil, {{Role: "system", Content: "x"}}, {{Role: "tool", Content: "invented"}}, {{Role: "user", Content: "  "}}} {
 		q.Messages = messages
 		if validateDialogue(q) == nil {
 			t.Fatal("unsupported context accepted")
+		}
+	}
+	for _, messages := range [][]inference.Message{
+		{{Role: "user", Content: "x"}, {Role: "assistant", Content: "y"}},
+		{{Role: "user", Content: "x"}, {Role: "user", Content: "y"}, {Role: "user", Content: "z"}},
+		{{Role: "assistant", Content: "prefix"}, {Role: "user", Content: "next"}},
+	} {
+		q.Messages = messages
+		if validateDialogue(q) != nil {
+			t.Fatalf("representable history rejected: %+v", messages)
 		}
 	}
 }
