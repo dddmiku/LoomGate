@@ -310,8 +310,43 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 		}
 		base.ServeHTTP(w, r)
 	})
+	// Accounts logged in before display facts were captured would otherwise show
+	// only an internal hash. This is a read-only account-info call per account,
+	// run once in the background; it never sends a login or changes a session.
+	go backfillDoubaoDisplay(vault)
 	keepTaskVault = true
 	return workbench, handler, nil
+}
+
+// backfillDoubaoDisplay fills the masked phone number and display name on Doubao
+// profiles that predate those fields. Best effort: a failure is logged and
+// retried on the next start.
+func backfillDoubaoDisplay(vault *accountvault.Vault) {
+	if vault == nil {
+		return
+	}
+	rows, err := vault.List()
+	if err != nil {
+		return
+	}
+	updated := 0
+	for _, a := range rows {
+		if a.Provider != "doubao" || !a.Enabled {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		changed, err := doubao.RefreshDisplayFacts(ctx, vault, a.ID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if changed {
+			updated++
+		}
+	}
+	if updated > 0 {
+		log.Printf("[doubao] 已回填 %d 个账号的脱敏手机号/昵称", updated)
+	}
 }
 
 // Import before Run starts. This version repairs already-imported workspaces
