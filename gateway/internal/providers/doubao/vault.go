@@ -52,5 +52,12 @@ func (v VaultSessions) Session(ctx context.Context, id string) (Session, error) 
 	if json.Unmarshal(plain, &p) != nil {
 		return Session{}, errors.New("doubao_session_invalid")
 	}
-	return Session{Query: p.Query, Headers: p.Headers, BotID: p.BotID, Runtime: p.Runtime, Revision: fmt.Sprint(account.Revision), Completion: p.CompletionTemplate}, nil
+	// A gateway-side login stores only cookies and identity; the protocol body
+	// shape comes from the embedded official-client template. A profile that
+	// carries its own captured template (legacy capture import) keeps using it.
+	completion := p.CompletionTemplate
+	if len(completion) == 0 {
+		completion = embeddedCompletionTemplate
+	}
+	return Session{Query: p.Query, Headers: p.Headers, BotID: p.BotID, Runtime: p.Runtime, Revision: fmt.Sprint(account.Revision), Completion: completion}, nil
 }

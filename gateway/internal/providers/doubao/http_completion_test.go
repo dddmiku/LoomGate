@@ -4,8 +4,71 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 )
+
+// TestEmbeddedTemplateIsProtocolOnly proves the build-time template ships no
+// account data. It is what makes gateway-side login work with no capture: the
+// template holds the wire schema only, and every per-account value is injected
+// from the encrypted vault at request time.
+func TestEmbeddedTemplateIsProtocolOnly(t *testing.T) {
+	if len(embeddedCompletionTemplate) == 0 {
+		t.Fatal("embedded completion template is empty")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(embeddedCompletionTemplate, &body); err != nil {
+		t.Fatalf("embedded template is not JSON: %v", err)
+	}
+	for _, key := range []string{"client_meta", "messages", "option", "user_context", "ext"} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("embedded template lost %q", key)
+		}
+	}
+	// No credential-shaped text may appear anywhere in the template.
+	lower := strings.ToLower(string(embeddedCompletionTemplate))
+	for _, banned := range []string{"cookie", "sessionid", "authorization", "passport_csrf", "ms_token", "mstoken"} {
+		if strings.Contains(lower, banned) {
+			t.Fatalf("embedded template contains credential material %q", banned)
+		}
+	}
+	// The bot id must be the client's hardcoded default, so a fresh profile has a
+	// valid fallback if discovery is unavailable.
+	meta := body["client_meta"].(map[string]any)
+	if meta["bot_id"] != defaultAssistantBotID {
+		t.Fatalf("embedded template bot_id = %v, want %q", meta["bot_id"], defaultAssistantBotID)
+	}
+}
+
+// TestBuildCompletionBodyAppliesAccountBotID proves the per-account bot id wins
+// over the template default: catalog and completion are both scoped to it.
+func TestBuildCompletionBodyAppliesAccountBotID(t *testing.T) {
+	const accountBotID = "9999999999999999999"
+	built, err := buildCompletionBodyFor(json.RawMessage(embeddedCompletionTemplate), accountBotID, "doubao:1:0", "hello", "", 0, false)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(built, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["client_meta"].(map[string]any)["bot_id"]; got != accountBotID {
+		t.Fatalf("bot_id = %v, want %q", got, accountBotID)
+	}
+
+	// An empty account id keeps the template default rather than blanking it.
+	built, err = buildCompletionBodyFor(json.RawMessage(embeddedCompletionTemplate), "", "doubao:1:0", "hello", "", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = nil
+	if err := json.Unmarshal(built, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["client_meta"].(map[string]any)["bot_id"]; got != defaultAssistantBotID {
+		t.Fatalf("default bot_id = %v", got)
+	}
+}
 
 // TestBuildCompletionBodyRewritesOnlyVolatileFields proves the captured template
 // keeps its official protocol shape. Every non-volatile key must survive

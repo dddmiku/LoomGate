@@ -291,7 +291,7 @@ func main() {
 			gateway.InternalHandler().ServeHTTP(w, r)
 		}
 	})
-	passport := &doubao.Passport{Prepare: func(context.Context, *http.Request) error { return nil }, Bootstrap: syntheticPassportBootstrap, Transport: syntheticPassportTransport{fixture}, Save: func(ctx context.Context, id string, profile doubao.StoredProfile) error {
+	passport := &doubao.Passport{Transport: syntheticPassportTransport{fixture}, Save: func(ctx context.Context, id string, profile doubao.StoredProfile) error {
 		rows, err := vault.List()
 		if err != nil {
 			return err

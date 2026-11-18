@@ -30,20 +30,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer v.Close()
-	p := &doubao.Passport{Bootstrap: func(context.Context) (doubao.StoredProfile, error) {
-		var p doubao.StoredProfile
-		b, e := os.ReadFile(*profile)
-		if e != nil {
-			return p, e
-		}
-		defer func() {
-			for i := range b {
-				b[i] = 0
-			}
-		}()
-		e = json.Unmarshal(b, &p)
-		return p, e
-	}}
+	// The gateway-side passport performs login itself; a pre-captured profile is
+	// no longer an input. -profile is still accepted for argument compatibility.
+	_ = profile
+	p := &doubao.Passport{}
 	s, err := authflow.Open(authflow.Options{Vault: v, Drivers: map[string]authflow.Driver{"doubao": p}})
 	if err != nil {
 		fmt.Println("authentication_service_unavailable")

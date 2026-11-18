@@ -268,6 +268,13 @@ func buildCompletionBody(template json.RawMessage, model, prompt, conversation s
 // buildCompletionBodyWithEffort is buildCompletionBody plus an explicit reasoning
 // effort. When withEffort is false the captured template value is preserved.
 func buildCompletionBodyWithEffort(template json.RawMessage, model, prompt, conversation string, effort int, withEffort bool) (json.RawMessage, error) {
+	return buildCompletionBodyFor(template, "", model, prompt, conversation, effort, withEffort)
+}
+
+// buildCompletionBodyFor stamps the account's own bot id into the template.
+// The template ships with the official client's default assistant id, but the
+// per-account entry must win: catalog and completion are both scoped to it.
+func buildCompletionBodyFor(template json.RawMessage, botID, model, prompt, conversation string, effort int, withEffort bool) (json.RawMessage, error) {
 	if len(template) == 0 || len(template) > 1<<20 || len(prompt) == 0 || len(prompt) > 65536 {
 		return nil, runtimeError("desktop_binding_invalid")
 	}
@@ -280,6 +287,12 @@ func buildCompletionBodyWithEffort(template json.RawMessage, model, prompt, conv
 	meta, ok := body["client_meta"].(map[string]any)
 	if !ok {
 		return nil, runtimeError("desktop_protocol_invalid")
+	}
+	if botID != "" {
+		if len(botID) > 32 {
+			return nil, runtimeError("desktop_binding_invalid")
+		}
+		meta["bot_id"] = botID
 	}
 	if conversation == "" {
 		meta["local_conversation_id"] = "local_" + randomDigits(16)

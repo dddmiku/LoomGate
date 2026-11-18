@@ -167,7 +167,7 @@ func (p *HTTPTextProvider) complete(ctx context.Context, model, text, conversati
 		}
 	}
 
-	body, err := buildCompletionBodyWithEffort(s.Completion, model, text, conversation, level, withEffort)
+	body, err := buildCompletionBodyFor(s.Completion, s.BotID, model, text, conversation, level, withEffort)
 	if err != nil {
 		return result, err
 	}

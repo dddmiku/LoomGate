@@ -75,31 +75,9 @@ func workbenchAuthDrivers(w *workbenchRuntime) map[string]authflow.Driver {
 		_, err = w.vault.Put(accountvault.Account{ID: id, Provider: "doubao", Enabled: true}, b, revision)
 		return err
 	}}
-	if path := os.Getenv("LOOMGATE_DOUBAO_AUTH_PROFILE"); path != "" {
-		driver.Bootstrap = func(ctx context.Context) (doubao.StoredProfile, error) {
-			var p doubao.StoredProfile
-			if ctx.Err() != nil {
-				return p, ctx.Err()
-			}
-			info, err := os.Lstat(path)
-			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-				return p, errors.New("bootstrap_unavailable")
-			}
-			b, err := os.ReadFile(path)
-			if err != nil {
-				return p, errors.New("bootstrap_unavailable")
-			}
-			defer func() {
-				for i := range b {
-					b[i] = 0
-				}
-			}()
-			if json.Unmarshal(b, &p) != nil {
-				return p, errors.New("bootstrap_invalid")
-			}
-			return p, nil
-		}
-	}
+	// The gateway-side passport performs QR and SMS login itself, so it no longer
+	// needs a pre-captured SDK context or a running desktop client. The fallback
+	// driver is what the panel uses when no managed client is attached.
 	if w.connection != nil {
 		if w.managed != nil {
 			return map[string]authflow.Driver{"doubao": &doubao.ManagedConnection{Binding: w.connection, Client: w.managed}}

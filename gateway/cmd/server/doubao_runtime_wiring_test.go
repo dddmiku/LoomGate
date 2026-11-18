@@ -143,7 +143,8 @@ func TestDoubaoRuntimeHelperDiscoveryUsesPackagedRuntimeRoot(t *testing.T) {
 // auto-discovered from <root>/doubao-runtime/bridge.py, and an explicit
 // loopback port attaches to an already-running official client. The gateway
 // must not claim to own a client lifecycle it cannot launch, so managed stays
-// nil and Passport sms/qr stay unavailable without an official signer.
+// nil. The gateway-side passport (sms/qr) needs no client at all, so those two
+// stay available next to the attached-desktop method.
 func TestDoubaoPackagedHelperDiscoveryDrivesAttachedClientRuntime(t *testing.T) {
 	bridge := writeSyntheticBridge(t)
 	packagedRoot := filepath.Dir(filepath.Dir(bridge))
@@ -163,8 +164,8 @@ func TestDoubaoPackagedHelperDiscoveryDrivesAttachedClientRuntime(t *testing.T) 
 		t.Fatalf("attached desktop method not available: %+v", methods)
 	}
 	for _, method := range methods[1:] {
-		if method.Available {
-			t.Fatalf("passport method %q advertised without an official signer: %+v", method.ID, method)
+		if !method.Available {
+			t.Fatalf("gateway-side passport method %q unavailable: %+v", method.ID, method)
 		}
 	}
 	if tr.calls.Load() != 0 {
@@ -172,6 +173,8 @@ func TestDoubaoPackagedHelperDiscoveryDrivesAttachedClientRuntime(t *testing.T) 
 	}
 }
 
+// The managed desktop client is what Linux cannot host; the gateway-side
+// passport login has no client dependency and must stay offered.
 func TestDoubaoLinuxWithoutRuntimeDoesNotAdvertiseManagedLogin(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "data")
 	w, _ := openDoubaoWiringRuntime(t, stateDir, "linux", executablePath(t), writeSyntheticBridge(t), "")
@@ -189,13 +192,16 @@ func TestDoubaoLinuxWithoutRuntimeDoesNotAdvertiseManagedLogin(t *testing.T) {
 	if len(methods) != 3 || methods[0].ID != "desktop" {
 		t.Fatalf("methods=%+v", methods)
 	}
-	for _, method := range methods {
-		if method.Available {
-			t.Fatalf("method %q advertised on a host with no official client: %+v", method.ID, method)
-		}
+	if methods[0].Available {
+		t.Fatalf("desktop method advertised on a host with no official client: %+v", methods[0])
 	}
 	if methods[0].Reason != "official_desktop_connection_required" {
 		t.Fatalf("desktop reason=%q", methods[0].Reason)
+	}
+	for _, method := range methods[1:] {
+		if !method.Available {
+			t.Fatalf("gateway-side passport method %q unavailable without a client: %+v", method.ID, method)
+		}
 	}
 }
 
@@ -215,10 +221,11 @@ func TestDoubaoLinuxExplicitLoopbackPortUsesAttachedClientPath(t *testing.T) {
 	if len(methods) != 3 || methods[0].ID != "desktop" || !methods[0].Available || methods[0].Reason != "" {
 		t.Fatalf("attached desktop method not available: %+v", methods)
 	}
-	// Passport sms/qr remain explicitly unavailable without Bootstrap+Prepare.
+	// The gateway-side passport performs QR/SMS login itself; it is not gated
+	// on an official-client signer.
 	for _, method := range methods[1:] {
-		if method.Available {
-			t.Fatalf("passport method %q advertised without a signer: %+v", method.ID, method)
+		if !method.Available {
+			t.Fatalf("gateway-side passport method %q unavailable: %+v", method.ID, method)
 		}
 	}
 }
