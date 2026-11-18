@@ -99,8 +99,17 @@ func TestTerminalAndNativeSemantics(t *testing.T) {
 	if err := s.Apply(c, event("SSE_REPLY_END", 4, `{"end_type":3}`), nil); err != nil || !c.Terminal || len(s.Handoffs) != 1 {
 		t.Fatal("async handoff lost")
 	}
-	if err := NewState(Limits{}).Apply(&Cursor{}, event("DOWNLINK_CMD", 1, `{"command":"synthetic-native-operation"}`), nil); err != ErrNativeAction {
-		t.Fatal("native command silently accepted")
+	// A control frame carries no answer text. It must not abort the turn: the
+	// official client receives these during ordinary chat as well. It is recorded
+	// as native content and the stream continues.
+	{
+		state := NewState(Limits{})
+		if err := state.Apply(&Cursor{}, event("DOWNLINK_CMD", 1, `{"command":"synthetic-native-operation"}`), nil); err != nil {
+			t.Fatalf("control frame aborted the stream: %v", err)
+		}
+		if !state.NativeContent {
+			t.Fatal("control frame was not recorded as native content")
+		}
 	}
 	if err := NewState(Limits{}).Apply(&Cursor{}, event("STREAM_ERROR", 1, `{"error_msg":"PRIVATE_SYNTHETIC_ERROR"}`), nil); err != ErrUpstream || strings.Contains(err.Error(), "PRIVATE") {
 		t.Fatal("upstream error leaked")

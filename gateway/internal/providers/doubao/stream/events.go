@@ -406,8 +406,14 @@ func (s *State) Apply(cursor *Cursor, event Event, emit func(Update) error) erro
 		event.ID = *snapshot.Next
 		event.HasID = true
 	case "DOWNLINK_CMD":
+		// A server-side control frame. The official client also receives these
+		// during ordinary chat (heartbeat / render hints); they carry no answer
+		// text and are not a reason to fail the turn. Record that native control
+		// data appeared and keep consuming the stream.
 		s.NativeContent = true
-		return ErrNativeAction
+		// Counted as processed so the stream continues; carries no text.
+		s.checkLimit()
+		return nil
 	case "STREAM_ERROR", "gateway-error":
 		return ErrUpstream
 	default:
@@ -556,11 +562,11 @@ func (s *State) applyBlocks(msg *Message, blocks []Block, outer int, emit func(U
 		if operation < 1 || operation > 3 {
 			return ErrMalformed
 		}
+		// Types 10016/10024 are official-card / interactive blocks. In ordinary
+		// chat they can accompany a normal text answer, so they are marked as
+		// native content but do not fail the turn. Only task work interprets them.
 		if b.Type == 10016 || b.Type == 10024 {
 			s.NativeContent = true
-			if !s.allowTaskWork {
-				return ErrNativeAction
-			}
 		}
 		if b.Type == 10019 {
 			s.NativeContent = true
