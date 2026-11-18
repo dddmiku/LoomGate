@@ -4,7 +4,7 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const date = value => value && !String(value).startsWith('0001-') ? new Date(typeof value === 'number' ? value * 1000 : value).toLocaleString('zh-CN', {hour12:false}) : '—';
   const number = value => typeof value === 'number' ? value.toLocaleString('zh-CN') : '—';
-  const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], taskCache:null, schedules:[], runs:[], pending:new Set(), poll:null};
+  const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], usageRange:null, taskCache:null, schedules:[], runs:[], pending:new Set(), poll:null};
   // Task names are a display convenience, not state: remember the last names the
   // server actually returned so a page refresh on 执行计划/执行记录 still shows
   // "每日签到" instead of a raw task key or "已保存的任务". Bounded and best-effort.
@@ -537,17 +537,45 @@
       else $('#run-poll').textContent='自动同步已达到 90 秒上限。任务仍在服务端运行，可点击刷新继续查看。';
     } else state.pollStarted=0;
   }
-  // Usage follows the shape of a metering dashboard rather than a single total:
-  // KPI tiles, then a breakdown by model / key / day so an operator can see where
-  // the tokens actually went. Every number is what the ledger recorded; a missing
-  // observation stays "—" and is never shown as zero.
+  // Usage follows the shape of a metering dashboard: a date range, KPI tiles, and
+  // breakdowns by model and caller. The range is the only time control — the list
+  // of individual days is not useful at a glance and is not shown.
+  function usageDays(data){return (data.days||[]).slice();}
+  function usageSum(days){
+    const out={requests:0,failed_requests:0,unreported_requests:0,prompt_tokens:0,completion_tokens:0,cached_tokens:0,total_tokens:0,credit:0};
+    for(const d of days){
+      const t=d.totals||{};
+      for(const k of Object.keys(out))if(typeof t[k]==='number')out[k]+=t[k];
+    }
+    return out;
+  }
+  function usageInRange(days,from,to){
+    if(!from&&!to)return days;
+    return days.filter(d=>(!from||d.day>=from)&&(!to||d.day<=to));
+  }
   async function usage() {
     const data=await api('usage'),totals=data.totals;
     if(!totals)throw new APIError('request_failed',503);
-    const days=(data.days||[]).slice(0,30);
+    const allDays=usageDays(data);
+    const today=new Date().toISOString().slice(0,10);
+    const cutoff=n=>new Date(Date.now()-(n-1)*86400000).toISOString().slice(0,10);
+    state.usageRange=state.usageRange||{from:'',to:''};
+    const range=state.usageRange;
+    const scoped=usageInRange(allDays,range.from,range.to);
+    const scopedTotals=range.from||range.to?usageSum(scoped):totals;
+    const rangeLabel=(()=>{
+      if(!range.from&&!range.to)return '全部时间';
+      if(range.from===today&&range.to===today)return '今天';
+      if(range.from===cutoff(7)&&range.to===today)return '近 7 天';
+      if(range.from===cutoff(30)&&range.to===today)return '近 30 天';
+      if(range.from===range.to)return range.from;
+      if(!range.from)return '截至 '+range.to;
+      if(!range.to)return range.from+' 起';
+      return range.from+' 至 '+range.to;
+    })();
+    // Per-model figures come from the scoped day buckets when a range is active;
+    // the all-time totals are used only when no range is selected.
     const keys=data.keys||[];
-    // Aggregate per model across the key dimension; the store keeps models under
-    // each key, so the same model from two keys sums here.
     const byModel=new Map();
     for(const key of keys){
       for(const m of (key.models||[])){
@@ -561,35 +589,40 @@
       }
     }
     const models=[...byModel.entries()].sort((a,b)=>(b[1].prompt+b[1].completion)-(a[1].prompt+a[1].completion));
-    const maxDayTokens=Math.max(1,...days.map(d=>d.totals.total_tokens||0));
     const pct=(n,total)=>total>0?Math.round(n/total*1000)/10:0;
-    const donut=(segments)=>{
-      let offset=0;
-      const stops=segments.filter(s=>s.value>0).map(s=>{
-        const start=offset;offset+=s.value;
-        return `${s.color} ${start}% ${offset}%`;
-      });
-      return `conic-gradient(${stops.join(',')||'var(--line) 0 100%'})`;
-    };
     const palette=['#4f7df3','#3bb273','#e8a33d','#c85fd0','#38a4c9','#9b8cf0','#e0644f'];
-    const modelSegments=models.slice(0,6).map((entry,i)=>({label:entry[0],value:entry[1].prompt+entry[1].completion,color:palette[i%palette.length]}));
+    const segments=models.slice(0,6).map((e,i)=>({value:e[1].prompt+e[1].completion,color:palette[i%palette.length]}));
     const rest=models.slice(6).reduce((n,e)=>n+e[1].prompt+e[1].completion,0);
-    if(rest>0)modelSegments.push({label:'其他',value:rest,color:palette[6]});
-    const modelTotal=modelSegments.reduce((n,s)=>n+s.value,0);
-
+    if(rest>0)segments.push({value:rest,color:palette[6]});
+    const donut=(rows)=>{
+      const total=rows.reduce((n,s)=>n+s.value,0);
+      if(!total)return 'var(--line) 0 100%';
+      let offset=0;
+      return 'conic-gradient('+rows.map(s=>{const start=offset;offset+=s.value/total*100;return `${s.color} ${start}% ${offset}%`;}).join(',')+')';
+    };
+    const modelTotal=segments.reduce((n,s)=>n+s.value,0);
     const tile=(label,value,detail)=>`<article class="usage-tile"><span>${esc(label)}</span><strong>${value}</strong>${detail?`<p>${detail}</p>`:''}</article>`;
+    const quick=(label,from,to,active)=>`<button type="button" data-action="usage-range" data-from="${from}" data-to="${to}" class="${active?'active':''}">${esc(label)}</button>`;
 
     $('#view').innerHTML=heading(button('reload','刷新用量','','quiet'))+
+      `<div class="usage-filter">
+        <div class="usage-quick">${quick('全部', '', '', !range.from&&!range.to)}${quick('今天', today, today, range.from===today&&range.to===today)}${quick('近 7 天', cutoff(7), today, range.from===cutoff(7)&&range.to===today)}${quick('近 30 天', cutoff(30), today, range.from===cutoff(30)&&range.to===today)}</div>
+        <label>从<input type="date" id="usage-from" value="${esc(range.from)}" max="${today}"></label>
+        <label>到<input type="date" id="usage-to" value="${esc(range.to)}" max="${today}"></label>
+        <button type="button" data-action="usage-apply">查询</button>
+        <button type="button" data-action="usage-reset" class="quiet">重置</button>
+        <span class="small muted">当前：${esc(rangeLabel)} · ${number(scopedTotals.requests)} 次请求</span>
+      </div>`+
       `<div class="usage-tiles">
-        ${tile('总请求',number(totals.requests),`${number(totals.failed_requests)} 次失败 · ${number(totals.unreported_requests)} 次未报告用量`)}
-        ${tile('总 Token',number(totals.total_tokens),`输入 ${number(totals.prompt_tokens)} / 输出 ${number(totals.completion_tokens)}${totals.cached_tokens?` / 缓存 ${number(totals.cached_tokens)}`:''}`)}
-        ${tile('已报告消耗',number(totals.credit),'只累计上游明确报告的数值')}
-        ${tile('账本跨度',`${number(days.length)} 天`,`自 ${date(data.since)} 起`)}
+        ${tile('总请求',number(scopedTotals.requests),`${number(scopedTotals.failed_requests||0)} 次失败 · ${number(scopedTotals.unreported_requests||0)} 次未报告用量`)}
+        ${tile('总 Token',number(scopedTotals.total_tokens),`输入 ${number(scopedTotals.prompt_tokens)} / 输出 ${number(scopedTotals.completion_tokens)}${scopedTotals.cached_tokens?` / 缓存 ${number(scopedTotals.cached_tokens)}`:''}`)}
+        ${tile('已报告消耗',number(scopedTotals.credit),'只累计上游明确报告的数值')}
+        ${tile('调用方',number(keys.length),'按访问密钥统计')}
       </div>`+
       `<div class="usage-grid">
         <section class="usage-card">
           <div class="usage-card-head"><h2>模型分布</h2><span class="small muted">按 Token</span></div>
-          ${modelSegments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(modelSegments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
+          ${segments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(segments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
         </section>
         <section class="usage-card">
           <div class="usage-card-head"><h2>调用方分布</h2><span class="small muted">按 Token</span></div>
@@ -597,14 +630,7 @@
         </section>
       </div>`+
       `<section class="usage-card">
-        <div class="usage-card-head"><h2>每日用量</h2><span class="small muted">最近 ${number(days.length)} 天</span></div>
-        ${days.length?`<div class="usage-bars">${days.slice().reverse().map(d=>{
-          const tokens=d.totals.total_tokens||0,width=Math.max(1,Math.round(tokens/maxDayTokens*100));
-          return `<div class="usage-bar-row"><time>${esc(d.day)}</time><div class="usage-bar"><span style="width:${width}%"></span></div><span class="usage-bar-value">${number(tokens)}</span><span class="small muted">${number(d.totals.requests)} 次 · ${number(d.totals.credit)}</span></div>`;
-        }).join('')}</div>`:empty('暂无每日用量','网关收到实际调用后将写入用量账本。')}
-      </section>`+
-      `<section class="usage-card">
-        <div class="usage-card-head"><h2>按模型明细</h2></div>
+        <div class="usage-card-head"><h2>按模型明细</h2><span class="small muted">${esc(rangeLabel)}</span></div>
         ${models.length?table(['模型','请求','输入','输出','缓存','消耗'],[...models].map(e=>[`<code>${esc(e[0])}</code>`,number(e[1].requests),number(e[1].prompt),number(e[1].completion),number(e[1].cached),number(e[1].credit)])):empty('暂无明细','')}
       </section>`+
       notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。`,'');
@@ -881,6 +907,9 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='copy-endpoint'){const value=element.dataset.value||'';try{await navigator.clipboard.writeText(value);toast('接入地址已复制。');}catch{const box=document.getElementById('endpoint-base');if(box){const range=document.createRange();range.selectNodeContents(box);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);}toast('已选中地址，请按 Ctrl+C 复制。');}return;}
     if(name==='logs-prev' || name==='logs-next'){state.logOffset=Math.max(0,(state.logOffset || 0)+(name==='logs-next'?30:-30));await reload();return;}
     if(name==='request-expand'){toggleRequestRow(index);return;}
+    if(name==='usage-range'){state.usageRange={from:element.dataset.from||'',to:element.dataset.to||''};await reload();return;}
+    if(name==='usage-apply'){const from=document.getElementById('usage-from')?.value||'',to=document.getElementById('usage-to')?.value||'';if(from&&to&&from>to){toast('起始日期不能晚于结束日期。');return;}state.usageRange={from,to};await reload();return;}
+    if(name==='usage-reset'){state.usageRange={from:'',to:''};await reload();return;}
     if(name==='lan-settings'){const st=await api('state');if(!st?.lan)throw new APIError('request_failed',502);const lan=st.lan;openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">这里修改的是配置文件中的监听地址与允许网段；保存成功后仍需重启服务，实际监听不会立即改变。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>监听地址<input name="listen" value="${esc(lan.listen||'')}" readonly aria-readonly="true"></label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.168.1.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);$('#lan-form').onsubmit=e=>{e.preventDefault();const form=new FormData(e.target);const want={enabled:form.get('enabled')==='on',allow_cidrs:String(form.get('allow_cidrs')||'').trim()};mutate('lan','lan',want,async data=>{if(data.ok===false)throw new APIError('request_failed',502);const saved=(await api('state'))?.lan;if(!saved||saved.enabled!==want.enabled||String(saved.allow_cidrs||'')!==want.allow_cidrs)throw new APIError('request_failed',502);closeDialog();toast((data.message||'设置已保存。')+' 已从服务端读回配置。');await reload();});};return;}
     if(name==='loop-toggle'){const current=await api('features/reasoning-loop');if(current?.stop_only===undefined)throw new APIError('request_failed',502);const want=!current.stop_only;await mutate('loop','features/reasoning-loop',{stop_only:want},async()=>{const saved=await api('features/reasoning-loop');if(saved?.stop_only!==want)throw new APIError('request_failed',502);toast('重复推理保护已切换，并已从服务端读回。');await reload();});return;}
     if(name==='update-check'){await mutate('update-check','update/check',{},async data=>{if(data.ok===false)throw new APIError('request_failed',502,typeof data.message==='string'?data.message:'');const status=data.status||{};toast('已检查更新：'+(status.message||status.state||'状态未变化')+'。');await reload();});return;}
