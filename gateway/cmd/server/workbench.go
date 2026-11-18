@@ -120,10 +120,12 @@ func resolveManagedPython(configured string) string {
 	return ""
 }
 
-// doubaoHasCapturedTemplate reports whether any enabled Doubao account carries
-// a captured official completion template. It reads the encrypted vault only to
-// decide wiring; the profile itself never leaves the vault package.
-func doubaoHasCapturedTemplate(vault *accountvault.Vault) bool {
+// doubaoHasBoundAccount reports whether any enabled Doubao account exists. The
+// plain-HTTP provider needs only a logged-in account: the request body shape
+// ships as an embedded protocol template, so a capture import is no longer a
+// prerequisite. It reads the encrypted vault only to decide wiring; the profile
+// itself never leaves the vault package.
+func doubaoHasBoundAccount(vault *accountvault.Vault) bool {
 	if vault == nil {
 		return false
 	}
@@ -132,21 +134,7 @@ func doubaoHasCapturedTemplate(vault *accountvault.Vault) bool {
 		return false
 	}
 	for _, a := range rows {
-		if a.Provider != "doubao" || !a.Enabled {
-			continue
-		}
-		_, raw, err := vault.Get(a.ID)
-		if err != nil {
-			continue
-		}
-		var probe struct {
-			Completion json.RawMessage `json:"completion_template"`
-		}
-		err = json.Unmarshal(raw, &probe)
-		for i := range raw {
-			raw[i] = 0
-		}
-		if err == nil && len(probe.Completion) > 0 {
+		if a.Provider == "doubao" && a.Enabled {
 			return true
 		}
 	}
@@ -285,13 +273,14 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 		workbench.connection.Runtime = runtime
 		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime, Dialogues: &doubao.DialogueStore{Vault: taskVault}}}
 		doubaoTasks.Work = &taskproviders.DoubaoWork{Vault: taskVault, Provider: workbench.inference["doubao"].(*doubao.TextProvider)}
-	} else if doubaoHasCapturedTemplate(vault) {
-		// A captured official /chat/completion template is enough to serve
-		// inference over plain HTTP, exactly like the WorkBuddy and Trae
-		// providers. No desktop client needs to be running.
+	} else if doubaoHasBoundAccount(vault) {
+		// A gateway-side login stores the session cookies and the account's model
+		// entry; the request body shape is the embedded official protocol
+		// template. That is enough to serve inference over plain HTTP, exactly
+		// like the WorkBuddy and Trae providers, with no desktop client running.
 		httpProvider := &doubao.HTTPTextProvider{Vault: vault, Client: client}
 		workbench.inference = map[string]inference.Provider{"doubao": httpProvider}
-		log.Printf("[doubao] 使用抓包模板走纯 HTTP 反代（无需桌面客户端）")
+		log.Printf("[doubao] 使用内置协议模板走纯 HTTP 反代（无需桌面客户端）")
 	}
 	base := e.Handler()
 	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, DoubaoMultiTurn: len(workbench.inference) > 0, DoubaoBinding: workbench.connection.DisplayBinding, LegacyCounts: func() map[string]providercatalog.Count {
