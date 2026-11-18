@@ -23,6 +23,10 @@ type Session struct {
 	BotID    string
 	Revision string
 	Runtime  *RuntimeBinding
+	// Completion is the captured official /chat/completion template. Its
+	// presence is what makes pure-HTTP inference possible without the desktop
+	// client running.
+	Completion json.RawMessage
 }
 
 func (Session) String() string   { return "doubao.Session[redacted]" }

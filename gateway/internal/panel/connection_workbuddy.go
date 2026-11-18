@@ -65,7 +65,19 @@ func (d *legacyConnection) workbuddyCall(ctx context.Context, realm, path string
 		return nil, false, errors.New("official_authorization_invalid")
 	}
 	if *envelope.Code != 0 {
-		if path != "" && strings.HasPrefix(path, "/v2/plugin/auth/token?") && strings.EqualFold(strings.TrimSpace(envelope.Msg), "login ing") {
+		// The token endpoint is the authoritative login-state probe. While the
+		// user has not finished authorizing, upstream answers a non-zero
+		// business code and the old CLI treated ANY such code as "still waiting"
+		// (cmd/login runPoll: status==0 or >=500 is fatal, everything else is
+		// waiting). Matching only the literal msg "login ing" was stricter than
+		// upstream's actual contract: a renamed/whitespace/locale variant turned
+		// a normal pending poll into a hard failure, and the console then showed
+		// "操作结果未确认，请核验官方界面后取消或重新接入" while the user had in
+		// fact just completed the login.
+		//
+		// Keep the auth/state endpoint strict (it issues the URL and must not be
+		// mistaken for a pending poll), and keep 5xx transport failures fatal.
+		if path != "" && strings.HasPrefix(path, "/v2/plugin/auth/token?") {
 			return nil, true, nil
 		}
 		return nil, false, errors.New("official_authorization_rejected")

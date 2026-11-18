@@ -259,6 +259,12 @@ func (p *Passport) request(ctx context.Context, st *passportState, method, path 
 	}
 	u := url.URL{Scheme: "https", Host: "accounts.doubao.com", Path: path}
 	q := cloneValues(st.Profile.Query)
+	// The passport endpoints reject `real_aid` with error 22 ("error"), and it is
+	// the ONLY device parameter that does so: a single-parameter bisect over the
+	// captured 25-param set showed every other parameter returns error_code 0
+	// with a QR token. The chat endpoints need real_aid, so it stays in the chat
+	// query; it must be stripped only for accounts.doubao.com.
+	q.Del("real_aid")
 	for k, v := range values {
 		if method == http.MethodGet {
 			q[k] = v

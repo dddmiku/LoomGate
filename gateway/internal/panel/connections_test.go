@@ -142,3 +142,67 @@ func TestConnectionTraeRejectsForeignCallbackBeforeExchange(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectionWorkBuddyPendingPollIsNotAFailure 锁定旧版 cmd/login 的轮询语义。
+//
+// /v2/plugin/auth/token 是权威登录状态端点：用户尚未在浏览器/扫码完成授权时，
+// 上游返回非 0 业务码（旧版实测为 msg="login ing"）。旧版 cmd/login runPoll 把
+// 「非 0 且 HTTP 正常」一律当 waiting，只有传输层失败或 5xx 才 fatal。
+//
+// 新版曾收紧成只认字面量 "login ing"：上游一旦改词、加空格或换语言，正常的
+// pending 轮询就被判成 official_authorization_rejected，authflow 随即把整个
+// 流程标成 uncertain 并显示「操作结果未确认，请核验官方界面后取消或重新接入」，
+// 而用户其实刚刚扫码成功。这条测试锁住「pending 不是失败」。
+func TestConnectionWorkBuddyPendingPollIsNotAFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		msg  string
+	}{
+		{"legacy wording", 40001, "login ing"},
+		{"whitespace and case", 40001, "  LOGIN ING "},
+		{"renamed message", 40001, "authorization pending"},
+		{"nonzero without message", 40001, ""},
+		{"chinese message", 40001, "登录中"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			defer h.server.Close()
+			client := &http.Client{Transport: connectionTransport(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != "/v2/plugin/auth/token" {
+					t.Fatalf("unexpected request: %s", r.URL.Path)
+				}
+				b, _ := json.Marshal(map[string]any{"code": tc.code, "msg": tc.msg})
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+			})}
+			d := &legacyConnection{s: h.server, provider: "workbuddy", client: client}
+			secret, _ := json.Marshal(legacyState{LoginID: "synthetic-state", URL: "https://copilot.tencent.com/synthetic-auth"})
+			result, err := d.Step(context.Background(), authflow.Flow{
+				View:   authflow.View{Request: authflow.Request{Provider: "workbuddy", Method: "qr", Realm: "cn"}},
+				Secret: secret,
+			}, "poll", authflow.Input{})
+			if err != nil {
+				t.Fatalf("pending poll surfaced an error: %v", err)
+			}
+			if result.Status != "waiting_scan" {
+				t.Fatalf("pending poll status=%q want waiting_scan", result.Status)
+			}
+		})
+	}
+}
+
+// TestConnectionWorkBuddyRejectedStateStartStillFails 锁定：auth/state 端点
+// 的非 0 业务码必须继续当失败，不能被「宽容 pending」逻辑吞掉——否则拿不到
+// 授权 URL 时界面会显示"等待扫码"却永远没有二维码。
+func TestConnectionWorkBuddyRejectedStateStartStillFails(t *testing.T) {
+	h := newHarness(t)
+	defer h.server.Close()
+	client := &http.Client{Transport: connectionTransport(func(r *http.Request) (*http.Response, error) {
+		b, _ := json.Marshal(map[string]any{"code": 40001, "msg": "login ing"})
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+	})}
+	d := &legacyConnection{s: h.server, provider: "workbuddy", client: client}
+	if _, err := d.Start(context.Background(), authflow.Request{Provider: "workbuddy", Method: "qr", Realm: "cn"}); err == nil {
+		t.Fatal("failed auth/state start was treated as pending")
+	}
+}

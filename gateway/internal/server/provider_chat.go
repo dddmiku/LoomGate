@@ -92,6 +92,11 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	for key := range fields {
 		switch key {
 		case "model", "messages", "stream", "stream_options", "n":
+		case "reasoning_effort", "reasoningEffort":
+			// Accepted and forwarded to providers that advertise a reasoning
+			// ladder. Providers without one simply ignore it; a level the model
+			// does not publish is down-graded to its highest published level at or
+			// below the request (never a 400).
 		case "tools", "tool_choice", "functions", "function_call", "parallel_tool_calls":
 			st.status = 400
 			writeOpenAIError(w, 400, "provider_tools_unsupported", "official work tools are distinct from caller-defined functions; caller tools are not supported by this provider")
@@ -127,6 +132,19 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		return
 	}
 	var text string
+	// Reasoning effort is optional metadata, not a hard capability. Parse it
+	// before dispatch so an effort-aware provider can apply it and a plain one
+	// can ignore it without failing the whole request.
+	effort := ""
+	for _, key := range []string{"reasoning_effort", "reasoningEffort"} {
+		if raw := fields[key]; raw != nil {
+			var value string
+			if json.Unmarshal(raw, &value) == nil {
+				effort = strings.TrimSpace(value)
+			}
+			break
+		}
+	}
 	dialogueProvider, hasDialogue := provider.(inference.DialogueProvider)
 	validMessages := json.Unmarshal(fields["messages"], &messages) == nil && len(messages) > 0 && len(messages) <= 101 && len(messages)%2 == 1
 	parsed := []inference.Message{}
@@ -199,18 +217,35 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			sink = newProviderStreamSink(w, r, model, st)
 			emit = sink.emit
 		}
-		result, err = providerDialogueSafely(r.Context(), dialogueProvider, q, emit)
+		// Prefer the effort-aware dialogue path when the provider offers one;
+		// this is what carries reasoning_effort through to the captured body.
+		if aware, ok := effortAware(provider); ok && effort != "" {
+			result, err = providerEffortDialogueSafely(r.Context(), aware, q, effort, emit)
+		} else {
+			result, err = providerDialogueSafely(r.Context(), dialogueProvider, q, emit)
+		}
 		if err == nil && sink != nil && result.Complete && result.Acknowledged {
 			err = sink.validate(result)
 		}
 	} else if progressive, ok := provider.(inference.StreamingProvider); streaming && ok {
 		sink = newProviderStreamSink(w, r, model, st)
-		result, err = providerStreamSafely(r.Context(), progressive, model, text, sink.emit)
+		if aware, ok := effortAware(provider); ok && effort != "" {
+			result, err = providerStreamSafelyWithEffort(r.Context(), aware, model, text, effort, sink.emit)
+		} else {
+			result, err = providerStreamSafely(r.Context(), progressive, model, text, sink.emit)
+		}
 		if err == nil && result.Complete && result.Acknowledged {
 			err = sink.validate(result)
 		}
 	} else {
-		result, err = providerCompleteSafely(r.Context(), provider, model, text)
+		// Buffered (non-streaming) completion. An effort-aware provider still
+		// receives the caller's level; providers without effort support take the
+		// ordinary path unchanged.
+		if aware, ok := effortAware(provider); ok && effort != "" {
+			result, err = providerEffortCompleteSafely(r.Context(), aware, model, text, effort)
+		} else {
+			result, err = providerCompleteSafely(r.Context(), provider, model, text)
+		}
 	}
 	if result.ConversationRef != "" {
 		w.Header().Set("X-LoomGate-Conversation", result.ConversationRef)

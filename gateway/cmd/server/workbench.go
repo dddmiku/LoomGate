@@ -142,6 +142,39 @@ func resolveManagedPython(configured string) string {
 	return ""
 }
 
+// doubaoHasCapturedTemplate reports whether any enabled Doubao account carries
+// a captured official completion template. It reads the encrypted vault only to
+// decide wiring; the profile itself never leaves the vault package.
+func doubaoHasCapturedTemplate(vault *accountvault.Vault) bool {
+	if vault == nil {
+		return false
+	}
+	rows, err := vault.List()
+	if err != nil {
+		return false
+	}
+	for _, a := range rows {
+		if a.Provider != "doubao" || !a.Enabled {
+			continue
+		}
+		_, raw, err := vault.Get(a.ID)
+		if err != nil {
+			continue
+		}
+		var probe struct {
+			Completion json.RawMessage `json:"completion_template"`
+		}
+		err = json.Unmarshal(raw, &probe)
+		for i := range raw {
+			raw[i] = 0
+		}
+		if err == nil && len(probe.Completion) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // doubaoManagedRuntimeSupported reports whether this gateway may own the
 // official Doubao client's lifecycle. tools/doubao-runtime/managed.py starts a
 // Windows desktop client and rejects every other operating system with
@@ -274,6 +307,13 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 		workbench.connection.Runtime = runtime
 		workbench.inference = map[string]inference.Provider{"doubao": &doubao.TextProvider{Vault: vault, Client: client, Runtime: runtime, Dialogues: &doubao.DialogueStore{Vault: taskVault}}}
 		doubaoTasks.Work = &taskproviders.DoubaoWork{Vault: taskVault, Provider: workbench.inference["doubao"].(*doubao.TextProvider)}
+	} else if doubaoHasCapturedTemplate(vault) {
+		// A captured official /chat/completion template is enough to serve
+		// inference over plain HTTP, exactly like the WorkBuddy and Trae
+		// providers. No desktop client needs to be running.
+		httpProvider := &doubao.HTTPTextProvider{Vault: vault, Client: client}
+		workbench.inference = map[string]inference.Provider{"doubao": httpProvider}
+		log.Printf("[doubao] 使用抓包模板走纯 HTTP 反代（无需桌面客户端）")
 	}
 	base := e.Handler()
 	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, DoubaoMultiTurn: len(workbench.inference) > 0, DoubaoBinding: workbench.connection.DisplayBinding, LegacyCounts: func() map[string]providercatalog.Count {
