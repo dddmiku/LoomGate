@@ -25,6 +25,12 @@ type StoredProfile struct {
 	// rewritten per request, so the protocol shape stays exactly what the
 	// official client sends.
 	CompletionTemplate json.RawMessage `json:"completion_template,omitempty"`
+	// Mobile and DisplayName are the account's non-secret display facts, exactly
+	// as the passport account-info endpoint returns them. The service already
+	// masks the phone number (e.g. "138****8000"), so storing it verbatim lets the
+	// account list show which account this is without revealing the full number.
+	Mobile      string `json:"mobile,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 func (StoredProfile) String() string   { return "doubao.StoredProfile[redacted]" }

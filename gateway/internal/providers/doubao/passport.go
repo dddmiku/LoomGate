@@ -56,6 +56,10 @@ type passportState struct {
 	// MobileTicket is a bounded opaque handle the service returns with some
 	// send-code errors. It is kept only inside the encrypted flow secret.
 	MobileTicket string `json:"mobile_ticket,omitempty"`
+	// Mobile and DisplayName are non-secret display facts read from account-info;
+	// the service masks the phone number itself.
+	Mobile      string `json:"mobile,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 	// CaptchaVerdict marks that the service demanded human verification, so the
 	// flow can say so instead of silently appearing to have sent an SMS.
 	CaptchaVerdict bool `json:"captcha_verdict,omitempty"`
@@ -298,6 +302,15 @@ func (p *Passport) verify(ctx context.Context, st *passportState) (authflow.Resu
 		return authflow.Result{Status: "manual_action", Secret: passportSecret(*st), ErrorCode: "session_not_verified", Notice: "授权尚未通过账号信息复核。"}, nil
 	}
 	st.UserID = id
+	// The service already masks the phone number it returns, so this is a display
+	// fact, not a credential: it lets the account list identify the login instead
+	// of showing only an internal hash. name/screen_name are the account's own
+	// display name and are equally non-secret.
+	st.Mobile = passportString(data, "mobile")
+	st.DisplayName = passportString(data, "name")
+	if st.DisplayName == "" {
+		st.DisplayName = passportString(data, "screen_name")
+	}
 	st.Phone = ""
 	return authflow.Result{Status: "verified", Secret: passportSecret(*st), Notice: "账号信息已复核，等待保存会话。"}, nil
 }
@@ -354,6 +367,8 @@ func (p *Passport) commit(ctx context.Context, f authflow.Flow, st *passportStat
 		BotID:       botID,
 		BindingFlow: "gateway-passport",
 		VerifiedAt:  time.Now().UTC(),
+		Mobile:      st.Mobile,
+		DisplayName: st.DisplayName,
 	}
 	if err := p.Save(ctx, id, profile); err != nil {
 		return authflow.Result{}, err

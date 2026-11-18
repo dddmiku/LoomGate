@@ -52,6 +52,9 @@ type Options struct {
 	// binding reports ok=false so the UI can say "未提供" instead of inventing
 	// a nickname from the account ID (P1-04).
 	DoubaoBinding func(id string) (botID string, verifiedAt time.Time, ok bool)
+	// DoubaoDisplay returns the account's masked phone number and display name.
+	// Both are non-secret and the phone number is already masked upstream.
+	DoubaoDisplay func(id string) (mobile, nickname string, ok bool)
 }
 
 // AccountView is the safe account row DTO returned by /workbench/accounts.
@@ -66,6 +69,10 @@ type AccountView struct {
 	BotID      string     `json:"bot_id,omitempty"`
 	VerifiedAt *time.Time `json:"verified_at,omitempty"`
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	// Mobile is the service-masked phone number (e.g. "138****8000"). The
+	// upstream masks it before returning it, so this never exposes a full
+	// number; it exists so a row can be told apart at a glance.
+	Mobile string `json:"mobile,omitempty"`
 }
 type Service struct {
 	opts  Options
@@ -137,6 +144,14 @@ func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
 				if !verifiedAt.IsZero() {
 					value := verifiedAt
 					view.VerifiedAt = &value
+				}
+			}
+		}
+		if s.opts.DoubaoDisplay != nil && a.Provider == "doubao" {
+			if mobile, nickname, ok := s.opts.DoubaoDisplay(a.ID); ok {
+				view.Mobile = mobile
+				if view.Nickname == "" {
+					view.Nickname = nickname
 				}
 			}
 		}

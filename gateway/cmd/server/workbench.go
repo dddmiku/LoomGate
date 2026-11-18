@@ -283,7 +283,7 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 		log.Printf("[doubao] 使用内置协议模板走纯 HTTP 反代（无需桌面客户端）")
 	}
 	base := e.Handler()
-	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, DoubaoMultiTurn: len(workbench.inference) > 0, DoubaoBinding: workbench.connection.DisplayBinding, LegacyCounts: func() map[string]providercatalog.Count {
+	catalogs := providercatalog.New(providercatalog.Options{Accounts: vault, Doubao: client, DoubaoInference: len(workbench.inference) > 0, DoubaoMultiTurn: len(workbench.inference) > 0, DoubaoBinding: workbench.connection.DisplayBinding, DoubaoDisplay: workbench.connection.DisplayAccount, LegacyCounts: func() map[string]providercatalog.Count {
 		counts := map[string]providercatalog.Count{}
 		for _, a := range p.List() {
 			id := "workbuddy"

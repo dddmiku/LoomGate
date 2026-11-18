@@ -305,3 +305,49 @@ func TestFirstBotID(t *testing.T) {
 		})
 	}
 }
+
+// TestPassportStoresMaskedMobileForDisplay proves the account list can identify a
+// Doubao login without exposing a full phone number: the service masks the
+// number before returning it, and that masked value is what gets stored.
+func TestPassportStoresMaskedMobileForDisplay(t *testing.T) {
+	const masked = "138****8000"
+	var saved StoredProfile
+	p := &Passport{
+		Transport: passportTransport(func(r *http.Request) (*http.Response, error) {
+			switch r.URL.Path {
+			case "/passport/account/info/v2/":
+				return passportReply(r, map[string]any{"user_id_str": "synthetic-user", "mobile": masked, "name": "合成昵称"}), nil
+			case "/alice/slot/action_bar_v3/brief_list":
+				return &http.Response{StatusCode: 200, Request: r,
+					Body:   io.NopCloser(strings.NewReader(`{"code":0,"data":{}}`)),
+					Header: http.Header{"Content-Type": {"application/json"}}}, nil
+			}
+			return nil, fmt.Errorf("unexpected_endpoint %s", r.URL.Path)
+		}),
+		Save: func(_ context.Context, _ string, profile StoredProfile) error {
+			saved = profile
+			return nil
+		},
+	}
+	st := passportState{
+		Profile: StoredProfile{Query: deviceQuery(), Headers: http.Header{}},
+		UserID:  "synthetic-user",
+		Cookies: []*http.Cookie{{Name: "sessionid", Value: "synthetic", Domain: ".doubao.com", Path: "/", Secure: true}},
+	}
+	// verify reads account-info and captures the display facts; commit then sees
+	// them through the encrypted flow secret, exactly as in a real login.
+	verified, err := p.Step(context.Background(), authflow.Flow{Secret: passportSecret(st)}, "resume", authflow.Input{})
+	if err != nil || verified.Status != "verified" {
+		t.Fatalf("verify: %v %v", verified.Status, err)
+	}
+	r, err := p.Step(context.Background(), authflow.Flow{Secret: verified.Secret}, "commit", authflow.Input{})
+	if err != nil || r.Status != "succeeded" {
+		t.Fatalf("commit: %v %v", r.Status, err)
+	}
+	if saved.Mobile != masked {
+		t.Fatalf("mobile = %q, want the upstream-masked value %q", saved.Mobile, masked)
+	}
+	if saved.DisplayName != "合成昵称" {
+		t.Fatalf("display name = %q", saved.DisplayName)
+	}
+}

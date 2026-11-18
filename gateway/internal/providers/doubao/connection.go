@@ -115,6 +115,20 @@ func (d *DesktopConnection) DisplayBinding(id string) (botID string, verifiedAt 
 	}
 	return profile.BotID, profile.VerifiedAt, true
 }
+// DisplayAccount returns the account's non-secret display facts: the masked
+// phone number the service itself returns and the account's own display name.
+// Neither is a credential. ok=false means the vault has no usable profile.
+func (d *DesktopConnection) DisplayAccount(id string) (mobile, nickname string, ok bool) {
+	if d == nil || d.Vault == nil || id == "" {
+		return "", "", false
+	}
+	_, profile, err := d.profile(id)
+	if err != nil {
+		return "", "", false
+	}
+	return profile.Mobile, profile.DisplayName, true
+}
+
 func intentResult(status, code, notice string, intent bindingIntent) authflow.Result {
 	raw, _ := json.Marshal(intent)
 	return authflow.Result{Status: status, ErrorCode: code, Notice: notice, Secret: raw}
