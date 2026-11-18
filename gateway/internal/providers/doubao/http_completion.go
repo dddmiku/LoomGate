@@ -271,10 +271,19 @@ func buildCompletionBodyWithEffort(template json.RawMessage, model, prompt, conv
 	return buildCompletionBodyFor(template, "", model, prompt, conversation, effort, withEffort)
 }
 
+// BodyProfile carries the catalog facts that the official client copies into
+// option.model_config.model_extra_params. The service reads the window size from
+// the request, not from the model_item_key alone, so an empty map makes a
+// work-task request look truncated.
+type BodyProfile struct {
+	ContextWindow int64
+	MemoryProfile string
+}
+
 // buildCompletionBodyFor stamps the account's own bot id into the template.
 // The template ships with the official client's default assistant id, but the
 // per-account entry must win: catalog and completion are both scoped to it.
-func buildCompletionBodyFor(template json.RawMessage, botID, model, prompt, conversation string, effort int, withEffort bool) (json.RawMessage, error) {
+func buildCompletionBodyFor(template json.RawMessage, botID, model, prompt, conversation string, effort int, withEffort bool, profiles ...BodyProfile) (json.RawMessage, error) {
 	if len(template) == 0 || len(template) > 1<<20 || len(prompt) == 0 || len(prompt) > 65536 {
 		return nil, runtimeError("desktop_binding_invalid")
 	}
@@ -301,7 +310,15 @@ func buildCompletionBodyFor(template json.RawMessage, botID, model, prompt, conv
 		if len(conversation) > 128 || strings.ContainsAny(conversation, "\r\n\x00") {
 			return nil, runtimeError("desktop_binding_invalid")
 		}
+		// A continuing turn addresses the existing conversation by its server id.
+		// The official client drops local_conversation_id and sends the section
+		// cursor fields instead; keeping a fresh local id here is what made the
+		// service treat the call as a new conversation.
 		meta["conversation_id"] = conversation
+		delete(meta, "local_conversation_id")
+		meta["last_section_id"] = ""
+		meta["last_message_index"] = nil
+		meta["local_permissions"] = []any{}
 	}
 
 	rows, ok := body["messages"].([]any)
@@ -349,6 +366,16 @@ func buildCompletionBodyFor(template json.RawMessage, botID, model, prompt, conv
 	setString(option, []string{"aggregate_params", "mode_id"}, modeID)
 	setString(option, []string{"conversation_init_ext", "model_item_key"}, itemKey)
 	setString(option, []string{"conversation_init_ext", "mode_id"}, modeID)
+	// mode_id "3" is the 工作 (work task) mode. The official client switches the
+	// whole request shape for it: conversation_mode 2, no agent_mode (that field
+	// belongs to the 对话 assistant), a general_task_param that declares a local
+	// runtime, and an ext block with only the three work keys. Keeping the 对话
+	// shape while naming a work model makes the service fall back to its free
+	// default model and open a fresh conversation - which is exactly what the
+	// desktop client showed.
+	if isWorkMode(modeID) {
+		applyWorkMode(option, body, itemKey, profiles)
+	}
 	if withEffort {
 		writeEffort(option, effort)
 	}
@@ -374,6 +401,85 @@ func setString(node map[string]any, path []string, value string) {
 	if _, exists := node[path[len(path)-1]]; exists {
 		node[path[len(path)-1]] = value
 	}
+}
+
+// isWorkMode reports whether the catalog mode is 工作 (work task). Mode "1" is
+// 对话 and must keep the captured chat shape; mode "3" is a different protocol
+// branch on the service side.
+func isWorkMode(modeID string) bool { return modeID == "3" }
+
+// workGeneralTaskParam is the exact object the official client sends when a
+// work-mode conversation runs on the service side. The client picks the runtime
+// plane with:
+//
+//	o = ready ? RuntimeType_Local_PC : RuntimeType_Cloud_VM
+//
+// and for Cloud_VM it returns `{runtime_type: 1}` — a single field. The
+// agent_task_param block belongs to the Local_PC branch only, where it carries
+// the desktop device identity. Mixing the two (cloud runtime plus an
+// agent_task_param saying local) makes the service accept the turn but wait for a
+// runtime that never answers: the stream then emits thousands of loading/heartbeat
+// events with zero answer text.
+func workGeneralTaskParam() map[string]any {
+	return map[string]any{"runtime_type": 1}
+}
+
+// applyWorkMode rewrites the captured 对话 body into the 工作 body the official
+// client sends. Only the shape changes; the prompt, bot id and model identity
+// come from the caller.
+//
+// The captured template is a 对话 request: option.conversation_mode=1,
+// option.agent_mode=2, a chat general_task_param and a chat ext block. Reusing
+// that shape while naming a work-only model makes the service fall back to the
+// free default model and open a separate conversation - the exact symptom seen
+// in the desktop client.
+func applyWorkMode(option, body map[string]any, itemKey string, profiles []BodyProfile) {
+	option["conversation_mode"] = 2
+	option["support_lazy_fetch_stream"] = false
+	option["is_old_user"] = false
+	option["message_storage_type"] = 0
+	option["general_task_param"] = workGeneralTaskParam()
+	// agent_mode belongs to the 对话 assistant. Work requests omit it entirely.
+	delete(option, "agent_mode")
+	// Work requests carry no conversation_init_option; the init data lives in
+	// conversation_init_ext only.
+	delete(option, "conversation_init_option")
+
+	if aggregate, ok := option["aggregate_params"].(map[string]any); ok {
+		aggregate["conversation_mode"] = "2"
+		aggregate["agent_mode"] = ""
+		delete(aggregate, "mention_skill_list")
+		delete(aggregate, "mention_plugin_list")
+		delete(aggregate, "mention_ext")
+	}
+	if config, ok := option["model_config"].(map[string]any); ok {
+		extra := map[string]any{}
+		if len(profiles) > 0 {
+			if profiles[0].ContextWindow > 0 {
+				extra["total_window_size"] = strconv.FormatInt(profiles[0].ContextWindow, 10)
+			}
+			extra["memory_profile"] = profiles[0].MemoryProfile
+		}
+		config["model_extra_params"] = extra
+	}
+	// The official work request's ext block has exactly these three keys. The
+	// chat-only keys (agent_mode, use_deep_think, brief, bot_id, ...) are not
+	// part of it, and leaving them in is visible to the service.
+	body["ext"] = map[string]any{
+		"general_task_param":              mustJSONString(workGeneralTaskParam()),
+		"sub_conv_firstmet_type":          "1",
+		"commerce_credit_config_enable":   "0",
+	}
+}
+
+// mustJSONString renders a small object as compact JSON. The wire field is a
+// string containing JSON, not a nested object.
+func mustJSONString(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // splitModel turns "doubao:<mode>:<model_item_key>" into its two wire values.
