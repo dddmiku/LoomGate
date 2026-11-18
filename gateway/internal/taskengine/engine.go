@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	_ "time/tzdata"
+	"unicode/utf8"
 )
 
 type Options struct {
@@ -215,7 +218,7 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 		if _, ok := e.state.Uncertain[pendingKey]; !ok {
 			continue
 		}
-		if pending.ProviderID != provider || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, pending.AccountID) || key != "" && key != "*" && key != pending.Key {
+		if pending.ProviderID != provider || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, pending.AccountID) || !TaskKeyMatches(key, pending.Key) {
 			continue
 		}
 		found := false
@@ -437,7 +440,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 		work.Tasks = []Task{}
 		work.Confirmed = map[string]bool{}
 		for _, t := range catalog.Tasks {
-			if r.TaskKey == "" || r.TaskKey == "*" || r.TaskKey == t.Key {
+			if TaskKeyMatches(r.TaskKey, t.Key) {
 				t.State = nil
 				work.Tasks = append(work.Tasks, t)
 			}
@@ -551,6 +554,83 @@ func mergeStatus(a, b Status) Status {
 	}
 	return a
 }
+
+var stepSecretField = regexp.MustCompile(`(?i)(authorization|access[_-]?token|refresh[_-]?token|token|cookie|password|passwd|secret|api[_-]?key|session(?:[_-]?id)?)\s*[:=]\s*[^\s,;]+`)
+var stepBearer = regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._~+/-]+=*`)
+var stepURL = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
+var stepJWT = regexp.MustCompile(`\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\b`)
+var stepOpaque = regexp.MustCompile(`\b[A-Za-z0-9_-]{40,}\b`)
+var stepEmail = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+var stepPhoneField = regexp.MustCompile(`(?i)(phone|mobile|手机号|电话号码|联系电话)\s*[:=：]\s*[^\s,;]+`)
+var stepPhoneDigits = regexp.MustCompile(`(^|[^0-9])\+?[0-9](?:[ -]?[0-9]){7,14}($|[^0-9])`)
+
+func safeStepSummary(summary, phase, code string) string {
+	text := strings.TrimSpace(summary)
+	text = stepSecretField.ReplaceAllString(text, "$1=[已隐藏]")
+	text = stepBearer.ReplaceAllString(text, "Bearer [已隐藏]")
+	text = stepURL.ReplaceAllString(text, "[官方链接]")
+	text = stepJWT.ReplaceAllString(text, "[已隐藏凭据]")
+	text = stepOpaque.ReplaceAllString(text, "[已隐藏标识]")
+	text = stepEmail.ReplaceAllString(text, "[已隐藏邮箱]")
+	text = stepPhoneField.ReplaceAllString(text, "$1=[已隐藏号码]")
+	text = stepPhoneDigits.ReplaceAllString(text, "$1[已隐藏号码]$2")
+	if text == "" {
+		if code != "" {
+			text = safeErrorSummary(code)
+		} else {
+			switch phase {
+			case "ready":
+				text = "状态已核验，当前可执行。"
+			case "pending":
+				text = "操作已提交或正在处理中，等待后续核验。"
+			case "claimable":
+				text = "官方状态显示可领取。"
+			case "done":
+				text = "官方状态已确认完成。"
+			case "manual":
+				text = "此步骤需要人工完成。"
+			case "blocked":
+				text = "当前条件不满足，未继续操作。"
+			case "skipped":
+				text = "本次条件不满足，已跳过。"
+			default:
+				text = "步骤已记录。"
+			}
+		}
+	}
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "�")
+	}
+	if len(text) > 512 {
+		runes := []rune(text)
+		text = string(runes[:min(len(runes), 500)]) + "…"
+	}
+	return text
+}
+
+func safeErrorSummary(code string) string {
+	switch code {
+	case "provider_rejected":
+		return "官方服务拒绝了此操作。"
+	case "operation_unconfirmed", "verification_required":
+		return "操作结果尚未确认，请先核验，不要重复提交。"
+	case "account_identity_changed":
+		return "账号身份或绑定发生变化，操作已停止。"
+	case "authentication_required":
+		return "需要重新登录后再执行。"
+	case "task_expired":
+		return "任务标识已过期，请刷新任务目录。"
+	case "operation_not_eligible":
+		return "当前账号暂不满足操作条件。"
+	case "provider_busy":
+		return "官方服务正忙，本次未完成。"
+	case "task_canceled":
+		return "任务已取消。"
+	default:
+		return "操作未完成；原始错误详情未保存。"
+	}
+}
+
 func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, error)) (Observation, error) {
 	begin := time.Now().UTC()
 	o, err := safeCall(fn)
@@ -574,7 +654,7 @@ func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, 
 			}
 		}
 	}
-	// Provider errors and arbitrary response summaries are deliberately never persisted.
+	// Persist only bounded operator summaries and stable error codes; raw provider errors are never stored.
 	outcome := ""
 	if stage == StageExecute || stage == StageClaim {
 		outcome = actionOutcome(t, stage, o)
@@ -593,7 +673,7 @@ func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, 
 	}
 	serr := e.updateRun(id, func(r *Run) {
 		r.Stage = stage
-		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, ErrorCode: code, UpstreamCode: upstreamCode, ActionOutcome: outcome})
+		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, Summary: safeStepSummary(o.Summary, o.Phase, code), ErrorCode: code, UpstreamCode: upstreamCode, ActionOutcome: outcome})
 		if len(r.Steps) > 2000 {
 			r.Steps = r.Steps[len(r.Steps)-2000:]
 		}
@@ -830,6 +910,203 @@ func (e *Engine) confirm(id, key string, t Task) (Status, error) {
 	return StatusSucceeded, err
 }
 
+// legacyDefaultV1IDs are the plans written by the first in-app import. On a
+// workspace where that import already ran, a missing v1 plan means the operator
+// deleted it; a later default generation must not resurrect it.
+var legacyDefaultV1IDs = map[string]bool{
+	"legacy-checkin": true, "legacy-trae-check": true, "legacy-balance": true,
+	"legacy-growth": true, "legacy-keepalive": true,
+}
+
+// ImportDefaultSchedulesOnce adds missing default plans once per generation and
+// never rewrites an existing plan: the operator's saved time, switch and account
+// scope always win. Plans missing from a previous generation are treated as
+// operator deletions. In-flight mutations block the import so no new plan is
+// armed while an unknown write still needs verification.
+func (e *Engine) ImportDefaultSchedulesOnce(generation string, schedules []Schedule) (int, error) {
+	if !IDPattern.MatchString(generation) || len(schedules) == 0 || len(schedules) > 256 {
+		return 0, ErrInvalid
+	}
+	prepared := make([]Schedule, len(schedules))
+	seen := map[string]bool{}
+	now := time.Now()
+	for i, s := range schedules {
+		s.Hours = append([]int{}, s.Hours...)
+		s.AccountIDs = append([]string{}, s.AccountIDs...)
+		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || len(s.AccountIDs) > 500 || seen[s.ID] {
+			return 0, ErrInvalid
+		}
+		seen[s.ID] = true
+		if _, err := time.LoadLocation(s.Timezone); err != nil {
+			return 0, ErrInvalid
+		}
+		hours := map[int]bool{}
+		for _, h := range s.Hours {
+			if h < 0 || h > 23 || hours[h] {
+				return 0, ErrInvalid
+			}
+			hours[h] = true
+		}
+		for _, id := range s.AccountIDs {
+			if !IDPattern.MatchString(id) {
+				return 0, ErrInvalid
+			}
+		}
+		sort.Ints(s.Hours)
+		s.LastRunID, s.LastDispatched, s.NextRun = "", nil, nil
+		if s.LegacyEnabled != nil {
+			source := *s.LegacyEnabled
+			s.LegacyEnabled = &source
+		}
+		if s.Enabled {
+			if next := NextFire(s, now); !next.IsZero() {
+				s.NextRun = &next
+			}
+		}
+		prepared[i] = s
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return 0, ErrInvalid
+	}
+	if e.state.ScheduleDefaultImports[generation] {
+		return 0, nil
+	}
+	if len(e.state.PendingTasks) > 0 || len(e.state.Receipts) > 0 || len(e.state.Attempts) > 0 {
+		return 0, fmt.Errorf("%w: in_flight_mutations", ErrLegacyScheduleImportBlocked)
+	}
+	for _, s := range prepared {
+		if e.adapters[s.ProviderID] == nil {
+			return 0, ErrInvalid
+		}
+	}
+	legacyImportWasDone := e.state.LegacyScheduleImportDone
+	added := 0
+	err := e.commit(func(state *persisted) {
+		if legacyImportWasDone {
+			for id := range legacyDefaultV1IDs {
+				if _, exists := state.Schedules[id]; !exists {
+					state.DeletedSchedules[id] = true
+				}
+			}
+		}
+		for _, s := range prepared {
+			if _, exists := state.Schedules[s.ID]; exists || state.DeletedSchedules[s.ID] {
+				continue
+			}
+			state.Schedules[s.ID] = s
+			added++
+		}
+		state.LegacyScheduleImportDone = true
+		state.ScheduleDefaultImports[generation] = true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if added > 0 {
+		e.notify()
+	}
+	return added, nil
+}
+
+func (e *Engine) ImportLegacySchedulesOnce(schedules []Schedule) (bool, error) {
+	prepared := make([]Schedule, len(schedules))
+	seen := make(map[string]bool, len(schedules))
+	now := time.Now()
+	for i, s := range schedules {
+		s.Hours = append([]int{}, s.Hours...)
+		s.AccountIDs = append([]string{}, s.AccountIDs...)
+		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || len(s.AccountIDs) > 500 || seen[s.ID] {
+			return false, ErrInvalid
+		}
+		seen[s.ID] = true
+		if _, err := time.LoadLocation(s.Timezone); err != nil {
+			return false, ErrInvalid
+		}
+		hours := map[int]bool{}
+		for _, hour := range s.Hours {
+			if hour < 0 || hour > 23 || hours[hour] {
+				return false, ErrInvalid
+			}
+			hours[hour] = true
+		}
+		for _, id := range s.AccountIDs {
+			if !IDPattern.MatchString(id) {
+				return false, ErrInvalid
+			}
+		}
+		sort.Ints(s.Hours)
+		s.NextRun, s.LastDispatched = nil, nil
+		s.LastRunID = ""
+		if s.LegacyEnabled != nil {
+			value := *s.LegacyEnabled
+			s.LegacyEnabled = &value
+		}
+		if s.Enabled {
+			if next := NextFire(s, now); !next.IsZero() {
+				s.NextRun = &next
+			}
+		}
+		prepared[i] = s
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return false, ErrInvalid
+	}
+	if e.state.LegacyScheduleImportDone {
+		return false, nil
+	}
+	apply, blocked := legacyScheduleImportDecision(e.state)
+	if blocked != "" {
+		// Never silently mark the import as done when user-owned data prevents
+		// it: the operator must see why the legacy read-only plan was not
+		// restored (P2-02). The marker stays false so a later manual cleanup
+		// can retry on the next boot.
+		return false, fmt.Errorf("%w: %s", ErrLegacyScheduleImportBlocked, blocked)
+	}
+	if apply {
+		for _, s := range prepared {
+			if e.adapters[s.ProviderID] == nil {
+				return false, ErrInvalid
+			}
+		}
+	}
+	if err := e.commit(func(state *persisted) {
+		if apply {
+			for _, s := range prepared {
+				state.Schedules[s.ID] = s
+			}
+		}
+		state.LegacyScheduleImportDone = true
+	}); err != nil {
+		return false, err
+	}
+	if apply {
+		e.notify()
+	}
+	return apply, nil
+}
+
+// legacyScheduleImportDecision separates "user-owned plans exist" (never
+// overwrite → blocked) from "only history exists, no plans at all" (safe to
+// import the legacy read-only plans). Runs/Completed/Uncertain/Work/Attempts
+// are execution history, not user plans: with schedules empty they must not
+// permanently prevent restoring the balance plan after a bridge upgrade
+// (P2-02). Anything else that could represent an in-flight mutation keeps the
+// import blocked.
+func legacyScheduleImportDecision(state persisted) (apply bool, blocked string) {
+	if len(state.Schedules) > 0 {
+		return false, "existing_schedules"
+	}
+	if len(state.PendingTasks) > 0 || len(state.Receipts) > 0 || len(state.Attempts) > 0 {
+		return false, "in_flight_mutations"
+	}
+	return true, ""
+}
+
 func (e *Engine) SaveSchedule(s Schedule) (Schedule, error) {
 	s.Hours = append([]int{}, s.Hours...)
 	s.AccountIDs = append([]string{}, s.AccountIDs...)
@@ -891,7 +1168,12 @@ func (e *Engine) DeleteSchedule(id string) error {
 	if _, ok := e.state.Schedules[id]; !ok {
 		return ErrNotFound
 	}
-	err := e.commit(func(s *persisted) { delete(s.Schedules, id) })
+	err := e.commit(func(s *persisted) {
+		delete(s.Schedules, id)
+		if len(id) >= 7 && id[:7] == "legacy-" {
+			s.DeletedSchedules[id] = true
+		}
+	})
 	e.notify()
 	return err
 }

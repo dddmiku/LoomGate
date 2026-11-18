@@ -270,7 +270,7 @@ func main() {
 	var workbenchHandler http.Handler
 	var taskController server.TaskController = sch
 	if useLoomGateWorkbench() {
-		workbench, workbenchHandler, err = openWorkbench(stateDirOf(cfg.StateFile), p, up, cfg.ExpiringSoonDur)
+		workbench, workbenchHandler, err = openWorkbenchWithLegacySchedules(stateDirOf(cfg.StateFile), p, up, cfg.Schedule, cfg.ExpiringSoonDur)
 		if err != nil {
 			log.Fatalf("open task engine: %v", err)
 		}

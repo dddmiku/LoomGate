@@ -24,6 +24,7 @@
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -41,6 +42,11 @@ GATEWAY = HERE.parent                            # gateway
 REPO = GATEWAY.parent                            # 仓库根
 OUT = REPO / "artifacts" / "devprod-20261018"
 GO = r"C:\tools\go\bin\go.exe"
+
+# 运行包打包器的清单是唯一事实来源；豆包组在仓库根 tools/ 下，不在 gateway/。
+_runtime_spec = importlib.util.spec_from_file_location("runtime_bundle", HERE / "runtime_bundle.py")
+runtime_bundle = importlib.util.module_from_spec(_runtime_spec)
+_runtime_spec.loader.exec_module(runtime_bundle)
 
 ROOT = "/opt/workbuddy2api"
 UPDATES = ROOT + "/data/updates"
@@ -178,6 +184,11 @@ def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
             dst = stage / name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes((GATEWAY / name).read_bytes().replace(b"\r\n", b"\n"))
+        # 可选豆包桥接组：完整运行包必须带齐整组，否则解包器按半包拒绝。
+        for name in runtime_bundle.DOUBAO_RUNTIME:
+            dst = stage / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(runtime_bundle.source_path(GATEWAY, name).read_bytes().replace(b"\r\n", b"\n"))
         archive = assets / ("wb2api-runtime-linux-%s.tar.gz" % arch)
         subprocess.run([sys.executable, str(GATEWAY / "scripts" / "runtime_bundle.py"),
                         "--stage", str(stage), "--version", version,

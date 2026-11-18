@@ -37,6 +37,7 @@ D:/LoomGate-work/build/catalog-fixture.exe -root D:/LoomGate-work/private/catalo
 另一终端执行：
 
 ```powershell
+python -I scripts/run_console_tests.py
 python tests/console_browser.py --runtime D:/LoomGate-work/private/catalog-fixture --output D:/LoomGate-work/evidence/phase02 --fixture D:/LoomGate-work/build/catalog-fixture.exe
 python tests/console_layout.py --runtime D:/LoomGate-work/private/catalog-fixture --output D:/LoomGate-work/evidence/phase06/layout
 ```
@@ -45,7 +46,7 @@ python tests/console_layout.py --runtime D:/LoomGate-work/private/catalog-fixtur
 
 报告区分页面异常、预期故障 HTTP 诊断及外网请求。外网请求必须为零。浏览器测试失败后先读取报告的 `failed_stage`；不会盲目重放真实操作。
 
-布局测试覆盖 1440、1024、768、390、320 五档宽度的十个页面，以及手机矮屏的抽屉焦点、桌面矮屏的独立导航滚动、跨断点恢复、筛选展开、长表单和明暗主题主按钮对比度；测试截图必须实际查看。主题和退出测试从侧栏入口操作。合成数据检查与官方客户端实时目录验收分别留存，不混作真实登录或任务奖励证据。
+布局测试覆盖 1440、1024、768、390、320 五档宽度的十二个页面，以及手机矮屏的抽屉焦点、桌面矮屏的独立导航滚动、跨断点恢复、筛选展开、长表单和明暗主题主按钮对比度；测试截图必须实际查看。主题和退出测试从侧栏入口操作。合成数据检查与官方客户端实时目录验收分别留存，不混作真实登录或任务奖励证据。
 
 ## 回退边界
 

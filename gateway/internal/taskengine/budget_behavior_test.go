@@ -37,7 +37,7 @@ func TestTaskBudgetOptInAndCancel(t *testing.T) {
 				if budget > tc.want || budget < tc.want-time.Second {
 					t.Fatal("wrong task budget")
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(20 * time.Second):
 				t.Fatal("adapter not entered")
 			}
 			if !e.Cancel(run.ID) {

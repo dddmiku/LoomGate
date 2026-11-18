@@ -84,16 +84,29 @@ type CatalogModel struct {
 	// 没给 model_detail_list，取不到 __dev 真名）。出站前用 Functions 校验，
 	// 不在就退回 solo_agent——那里一定有它。
 	Functions map[string]bool
-	// Hidden 报告该模型在**所有**出现的表里都被标了 is_invisible_to_user。
+	// Hidden 报告该模型是否**不应对外公布**（/v1/models 不列）。
 	//
-	// 语义是「Trae 界面不显示」，不是「不可调用」：kimi-k2 在 chat_v3 / builder
-	// 标了 invisible，但实测 chat_v3 能正常出词。所以 Hidden 只影响对外公布
-	// （ModelIDsFromCatalog / /v1/models），不影响出站选择——用户显式点名
-	// 某个 Hidden 模型时仍应照常发出去。
+	// 判定口径（2026-11-18 P1-02 修正）：只看**用户面** function 的表——
+	// solo_agent / solo_coder / chat_v3 / chat / inline_chat / builder 系列 /
+	// code_reviewer / multimodal 等客户端真实展示的表。只要模型在任一用户面
+	// 表里没标 is_invisible_to_user，它就可公布；反之，如果所有用户面表都标了
+	// invisible、它只在 utils / code_review_summary / system_diagnosis 这类
+	// 后台工具表里「可见」，也不得公布（工具表不是客户端模型选择器）。
 	//
-	// 注意是「全部标了」才 Hidden：只要有一张表没标（kimi-k2 的 inline_chat），
-	// 它就不是纯内部模型。
+	// 旧口径是「所有表都标了才 Hidden」：一个在 solo_agent 标 invisible、又在
+	// utils 表出现的模型会被洗白成可公布——合成回归
+	// client_visible_catalog_test.go 的反例。真实抓包
+	// （2026-10-19 目录，89 模型/10 表）两口径零差异：31 个全隐藏模型完全一致，
+	// DeepSeek-V4-Pro / glm-5.1 等仅在 solo_coder（用户面）可见的模型照常公布。
+	//
+	// Hidden 只影响公布，不影响出站选择——用户显式点名某个 Hidden 模型时
+	// 仍应照常发出去（is_invisible_to_user 语义是「界面不显示」，不是「不可调用」；
+	// kimi-k2 在 chat_v3 / builder 标了 invisible，实测 chat_v3 能正常出词）。
 	Hidden bool
+	// hiddenInTables 记录该模型在**每张表**的 invisible 标记（合并时按表名并集）。
+	// userFacingCatalogFunctions 之外的表（utils 等工具表）不参与 Hidden 判定，
+	// 但出站时 FunctionForModel 仍可按 Functions 路由到它们。
+	hiddenInTables map[string]bool
 	// Profiles 记录**每个 function 各自**的出站真名与档位上限。
 	//
 	// 为什么不能只留一份（2026-10-18 实测）：同一 config_name 在不同 function 的
@@ -194,6 +207,29 @@ var catalogFunctions = []string{
 	"code_review_summary", "solo_agent", "solo_agent_remote", "solo_work_remote",
 	"solo_agent_lite", "solo_work_lite", "solo_design_lite", "solo_design_remote",
 	"multimodal", "system_diagnosis",
+}
+
+// userFacingCatalogFunctions 是客户端模型选择器真实展示的 function 集合。
+//
+// Hidden 判定只看这些表（见 CatalogModel.Hidden 的口径说明）；utils /
+// code_review_summary / system_diagnosis / custom_agent_generation 是后台
+// 工具表，它们「可见」不代表客户端可选。集合覆盖 catalogFunctions 里所有
+// agent/chat/builder/design/coder/reviewer/multimodal 表；上游新增的表名
+// （抓包里出现过 assistant）默认按用户面处理（不在工具表清单里），
+// 保守起见宁可公布也不隐藏。
+var userFacingCatalogFunctions = map[string]bool{
+	"ui_builder_v2": true, "solo_coder": true, "chat_v3": true, "solo_builder": true,
+	"builder_v3": true, "builder": true, "chat": true, "inline_chat": true,
+	"git_ai": true, "code_reviewer": true, "solo_agent": true, "solo_agent_remote": true,
+	"solo_work_remote": true, "solo_agent_lite": true, "solo_work_lite": true,
+	"solo_design_lite": true, "solo_design_remote": true, "multimodal": true,
+}
+
+// utilityCatalogFunctions 是后台工具表：出现在这里且不出现在任何用户面表
+// 的模型不对外公布（出站仍可路由，见 CatalogModel.hiddenInTables）。
+var utilityCatalogFunctions = map[string]bool{
+	"utils": true, "code_review_summary": true, "system_diagnosis": true,
+	"custom_agent_generation": true,
 }
 
 func fetchCatalogUpstream(ctx context.Context, a *auth.Auth) ([]CatalogModel, error) {
@@ -325,6 +361,13 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 				model.Functions = map[string]bool{}
 			}
 			model.Functions[entry.function] = true
+			// 每张表各记一份 invisible 标记：Hidden 判定只看用户面表
+			// （见 CatalogModel.Hidden），工具表的「可见」不洗白 solo_agent
+			// 里标了 invisible 的模型。
+			if model.hiddenInTables == nil {
+				model.hiddenInTables = map[string]bool{}
+			}
+			model.hiddenInTables[entry.function] = model.Hidden
 			// 每个 function 各自记一份出站真名：同一 config_name 在不同表里可能
 			// 对应不同的 model_name（见 CatalogModel.Profiles 的实测例）。
 			model.Profiles = map[string]CatalogFunctionProfile{
@@ -335,6 +378,9 @@ func parseCatalog(data []byte) ([]CatalogModel, error) {
 					MaxPromptMax: model.MaxPromptMax,
 				},
 			}
+			// hiddenInTables 已按表记 invisible；聚合 Hidden 由
+			// hiddenByUserFacingTables 统一重算（见 mergeCatalogModel 与下方）。
+			model.Hidden = hiddenByUserFacingTables(model.hiddenInTables)
 		}
 		if previous, seen := merged[model.ConfigName]; seen {
 			merged[model.ConfigName] = mergeCatalogModel(previous, model)
@@ -362,9 +408,24 @@ func mergeCatalogModel(a, b CatalogModel) CatalogModel {
 	}
 	out.Multimodal = a.Multimodal || b.Multimodal
 	out.MaxMode = a.MaxMode || b.MaxMode
-	// Hidden 取**交集**：只要有一张表没标 invisible，这个模型就不是纯内部模型
-	// （kimi-k2 在 inline_chat 里没标）。
-	out.Hidden = a.Hidden && b.Hidden
+	// hiddenInTables 按表名并集，Hidden 再按用户面口径统一重算：
+	// 用户面任一表可见 → 公布；仅工具表可见 → 隐藏。旧口径（全表 AND）
+	// 会被 utils 表洗白（P1-02），真实抓包两口径零差异（见 Hidden 注释）。
+	if len(b.hiddenInTables) > 0 {
+		if out.hiddenInTables == nil {
+			out.hiddenInTables = map[string]bool{}
+		}
+		for fn, hidden := range b.hiddenInTables {
+			out.hiddenInTables[fn] = hidden
+		}
+	}
+	// 扁平形状（无 function 名）没有 hiddenInTables；沿用旧条目的聚合判定，
+	// 由 b.Hidden（该形态下已是用户面口径的布尔）直接参与：
+	if len(out.hiddenInTables) == 0 {
+		out.Hidden = a.Hidden && b.Hidden
+	} else {
+		out.Hidden = hiddenByUserFacingTables(out.hiddenInTables)
+	}
 	// Functions 取并集：模型在任一 function 的表里出现过就算可用。
 	if len(b.Functions) > 0 {
 		if out.Functions == nil {
@@ -399,6 +460,20 @@ func mergeCatalogModel(a, b CatalogModel) CatalogModel {
 		out.MaxPromptMax = b.MaxPromptMax
 	}
 	return out
+}
+
+// hiddenByUserFacingTables 按用户面口径重算 Hidden：任一用户面表未标
+// invisible 即可公布；无用户面表（仅工具表）则隐藏。
+func hiddenByUserFacingTables(hiddenIn map[string]bool) bool {
+	for fn, hidden := range hiddenIn {
+		if utilityCatalogFunctions[fn] {
+			continue
+		}
+		if !hidden {
+			return false
+		}
+	}
+	return true
 }
 
 // catalogModelFrom 把一个原始条目转成 CatalogModel；不可选时返回 false。

@@ -4,7 +4,9 @@ package taskproviders
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
@@ -84,13 +86,16 @@ func (s ModuleSpec) realm(realm string) bool {
 }
 
 type Accounts struct {
-	Pool          *pool.Pool
-	Upstream      *upstream.Client
-	Provider      string
-	Modules       []Module
-	ExpiringSoon  time.Duration
-	ModuleTimeout time.Duration
-	options       AccountsOptions
+	Pool                 *pool.Pool
+	Upstream             *upstream.Client
+	Provider             string
+	Modules              []Module
+	ExpiringSoon         time.Duration
+	ModuleTimeout        time.Duration
+	DiscoveryConcurrency int
+	discoverySlots       chan struct{}
+	discoveryOnce        sync.Once
+	options              AccountsOptions
 }
 
 func (a *Accounts) modules() ([]Module, error) {
@@ -176,68 +181,142 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	for _, status := range a.Pool.List() {
-		if ctx.Err() != nil {
-			return out, ctx.Err()
-		}
-		if status.Disabled && status.DisabledReason != pool.SessionDeadReason() {
-			continue
-		}
-		selected := len(scope.AccountIDs) == 0
+	limit := a.discoveryConcurrency()
+	jobs := make(chan discoveryJob, 1)
+	results := make(chan discoveryResult, limit)
+	var producers sync.WaitGroup
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
+		defer close(jobs)
+		selected := make(map[string]bool, len(scope.AccountIDs))
 		for _, id := range scope.AccountIDs {
-			if id == status.UID {
-				selected = true
-			}
+			selected[id] = true
 		}
-		if !selected {
-			continue
-		}
-		account, err := a.accountForTask(status.UID, true)
-		if err != nil {
-			continue
-		}
-		for _, m := range modules {
-			s := m.Spec()
-			if status.Disabled && !s.RecoverSession {
-				continue
-			}
-			if !s.realm(account.Realm()) || key != "" && key != "*" && !s.matches(key) {
-				continue
-			}
-			bounded, cancel := context.WithTimeout(ctx, timeout)
-			defs, states, err := discoverModuleState(bounded, m, account)
-			cancel()
+		for _, status := range a.Pool.List() {
 			if ctx.Err() != nil {
-				return out, ctx.Err()
+				return
 			}
-			if err == nil {
-				for _, d := range defs {
-					if !s.matches(d.Key) || d.ProviderID != "" && d.ProviderID != a.Provider {
-						err = errors.New("module_definition_mismatch")
-						break
-					}
-				}
-			}
-			if err != nil {
-				out.Issues = append(out.Issues, taskengine.DiscoveryIssue{ProviderID: a.Provider, AccountID: account.UID, ModuleID: s.ID, ErrorCode: "module_discovery_failed"})
+			if status.Disabled && status.DisabledReason != pool.SessionDeadReason() {
 				continue
 			}
-			for _, d := range defs {
-				if key != "" && key != "*" && d.Key != key {
+			if len(scope.AccountIDs) > 0 && !selected[status.UID] {
+				continue
+			}
+			account, err := a.accountForTask(status.UID, true)
+			if err != nil {
+				continue
+			}
+			for _, m := range modules {
+				s := m.Spec()
+				if status.Disabled && !s.RecoverSession || !s.realm(account.Realm()) || key != "" && key != "*" && !s.matches(key) {
 					continue
 				}
-				d.ProviderID = a.Provider
-				task := taskengine.Task{Definition: d, Target: taskengine.Target{AccountID: account.UID, Realm: account.Realm()}}
-				if state, ok := states[d.Key]; ok {
-					copy := state
-					task.State = &copy
+				select {
+				case jobs <- discoveryJob{account: account, module: m, spec: s}:
+				case <-ctx.Done():
+					return
 				}
-				out.Tasks = append(out.Tasks, task)
+			}
+		}
+	}()
+	var workers sync.WaitGroup
+	workers.Add(limit)
+	for i := 0; i < limit; i++ {
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				result := a.discoverOne(ctx, timeout, job, key)
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() { producers.Wait(); workers.Wait(); close(results) }()
+	for result := range results {
+		out.Tasks = append(out.Tasks, result.tasks...)
+		if result.issue != nil {
+			out.Issues = append(out.Issues, *result.issue)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+	sort.SliceStable(out.Tasks, func(i, j int) bool { return out.Tasks[i].AccountID < out.Tasks[j].AccountID })
+	sort.SliceStable(out.Issues, func(i, j int) bool {
+		if out.Issues[i].AccountID != out.Issues[j].AccountID {
+			return out.Issues[i].AccountID < out.Issues[j].AccountID
+		}
+		return out.Issues[i].ModuleID < out.Issues[j].ModuleID
+	})
+	return out, nil
+}
+
+type discoveryJob struct {
+	account *auth.Auth
+	module  Module
+	spec    ModuleSpec
+}
+
+type discoveryResult struct {
+	tasks []taskengine.Task
+	issue *taskengine.DiscoveryIssue
+}
+
+func (a *Accounts) discoveryConcurrency() int {
+	a.discoveryOnce.Do(func() {
+		limit := a.DiscoveryConcurrency
+		if limit <= 0 {
+			limit = 8
+		}
+		if limit > 32 {
+			limit = 32
+		}
+		a.discoverySlots = make(chan struct{}, limit)
+	})
+	return cap(a.discoverySlots)
+}
+
+func (a *Accounts) discoverOne(ctx context.Context, timeout time.Duration, job discoveryJob, key string) discoveryResult {
+	bounded, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	defs, states, err := discoverModuleState(bounded, job.module, job.account)
+	if err == nil {
+		for _, d := range defs {
+			if !job.spec.matches(d.Key) || d.ProviderID != "" && d.ProviderID != a.Provider {
+				err = errors.New("module_definition_mismatch")
+				break
 			}
 		}
 	}
-	return out, nil
+	if err != nil {
+		return discoveryResult{issue: &taskengine.DiscoveryIssue{ProviderID: a.Provider, AccountID: job.account.UID, ModuleID: job.spec.ID, ErrorCode: "module_discovery_failed"}}
+	}
+	result := discoveryResult{tasks: make([]taskengine.Task, 0, len(defs))}
+	for _, d := range defs {
+		// 计划可以按模块前缀表达「该模块当前的所有任务」（如 "growth/"）：
+		// 旧 config 只有模块级排程，逐字比较会把发现出来的 "growth/<任务码>"
+		// 全部丢掉，计划按点触发却什么都不做。
+		if !taskengine.TaskKeyMatches(key, d.Key) {
+			continue
+		}
+		d.ProviderID = a.Provider
+		task := taskengine.Task{Definition: d, Target: taskengine.Target{AccountID: job.account.UID, Realm: job.account.Realm()}}
+		if state, ok := states[d.Key]; ok {
+			copy := state
+			task.State = &copy
+		}
+		result.tasks = append(result.tasks, task)
+	}
+	return result
 }
+
 func discoverModuleState(ctx context.Context, m Module, a *auth.Auth) (defs []taskengine.Definition, states map[string]taskengine.Observation, err error) {
 	defer func() {
 		if recover() != nil {

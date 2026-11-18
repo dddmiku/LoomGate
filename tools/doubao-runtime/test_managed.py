@@ -59,6 +59,13 @@ class ManagedTests(unittest.TestCase):
         with patch.object(managed,'ensure') as ensure:
             with self.assertRaises(managed.Failure):managed.execute({'action':'send_sms','root':str(self.root),'phone':'synthetic'})
             ensure.assert_not_called()
+    def test_non_windows_host_rejects_managed_lifecycle_before_disk_or_process(self):
+        with patch.object(managed.os,'name','posix'),patch.object(managed,'ensure') as ensure:
+            for action in ('status','ensure','login_start'):
+                with self.subTest(action=action),self.assertRaisesRegex(managed.Failure,'^desktop_management_platform_unsupported$'):
+                    managed.execute({'action':action,'root':str(self.root),'nonce':'a'*32,'method':'qr'})
+            ensure.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()),[])
 
 
 class SyntheticOfficial:

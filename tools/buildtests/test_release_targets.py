@@ -35,7 +35,9 @@ class ReleaseTargetsTests(unittest.TestCase):
         (self.gateway / "release-signing.pub").write_text("11" * 32, encoding="ascii")
         for name in build.runtime_bundle.FILES:
             if name not in build.PROGRAMS:
-                path = self.gateway / name
+                # doubao-runtime/* lives under the repository-root tools/ tree;
+                # mirror that layout so the packager's source mapping is real.
+                path = build.runtime_bundle.source_path(self.gateway, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"synthetic source\r\n")
         guard = patch.object(build, "GATEWAY", self.gateway)
@@ -91,7 +93,10 @@ class ReleaseTargetsTests(unittest.TestCase):
         with tarfile.open(out / "wb2api-runtime-linux-amd64.tar.gz") as archive:
             self.assertEqual(set(archive.getnames()), set(build.runtime_bundle.FILES) | {"manifest.json"})
             self.assertNotIn("config.json", archive.getnames())
-        self.assertEqual(report["version"], "dev-" + "a" * 12)
+        # CI artifacts are versioned "dev" (a fixed test/deploy marker); the
+        # source commit is recorded separately and must still be attributed.
+        self.assertEqual(report["version"], "dev")
+        self.assertEqual(report["commit"], "a" * 40)
         self.assertFalse(report["published"])
         self.assertEqual(report["release_signature"], "NOT GENERATED")
         self.assertFalse((out / self.data["signature_asset"]).exists())

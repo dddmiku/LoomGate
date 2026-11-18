@@ -160,7 +160,18 @@ func (d *ManagedConnection) StartPrepared(ctx context.Context, f authflow.Flow) 
 		return authflow.Result{}, authflow.ErrInvalid
 	}
 	if _, err := d.Client.Endpoint(ctx, true); err != nil {
-		return d.pending(st, "manual_action", "desktop_management_unavailable", "无法启动独立官方客户端，请检查是否已安装豆包和连接组件；未发起登录。"), nil
+		code := "desktop_management_unavailable"
+		notice := "无法启动独立官方客户端，请检查是否已安装豆包和连接组件；未发起登录。"
+		var api *APIError
+		if errors.As(err, &api) && api.Kind == "desktop_management_platform_unsupported" {
+			// managed.py owns a Windows desktop client; on other hosts it
+			// refuses before touching a profile or opening a window. Say that
+			// plainly instead of asking the user to reinstall a client that
+			// this platform can never launch.
+			code = api.Kind
+			notice = "当前网关平台不能启动豆包官方客户端；请使用 Windows 桌面版网关，或在已运行官方客户端的本机配置回环调试端口后连接现有会话。"
+		}
+		return d.pending(st, "manual_action", code, notice), nil
 	}
 	if st.Method == "desktop" {
 		return d.verifyBinding(ctx, st)

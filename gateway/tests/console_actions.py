@@ -20,8 +20,13 @@ def choose_account(page, selector, value):
     page.locator('#scope-search').fill(value)
     page.locator('[data-account-choice="' + value + '"]').click()
     page.locator('#dialog').wait_for(state='hidden')
-    label = value or ('所有账号（分页）' if selector == '#model-account' else '全部已启用账号')
-    page.wait_for_function('([selector,label])=>document.querySelector(selector+" strong")?.textContent===label', arg=[selector,label])
+    # The trigger label is the verified nickname when the provider supplies one;
+    # only the account id or the "all accounts" label can be asserted exactly.
+    if not value:
+        label = '所有账号（分页）' if selector == '#model-account' else '全部已启用账号'
+        page.wait_for_function('([selector,label])=>document.querySelector(selector+" strong")?.textContent===label', arg=[selector,label])
+    else:
+        page.wait_for_function('(selector)=>{const el=document.querySelector(selector);const text=el?.querySelector("strong")?.textContent||"";return el&&!el.disabled&&text&&text!=="正在读取账号…"}', arg=selector)
 
 
 def choose_capability(page, value):
@@ -37,6 +42,13 @@ def sidebar_action(page, selector, close=True):
 
 
 def select_task(page, key, action=None, first=False):
+    """Select a task in the grouped task center.
+
+    The list is grouped by (provider, realm, task key); accounts are listed in
+    the detail pane. Rows carry ``data-task`` with the task key, so the helper
+    keeps working; the per-account action button lives in the detail pane and
+    uses ``data-task-index``.
+    """
     row = page.locator('[data-task="' + key + '"]')
     if first:
         row = row.first
@@ -45,12 +57,16 @@ def select_task(page, key, action=None, first=False):
     row.click()
     page.locator('#task-detail').wait_for(state='visible')
     if action:
-        page.locator('#task-detail [data-action="' + action + '"]').click()
+        page.locator('#task-detail [data-action="' + action + '"]').first.click()
 
 
 def plan_timing(page):
-    page.locator('#plan-next:not([disabled])').wait_for()
-    page.locator('#plan-next').click()
+    # Fixed-work editors (opened from a task or an existing plan) start on the
+    # timing step and expose only 保存计划; the old three-step flow is gone.
+    advance = page.locator('#plan-next')
+    if advance.count() and advance.is_visible():
+        page.locator('#plan-next:not([disabled])').wait_for()
+        advance.click()
     page.locator('[data-plan-step="1"]').wait_for(state='visible')
 
 
@@ -68,6 +84,8 @@ def plan_times(page, times, zone=None):
 
 
 def plan_review(page):
-    page.locator('#plan-next').click()
-    page.locator('[data-plan-step="2"]').wait_for(state='visible')
+    advance = page.locator('#plan-next')
+    if advance.count() and advance.is_visible():
+        advance.click()
+        page.locator('[data-plan-step="2"]').wait_for(state='visible')
     page.locator('#plan-save').wait_for(state='visible')

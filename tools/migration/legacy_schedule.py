@@ -23,17 +23,27 @@ class LegacyScheduleError(Exception):
 
 TIMEZONE = "Asia/Shanghai"
 
-# field -> (task key, default hours, provider, once per day)
+# field -> (legacy task name, hours field, enabled field, default hours, provider, once per day)
+#
+# `task_key` is intentionally not the legacy module name. The new engine filters
+# discovered tasks with TaskKeyMatches(pattern, key): a literal key must equal a
+# real discovered task key, a pattern ending in "/" covers that module prefix.
+# Legacy config only had module-level schedule fields, so:
+#   - trae_check ran Trae's check-in: adapter "trae", real task key "checkin";
+#   - travel_* ran the Buddy travel pipeline: discovered keys travel/<action>;
+#   - growth_* ran the whole growth-center pipeline: discovered keys growth/<...>.
+# Writing the legacy names verbatim produced plans that fired on time, discovered
+# zero tasks and finished as "skipped" — visible in the console, doing nothing.
 LEGACY_TASKS = (
-    ("checkin", "checkin_hours", "checkin_enabled", [9, 21], "workbuddy", False),
-    ("trae_check", "trae_check_hours", "trae_check_enabled", [0], "trae", False),
-    ("travel", "travel_hours", "travel_enabled", [15], "workbuddy", False),
-    ("activity", "activity_hours", "activity_enabled", [10], "workbuddy", False),
-    ("keepalive", "keepalive_hours", "keepalive_enabled", [22], "workbuddy", False),
-    ("school", "school_hours", "school_enabled", [13], "workbuddy", False),
-    ("cat", "cat_hours", "cat_enabled", [1], "workbuddy", False),
-    ("growth", "growth_hours", "growth_enabled", [12], "workbuddy", False),
-    ("balance", "balance_hours", "balance_enabled", [14], "workbuddy", False),
+    ("checkin", "checkin_hours", "checkin_enabled", [9, 21], "workbuddy", "checkin", False),
+    ("trae_check", "trae_check_hours", "trae_check_enabled", [0], "trae", "checkin", False),
+    ("travel", "travel_hours", "travel_enabled", [15], "workbuddy", "travel/", False),
+    ("activity", "activity_hours", "activity_enabled", [10], "workbuddy", "activity", False),
+    ("keepalive", "keepalive_hours", "keepalive_enabled", [22], "workbuddy", "keepalive", False),
+    ("school", "school_hours", "school_enabled", [13], "workbuddy", "school", False),
+    ("cat", "cat_hours", "cat_enabled", [1], "workbuddy", "cat", False),
+    ("growth", "growth_hours", "growth_enabled", [12], "workbuddy", "growth/", False),
+    ("balance", "balance_hours", "balance_enabled", [14], "workbuddy", "balance", False),
 )
 
 # Tasks whose old implementation reported fabricated usage events. They are
@@ -81,7 +91,7 @@ def legacy_schedule_document(config: dict) -> dict:
 
     schedules = {}
     skipped = []
-    for key, hours_field, enabled_field, default_hours, provider, once in LEGACY_TASKS:
+    for key, hours_field, enabled_field, default_hours, provider, task_key, once in LEGACY_TASKS:
         enabled = legacy.get(enabled_field, True)
         if type(enabled) is not bool:
             raise LegacyScheduleError("invalid_legacy_schedule_" + key)
@@ -95,7 +105,7 @@ def legacy_schedule_document(config: dict) -> dict:
         # turns a plan on explicitly after reviewing the migration report.
         schedules[schedule_id] = {
             "id": schedule_id,
-            "task_key": key,
+            "task_key": task_key,
             "provider_id": provider,
             "enabled": False,
             "hours": hours,
@@ -103,11 +113,17 @@ def legacy_schedule_document(config: dict) -> dict:
             "timezone": TIMEZONE,
             "account_ids": [],
             "once_per_day": once,
+            # 审计事实：旧部署里这条排程的开关原本是什么。计划本身一律停用
+            # （升级不能自动恢复写操作），但控制台要靠这个字段显示「旧版曾启用」
+            # 或「旧版未启用」——否则运维无法判断一条停用的计划是迁移有意停的，
+            # 还是旧配置本来就没开。应用内启动导入（cmd/server/workbench.go）写
+            # 的是同一个字段名，两个入口必须一致。
+            "legacy_enabled": enabled,
         }
         if manual_only or not enabled:
             skipped.append({"id": schedule_id, "reason": "manual_only_legacy_event_report" if manual_only else "disabled_in_source"})
     originals = {}
-    for key, _, enabled_field, _, _, _ in LEGACY_TASKS:
+    for key, _, enabled_field, _, _, _, _ in LEGACY_TASKS:
         originals["legacy-" + key.replace("_", "-")] = bool(legacy.get(enabled_field, True))
     return {
         "format": 4,
@@ -120,6 +136,12 @@ def legacy_schedule_document(config: dict) -> dict:
         "receipts": {},
         "attempts": {},
         "work": {},
+        # 离线迁移本身就是「旧计划导入」这一次动作。不写这个标记的话，网关
+        # 首次启动会再跑一遍应用内导入：发现计划已存在 → 判定为用户数据 →
+        # 报 ErrLegacyScheduleImportBlocked 并保持标记未完成，每次启动都重试；
+        # 更严重的是用户删掉迁移来的计划后，下次启动会因为标记仍为 false 而把
+        # 它们重新写回（应用内路径已有「删除不得复活」的回归测试）。
+        "legacy_schedule_import_done": True,
         "import": {
             "source": "legacy-config-schedule",
             "timezone": TIMEZONE,

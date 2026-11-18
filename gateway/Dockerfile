@@ -62,7 +62,10 @@ RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.example.json
-RUN python3 /app/scripts/runtime_bundle.py --stage /app --version "${VERSION}" --arch "${TARGETARCH:-$(uname -m)}"
+# 2026-11-18：镜像构建上下文是 gateway/，看不到仓库根的 tools/doubao-runtime；
+# 显式产出旧版 18 文件包（整组省略，解包器按可选组接受）。豆包官方客户端桥接
+# 需要同机运行的官方客户端，容器内无法启动，完整 28 文件包由发布流水线构建。
+RUN python3 /app/scripts/runtime_bundle.py --stage /app --version "${VERSION}" --arch "${TARGETARCH:-$(uname -m)}" --without-doubao-runtime
 ENV WB2API_PANEL_ENABLED=1 \
     WB2API_GATEWAY_DIR=/app \
     WB2API_ADMIN_DIR=/app/panel-data \

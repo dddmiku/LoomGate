@@ -341,7 +341,7 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		writeHTML(w, http.StatusOK, body)
 		return
-	case s.opts.Console && (path == "/console/app.js" || path == "/console/connections.js" || path == "/console/plan-editor.js"):
+	case s.opts.Console && (path == "/console/app.js" || path == "/console/connections.js" || path == "/console/plan-editor.js" || path == "/console/model-picker.js"):
 		s.consoleAsset(w, path)
 		return
 	case strings.HasPrefix(path, "/vendor/"):
@@ -428,8 +428,8 @@ func (s *Server) serveGet(w http.ResponseWriter, r *http.Request, path string) {
 }
 
 func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) {
-	// 密钥管理有自己的一整套闸门（它要在会话之前拿到 body 才能判 8192 上限），
-	// 与 Python 版一致地单独分流。
+	// 密钥管理有自己的一整套闸门（会话、同源、管理标记），body 上限也与
+	// 通用路径不同（64 KiB，见 keysPost），与 Python 版一致地单独分流。
 	switch path {
 	case "/api/keys", "/api/keys/update", "/api/keys/delete", "/api/keys/copy":
 		s.keysPost(w, r, path)
@@ -450,10 +450,6 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 	}
 	if message := validateActionBody(path, body); message != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": message})
-		return
-	}
-	if path == "/api/migration/preflight" {
-		s.migrationPreflight(w, r, body)
 		return
 	}
 	if path == "/api/auth/login" {
@@ -513,6 +509,11 @@ func (s *Server) servePost(w http.ResponseWriter, r *http.Request, path string) 
 		s.updatePost(w, r, path, body)
 	case "/api/models/refresh":
 		s.modelsRefresh(w, r)
+	case "/api/migration/preflight":
+		// 预检会启动 Python 子进程并读取任意绝对路径目录树；它是管理操作，
+		// 必须先过会话闸门。放在会话前会把「目录存在性探测 + 任意读」暴露给
+		// 未登录的同网段用户（LAN 开放时即可达）。
+		s.migrationPreflight(w, r, body)
 	case "/api/credit":
 		writeJSON(w, http.StatusOK, map[string]any{"credit": s.credits.Get(r.Context(), true)})
 	default:

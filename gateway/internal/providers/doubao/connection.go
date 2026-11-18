@@ -99,6 +99,22 @@ func (d *DesktopConnection) profile(id string) (accountvault.Account, StoredProf
 	}
 	return a, profile, nil
 }
+
+// DisplayBinding returns the verified, non-secret display facts of a bound
+// Doubao account. The encrypted profile, headers and query parameters never
+// leave this method — only the official BotID and the verification timestamp,
+// both of which were confirmed through the signed official connection proof.
+// ok=false means the vault has no binding for that id.
+func (d *DesktopConnection) DisplayBinding(id string) (botID string, verifiedAt time.Time, ok bool) {
+	if d == nil || d.Vault == nil || id == "" {
+		return "", time.Time{}, false
+	}
+	_, profile, err := d.profile(id)
+	if err != nil || profile.Runtime == nil || !identityDigest.MatchString(profile.Runtime.Identity) || !runtimeBotID.MatchString(profile.BotID) {
+		return "", time.Time{}, false
+	}
+	return profile.BotID, profile.VerifiedAt, true
+}
 func intentResult(status, code, notice string, intent bindingIntent) authflow.Result {
 	raw, _ := json.Marshal(intent)
 	return authflow.Result{Status: status, ErrorCode: code, Notice: notice, Secret: raw}

@@ -26,15 +26,25 @@ def main():
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
   page.request.post(base+'/__fixture/mode/success');initial=stats()
-  stage='discover';nav('tasks');page.locator('[data-task=balance]').first.wait_for();assert page.locator('[data-task=balance]').count()==3;assert page.locator('[data-task=checkin]').count()==2;assert page.locator('[data-task="growth/fixture-growth"]').count()==2;done('registered_tasks_dynamic_growth_and_global_scope')
+  stage='discover';nav('tasks');page.locator('[data-task=balance]').first.wait_for()
+  # The task list is grouped by provider+realm+task key: one row per task and
+  # realm, not one row per account. balance spans CN (2 accounts) and global
+  # (1 account) → 2 rows whose detail panes hold 3 account rows in total.
+  assert page.locator('[data-task=balance]').count()==2;assert page.locator('[data-task=checkin]').count()==1;assert page.locator('[data-task="growth/fixture-growth"]').count()==1
+  rows=page.locator('[data-task=balance]');accounts_total=0
+  for i in range(rows.count()):
+   page.locator('[data-action=task-back]').click() if page.locator('[data-action=task-back]').is_visible() else None
+   rows.nth(i).click();page.locator('#task-detail').wait_for();accounts_total+=page.locator('#task-detail .account-task-row').count()
+  assert accounts_total==3,accounts_total
+  done('registered_tasks_dynamic_growth_and_global_scope')
   stage='balance';choose_account(page,'#task-account','1003');page.locator('[data-task=balance]').wait_for();assert page.locator('[data-task=checkin]').count()==0
   select_task(page,'balance','run-task');submit('succeeded');s=stats();assert s['balance_reads']==initial['balance_reads']+1 and s['signins']==initial['signins'] and s['claims']==initial['claims']
   assert stats()['global_credits']==750 and stats()['global_expiring']==750;done('balance_only_updates_actual_pool_without_signin')
-  stage='partial';page.request.post(base+'/__fixture/mode/failed');nav('tasks');choose_account(page,'#task-account','');page.locator('[data-discovery-issues="2"]').wait_for();assert page.locator('[data-task=balance]').count()==3
+  stage='partial';page.request.post(base+'/__fixture/mode/failed');nav('tasks');choose_account(page,'#task-account','');page.locator('[data-discovery-issues="2"]').wait_for();assert page.locator('[data-task=balance]').count()==2
   page.screenshot(path=str(out/'tasks-partial-desktop.png'),full_page=True)
   page.locator('[data-action=run-all]').click();run=submit('failed')
   assert len(run['discovery_issues'])==2;assert any(x['task_key']=='balance' for x in run['steps']);assert stats()['balance_reads']>=initial['balance_reads']+4;done('partial_failure_visible_and_other_modules_still_execute')
-  stage='schedule';nav('tasks');page.locator('[data-task=balance]').first.wait_for();select_task(page,'balance','task-schedule',first=True);page.locator('#plan-next:not([disabled])').wait_for();assert page.locator('#plan-task').input_value()=='balance';plan_timing(page);plan_times(page,['08:00','20:00'],'UTC');plan_review(page);page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden');plan=next(s for s in api('workbench')['schedules'] if s['task_key']=='balance');assert plan['timezone']=='UTC' and plan['hours']==[8,20] and not plan['enabled'];done('module_task_schedule_persists_without_engine_specific_code')
+  stage='schedule';nav('tasks');page.locator('[data-task=balance]').first.wait_for();select_task(page,'balance','task-schedule',first=True);page.locator('#plan-save').wait_for();assert page.locator('[data-plan-step="0"]').is_hidden() and page.locator('#plan-task').is_hidden();plan_timing(page);plan_times(page,['08:00','20:00'],'UTC');plan_review(page);page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden');plan=next(s for s in api('workbench')['schedules'] if s['task_key']=='balance');assert plan['timezone']=='UTC' and plan['hours']==[8,20] and not plan['enabled'];done('module_task_schedule_persists_without_engine_specific_code')
   stage='mobile';nav('tasks');page.locator('[data-discovery-issues]').wait_for();page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.screenshot(path=str(out/'tasks-partial-mobile.png'),full_page=True);done('partial_catalog_mobile_layout')
   stage='recover';page.request.post(base+'/__fixture/mode/success');nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');page.locator('[data-task="growth/fixture-growth"]').first.wait_for();assert page.locator('[data-discovery-issues]').count()==0
   choose_account(page,'#task-account','1001');select_task(page,'growth/fixture-growth','run-task');submit('succeeded');assert stats()['claims']<=initial['claims']+1;done('growth_recovery_claim_and_authoritative_verification')

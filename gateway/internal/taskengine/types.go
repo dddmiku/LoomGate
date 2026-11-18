@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -38,8 +39,38 @@ var (
 	ErrInvalid   = errors.New("invalid task configuration")
 	ErrLeaseLost = errors.New("task lease lost")
 	ErrUncertain = errors.New("previous non-idempotent execution needs verification")
+	// ErrLegacyScheduleImportBlocked means the one-time legacy schedule import
+	// was skipped because user-owned data (existing plans or in-flight
+	// mutations) must not be overwritten. The import marker stays unset so the
+	// operator can retry after resolving the state.
+	ErrLegacyScheduleImportBlocked = errors.New("legacy schedule import blocked by existing state")
 )
 var IDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// TaskKeyMatches 判断一个「请求/计划的任务键」是否覆盖某个已发现任务。
+//
+// 语义：
+//   - "" 与 "*" 覆盖全部任务（与既有行为一致）；
+//   - 完全相等覆盖该任务；
+//   - 以 "/" 结尾时按前缀覆盖（例如 "growth/" 覆盖 "growth/accept/<码>" 与
+//     "growth/<码>"）。
+//
+// 为什么需要前缀：旧 config 的 schedule 段只有**模块级**排程（growth_hours
+// 表示成长中心整条流水线），而发现出来的任务键是 "growth/<任务码>"。导入时
+// 若用裸模块名 "growth"，发现阶段能给出任务（模块 spec 本身按前缀匹配），但
+// 运行阶段的逐字过滤会把它们全丢掉——计划按点触发、发现 0 个任务、以
+// status=skipped 结束，看起来启用、实际什么都不做。用 "growth/" 表达「这个
+// 模块下的所有当前任务」，既不丢任务，也不会像 "*" 那样把签到、余额刷新等
+// 无关侧写任务一起带进来。
+func TaskKeyMatches(pattern, key string) bool {
+	if pattern == "" || pattern == "*" {
+		return true
+	}
+	if pattern == key {
+		return true
+	}
+	return strings.HasSuffix(pattern, "/") && strings.HasPrefix(key, pattern)
+}
 
 type Definition struct {
 	Key            string  `json:"key"`
@@ -135,6 +166,10 @@ type Schedule struct {
 	Timezone       string     `json:"timezone"`
 	AccountIDs     []string   `json:"account_ids"`
 	OncePerDay     bool       `json:"once_per_day"`
+	LegacyEnabled  *bool      `json:"legacy_enabled,omitempty"`
+	// UserEdited marks a plan saved through the operator API. Default-import
+	// repair must never flip a plan the operator deliberately changed.
+	UserEdited     bool       `json:"user_edited,omitempty"`
 	NextRun        *time.Time `json:"next_run,omitempty"`
 	LastRunID      string     `json:"last_run_id,omitempty"`
 	LastDispatched *time.Time `json:"last_dispatched,omitempty"`

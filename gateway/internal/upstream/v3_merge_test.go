@@ -13,11 +13,18 @@ import (
 // v3Fixture /v3/config 响应（对象形态）：3 个模型，hy4-preview 带 v3 口径 credits
 // （x0.29——与 v2 的 x0.00 分歧正是任务书「v3 为主时以 v3 为准」的判据），
 // deepseek-v4.1-flash 是 v3 独有模型（缺 4 模型问题的主角）。
+// 2026-11-18 P1-01 修正：真实 /v3/config 响应（2026-10-29 抓包，
+// _wb_capture_new/20261029-103215.996-032-v3-config-resp.json）带 agents[cli]
+// 白名单（58 个模型里 cli 只允许 16 个）。无 agents 的 v3 后端全量表**不得**
+// 扩充客户端可见集——那正是用户报的「隐藏模型全列出来」。本 fixture 补上
+// agents[cli]，让「v3 主」语义建立在白名单之上；deepseek-v4.1-flash
+// 必须在白名单里才会公布。
 const v3Fixture = `{"code":0,"data":{"models":[
 	{"id":"glm-5.2","name":"GLM-5.2","credits":"x0.05","maxInputTokens":131072,"maxOutputTokens":8192},
 	{"id":"hy4-preview","name":"Hy4","credits":"x0.29","maxInputTokens":256000,"maxOutputTokens":32000},
-	{"id":"deepseek-v4.1-flash","name":"DS-Flash","credits":"x0.00","maxInputTokens":1000000,"maxOutputTokens":128000}
-]}}`
+	{"id":"deepseek-v4.1-flash","name":"DS-Flash","credits":"x0.00","maxInputTokens":1000000,"maxOutputTokens":128000},
+	{"id":"hidden-backend-model","name":"HiddenBackend","credits":"x0.00","maxInputTokens":100000,"maxOutputTokens":8192}
+],"agents":[{"name":"cli","models":["glm-5.2","hy4-preview","deepseek-v4.1-flash"]}]}}`
 
 // v2Fixture /v2/enterprises/personal/models 响应（对象形态，无 agents——global 探测
 // 口径不读 agents）：glm-5.2 与 v3 重复；hy4-preview credits 与 v3 分歧（x0.00）；
@@ -70,7 +77,9 @@ func TestGlobalModelsMergeV3PrimaryV2Supplement(t *testing.T) {
 		t.Fatalf("probe calls=%v want 2 (v3 + v2)", calls)
 	}
 
-	// 名单：v3 原序（glm-5.2, hy4-preview, deepseek-v4.1-flash）+ v2 补充（gpt-5.3-codex）。
+	// 名单：v3 白名单原序（glm-5.2, hy4-preview, deepseek-v4.1-flash）+ v2 补充
+	// （gpt-5.3-codex）。hidden-backend-model 在 v3 全量表里但不在 cli 白名单
+	// 里 → 不得公布（P1-01：后端全量表不得扩充可见集）。
 	want := []string{"glm-5.2", "hy4-preview", "deepseek-v4.1-flash", "gpt-5.3-codex"}
 	if !sameStrings(names, want) {
 		t.Fatalf("merged names=%v want %v (v3 primary order + v2 supplement)", names, want)
@@ -92,6 +101,9 @@ func TestGlobalModelsMergeV3PrimaryV2Supplement(t *testing.T) {
 	}
 	if got := byID["deepseek-v4.1-flash"].ContextWindow; got != 1000000 {
 		t.Errorf("deepseek-v4.1-flash contextWindow=%d want 1000000 (v3 entry)", got)
+	}
+	if _, ok := byID["hidden-backend-model"]; ok {
+		t.Errorf("hidden-backend-model escaped the cli allowlist: %v", names)
 	}
 }
 
@@ -169,9 +181,10 @@ func TestGlobalModelsMergeStableOutput(t *testing.T) {
 	}
 }
 
-// TestCNModelsV3PrimaryConsoleSupplement CN 侧对称合并（任务书需求 3）：
-// console 口径（agents[cli] 过滤）零回归 + v3 主、console 补缺——v3 独有 hy4-preview-f
-// 补进、console 独有 hy4-preview 补进，共有 glm-5.2 以 v3 条目为主。
+// TestCNModelsV3PrimaryConsoleSupplement CN 侧合并（P1-01 修正后口径）：
+// console 的 agents[cli] 白名单决定集合（v3 无白名单时只补元数据、不扩集合）——
+// v3 独有的 hy4-preview-f 不在 cli 白名单里 → 不公布；console 独有 hy4-preview
+// 在白名单里 → 公布；共有 glm-5.2 以 v3 富字段为主（credits 由元数据填充）。
 func TestCNModelsV3PrimaryConsoleSupplement(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -208,18 +221,21 @@ func TestCNModelsV3PrimaryConsoleSupplement(t *testing.T) {
 	if len(paths) != 2 {
 		t.Fatalf("paths=%v want 2 (console + v3 concurrent)", paths)
 	}
-	// 并集：v3 条目（glm-5.2 v3 主）+ console 补缺（hy4-preview）+ v3 独有（hy4-preview-f）。
-	// 注意合并顺序：fetchV3Models 为主路在前，console 补充在后。
+	// console 白名单集合：glm-5.2（v3 富字段补 blank）+ hy4-preview（console 补充）。
+	// hy4-preview-f 不在 cli 白名单 → 不公布（v3 无白名单时只补元数据不扩集合）。
 	byID := map[string]ModelInfo{}
 	var ids []string
 	for _, mi := range infos {
 		byID[mi.ID] = mi
 		ids = append(ids, mi.ID)
 	}
-	for _, want := range []string{"glm-5.2", "hy4-preview", "hy4-preview-f"} {
+	for _, want := range []string{"glm-5.2", "hy4-preview"} {
 		if _, ok := byID[want]; !ok {
 			t.Fatalf("merged cn models missing %s: %v", want, ids)
 		}
+	}
+	if _, ok := byID["hy4-preview-f"]; ok {
+		t.Fatalf("non-allowlisted v3-only model published: %v", ids)
 	}
 	if counts := countIDs(ids, "glm-5.2"); counts != 1 {
 		t.Errorf("glm-5.2 count=%d want 1 (dedupe)", counts)

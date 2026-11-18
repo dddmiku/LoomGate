@@ -87,10 +87,10 @@ def main():
         stage='services'
         nav('providers');page.locator('[data-provider="doubao"] h2').wait_for()
         card=page.locator('article.service-entry[data-provider="doubao"]')
-        assert '模型目录' in card.inner_text() and '双登录' in card.inner_text()
+        assert '模型目录' in card.inner_text() and '消息转发' in card.inner_text()
         card.locator('[data-action=provider-accounts]').click()
         page.locator('#account-provider').wait_for()
-        page.get_by_text('a-fixture',exact=True).wait_for()
+        page.locator('#account-list [data-account="a-fixture"]').first.wait_for()
         assert page.locator('#account-list tbody tr').count()>=24
         page.locator('#account-search').fill('c-disabled')
         assert page.locator('#account-list tbody tr').count()==1
@@ -102,16 +102,14 @@ def main():
         assert page.locator('[data-account-status=disabled]').count()==1
         assert page.locator('#model-list img').count()==0
         assert '仅目录' in page.locator('#model-list').inner_text()
-        page.locator('[data-action=model-next]').click();models_settled()
-        assert '9–16 / ' in page.locator('#model-pagination').inner_text()
-        page.locator('[data-action=model-prev]').click();models_settled()
         choose_account(page,'#model-account','a-fixture');models_settled()
         assert page.locator('.selection-row').count()==1
         choose_capability(page,'supports_tool_call');assert page.locator('.selection-row').count()==0
         choose_capability(page,'native_tools');assert page.locator('.selection-row').count()==1
         page.locator('#model-search').fill('no-such-model');assert page.locator('.selection-row').count()==0
         page.locator('#model-search').fill('合成');assert page.locator('.selection-row').count()==1
-        done('catalog_scope_pagination_filter_xss_and_capability_semantics');shot('console-models.png')
+        model_rows=page.locator('.selection-row').count();assert page.locator('#model-list .channel-filter').count() in (0,1)
+        done('catalog_scope_channel_filter_group_paging_filter_xss_and_capability_semantics');shot('console-models.png')
         stage='stale'
         page.request.post(base+'/__fixture/mode/failed')
         before=page.request.get(base+'/__fixture/stats').json()['calls']
@@ -155,14 +153,17 @@ def main():
         select_task(page,'fixture-manual','manual-task')
         assert '选择需要处理的文档' in page.locator('#dialog-body').inner_text()
         page.locator('#dialog-close').click();done('dynamic_tasks_and_specific_manual_action');shot('console-tasks.png')
+        page.locator('[data-action=select-task-group]').first.click()
+        page.locator('#task-detail [data-action=open-runs]').click()
+        page.wait_for_function("document.querySelector('h1')?.textContent==='执行记录'")
+        done('task_detail_links_directly_to_execution_records')
+        nav('tasks');choose_provider(page,'#task-provider','doubao');page.locator('[data-task]').first.wait_for()
         stage='schedule-create'
         select_task(page,'fixture-check','task-schedule')
-        page.locator('#plan-next:not([disabled])').wait_for()
-        assert page.locator('#plan-task').input_value()=='fixture-check'
-        plan_timing(page)
+        assert page.locator('[data-plan-step="1"]').is_visible() and page.locator('#plan-save').is_visible()
+        assert page.locator('#plan-provider').is_hidden() and page.locator('#plan-task').is_hidden()
         plan_times(page,['06:17','18:17'],'Asia/Shanghai')
-        plan_review(page)
-        page.locator('#plan-enabled').check()
+        page.locator('#plan-enabled-quick').check()
         shot('console-schedule-editor.png')
         before_ids={x['id'] for x in work()['schedules']}
         page.locator('#plan-save').click()
@@ -197,10 +198,11 @@ def main():
         done('actual_process_restart_preserves_schedule_and_session')
         stage='schedule-edit'
         row=page.locator('[data-schedule-id="'+sid+'"]')
-        row.locator('[data-action=edit-schedule]').click();plan_timing(page)
-        plan_times(page,['06:17','06:17']);page.locator('#plan-next').click()
+        row.locator('[data-action=edit-schedule]').click()
+        assert page.locator('[data-plan-step="1"]').is_visible() and page.locator('#plan-save').is_visible()
+        plan_times(page,['06:17','06:17']);page.locator('#plan-save').click()
         assert page.locator('#form-message').is_visible()
-        plan_times(page,['07:17','19:17'],'UTC');plan_review(page)
+        plan_times(page,['07:17','19:17'],'UTC')
         page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden')
         assert next(x for x in work()['schedules'] if x['id']==sid)['timezone']=='UTC'
         row=page.locator('[data-schedule-id="'+sid+'"]')
@@ -254,6 +256,14 @@ def main():
         page.set_viewport_size({'width':1440,'height':1000})
         nav('keys')
         page.locator('[data-action="key-new"]').click()
+        page.locator('.model-picker-options [data-key-model]').first.wait_for(timeout=20000)
+        picker_row=page.locator('.model-picker-options [data-key-model]').first
+        assert picker_row.locator('.model-rate').count()==1
+        assert '倍率未知' in picker_row.inner_text() or '免费' in picker_row.inner_text() or 'x' in picker_row.inner_text()
+        picker_id=picker_row.get_attribute('data-key-model')
+        page.locator('[data-model-channel="doubao"]').click();assert page.locator('.model-picker-options [data-key-model]').count()==0
+        page.locator('[data-model-channel=""]').click();page.locator('[data-key-model="'+picker_id+'"]').click()
+        assert page.locator('#key-form input[name="models"]').input_value()==picker_id
         page.locator('#key-form input[name="name"]').fill('synthetic-browser-key')
         page.locator('#key-form button[type=submit]').click()
         page.locator('#dialog textarea[readonly]').wait_for()
@@ -268,6 +278,8 @@ def main():
         page.locator('[data-status=disabled]').first.wait_for(timeout=10000)
         done('key_disable_persists_and_reads_back')
         page.locator('[data-action="key-edit"]').first.click()
+        page.locator('.model-picker-options [data-key-model]').first.wait_for(timeout=20000)
+        assert page.locator('.model-picker-tag').count()==1 and picker_id in page.locator('.model-picker-tags').inner_text()
         page.locator('#key-form input[name="note"]').fill('synthetic note')
         page.locator('#key-form button[type=submit]').click()
         page.locator('text=synthetic note').wait_for(timeout=10000)

@@ -243,53 +243,57 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [上游] 国际版模型：企业端点失败，仅剩 v3/config：%v", enterprise.err)
-		return v3.names, v3.infos, v3.efforts, v3.defaults, nil
+		// v3 带权威 cli 白名单（目录级旗标，非单条启发）时可以独立充当客户端目录；
+		// 否则缺企业目录就是失败（不能拿后端全量表冒充客户端可见集，P1-01）。
+		if v3ClientScoped(v3.infos) {
+			return v3.names, v3.infos, v3.efforts, v3.defaults, nil
+		}
+		return nil, nil, nil, nil, fmt.Errorf("global client model directory unavailable")
 	}
-	// 两路皆成功：v3 为主、企业端点补缺合并。
-	names, infos = mergeGlobalCatalog(v3.names, v3.infos, enterprise.names, enterprise.infos)
+	// v3 带权威 cli 白名单 → 白名单决定主集合；企业端点（/v2 个人客户端目录）
+	// 只补 v3 缺失的 id，v3 条目字段优先（P1-01：客户端集合为空时不回退放大，
+	// 后端全量表不得扩充可见集）。
+	if v3ClientScoped(v3.infos) {
+		names = append([]string(nil), v3.names...)
+		infos = append([]ModelInfo(nil), v3.infos...)
+		seenIDs := make(map[string]bool, len(names))
+		for _, id := range names {
+			seenIDs[id] = true
+		}
+		for _, id := range enterprise.names {
+			if id == "" || seenIDs[id] {
+				continue
+			}
+			seenIDs[id] = true
+			names = append(names, id)
+			for _, mi := range enterprise.infos {
+				if mi.ID == id {
+					mi.clientScoped = true
+					infos = append(infos, mi)
+					break
+				}
+			}
+		}
+		return names, infos, v3.efforts, v3.defaults, nil
+	}
+	names = append([]string(nil), enterprise.names...)
+	// 窄表企业响应（infos nil）保持 nil——无对象字段不编造（既有语义，
+	// TestFetchGlobalModelInfosNarrowNil 的断言）。
+	infos = clientModelMetadata(enterprise.infos, v3.infos)
 	efforts = mergeEffortBuckets(v3.efforts, enterprise.efforts)
 	defaults = mergeEffortDefaults(v3.defaults, enterprise.defaults)
 	return names, infos, efforts, defaults, nil
 }
 
-// mergeGlobalCatalog 两路合并（v3 主、企业补缺）：names 按 id 去重（v3 原序在前、
-// 企业端点补充项在其原序后追加——稳定输出）；infos 同步合并（v3 条目字段权威，
-// 企业端点条目只在 id 缺失时进并集，其 credits 为 v2 原值）。
-// 窄表形态（infos nil）时保持 nil——无对象字段不编造。
-func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, secondaryNames []string, secondaryInfos []ModelInfo) (names []string, infos []ModelInfo) {
-	if len(secondaryNames) == 0 {
-		return primaryNames, primaryInfos
-	}
-	seen := make(map[string]bool, len(primaryNames)+len(secondaryNames))
-	out := make([]string, 0, len(primaryNames)+len(secondaryNames))
-	for _, id := range primaryNames {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	var outInfos []ModelInfo
-	if primaryInfos != nil {
-		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
-		outInfos = append(outInfos, primaryInfos...)
-	}
-	for _, id := range secondaryNames {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-		// 窄表企业响应（secondaryInfos nil / 超出条目数）时该 id 无对象字段，
-		// infos 保持原样（调用方按 id 名单输出裸条目，不编造字段）。
-		for _, mi := range secondaryInfos {
-			if mi.ID == id {
-				outInfos = append(outInfos, mi)
-				break
-			}
+// v3ClientScoped 报告该响应是否带**目录级** cli 白名单（parseGlobalModelNames
+// 对全部条目统一置位；空白名单/缺 agents 一律 false）。
+func v3ClientScoped(infos []ModelInfo) bool {
+	for _, mi := range infos {
+		if mi.clientScoped {
+			return true
 		}
 	}
-	return out, outInfos
+	return false
 }
 
 // mergeEffortBuckets 合并两路 effort 桶：主路（v3）权威，企业端点只补主路缺失的模型档位。
@@ -395,9 +399,31 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 	// dynModelEntry 与 CN FetchModels 共用（两域模型对象同构），零解析口径漂移。
 	var obj struct {
 		Models []dynModelEntry `json:"models"`
+		Agents []struct {
+			Name   string   `json:"name"`
+			Models []string `json:"models"`
+		} `json:"agents"`
 	}
 	if err := json.Unmarshal(env.Data, &obj); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
+	}
+	// A client-scoped directory is an allowlist, not a bag of hidden backend
+	// models. An explicitly empty agents list must not broaden discovery.
+	// hasAllowlist is directory-level: set only when agents[cli].models is a
+	// non-empty allowlist; every entry then carries clientScoped so callers
+	// never infer scope from a single heuristic entry (P1-01).
+	var clientModels map[string]bool
+	hasAllowlist := false
+	if obj.Agents != nil {
+		clientModels = map[string]bool{}
+		for _, agent := range obj.Agents {
+			if agent.Name == "cli" && len(agent.Models) > 0 {
+				hasAllowlist = true
+				for _, id := range agent.Models {
+					clientModels[id] = true
+				}
+			}
+		}
 	}
 	out := make([]string, 0, len(obj.Models))
 	infos = make([]ModelInfo, 0, len(obj.Models))
@@ -406,12 +432,13 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 		if id == "" {
 			id = m.Name
 		}
-		if id == "" || m.Disabled {
+		if id == "" || m.Disabled || clientModels != nil && !clientModels[id] {
 			continue
 		}
 		out = append(out, id)
 		mi := m.modelInfo()
 		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
+		mi.clientScoped = hasAllowlist
 		infos = append(infos, mi)
 		// effort 桶：supportedEfforts 数组优先；缺数组但 reasoning.effort 单档非空 → 视作单档表。
 		if len(m.Reasoning.SupportedEfforts) > 0 {

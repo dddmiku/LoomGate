@@ -203,6 +203,10 @@ except ValueError:
 
 REALMS = ("cn", "global", "trae")
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+# 完整模型名的前缀是**动态命名空间**（cn/global/trae/doubao/…），不是固定平台表。
+# 与 Go 面板的 modelBindingError、密钥库的 splitRealm 保持同一口径：
+# 前缀 1–32 个小写字母/数字/下划线/中划线且以小写字母开头，冒号后必须有内容。
+PREFIXED_MODEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}:.+$")
 # auth 文件命名口径的单一来源：与网关 internal/auth/auth.go 的 AuthFileGlob（`workbuddy*.json`）
 # 保持同一宽度。网关会加载不带连字符的名字（如 workbuddy_new.json，auth.go 的注释里就点了这个
 # 文件名），面板必须看到同一批文件，否则网关在服务、面板却列不出也管不了（审查发现 19）。
@@ -1752,7 +1756,9 @@ class Handler(BaseHTTPRequestHandler):
         """把 /v1/models 的原始响应整理成面板要的形状。
 
         models 是纯 id 列表（兼容旧前端），items 带展示字段（倍率/名称/供应商/
-        能力旗标），全部原样透传，缺字段就省略——不编造。
+        能力旗标），全部原样透传，缺字段就省略——不编造。provider_errors 表示
+        某个渠道的目录没读到（如豆包超时）；不透传它，用户会把「这个渠道失败了」
+        误读成「本来就没有这些模型」，甚至据此删掉已有绑定。
         """
         ids, items = [], []
         if isinstance(payload, dict):
@@ -1768,7 +1774,22 @@ class Handler(BaseHTTPRequestHandler):
                     if item.get(key):
                         entry[key] = True
                 items.append(entry)
-        return {"ok": True, "models": sorted(set(ids)), "items": items}
+        body = {"ok": True, "models": sorted(set(ids)), "items": items}
+        # 只透传 {provider, code}（与 Go 仓 modelsPayload 的白名单一致）：
+        # 上游原始错误文本不进面板，避免私密/内部细节外泄，也避免它被当作
+        # 可展示的文案。
+        errors = payload.get("provider_errors") if isinstance(payload, dict) else None
+        safe = []
+        if isinstance(errors, list):
+            for row in errors[:32]:
+                if not isinstance(row, dict):
+                    continue
+                provider, code = row.get("provider"), row.get("code")
+                if isinstance(provider, str) and provider and isinstance(code, str) and code:
+                    safe.append({"provider": provider, "code": code})
+        if safe:
+            body["provider_errors"] = safe
+        return body
 
     def _models_refresh(self):
         """强制网关回源刷新模型列表，成功后连同新列表一起返回。
@@ -1819,7 +1840,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
             return self._reject_unread_body(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
         try:
-            body = self._body(8192)
+            # 64 KiB：密钥库允许 64 项 × 每项最多 256 字节的模型绑定，合法请求体
+            # 会超过 8 KiB。字段级约束仍由 _model_binding_error 等逐项校验。
+            body = self._body(65536)
         except RequestBodyError as error:
             self.close_connection = True
             return self._json(error.status, {"ok": False, "message": str(error)})
@@ -1884,13 +1907,13 @@ class Handler(BaseHTTPRequestHandler):
         if models is None:
             return None
         if not isinstance(models, list) or len(models) > 64 or any(
-                not isinstance(item, str) or not item or len(item) > 64 or
+                not isinstance(item, str) or not item or len(item) > 256 or
                 item.strip() != item or any(ch.isspace() or ord(ch) < 32 for ch in item)
                 for item in models) or len(set(models)) != len(models):
             return "模型绑定需为最多 64 个不重复的模型名"
         # 前缀后必须还有模型名：`cn:` / `global:` 这种只有前缀的写法同样匹配不上。
-        if any(not re.fullmatch(r"(cn|global|trae):.+", item) for item in models):
-            return "模型绑定必须选完整模型名（cn: / global: / trae: 开头），请从模型列表添加"
+        if any(not PREFIXED_MODEL_RE.fullmatch(item) for item in models):
+            return "模型绑定必须选完整模型名（带平台前缀），请从模型列表添加"
         return None
 
     @staticmethod

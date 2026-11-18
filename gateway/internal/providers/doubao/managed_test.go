@@ -13,7 +13,7 @@ import (
 
 type managedFixture struct {
 	state, reason                    string
-	err                              error
+	err, endpointErr                 error
 	starts, polls, cancels, launches int
 	before                           func()
 }
@@ -21,6 +21,9 @@ type managedFixture struct {
 func (m *managedFixture) Endpoint(_ context.Context, start bool) (int, error) {
 	if start {
 		m.launches++
+	}
+	if m.endpointErr != nil {
+		return 0, m.endpointErr
 	}
 	return 19227, nil
 }
@@ -190,6 +193,24 @@ func TestManagedCommitRejectsSwitchAndDisable(t *testing.T) {
 		})
 	}
 }
+func TestManagedUnsupportedPlatformDoesNotPretendToStartClient(t *testing.T) {
+	s, _, m, _, v, _, _ := managedService(t)
+	m.endpointErr = &APIError{Kind: "desktop_management_platform_unsupported"}
+	f, err := s.Start(context.Background(), authflow.Request{Provider: "doubao", Method: "qr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Status != "manual_action" || f.ErrorCode != "desktop_management_platform_unsupported" || f.InputMode != "official" {
+		t.Fatalf("platform refusal was not preserved: status=%q code=%q", f.Status, f.ErrorCode)
+	}
+	if f.Notice == "" || m.starts != 0 || m.launches != 1 {
+		t.Fatal("unsupported platform attempted an official login")
+	}
+	if rows, _ := v.List(); len(rows) != 0 {
+		t.Fatal("unsupported platform saved an account")
+	}
+}
+
 func TestManagedUnknownStartPreservesIntentAndExpiry(t *testing.T) {
 	s, _, m, r, v, now, _ := managedService(t)
 	m.err = errors.New("synthetic_lost_response")

@@ -3,6 +3,7 @@ package taskengine_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -224,5 +225,154 @@ func TestCatalogRejectsDailyTasksWithoutAuthoritativeBusinessPeriod(t *testing.T
 	registerBehavior(t, e, "fake", singleAdapter(task))
 	if _, err := e.Catalog(context.Background(), "fake", taskengine.Scope{}); err == nil {
 		t.Fatal("daily task without upstream business period accepted")
+	}
+}
+
+func TestLegacyScheduleImportIsOneShotAndOnlyAppliesToEmptyEngine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	e := openBehaviorEngine(t, taskengine.Options{Path: path})
+	a := singleAdapter(syntheticTask("fake", "account-a", "balance"))
+	registerBehavior(t, e, "fake", a)
+
+	candidate := taskengine.Schedule{ID: "legacy-balance", ProviderID: "fake", TaskKey: "balance", Enabled: true, Hours: []int{14}, Minute: 0, Timezone: "Asia/Shanghai", AccountIDs: []string{}}
+	applied, err := e.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+	if err != nil || !applied {
+		t.Fatalf("first import applied=%v err=%v", applied, err)
+	}
+	plans := e.Schedules()
+	if len(plans) != 1 || plans[0].ID != candidate.ID || plans[0].TaskKey != candidate.TaskKey || !plans[0].Enabled || plans[0].Timezone != "Asia/Shanghai" || len(plans[0].AccountIDs) != 0 || plans[0].NextRun == nil || !plans[0].NextRun.After(time.Now()) {
+		t.Fatalf("imported plan does not preserve a future active schedule: %+v", plans)
+	}
+	if len(e.Runs()) != 0 {
+		t.Fatal("importing a schedule dispatched task work")
+	}
+	if err := e.DeleteSchedule(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := openBehaviorEngine(t, taskengine.Options{Path: path})
+	registerBehavior(t, restarted, "fake", a)
+	applied, err = restarted.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+	if err != nil || applied {
+		t.Fatalf("restart import applied=%v err=%v; deleted legacy plan must not be resurrected", applied, err)
+	}
+	if len(restarted.Schedules()) != 0 || len(restarted.Runs()) != 0 {
+		t.Fatalf("one-shot import changed the post-delete state: schedules=%+v runs=%+v", restarted.Schedules(), restarted.Runs())
+	}
+}
+
+// TestLegacyImportAllowsRunsHistoryButBlocksUserPlansAndInFlightMutations
+// 锁定 P2-02 的分离口径：历史执行记录（runs）不再永久阻止导入只读计划；
+// 已有用户计划或在途 mutation（pending/receipts/attempts）仍阻止，且标记保持未完成。
+func TestLegacyImportAllowsRunsHistoryButBlocksUserPlansAndInFlightMutations(t *testing.T) {
+	candidate := taskengine.Schedule{ID: "legacy-balance", ProviderID: "fake", TaskKey: "balance", Enabled: true, Hours: []int{14}, Timezone: "Asia/Shanghai"}
+	adapter := singleAdapter(syntheticTask("fake", "account-a", "balance"))
+
+	t.Run("runs_history_only_imports", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		e := openBehaviorEngine(t, taskengine.Options{Path: path})
+		registerBehavior(t, e, "fake", adapter)
+		if _, err := e.Submit(taskengine.Request{ProviderID: "fake"}); err != nil {
+			t.Fatal(err)
+		}
+		awaitBehaviorRun(t, e, e.Runs()[0].ID)
+		applied, err := e.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+		if err != nil || !applied {
+			t.Fatalf("runs history must not block the read-only import: applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("existing_schedule_blocks_without_marker", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		e := openBehaviorEngine(t, taskengine.Options{Path: path})
+		registerBehavior(t, e, "fake", adapter)
+		if _, err := e.SaveSchedule(taskengine.Schedule{ID: "user-plan", ProviderID: "fake", TaskKey: "balance", Enabled: true, Hours: []int{9}, Timezone: "Asia/Shanghai"}); err != nil {
+			t.Fatal(err)
+		}
+		applied, err := e.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+		if applied || !errors.Is(err, taskengine.ErrLegacyScheduleImportBlocked) {
+			t.Fatalf("user plan must block import: applied=%v err=%v", applied, err)
+		}
+		if _, err := e.SaveSchedule(taskengine.Schedule{ID: "user-plan", ProviderID: "fake", TaskKey: "balance", Enabled: true, Hours: []int{10}, Timezone: "Asia/Shanghai"}); err != nil {
+			t.Fatalf("marker was consumed by a blocked import: %v", err)
+		}
+	})
+}
+
+// TestScheduleEditPreservesLegacySourceFlag 锁定迁移来源标记的存活：
+// 旧配置导入的计划带 legacy_enabled 审计事实；用户在控制台改时间或停启用
+// 时若前端漏传，后端不能替它编一个新值。这里从引擎层验证：带回原值时编辑
+// 后仍在，明确置 nil 时才消失（前端 cleanSchedule 必须原样带回）。
+func TestScheduleEditPreservesLegacySourceFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	e := openBehaviorEngine(t, taskengine.Options{Path: path})
+	registerBehavior(t, e, "fake", singleAdapter(syntheticTask("fake", "account-a", "task-a")))
+	enabled := true
+	s := taskengine.Schedule{ID: "legacy-checkin", ProviderID: "fake", TaskKey: "checkin", Enabled: false, Hours: []int{9}, Minute: 0, Timezone: "Asia/Shanghai", LegacyEnabled: &enabled}
+	if _, err := e.SaveSchedule(s); err != nil {
+		t.Fatal(err)
+	}
+	s.Hours, s.Minute, s.Enabled = []int{7, 19}, 30, true
+	saved, err := e.SaveSchedule(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.LegacyEnabled == nil || !*saved.LegacyEnabled {
+		t.Fatalf("editing a legacy plan dropped the recorded source switch: %+v", saved)
+	}
+	edited := saved
+	edited.LegacyEnabled = nil
+	cleared, err := e.SaveSchedule(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.LegacyEnabled != nil {
+		t.Fatalf("engine invented a legacy source flag after it was explicitly cleared: %+v", cleared)
+	}
+}
+
+// TestMigratedDocumentDoesNotReimportOrResurrectDeletedPlans 验证离线迁移产物
+// 与「一次性导入」契约的衔接：迁移工具写的 task-engine.json 带
+// legacy_schedule_import_done=true，网关启动时的应用内导入必须
+//   - 不把已存在的迁移计划判成「用户数据冲突」而每次启动重试；
+//   - 不在用户删掉计划后把它重新写回（与 TestLegacyScheduleImportIsOneShot… 同契约）。
+//
+// 这里的文档形状来自 tools/migration/legacy_schedule.py（见其 test_migrate.py），
+// 只手写等价 JSON，不依赖 Python 运行时。
+func TestMigratedDocumentDoesNotReimportOrResurrectDeletedPlans(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "task-engine.json")
+	migrated := `{"format":4,"version":4,"schedules":{"legacy-balance":{"id":"legacy-balance","task_key":"balance","provider_id":"fake","enabled":false,"hours":[14],"minute":0,"timezone":"Asia/Shanghai","account_ids":[],"once_per_day":false,"legacy_enabled":true}},"runs":[],"completed":{},"uncertain":{},"pending_tasks":{},"receipts":{},"attempts":{},"work":{},"legacy_schedule_import_done":true}`
+	if err := os.WriteFile(path, []byte(migrated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := openBehaviorEngine(t, taskengine.Options{Path: path})
+	a := singleAdapter(syntheticTask("fake", "account-a", "balance"))
+	registerBehavior(t, e, "fake", a)
+	candidate := taskengine.Schedule{ID: "legacy-checkin", ProviderID: "fake", TaskKey: "checkin", Enabled: false, Hours: []int{9}, Minute: 0, Timezone: "Asia/Shanghai"}
+	applied, err := e.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+	if err != nil || applied {
+		t.Fatalf("migrated workspace must not import again: applied=%v err=%v", applied, err)
+	}
+	plans := e.Schedules()
+	if len(plans) != 1 || plans[0].ID != "legacy-balance" {
+		t.Fatalf("startup import modified a migrated workspace: %+v", plans)
+	}
+	if err := e.DeleteSchedule("legacy-balance"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := openBehaviorEngine(t, taskengine.Options{Path: path})
+	registerBehavior(t, restarted, "fake", a)
+	applied, err = restarted.ImportLegacySchedulesOnce([]taskengine.Schedule{candidate})
+	if err != nil || applied {
+		t.Fatalf("restart import applied=%v err=%v", applied, err)
+	}
+	if len(restarted.Schedules()) != 0 {
+		t.Fatalf("deleted migrated plan was resurrected: %+v", restarted.Schedules())
 	}
 }

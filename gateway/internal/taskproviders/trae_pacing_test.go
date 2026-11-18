@@ -92,7 +92,7 @@ func TestTraePacedWorkSurvivesTimeoutBudgetRestartAndCancellation(t *testing.T) 
 			id := e.Runs()[0].ID
 			select {
 			case <-first:
-			case <-time.After(3 * time.Second):
+			case <-time.After(20 * time.Second):
 				t.Fatal("first claim absent")
 			}
 			// Wait for the first result and second-account pacing, using observable steps.

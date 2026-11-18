@@ -989,6 +989,11 @@ function realmTag(realm){
 
 function acctState(a){
   var p = a.pool || {};
+  // 凭证文件解析失败：网关根本不会加载它（服务端 readAuthDoc 解析失败返回空
+  // map，AuthSummary.parsable=false）。这种号在旧面板里会落到下面的「不在池中」，
+  // 看起来像「还没加载」，用户不知道该重新登录——必须单独标出，且优先于
+  // 池状态：一个坏的凭证文件即使池里还留着旧条目也不能算可用。
+  if (a.parsable === false) return { cls:'e', text:'凭证无法解析' };
   // 池级停用（网关自己停的，多为被上游封禁/标记）优先展示——这是真正"用不了"
   // 且需要重登的原因；文件级停用（面板改名）在它之后。两者都用 acctOff 口径，
   // 保证与总览卡片一致（见 acctOff 注释）。
@@ -1062,7 +1067,9 @@ function renderAccounts(){
   }
   if (q) list = list.filter(function(a){
     return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
-           (a.uid || '').toLowerCase().indexOf(q) >= 0;
+           (a.uid || '').toLowerCase().indexOf(q) >= 0 ||
+           (a.mobile || '').toLowerCase().indexOf(q) >= 0 ||
+           (a.enterpriseId || '').toLowerCase().indexOf(q) >= 0;
   });
   // 排序。默认（''）按「可用性」分档，健康的号在最前：
   //
@@ -1222,9 +1229,21 @@ function renderAccounts(){
     // 为什么换掉 uid：Trae 的 uid 是一串内部数字（411685466945619），运维看不出
     // 哪个号是哪个；手机号（哪怕掩码）能直接对上人。
     var idLine = a.mobile ? a.mobile : shortUid(a.uid);
+    // 企业租户：多租户/同昵称场景下这是唯一能区分两个号的事实。服务端
+    // AuthSummary.enterpriseId 一直有下发，旧面板此前整体丢弃。空值不渲染，
+    // 避免出现「企业：」空标签。
+    var enterpriseLine = a.enterpriseId
+      ? '<div class="sub mono" title="企业租户">企业 ' + esc(a.enterpriseId) + '</div>'
+      : '';
+    // 凭证文件解析失败时说明「网关不会加载它 + 该怎么做」——否则状态列的
+    // 「凭证无法解析」只是换了个词，用户仍不知道要重新登录。
+    var unparsableLine = (a.parsable === false)
+      ? '<div class="sub">账号文件存在但网关不会加载；请重新登录，或核对旧版凭证格式后再启用。</div>'
+      : '';
     return '<tr>' +
       '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
-      '<div class="sub mono">' + esc(idLine) + ' · ' + realmTag(a.realm) + '</div></td>' +
+      '<div class="sub mono">' + esc(idLine) + ' · ' + realmTag(a.realm) + '</div>' +
+      enterpriseLine + unparsableLine + '</td>' +
       '<td data-l="状态"><span class="cell-in">' + badge(st) +
       exhaustedSub + coolSub + rlmSub + credSub +
       '</span></td>' +

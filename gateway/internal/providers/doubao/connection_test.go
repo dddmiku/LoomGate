@@ -307,3 +307,21 @@ func TestDesktopReconnectionPreservesExistingProfileFields(t *testing.T) {
 		t.Fatal("reconnection discarded existing profile fields")
 	}
 }
+
+// TestDesktopConnectionMethodsReportMissingRuntimeReason 锁定 P2-01：
+// 没有官方客户端运行时（华为云等无桌面组件环境）时，desktop 方式必须不可用，
+// 且 reason=official_desktop_connection_required；前端据此给出精确说明，
+// 不得把该状态伪装成可点击的登录步骤。
+func TestDesktopConnectionMethodsReportMissingRuntimeReason(t *testing.T) {
+	d := &DesktopConnection{}
+	methods := d.Methods()
+	if len(methods) != 1 || methods[0].ID != "desktop" {
+		t.Fatalf("unexpected methods without fallback: %+v", methods)
+	}
+	if methods[0].Available {
+		t.Fatal("desktop method must be unavailable without a runtime")
+	}
+	if methods[0].Reason != "official_desktop_connection_required" {
+		t.Fatalf("reason=%q want official_desktop_connection_required", methods[0].Reason)
+	}
+}

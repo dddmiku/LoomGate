@@ -179,7 +179,7 @@ def build_target(data, ident, work_root, commit, release_version=""):
     out.mkdir(parents=True, exist_ok=True)
     # CI artifacts stay development builds; the official release gate passes
     # --version so the runtime manifest matches the Release tag exactly.
-    version = release_version or ("dev-" + commit[:12].lower())
+    version = release_version or "dev"
     built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flags = ("-s -w -X workbuddy2api/internal/version.Version=%s "
              "-X workbuddy2api/internal/version.Commit=%s -X workbuddy2api/internal/version.BuiltAt=%s "
@@ -210,7 +210,9 @@ def build_target(data, ident, work_root, commit, release_version=""):
             path = stage / name
             path.parent.mkdir(parents=True, exist_ok=True)
             # Only the runtime packager's explicit source allowlist is eligible.
-            path.write_bytes((GATEWAY / name).read_bytes().replace(b"\r\n", b"\n"))
+            # doubao-runtime/* is checked in under the repo-root tools/ tree, so
+            # resolve through source_path instead of assuming gateway/.
+            path.write_bytes(runtime_bundle.source_path(GATEWAY, name).read_bytes().replace(b"\r\n", b"\n"))
         arch = "armv" + target["goarm"] if target["goarch"] == "arm" else target["goarch"]
         runtime_bundle.package(stage, version, arch, out / target["runtime_asset"])
         artifacts.append(target["runtime_asset"])

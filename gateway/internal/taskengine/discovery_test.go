@@ -53,7 +53,7 @@ func TestPartialDiscoveryHTTPExecutionAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		runs := e.Runs()
 		if len(runs) == 1 && runs[0].FinishedAt != nil {

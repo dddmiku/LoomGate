@@ -26,6 +26,27 @@ function catalogOptions(){
   if(options.some(function(a){return a.id===chosen;}))account.value=chosen;
   account.disabled=provider.value!==''&&provider.value!=='doubao';
 }
+// 聚合目录 /api/models 里每个 provider 的命名空间是确定的：WorkBuddy 用
+// cn:/global:，Trae 用 trae:。豆包是账号级目录（/api/workbench/models 按账号
+// 返回、带 account_id），聚合目录里的 doubao:* 没有账号归属，不能猜。
+// 原实现是「非 trae 即 WorkBuddy」，于是豆包推理注册后 doubao:* 会混进
+// WorkBuddy 的目录，用户以为选的是 WorkBuddy 模型。未知命名空间同理丢弃。
+var LEGACY_PROVIDER_PREFIXES={workbuddy:['cn:','global:'],trae:['trae:']};
+function legacyCatalogGroups(items,provider){
+  var groups={};
+  (items||[]).forEach(function(m){
+    var id=m&&typeof m.id==='string'?m.id:'';
+    if(!id)return;
+    var owner='';
+    Object.keys(LEGACY_PROVIDER_PREFIXES).some(function(p){
+      if(LEGACY_PROVIDER_PREFIXES[p].some(function(prefix){return id.indexOf(prefix)===0;})){owner=p;return true;}
+      return false;
+    });
+    if(!owner||(provider&&provider!==owner))return;
+    (groups[owner]||(groups[owner]=[])).push(m);
+  });
+  return groups;
+}
 async function loomProviders(){
   catalogCancel();var generation=LC.generation,controller=new AbortController();LC.controller=controller;
   var timer=setTimeout(function(){controller.abort();},18000);
@@ -35,7 +56,7 @@ async function loomProviders(){
     LC.providers=meta.providers;LC.accounts=meta.accounts;LC.initialized=true;
     $('#providerGrid').innerHTML=meta.providers.map(function(p){
       var counts=p.accounts||{},isCatalogOnly=!p.inference_available;
-      return '<article class="loom-card" data-provider="'+esc(p.id)+'"><div class="card-head"><span class="provider-icon">'+esc(p.name.slice(0,1))+'</span><div><h3>'+esc(p.name)+'</h3><code>'+esc(p.id)+'</code></div></div><div class="loom-tags"><span class="loom-tag '+(isCatalogOnly?'wait':'good')+'">'+(isCatalogOnly?'目录与任务接入':'API 调用已接入')+'</span><span class="loom-tag">'+esc(counts.enabled||0)+' / '+esc(counts.total||0)+' 个账号启用</span></div><p>'+(isCatalogOnly?'可查看账号模型目录。消息转发与双登录仍在开发，当前不能通过网关调用这些模型。':'模型来自当前服务目录，可继续使用已有账号登录与网关 API。')+'</p>'+(p.error_code?'<p role="alert">'+esc(CERROR[p.error_code]||'服务状态暂时不可用。')+'</p>':'')+'<div class="card-actions"><button class="btn pri" data-catalog-provider="'+esc(p.id)+'">查看模型目录</button>'+(p.login_available?'<button class="btn" data-loom-add="'+esc(p.id)+'">管理账号</button>':'')+'</div></article>';
+      return '<article class="loom-card" data-provider="'+esc(p.id)+'"><div class="card-head"><span class="provider-icon">'+esc(p.name.slice(0,1))+'</span><div><h3>'+esc(p.name)+'</h3><code>'+esc(p.id)+'</code></div></div><div class="loom-tags"><span class="loom-tag '+(isCatalogOnly?'wait':'good')+'">'+(isCatalogOnly?'目录与任务接入':'API 调用已接入')+'</span><span class="loom-tag">'+esc(counts.enabled||0)+' / '+esc(counts.total||0)+' 个账号启用</span></div><p>'+(isCatalogOnly?'可查看账号模型目录。当前仅提供账号目录与任务接入，还不能通过网关调用这些模型。':'模型来自当前服务目录，可继续使用已有账号登录与网关 API。')+'</p>'+(p.error_code?'<p role="alert">'+esc(CERROR[p.error_code]||'服务状态暂时不可用。')+'</p>':'')+'<div class="card-actions"><button class="btn pri" data-catalog-provider="'+esc(p.id)+'">查看模型目录</button>'+(p.login_available?'<button class="btn" data-loom-add="'+esc(p.id)+'">管理账号</button>':'')+'</div></article>';
     }).join('')||loomEmpty('尚无已注册服务','服务配置就绪后可在此查看。');
     loomNotice('providersNotice',meta.accountError?'加密账号存储读取失败，豆包账号信息暂不可用。':'');
   }catch(e){if(generation!==LC.generation)return;$('#providerGrid').innerHTML=loomEmpty('服务信息读取失败','检查网关连接后，点击刷新目录重试。');loomNotice('providersNotice','无法读取当前服务能力。');}
@@ -67,7 +88,7 @@ async function loomModels(force,append){
     results.forEach(function(result){
       if(result.error){LC.rows.push({provider_id:result.kind==='legacy'?(provider||'legacy'):'doubao',status:'unavailable',error_code:'catalog_failed',models:[]});return;}
       if(result.kind==='legacy'){
-        var groups={};result.items.forEach(function(m){var p=String(m.id).indexOf('trae:')===0?'trae':'workbuddy';if(provider&&provider!==p)return;(groups[p]||(groups[p]=[])).push(m);});
+        var groups=legacyCatalogGroups(result.items,provider);
         Object.keys(groups).forEach(function(p){LC.rows.push({provider_id:p,status:'ready',routing_status:'available',scope:'provider',models:groups[p]});});
       }else{
         LC.rows=LC.rows.concat(result.page.catalogs||[]);LC.total=result.page.total||0;LC.offset=(result.page.offset||0)+(result.page.catalogs||[]).length;LC.hasMore=!!result.page.has_more;

@@ -1693,6 +1693,7 @@ type ModelInfo struct {
 	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
 	ReasoningEffort   string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
 	ReasoningSummary  string   // reasoning.summary 推理摘要模式（如 "auto"）
+	clientScoped      bool     // unexported: the upstream response included an authoritative agents[cli] allowlist.
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1833,7 +1834,31 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if enterprise.err != nil {
 		log.Printf("WARN: [上游] 拉模型列表：企业端点失败，仅剩 v3/config：%v", enterprise.err)
 	}
-	out := mergeModelInfos(v3.infos, enterprise.infos)
+	// Membership comes from a client allowlist. The broad v3 backend table
+	// may enrich those entries but may never expand their visible set.
+	// v3 白名单为主集（真实 /v3/config 带 agents[cli]，2026-10-29 抓包确证）；
+	// 企业端点（console 个人客户端目录）只补 v3 缺失的 id，条目字段以 v3 为准。
+	var out []ModelInfo
+	switch {
+	case v3.err == nil && v3ClientScoped(v3.infos):
+		out = append([]ModelInfo(nil), v3.infos...)
+		seenIDs := make(map[string]bool, len(out))
+		for _, mi := range out {
+			seenIDs[mi.ID] = true
+		}
+		for _, mi := range enterprise.infos {
+			if mi.ID == "" || seenIDs[mi.ID] {
+				continue
+			}
+			seenIDs[mi.ID] = true
+			mi.clientScoped = true
+			out = append(out, mi)
+		}
+	case enterprise.err == nil:
+		out = clientModelMetadata(enterprise.infos, v3.infos)
+	default:
+		return nil, fmt.Errorf("client model directory unavailable")
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
@@ -1857,6 +1882,75 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
 	c.storeEfforts(a.Realm(), cache, defCache)
 	return out, nil
+}
+
+// clientModelMetadata preserves the client directory's exact membership/order,
+// filling only blank display fields of each client entry from current v3
+// metadata (P1-01: whole-entry replacement dropped client-only capability
+// fields; blanks-only fill keeps the client directory authoritative).
+// visible may be nil (narrow enterprise response): metadata is then dropped,
+// the caller keeps nil infos (never invent object fields).
+func clientModelMetadata(visible, metadata []ModelInfo) []ModelInfo {
+	if len(visible) == 0 {
+		return nil
+	}
+	byID := make(map[string]*ModelInfo, len(metadata))
+	for i := range metadata {
+		byID[metadata[i].ID] = &metadata[i]
+	}
+	out := make([]ModelInfo, 0, len(visible))
+	seen := map[string]bool{}
+	for _, m := range visible {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		if rich, ok := byID[m.ID]; ok {
+			// Fill blanks only — never overwrite non-zero client fields.
+			if m.Name == "" {
+				m.Name = rich.Name
+			}
+			if m.ContextWindow == 0 {
+				m.ContextWindow = rich.ContextWindow
+			}
+			if m.MaxTokens == 0 {
+				m.MaxTokens = rich.MaxTokens
+			}
+			if len(m.Efforts) == 0 {
+				m.Efforts = rich.Efforts
+			}
+			if m.DefaultEffort == "" {
+				m.DefaultEffort = rich.DefaultEffort
+			}
+			if m.Description == "" {
+				m.Description = rich.Description
+			}
+			if m.Credits == "" {
+				m.Credits = rich.Credits
+			}
+			if len(m.Tags) == 0 {
+				m.Tags = rich.Tags
+			}
+			if m.Vendor == "" {
+				m.Vendor = rich.Vendor
+			}
+			if !m.SupportsImages && rich.SupportsImages {
+				m.SupportsImages = rich.SupportsImages
+			}
+			if !m.SupportsReasoning && rich.SupportsReasoning {
+				m.SupportsReasoning = rich.SupportsReasoning
+			}
+			if !m.SupportsToolCall && rich.SupportsToolCall {
+				m.SupportsToolCall = rich.SupportsToolCall
+			}
+			if m.MaxAllowedSize == 0 {
+				m.MaxAllowedSize = rich.MaxAllowedSize
+			}
+		}
+		m.clientScoped = true
+		out = append(out, m)
+	}
+	return out
 }
 
 // mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
@@ -1954,7 +2048,12 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		if !ok || m.Disabled {
 			continue
 		}
-		out = append(out, m.modelInfo())
+		mi := m.modelInfo()
+		// The enterprise endpoint's agents[cli].models is a client allowlist:
+		// mark every published row so a later merge can treat it as authoritative
+		// membership instead of a best-effort heuristic (P1-01).
+		mi.clientScoped = true
+		out = append(out, mi)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")

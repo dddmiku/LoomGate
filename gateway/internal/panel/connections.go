@@ -85,7 +85,7 @@ func (d *legacyConnection) Methods() []authflow.Method {
 }
 func safeLoginURL(raw string) bool {
 	u, e := url.Parse(raw)
-	return e == nil && u.Scheme == "https" && u.User == nil && (u.Hostname() == "www.workbuddy.ai" || u.Hostname() == "workbuddy.ai" || strings.HasSuffix(u.Hostname(), ".codebuddy.cn") || u.Hostname() == "www.codebuddy.cn" || strings.HasSuffix(u.Hostname(), ".workbuddy.ai") || u.Hostname() == "www.trae.cn" || u.Hostname() == "www.trae.ai" || u.Hostname() == "www.trae.com.cn")
+	return e == nil && u.Scheme == "https" && u.User == nil && (u.Hostname() == "www.workbuddy.ai" || u.Hostname() == "workbuddy.ai" || u.Hostname() == "copilot.tencent.com" || strings.HasSuffix(u.Hostname(), ".codebuddy.cn") || u.Hostname() == "www.codebuddy.cn" || strings.HasSuffix(u.Hostname(), ".workbuddy.ai") || u.Hostname() == "www.trae.cn" || u.Hostname() == "www.trae.ai" || u.Hostname() == "www.trae.com.cn")
 }
 func (d *legacyConnection) Start(ctx context.Context, r authflow.Request) (authflow.Result, error) {
 	if d.provider == "workbuddy" {

@@ -26,8 +26,13 @@ def main():
         def nav():
             if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
             page.locator('#navigation a[href="#accounts"]').click();page.locator('#account-provider').wait_for();choose_provider(page,'#account-provider','doubao');page.locator('#account-list .loading').wait_for(state='detached');page.locator('[data-action=connect-account]').wait_for()
-        def begin(method):
-            page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('doubao');page.locator('#connection-method').select_option(method);page.locator('#connection-begin').click()
+        def pick(selector,value):
+            page.locator(selector+' input[value="'+value+'"]').check()
+        def begin(method,provider='doubao',realm=None):
+            page.locator('[data-action=connect-account]').click();pick('#connection-provider',provider)
+            page.locator('#connection-provider').dispatch_event('change')
+            if realm:pick('#connection-realm',realm)
+            pick('#connection-method',method);page.locator('#connection-begin').click()
         fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
         page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
         assert 'sms_calls' in stats();page.request.post(base+'/__fixture/mode/success')
@@ -66,27 +71,33 @@ def main():
         page.reload();page.locator('[data-connection-resume="'+fid+'"]').wait_for();page.locator('[data-connection-resume="'+fid+'"]').click()
         page.locator('#connection-sensitive input[name=code]').wait_for();assert stats()['sms_calls']==0
         done('actual_process_restart_resumes_code_wait_without_resend')
-        stage='sms-verify';page.locator('#connection-sensitive input').fill('000000');page.locator('#connection-sensitive button').click();page.locator('#connection-commit').wait_for()
-        assert next(f for f in flows() if f['id']==fid)['status']=='verified'
-        page.locator('#connection-commit').click();page.locator('#connection-done').wait_for()
+        stage='sms-verify';page.locator('#connection-sensitive input').fill('000000');page.locator('#connection-sensitive button').click();page.locator('#connection-done').wait_for(timeout=20000)
         completed=next(f for f in flows() if f['id']==fid);assert completed['status']=='succeeded';aid=completed['account_id'];assert any(a['id']==aid for a in accounts())
         page.locator('#connection-done').click();done('official_protocol_fixture_verification_and_encrypted_account_commit')
-        stage='account-toggle';page.locator('#account-list').get_by_text(aid,exact=True).wait_for();row=page.locator('#account-list tbody tr').filter(has=page.get_by_text(aid,exact=True));row.locator('[data-action=toggle-account]').click();page.locator('#account-toggle-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
+        stage='account-toggle';page.locator('#account-list [data-account="'+aid+'"]').first.wait_for();row=page.locator('#account-list tbody tr').filter(has=page.locator('[data-account="'+aid+'"]'));row.locator('[data-action=toggle-account]').click();page.locator('#account-toggle-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
         assert not next(a for a in accounts() if a['id']==aid)['enabled']
-        page.locator('#account-list').get_by_text(aid,exact=True).wait_for();page.locator('#account-list tbody tr').filter(has=page.get_by_text(aid,exact=True)).locator('[data-action=toggle-account]').click();page.locator('#account-toggle-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden');assert next(a for a in accounts() if a['id']==aid)['enabled']
+        page.locator('#account-list [data-account="'+aid+'"]').first.wait_for();page.locator('#account-list tbody tr').filter(has=page.locator('[data-account="'+aid+'"]')).locator('[data-action=toggle-account]').click();page.locator('#account-toggle-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden');assert next(a for a in accounts() if a['id']==aid)['enabled']
         done('account_enable_disable_and_readback')
         stage='qr';begin('qr');page.locator('#connection-qr svg').wait_for(state='attached');shot('connection-qr.png')
         qr=next(f for f in flows() if f['status']=='waiting_scan');qbefore=stats()['qr_calls'];assert post('connections/start',{'provider':'doubao','method':'qr'}).status==409 and stats()['qr_calls']==qbefore
         page.get_by_text('豆包工作 · 已扫码，待确认',exact=True).wait_for(timeout=12000)
         assert next(f for f in flows() if f['id']==qr['id'])['status']=='scanned'
-        page.locator('#connection-commit').wait_for(timeout=15000);assert next(f for f in flows() if f['id']==qr['id'])['status']=='verified'
-        page.locator('#connection-cancel').click();page.locator('#connection-done').wait_for();page.locator('#connection-done').click();done('qr_wait_scan_confirm_verification_and_duplicate_start_guard')
+        page.locator('#connection-done').wait_for(timeout=25000);assert next(f for f in flows() if f['id']==qr['id'])['status'] in ('succeeded','verified')
+        page.locator('#connection-done').click();done('qr_wait_scan_confirm_verification_and_duplicate_start_guard')
         stage='expired';page.request.post(base+'/__fixture/mode/qr-expired');begin('qr');page.locator('#connection-qr svg').wait_for(state='attached');before=stats()['qr_calls'];page.get_by_text('豆包工作 · 已过期',exact=True).wait_for(timeout=12000);assert stats()['qr_calls']==before
         page.locator('#connection-done').click();done('official_qr_expiry_without_auto_refresh')
-        stage='challenge';page.request.post(base+'/__fixture/mode/challenge');begin('qr');page.get_by_text('豆包工作 · 需要人工处理',exact=True).wait_for();assert 'synthetic-private-rejection' not in page.locator('#dialog-body').inner_text();shot('connection-manual.png');page.locator('#connection-cancel').click();page.locator('#connection-done').click();done('manual_verification_preserves_safe_status')
-        stage='legacy-methods';page.request.post(base+'/__fixture/mode/success');page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('workbuddy');assert page.locator('#connection-realm').is_visible();page.locator('#connection-realm').select_option('global');page.locator('#connection-begin').click();page.locator('#connection-cancel').wait_for();page.locator('#connection-cancel').click();page.locator('#connection-done').click()
-        page.locator('[data-action=connect-account]').click();page.locator('#connection-provider').select_option('trae');page.locator('#connection-method').select_option('browser');page.locator('#connection-begin').click();page.locator('#connection-callback input').wait_for();done('existing_workbuddy_realms_and_trae_authorization_ui_retained')
-        stage='mobile';page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');shot('connection-mobile.png');page.locator('#connection-cancel').click();page.locator('#connection-done').click();done('mobile_auth_forms_and_dialog')
+        stage='challenge';page.request.post(base+'/__fixture/mode/challenge');begin('qr');page.get_by_text('豆包工作 · 需要人工处理',exact=True).wait_for();assert 'synthetic-private-rejection' not in page.locator('#dialog-body').inner_text();shot('connection-manual.png');page.locator('#connection-cancel').click();page.locator('#connection-done').click();page.locator('#dialog').wait_for(state='hidden');done('manual_verification_preserves_safe_status')
+        stage='legacy-methods';page.request.post(base+'/__fixture/mode/success')
+        page.locator('[data-action=connect-account]').click();pick('#connection-provider','workbuddy');page.locator('#connection-provider').dispatch_event('change');assert page.locator('#connection-realm').is_visible()
+        pick('#connection-realm','global');page.locator('#connection-realm').dispatch_event('change')
+        assert page.locator('#dialog').is_visible() and page.locator('#connection-method input:checked').count()==1
+        pick('#connection-realm','cn');page.locator('#connection-realm').dispatch_event('change')
+        assert page.locator('#dialog').is_visible() and page.locator('#connection-method input:checked').count()==1
+        done('realm_reselection_inside_open_drawer_rebuilds_methods')
+        pick('#connection-realm','global');pick('#connection-method','browser');page.locator('#connection-begin').click();page.locator('#connection-qr svg, a.official-link').first.wait_for();done('workbuddy_global_realm_drawer_opens_supported_method')
+        page.locator('#dialog-close').click();page.locator('#dialog').wait_for(state='hidden')
+        page.locator('[data-action=connect-account]').click();pick('#connection-provider','trae');page.locator('#connection-provider').dispatch_event('change');pick('#connection-method','browser');page.locator('#connection-begin').click();page.locator('#connection-callback input').wait_for();done('trae_authorization_ui_retained')
+        stage='mobile';page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');shot('connection-mobile.png');done('mobile_auth_forms_and_dialog');page.locator('#dialog-close').click();page.locator('#dialog').wait_for(state='hidden')
         stage='permissions';assert page.request.post(base+'/admin/api/connections/start',data={'provider':'trae','method':'browser'}).status==403
         assert page.request.post(base+'/admin/api/connections/start',data={'provider':'trae','method':'browser'},headers={'Origin':'https://foreign.invalid','X-Admin-Request':'1'}).status==403
         sidebar_action(page,'#logout',close=False);page.locator('#login-submit').wait_for();assert page.request.get(base+'/admin/api/connections/flows').status==401;done('authentication_management_permission_boundary')

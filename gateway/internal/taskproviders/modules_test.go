@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"workbuddy2api/internal/auth"
@@ -19,8 +20,8 @@ import (
 )
 
 type businessFixture struct {
-	mu                                                       sync.Mutex
-	counts                                                   map[string]int
+	mu                                                                                                      sync.Mutex
+	counts                                                                                                  map[string]int
 	checked, claimed, accepted, notAccepted, workDone, rejectAccept, failGrowth, brokenBalance, slowBalance bool
 }
 
@@ -141,7 +142,11 @@ func setupModules(t *testing.T) (*Accounts, *businessFixture, *pool.Pool) {
 }
 func waitModuleRun(t *testing.T, e *taskengine.Engine, id string) taskengine.Run {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	// Deadlock guard, not a latency assertion: each module run is bounded by
+	// the engine's own timeout. Under full-suite parallelism on Windows, child
+	// process startup and state fsync can take seconds; a tight wall-clock
+	// bound here produced false failures while the same test passed serially.
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
@@ -220,7 +225,6 @@ func TestWildcardContinuesModulesButPersistsPartialFailure(t *testing.T) {
 		t.Fatal("raw discovery error leaked")
 	}
 }
-
 
 func TestGrowthAcceptUnknownSurvivesRestartWithoutReplay(t *testing.T) {
 	a, f, _ := setupModules(t)
@@ -362,15 +366,128 @@ func TestBalanceMalformedCancellationDisabledAndForeignScope(t *testing.T) {
 	}
 }
 
+type catalogProbeModule struct {
+	moduleBase
+	started   chan<- string
+	active    *atomic.Int32
+	maxActive *atomic.Int32
+	wait      bool
+}
+
+func (m *catalogProbeModule) Discover(ctx context.Context, _ *auth.Auth) ([]taskengine.Definition, error) {
+	if m.active != nil {
+		current := m.active.Add(1)
+		for {
+			old := m.maxActive.Load()
+			if current <= old || m.maxActive.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		defer m.active.Add(-1)
+	}
+	if m.started != nil {
+		m.started <- m.Spec().ID
+	}
+	if m.wait {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []taskengine.Definition{m.definition}, nil
+}
+func (m *catalogProbeModule) Inspect(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.Observation{Phase: "ready"}, nil
+}
+func (m *catalogProbeModule) Execute(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.Observation{Phase: "pending"}, nil
+}
+func (m *catalogProbeModule) Claim(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.Observation{}, nil
+}
+func (m *catalogProbeModule) Verify(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.Observation{Phase: "done"}, nil
+}
+
+func TestDiscoverCatalogConcurrentBoundedAndIsolatesSlowModules(t *testing.T) {
+	a, _, _ := setupModules(t)
+	started := make(chan string, 8)
+	var active, maxActive atomic.Int32
+	makeModule := func(id, key string, slow bool) Module {
+		spec := ModuleSpec{ID: id, Key: key, Realms: []string{"cn"}}
+		return &catalogProbeModule{moduleBase: moduleBase{spec: spec, definition: taskengine.Definition{Key: key, Name: key}}, started: started, active: &active, maxActive: &maxActive, wait: slow}
+	}
+	a.Modules = []Module{makeModule("slow-a", "slow-a", true), makeModule("fast", "fast", false), makeModule("slow-b", "slow-b", true)}
+	a.ModuleTimeout = 35 * time.Millisecond
+	a.DiscoveryConcurrency = 2
+	begin := time.Now()
+	catalog, err := a.DiscoverCatalog(context.Background(), taskengine.Scope{AccountIDs: []string{"cn-fixture"}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(begin); elapsed > 250*time.Millisecond {
+		t.Fatalf("discovery waited serially: %v", elapsed)
+	}
+	if maxActive.Load() != 2 {
+		t.Fatalf("observed concurrency=%d want 2", maxActive.Load())
+	}
+	if len(catalog.Tasks) != 1 || catalog.Tasks[0].Key != "fast" {
+		t.Fatalf("fast result lost: %+v", catalog.Tasks)
+	}
+	if len(catalog.Issues) != 2 || catalog.Issues[0].ModuleID != "slow-a" || catalog.Issues[1].ModuleID != "slow-b" {
+		t.Fatalf("slow module issues lost or reordered: %+v", catalog.Issues)
+	}
+}
+
+func TestDiscoverCatalogParentCancellationStopsQueuedWork(t *testing.T) {
+	a, _, _ := setupModules(t)
+	started := make(chan string, 8)
+	var active, maxActive atomic.Int32
+	makeModule := func(id, key string) Module {
+		spec := ModuleSpec{ID: id, Key: key, Realms: []string{"cn"}}
+		return &catalogProbeModule{moduleBase: moduleBase{spec: spec, definition: taskengine.Definition{Key: key, Name: key}}, started: started, active: &active, maxActive: &maxActive, wait: true}
+	}
+	a.Modules = []Module{makeModule("slow-a", "slow-a"), makeModule("slow-b", "slow-b"), makeModule("queued", "queued")}
+	a.DiscoveryConcurrency = 1
+	a.ModuleTimeout = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.DiscoverCatalog(ctx, taskengine.Scope{AccountIDs: []string{"cn-fixture"}}, "")
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("cancel error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("discovery did not stop on parent cancellation")
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("queued discovery started after cancellation: %s", got)
+	default:
+	}
+}
+
 type testModule struct {
 	moduleBase
 	panicDiscover bool
 	inspect       func()
+	discover      func(context.Context, *auth.Auth) ([]taskengine.Definition, error)
 }
 
-func (m *testModule) Discover(context.Context, *auth.Auth) ([]taskengine.Definition, error) {
+func (m *testModule) Discover(ctx context.Context, account *auth.Auth) ([]taskengine.Definition, error) {
 	if m.panicDiscover {
 		panic("synthetic-private-panic")
+	}
+	if m.discover != nil {
+		return m.discover(ctx, account)
 	}
 	return []taskengine.Definition{m.definition}, nil
 }

@@ -72,7 +72,9 @@ def main():
         nav('tasks'); settled()
         assert page.locator('.scope-toolbar select,.scope-toolbar details').count() == 0
         assert page.locator('#task-provider [aria-pressed=true]').inner_text() == 'WorkBuddy'
-        assert page.locator('[data-task=balance]').count() == 3
+        # Grouped by provider+realm+task key: balance = one CN row + one global
+        # row, with the 3 accounts listed in each detail pane.
+        assert page.locator('[data-task=balance]').count() == 2
         choose_account(page, '#task-account', '1003'); settled()
         assert requests[-1]['query'] == {'provider': ['workbuddy'], 'accounts': ['1003']}
         assert page.locator('[data-task=balance]').count() == 1
@@ -80,7 +82,15 @@ def main():
         assert page.locator('#task-account').evaluate('(e)=>e===document.activeElement')
         choose_account(page, '#task-account', ''); settled()
         assert requests[-1]['query'] == {'provider': ['workbuddy']}
-        assert page.locator('[data-task=balance]').count() == 3
+        assert page.locator('[data-task=balance]').count() == 2
+        # Rows are ordered by Chinese task name, so realm order is not fixed:
+        # one row is the CN group (2 accounts) and the other is global (1).
+        rows = page.locator('[data-task=balance]'); counts = []
+        for i in range(rows.count()):
+            page.locator('[data-action=task-back]').click() if page.locator('[data-action=task-back]').is_visible() else None
+            rows.nth(i).click(); page.locator('#task-detail').wait_for()
+            counts.append(page.locator('#task-detail .account-task-row').count())
+        assert sorted(counts) == [1, 2], counts
         report['actions'].append('single_and_all_scope_reach_actual_catalog_and_change_task_rows')
         shot('filters-tasks-desktop.png')
         page.locator('#task-account').click(); shot('filters-account-desktop.png'); page.keyboard.press('Escape')
@@ -142,7 +152,7 @@ def main():
         page.locator('#account-search').fill('c-disabled')
         assert page.locator('#account-list tbody tr').count() == 1
         page.locator('[data-action=connect-account]').click()
-        assert page.locator('#connection-provider').input_value() == 'doubao'
+        assert page.locator('#connection-provider input:checked').get_attribute('value') == 'doubao'
         page.keyboard.press('Escape')
         report['actions'].append('model_scope_disabled_catalog_capabilities_and_connect_default')
 

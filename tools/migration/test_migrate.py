@@ -98,6 +98,49 @@ class LegacyScheduleConversionTests(unittest.TestCase):
                     self.convert(schedule)
             self.assertTrue(True)
 
+    def test_migrated_document_marks_the_legacy_import_as_already_done(self):
+        """迁移产物必须带 legacy_schedule_import_done，否则每次启动都会重新导入。
+
+        网关启动时还会跑一次「应用内旧计划导入」。它的判定是「引擎里已有计划
+        就视为用户数据，阻止导入并保持标记未完成」——对迁移出来的工作区，这
+        意味着每次启动都打印「旧版计划导入失败（下次启动会重试）」；更糟的是
+        用户从控制台删掉迁移来的计划后，下次启动会因为没有完成标记而把它们
+        重新写回去（schedule_behavior_test.go 已锁住应用内路径「删除不得复活」
+        的契约，离线迁移路径此前绕开了它）。
+        离线迁移本身就是那次导入，所以产物必须显式声明已完成。
+        """
+        doc = self.convert({"checkin_hours": [9]})
+        self.assertIs(doc.get("legacy_schedule_import_done"), True)
+        self.assertEqual(doc["version"], 4)
+
+    def test_every_imported_plan_keeps_the_original_switch_as_an_audit_fact(self):
+        """迁移计划必须带 legacy_enabled，否则控制台丢掉「旧版曾启用/未启用」。
+
+        启动时的应用内导入（cmd/server/workbench.go）给每条计划写
+        ``legacy_enabled``，控制台据此显示审计徽章；而离线迁移写入的
+        task-engine.json 原先只有 ``import.originally_enabled``（运行时不读取，
+        且引擎首次写盘就会把这个未知字段丢掉）。于是同一次升级，走应用内导入
+        能看到旧意图，走离线迁移就看不到——运维无法判断这条停用的计划原来是
+        开着还是关着。这里锁住每条计划都带一个布尔审计事实。
+        """
+        doc = self.convert({
+            "checkin_hours": [7, 19],
+            "checkin_enabled": False,
+            "trae_check_enabled": True,
+            "growth_enabled": True,
+            "school_enabled": False,
+        })
+        rows = doc["schedules"]
+        self.assertIs(rows["legacy-checkin"]["legacy_enabled"], False)
+        self.assertIs(rows["legacy-trae-check"]["legacy_enabled"], True)
+        self.assertIs(rows["legacy-growth"]["legacy_enabled"], True)
+        self.assertIs(rows["legacy-school"]["legacy_enabled"], False)
+        self.assertIs(rows["legacy-balance"]["legacy_enabled"], True)
+        for schedule_id, row in rows.items():
+            self.assertIsInstance(row.get("legacy_enabled"), bool, schedule_id)
+            # 计划本身仍然全部停用：升级不能自动恢复写操作。
+            self.assertFalse(row["enabled"], schedule_id)
+
     def test_engine_document_has_no_runs_or_uncertain_state(self):
         doc = self.convert({"checkin_hours": [8], "activity_enabled": False})
         self.assertEqual(doc["version"], 4)
@@ -105,6 +148,57 @@ class LegacyScheduleConversionTests(unittest.TestCase):
         for key in ("completed", "uncertain", "pending_tasks", "receipts", "attempts", "work"):
             self.assertEqual(doc[key], {})
         self.assertEqual(doc["schedules"]["legacy-checkin"]["account_ids"], [])
+
+    def test_task_keys_match_concrete_discovered_tasks(self):
+        """迁移出来的计划键必须能被新引擎的 TaskKeyMatches 命中。
+
+        旧 config 只有模块级排程：growth_hours 表示成长中心整条流水线，
+        travel_hours 表示 Buddy 旅行。新引擎按 ``TaskKeyMatches(pattern, key)``
+        过滤发现结果（逐字相等，或 pattern 以 "/" 结尾按前缀）。迁移工具原先直接
+        写入模块名 ``growth``/``travel``/``trae_check``：
+
+        - ``growth`` 匹配不到任何 ``growth/<任务码>`` —— 计划按点触发、发现 0 个
+          任务、以 skipped 结束，用户以为成长任务在跑；
+        - ``trae_check`` 更糟：Trae 适配器注册名是 ``trae``，真实任务键是
+          ``checkin``，这个计划不但发现不到任务，连 provider 都认不出；
+        - ``travel`` 同理匹配不到 ``travel/depart`` / ``travel/claim``。
+
+        这里用与 Go 侧相同的匹配语义做交叉校验，并锁住「静态键原样、动态模块用
+        模块前缀」的映射口径。
+        """
+        doc = self.convert({
+            "checkin_hours": [9], "trae_check_hours": [0], "travel_hours": [15],
+            "growth_hours": [12], "balance_hours": [14], "keepalive_hours": [22],
+        })
+        rows = doc["schedules"]
+
+        def matches(pattern, key):
+            if pattern in ("", "*"):
+                return True
+            if pattern == key:
+                return True
+            return pattern.endswith("/") and key.startswith(pattern)
+
+        # provider_id 必须是引擎真正注册的适配器名。
+        self.assertEqual(rows["legacy-trae-check"]["provider_id"], "trae")
+        self.assertEqual(rows["legacy-trae-check"]["task_key"], "checkin")
+        self.assertTrue(matches(rows["legacy-trae-check"]["task_key"], "checkin"))
+        # 静态任务键原样保留，且能命中真实键。
+        for schedule_id, key in (("legacy-checkin", "checkin"),
+                                ("legacy-balance", "balance"),
+                                ("legacy-keepalive", "keepalive")):
+            self.assertEqual(rows[schedule_id]["task_key"], key)
+            self.assertTrue(matches(rows[schedule_id]["task_key"], key))
+        # 动态模块导入为模块前缀，能展开真实发现键，但不会串到别的模块。
+        for schedule_id, prefix in (("legacy-growth", "growth/"),
+                                   ("legacy-travel", "travel/")):
+            self.assertEqual(rows[schedule_id]["task_key"], prefix)
+            self.assertTrue(matches(prefix, prefix + "synthetic-code"))
+            self.assertFalse(matches(prefix, "checkin"))
+            self.assertFalse(matches(prefix, "balance"))
+        # 裸模块名不再出现在任何导入计划里（这正是静默跳过的形态）。
+        for row in rows.values():
+            self.assertNotIn(row["task_key"], {"growth", "travel", "trae_check"})
 
 
 class MigrationScheduleIntegrationTests(unittest.TestCase):

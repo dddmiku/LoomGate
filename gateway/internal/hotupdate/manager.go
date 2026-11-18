@@ -73,6 +73,10 @@ type Status struct {
 	CheckedAt       time.Time `json:"checked_at"`
 	LastError       string    `json:"last_error"`
 	InheritedFD     bool      `json:"inherited_fd"`
+	// SignatureVerification 报告本二进制是否内置发布验签公钥。
+	// 面板必须按真实值显示「签名校验：已启用 / 未内置公钥」；笼统写「已签名的
+	// 运行包」会让开发构建看起来具备它并不具备的信任根（P1 发布口径）。
+	SignatureVerification bool `json:"signature_verification"`
 }
 
 // Options 构造参数。
@@ -548,6 +552,8 @@ func (m *Manager) statusLocked() Status {
 		CheckedAt:         m.checkedAt,
 		LastError:         m.lastError,
 		InheritedFD:       Inherited(),
+
+		SignatureVerification: version.ReleaseVerificationEnabled(),
 	}
 }
 

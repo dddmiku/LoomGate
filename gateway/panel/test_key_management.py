@@ -72,12 +72,33 @@ class KeyManagementTests(unittest.TestCase):
                 upstream.assert_not_called()
 
     def test_validates_body_size_type_and_ids(self):
-        cases = [("/api/keys", " " * 8193, 413), ("/api/keys", "[]", 400), ("/api/keys", "null", 400), ("/api/keys", "broken", 400), ("/api/keys/delete", '{"id":"../../config"}', 400), ("/api/keys/update", '{"id":"legacy","sha256":"x"}', 400)]
+        # 上限是 64 KiB（密钥库允许 64 项 × 256 字节的模型绑定，合法体可超过 8 KiB）；
+        # 8193 字节的纯空白不再是「超限」，而是「不是完整 JSON」。
+        cases = [("/api/keys", "[]", 400), ("/api/keys", "null", 400), ("/api/keys", "broken", 400), ("/api/keys/delete", '{"id":"../../config"}', 400), ("/api/keys/update", '{"id":"legacy","sha256":"x"}', 400)]
         for path, body, expected in cases:
             with self.subTest(path=path, body=body[:40]), patch.object(app.key_management, "request") as upstream:
                 self.assertEqual(self.request(path, body)[0], expected)
                 upstream.assert_not_called()
+        # 超限只看 Content-Length，不读 body：用声明的长度造超限请求，避免
+        # 客户端真写 64 KiB 时服务端已关闭连接、Windows 上变成 ConnectionReset。
+        with patch.object(app.key_management, "request") as upstream:
+            self.assertEqual(self.request(headers={"Content-Length": "65537"})[0], 413)
+            upstream.assert_not_called()
         self.assertEqual(self.request(headers={"Content-Type": "text/plain"})[0], 415)
+
+    def test_accepts_maximum_legal_model_binding_body(self):
+        """合法最大绑定（64 项 × 每项 200+ 字节）必须放行。
+
+        旧上限 8192 会把这种请求 413 掉，而密钥库本身允许同一份配置；
+        用户看到的是「请求体超过大小限制」，却找不到任何超限字段。
+        """
+        models = ["doubao:" + "m" * 190 + chr(97 + i % 26) + chr(97 + i // 26) for i in range(64)]
+        body = json.dumps({"name": "many", "models": models})
+        self.assertGreater(len(body), 8192)
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"),                 patch.object(app.key_management, "request", return_value=(201, {"ok": True, "key": "synthetic"})) as upstream:
+            code, result = self.request(body=body)
+            self.assertEqual(code, 201, result)
+            upstream.assert_called_once()
 
     def test_forwards_only_authenticated_management_requests(self):
         with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), patch.object(app.key_management, "request", return_value=(201, {"ok": True, "key": "synthetic-once"})) as upstream:
@@ -101,8 +122,16 @@ class KeyManagementTests(unittest.TestCase):
             # 不能保存成功却让调用方全撞 403。
             '{"id":"legacy","models":["deepseek-v4.1-flash"]}',
             '{"id":"legacy","models":["cn:deepseek-v4.1-flash","glm-5.2"]}',
-            '{"id":"legacy","models":["us:deepseek-v4.1-flash"]}',
+            # 前缀大小写非法（命名空间必须小写开头）。
+            '{"id":"legacy","models":["US:deepseek-v4.1-flash"]}',
+            '{"id":"legacy","models":[":deepseek-v4.1-flash"]}',
         ]
+        # 未知但语法合法的命名空间必须放行到网关：前缀是动态命名空间，
+        # 面板不维护平台表；该模型是否存在由网关按完整名比对。
+        with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"),                 patch.object(app.key_management, "request", return_value=(200, {"ok": True})) as upstream:
+            self.assertEqual(self.request("/api/keys/update",
+                                         '{"id":"legacy","models":["us:deepseek-v4.1-flash"]}')[0], 200)
+            upstream.assert_called_once()
         for body in bad_update:
             with self.subTest(body=body[:40]), patch.object(app.key_management, "request") as upstream:
                 self.assertEqual(self.request("/api/keys/update", body)[0], 400)
@@ -449,6 +478,29 @@ class ModelsEndpointTests(unittest.TestCase):
         self.assertEqual(body["models"], [])
         self.assertEqual(body["items"], [])
 
+    def test_provider_catalog_failures_reach_the_picker(self):
+        """某个 provider 的目录拉取失败必须传到面板，否则用户以为「模型就是少」。
+
+        Go 面板的 modelsPayload 已透传 /v1/models 的 provider_errors（P1-07，只含
+        {provider, code}），新控制台据此提示「部分渠道目录暂不可用」。Python 面板
+        （WB2API_PANEL_GO=0 兼容出口 / 容器默认）此前整体丢弃该字段：豆包目录超时
+        时模型选择器只剩 WorkBuddy 的模型，用户无法区分「没有这个模型」与「这个渠道
+        没读到」，可能误删已有绑定。这里锁住透传与字段白名单。
+        """
+        status, body = self.get_models({
+            "data": [{"id": "cn:only"}],
+            "provider_errors": [{"provider": "doubao", "code": "catalog_unavailable"},
+                                {"provider": "trae", "code": "catalog_timeout", "message": "upstream detail"}],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(body["provider_errors"], [
+            {"provider": "doubao", "code": "catalog_unavailable"},
+            {"provider": "trae", "code": "catalog_timeout"},
+        ], "只透传 provider/code，不得把上游原文 message 带进面板")
+        # 没有错误时字段整体省略，前端据此判断「全部渠道正常」。
+        status, body = self.get_models({"data": [{"id": "cn:only"}]})
+        self.assertNotIn("provider_errors", body)
+
     def post_models_refresh(self, gateway_result, models_payload):
         """gateway_result 为 (code, payload) 时按该码返回，否则视为 (200, payload)。"""
         """触发面板的「刷新模型」，返回 (面板响应, 是否真的调了网关刷新)。"""
@@ -524,9 +576,15 @@ class TraeModelBindingTest(unittest.TestCase):
             with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
                 self.sources[name] = fh.read()
 
-    def test_backend_accepts_trae_prefix(self):
-        self.assertIn(r"(cn|global|trae):.+", self.sources["app.py"])
-        self.assertNotIn(r're.fullmatch(r"(cn|global):.+"', self.sources["app.py"])
+    def test_backend_accepts_dynamic_provider_prefix(self):
+        # 前缀是动态命名空间（cn/global/trae/doubao/…），与 Go 面板的
+        # modelBindingError 和密钥库的 splitRealm 同一口径；写死 cn|global|trae
+        # 会把豆包模型绑定的合法请求拒成 400。
+        source = self.sources["app.py"]
+        self.assertIn("PREFIXED_MODEL_RE = re.compile(", source)
+        self.assertIn("^[a-z][a-z0-9_-]{0,31}:.+$", source)
+        self.assertIn("PREFIXED_MODEL_RE.fullmatch(item)", source)
+        self.assertNotIn(r're.fullmatch(r"(cn|global|trae):.+"', self.sources["app.py"])
 
     def _run_frontend_behavior(self, source_name, expression):
         from html.parser import HTMLParser

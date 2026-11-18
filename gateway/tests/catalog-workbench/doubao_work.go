@@ -47,7 +47,26 @@ func (f *doubaoWorkFixture) Activities(context.Context, doubao.RuntimeBinding) (
 func (f *doubaoWorkFixture) TaskAction(_ context.Context, _ doubao.RuntimeBinding, op, group, key, instance string) (doubao.Activity, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if op != "task_claim" || group != "synthetic-work-group" || key != "synthetic-work-task" || instance != "synthetic-work-instance" || f.state.Status != 2 {
+	if group != "synthetic-work-group" || key != "synthetic-work-task" || instance != "synthetic-work-instance" {
+		return doubao.Activity{}, errors.New("synthetic_action_rejected")
+	}
+	switch op {
+	case "task_start":
+		// The production adapter starts the official work instance before it
+		// generates content; without this the real execute chain is rejected
+		// and the fixture would test a path that can never happen upstream.
+		if f.state.Status != 1 {
+			return doubao.Activity{}, errors.New("synthetic_action_rejected")
+		}
+		f.state.Status = 4
+		out := f.snapshot()
+		out.OperationStatus = "submitted"
+		return out, nil
+	case "task_claim":
+		if f.state.Status != 2 {
+			return doubao.Activity{}, errors.New("synthetic_action_rejected")
+		}
+	default:
 		return doubao.Activity{}, errors.New("synthetic_action_rejected")
 	}
 	f.state.Claims++
@@ -83,11 +102,30 @@ func (f *doubaoWorkFixture) CompleteTask(ctx context.Context, q doubao.TaskWorkR
 		return inference.Result{}, ctx.Err()
 	}
 	f.state.Generated++
-	f.state.Status = 2
+	f.state.Status = 4
 	if err := f.save(); err != nil {
 		return inference.Result{Attempted: true}, err
 	}
-	return inference.Result{Text: "合成工作已完成", Attempted: true, Complete: true, Acknowledged: true, ConversationRef: "dialog-synthetic-work"}, nil
+	// The adapter only proceeds to the fact report with this private message id;
+	// generation alone must never be treated as task completion.
+	return inference.Result{Text: "合成工作已完成", Attempted: true, Complete: true, Acknowledged: true, ConversationRef: "dialog-synthetic-work", MessageID: "synthetic-work-message"}, nil
+}
+
+// TaskFact accepts only the signed id of this attempt's own message, matching
+// the production runtime contract. The activity status moves to completed (2).
+func (f *doubaoWorkFixture) TaskFact(_ context.Context, _ doubao.RuntimeBinding, group, key, instance, message string) (doubao.Activity, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if group != "synthetic-work-group" || key != "synthetic-work-task" || instance != "synthetic-work-instance" || message != "synthetic-work-message" || f.state.Status != 4 {
+		return doubao.Activity{}, errors.New("synthetic_fact_rejected")
+	}
+	f.state.Status = 2
+	if err := f.save(); err != nil {
+		return doubao.Activity{}, err
+	}
+	out := f.snapshot()
+	out.OperationStatus = "submitted"
+	return out, nil
 }
 func newDoubaoWorkFixture(root string, vault *accountvault.Vault) (*taskproviders.Doubao, *doubaoWorkFixture, *accountvault.Vault, error) {
 	state, err := accountvault.Open(filepath.Join(root, "data", "synthetic-work-state"))

@@ -246,7 +246,7 @@ func (s *Server) keysWithUsage(w http.ResponseWriter, r *http.Request) {
 
 // keysPost 处理密钥的创建/修改/删除/复制。
 //
-// 这些路由在**会话之前**分流（与 Python 版一致）：它们要在读 body 时就用 8192 的上限，
+// 这些路由在**会话之前**分流（与 Python 版一致）：密钥 body 要单独定上限，
 // 而通用路径要按路径决定上限。闸门本身一样不少——会话、同源、管理标记，缺一即拒。
 func (s *Server) keysPost(w http.ResponseWriter, r *http.Request, path string) {
 	if s.session(w, r, false) == nil {
@@ -258,7 +258,10 @@ func (s *Server) keysPost(w http.ResponseWriter, r *http.Request, path string) {
 			map[string]any{"ok": false, "message": "请求来源无效，请从管理页面重新操作"})
 		return
 	}
-	body, ok := s.readBody(w, r, 8192)
+	// 64 KiB 与密钥库的 AdminBodyLimit 对齐：单个密钥允许 64 项 × 每项最多
+	// 256 字节的模型绑定，合法 JSON 可以超过 8 KiB。再小的上限会把「模型多选」
+	// 正常配置拦成 413，用户看到的是「请求体超过大小限制」却找不到哪个字段超限。
+	body, ok := s.readBody(w, r, 64<<10)
 	if !ok {
 		return
 	}
@@ -478,7 +481,9 @@ func modelsPayload(payload map[string]any) map[string]any {
 		ids = append(ids, id)
 		item := map[string]any{"id": id}
 		for _, key := range []string{"credits", "name", "vendor", "tags", "description"} {
-			if value := entry[key]; value != nil && !isZeroJSON(value) {
+			// credits 的 0 / "x0.00" 是有效事实（免费模型），不能按 Python 假值
+			// 语义丢弃；其余展示字段仍按非零过滤（P1-07）。
+			if value := entry[key]; value != nil && (key == "credits" || !isZeroJSON(value)) {
 				item[key] = value
 			}
 		}
@@ -496,7 +501,15 @@ func modelsPayload(payload map[string]any) map[string]any {
 			unique = append(unique, id)
 		}
 	}
-	return map[string]any{"ok": true, "models": unique, "items": items}
+	out := map[string]any{"ok": true, "models": unique, "items": items}
+	// Provider-level catalog failures are already reduced to {provider, code}
+	// by /v1/models (never raw upstream text). Surface them so the model picker
+	// can say "部分渠道目录暂不可用" instead of silently showing a short list
+	// (P1-07).
+	if errors, ok := payload["provider_errors"].([]any); ok && len(errors) > 0 {
+		out["provider_errors"] = errors
+	}
+	return out
 }
 
 // isZeroJSON 判断 JSON 值是否「假值」（Python 的 `if item.get(key)` 语义）。

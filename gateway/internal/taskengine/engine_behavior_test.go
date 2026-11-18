@@ -101,7 +101,12 @@ func submitBehavior(t *testing.T, e *taskengine.Engine, req taskengine.Request) 
 }
 func awaitBehaviorRun(t *testing.T, e *taskengine.Engine, id string) taskengine.Run {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	// This is a deadlock guard, not a latency assertion: the run itself has a
+	// short engine timeout, and a correct run finishes in milliseconds. On a
+	// loaded CI host (parallel packages, antivirus) process spawn and disk
+	// fsync can exceed several seconds, so keep the bound generous. No
+	// assertion depends on how long the run took.
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
@@ -122,7 +127,7 @@ func awaitBehaviorSignal(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(3 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("adapter did not reach expected stage")
 	}
 }

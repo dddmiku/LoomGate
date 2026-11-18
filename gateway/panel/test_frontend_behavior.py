@@ -59,7 +59,7 @@ function node(rawId) {
 // window 必须存在：requests.js 等模块在加载时就会写 window.loadRequests /
 // window.openRequestsForKey，缺了它整个脚本会在解析期抛错，测试根本进不到断言。
 const win = {addEventListener(){}, location:{origin:'http://fixture.invalid',hash:'#overview'}};
-const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON, Object, Array, String, Number, Boolean, Error, RegExp, Math,
+const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON, Object, Array, String, Number, Boolean, Error, RegExp, Math, AbortController,
   setTimeout(){return 1},clearTimeout(){},setInterval(){return 1},clearInterval(){},
   location:{origin:'http://fixture.invalid',hash:'#overview',replace(){}},
   history:{replaceState(){}},localStorage:{getItem(){return null},setItem(){}},
@@ -539,6 +539,35 @@ return {empty:empty, badgeEmpty:badgeEmpty, badgeOne:badgeOne, badgeAll:badgeAll
         self.assertEqual(result["badgeOne"], "1/2")
         self.assertEqual(result["badgeAll"], "", "不过滤时不显示计数徽标")
 
+    def test_partial_provider_catalog_failure_is_shown_in_the_model_picker(self):
+        """渠道目录失败必须提示，不能让人以为「模型本来就只有这些」。
+
+        /api/models 的 provider_errors 表示某个渠道（如豆包）的目录没读到。
+        不提示的话，模型选择器只剩 WorkBuddy 的模型，运维可能据此删掉豆包绑定。
+        提示只列渠道名，不渲染上游原文（后端只透传 {provider,code}）；全部渠道
+        失败、列表为空时也必须出现。
+        """
+        result = self.run_frontend("""
+KS.modelItems=[{id:'cn:glm-5.3',credits:'x0.11'}];
+KS.providerErrors=[{provider:'doubao',code:'catalog_unavailable'}];
+renderModelPanel();
+var partial=$('#keyModelPanel').innerHTML;
+KS.modelItems=[];
+renderModelPanel();
+var empty=$('#keyModelPanel').innerHTML;
+KS.providerErrors=[];
+KS.modelItems=[{id:'cn:glm-5.3'}];
+renderModelPanel();
+var normal=$('#keyModelPanel').innerHTML;
+return {partial:partial, empty:empty, normal:normal};
+""", extra_sources=("keys.js",))
+        self.assertIn("部分渠道目录暂不可用", result["partial"])
+        self.assertIn("豆包", result["partial"])
+        self.assertIn("已有绑定保留", result["partial"])
+        self.assertNotIn("catalog_unavailable", result["partial"], "不得把内部错误码当文案渲染")
+        self.assertIn("部分渠道目录暂不可用", result["empty"], "全部渠道失败时也要说明原因")
+        self.assertNotIn("部分渠道目录暂不可用", result["normal"], "渠道都正常时不得出现告警")
+
 
     def test_expiring_credits_are_surfaced(self):
         """快过期积分必须显示出来——到期即作废，运维得知道有积分要浪费了。
@@ -871,7 +900,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class VersionAndModelRefreshTest(unittest.TestCase):
+class VersionAndModelRefreshTest(FrontendHarness, unittest.TestCase):
     """锁定两处用户实测反馈的修复。
 
     1) 顶栏版本号渲染成 "wv2.6.26"：网关版本号自带 "v" 前缀（VERSION 文件是
@@ -898,10 +927,55 @@ class VersionAndModelRefreshTest(unittest.TestCase):
         # 静默：自动刷新失败不该弹错误打断编辑。
         self.assertIn("opts.toast !== false", self.keys_js)
 
+    def test_model_name_length_matches_key_store_limit(self):
+        """旧面板曾按 64 字符拦模型名，而密钥库允许 256 字节。
+
+        豆包的完整模型名是 `doubao:<mode>:<上游 ID>`，很容易超过 64 字符。
+        同一份绑定从新控制台/API 保存成功、从旧面板保存失败——同一配置两个入口
+        结论不同。这里锁住两件事：上限与密钥库一致（256），且打包产物同步更新。
+        """
+        self.assertIn("item.length > 256", self.keys_js)
+        self.assertIn("item.length > 256", self.index)
+        self.assertNotIn("item.length > 64", self.keys_js)
+        self.assertNotIn("item.length > 64", self.index)
+
     def test_manual_refresh_still_toasts(self):
         """手动点刷新仍要有反馈（不能因为抽函数把提示弄丢）。"""
         self.assertIn("toast('模型列表已刷新", self.keys_js)
         self.assertIn("btnRefreshModels", self.keys_js)
+
+    def test_legacy_catalog_never_attributes_doubao_models_to_workbuddy(self):
+        """旧面板把「非 trae」的模型全部归到 WorkBuddy。
+
+        /api/models 是聚合目录（cn:/global:/trae:/doubao:…）。豆包推理接入后，
+        `doubao:*` 会出现在 WorkBuddy 的目录里——用户以为选的是 WorkBuddy 模型，
+        实际调用走豆包。豆包是账号级目录（另有 /api/workbench/models 按账号返回），
+        聚合目录里的豆包条目没有账号归属，不能靠猜来展示。未知命名空间同理：
+        宁可丢弃，也不能冒充某个已有服务。
+        """
+        result = self.run_frontend("""
+var items=[{id:'cn:deepseek'},{id:'global:gpt'},{id:'trae:seed'},
+           {id:'doubao:synthetic:text'},{id:'future:model'}];
+var all=legacyCatalogGroups(items,'');
+return {
+  providers:Object.keys(all).sort(),
+  workbuddy:all.workbuddy.map(function(m){return m.id;}),
+  trae:all.trae.map(function(m){return m.id;}),
+  doubao:!!all.doubao,
+  future:!!all.future,
+  filtered:Object.keys(legacyCatalogGroups(items,'trae')).sort()
+};
+""", extra_sources=("catalog.js",))
+        self.assertEqual(result["providers"], ["trae", "workbuddy"])
+        self.assertEqual(result["workbuddy"], ["cn:deepseek", "global:gpt"])
+        self.assertEqual(result["trae"], ["trae:seed"])
+        self.assertFalse(result["doubao"], "豆包模型不能出现在旧面板的 WorkBuddy 分组里")
+        self.assertFalse(result["future"], "未知命名空间不能继承 WorkBuddy")
+        self.assertEqual(result["filtered"], ["trae"], "按服务筛选时只保留该服务的分组")
+        # 打包产物必须同步：旧面板部署的是单文件 index.html，只改 catalog.js
+        # 对用户无效。
+        self.assertIn("legacyCatalogGroups", self.index)
+        self.assertNotIn("indexOf('trae:')===0?'trae':'workbuddy'", self.index)
 
 
 

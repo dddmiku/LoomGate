@@ -13,7 +13,7 @@
 // 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
 // 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
 
-var KS = {keys:null, loading:false, error:'', query:'', models:null, modelItems:null, modelsLoading:false, modelQuery:'', guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
+var KS = {keys:null, loading:false, error:'', query:'', models:null, modelItems:null, providerErrors:[], modelsLoading:false, modelQuery:'', guardDefault:true, revision:0, limits:null, limitsError:'', usageAvailable:true};
 var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false, active:false, recoverable:false, mode:'edit'};
 
 function keyGuardEnabled(key){
@@ -83,7 +83,11 @@ async function loadKeyModels(){
     KS.modelItems = (result && Array.isArray(result.items) && result.items.length)
       ? result.items
       : KS.models.map(function(id){ return {id:id}; });
-  }catch(error){ KS.models = []; KS.modelItems = []; }
+    // provider_errors 表示某个渠道的目录没读到（如豆包超时）。不显示它，
+    // 用户会把「这个渠道失败」当成「本来就没有这些模型」，甚至据此删掉已有
+    // 绑定。只含 {provider,code}，不展示上游原文。
+    KS.providerErrors = (result && Array.isArray(result.provider_errors)) ? result.provider_errors : [];
+  }catch(error){ KS.models = []; KS.modelItems = []; KS.providerErrors = []; }
   finally{
     KS.modelsLoading = false;
     renderModelPanel();
@@ -154,19 +158,30 @@ function renderModelPanel(){
   var panel = $('#keyModelPanel');
   if (!panel) return;
   var all = KS.modelItems || [];
+  // 渠道级目录失败提示：只列出失败渠道，不展示上游原文。必须在空列表分支
+  // 之前算——「全部渠道都失败」时列表为空，只显示「暂时读不到模型列表」
+  // 看不出是哪个渠道，也看不出「已有绑定仍然保留」。
+  var providerErrors = Array.isArray(KS.providerErrors) ? KS.providerErrors : [];
+  // 渠道显示名：只在这一处用，写成局部常量避免依赖 workspace.js 的加载顺序。
+  var providerLabel = {workbuddy:'WorkBuddy',trae:'Trae',doubao:'豆包'};
+  var errorNote = providerErrors.length
+    ? '<div class="mempty" role="status">部分渠道目录暂不可用（' +
+      esc(providerErrors.map(function(e){ return providerLabel[e.provider] || e.provider; }).join('、')) +
+      '）。列表可能不完整；已有绑定保留，可点「刷新」重试。</div>'
+    : '';
   if (!all.length){
-    panel.innerHTML = '<div class="mempty">' + (KS.modelsLoading ? '正在读取模型列表…' : '暂时读不到模型列表') + '</div>';
+    panel.innerHTML = errorNote + '<div class="mempty">' + (KS.modelsLoading ? '正在读取模型列表…' : '暂时读不到模型列表') + '</div>';
     updateModelCount(0, 0);
     return;
   }
   var items = filteredModelItems();
   updateModelCount(items.length, all.length);
   if (!items.length){
-    panel.innerHTML = '<div class="mempty">没有匹配「' + esc(KS.modelQuery) + '」的模型</div>';
+    panel.innerHTML = errorNote + '<div class="mempty">没有匹配「' + esc(KS.modelQuery) + '」的模型</div>';
     return;
   }
   var chosen = currentModels();
-  panel.innerHTML = items.map(function(item){
+  panel.innerHTML = errorNote + items.map(function(item){
     var on = chosen.indexOf(item.id) >= 0;
     var caps = [];
     if (item.supports_images) caps.push('图片');
@@ -525,6 +540,10 @@ async function refreshKeyModels(options){
     if (result && result.ok === false) throw new Error(result.message || '刷新失败');
     KS.models = (result && Array.isArray(result.models)) ? result.models : KS.models;
     KS.modelItems = (result && Array.isArray(result.items)) ? result.items : KS.modelItems;
+    // 刷新结果同样要带上渠道级失败：刷新后某渠道仍失败时，用户看到的仍是
+    // 残缺列表，不能在这次操作里把这个事实丢掉（只有成功路径会走到这里，
+    // 网关明确 ok=true 才返回列表）。
+    KS.providerErrors = (result && Array.isArray(result.provider_errors)) ? result.provider_errors : [];
     renderModelPanel(); renderModelTags();
     if (opts.toast !== false){
       toast('模型列表已刷新（' + ((KS.modelItems || []).length) + ' 个）', 'ok');
@@ -559,7 +578,10 @@ $('#keyForm').addEventListener('submit', async function(event){
   var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value), reasoning_loop_guard:$('#keyGuard').checked, global_fallback_to_cn:$('#keyGlobalFallback').checked};
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
-  if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
+  // 单项上限与密钥库一致（256 字节）：豆包的完整模型名是
+  // doubao:<mode>:<上游 ID>，很容易超过 64 字符。旧面板在这里按 64 拦，
+  // 而同一份绑定从新控制台/API 保存是成功的——同一份配置两个入口结论不同。
+  if (body.models.some(function(item){return item.length > 256;})){keyFormError('单个模型名不能超过 256 个字符');$('#keyModels').focus();return;}
   // 绑定按完整模型名逐字比对，裸名一条也匹配不上（模型列表里没有裸名）。
   // 手填时先在这里拦住，免得保存成功却调用全 403。
   if (body.models.some(function(item){return !isCatalogModel(item);})){

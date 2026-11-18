@@ -27,7 +27,33 @@ var runtimeFiles = map[string]os.FileMode{
 	// 补偿积分领取（一次性任务）的执行体。必须与 scripts/runtime_bundle.py 的
 	// FILES 同步——TestRuntimeFileListsMatch 会拦住漏改的那一侧。
 	"scripts/compensation_claim.py": 0644,
+	// 豆包官方桌面目录桥接。Linux 运行包带上它，才能在已运行官方客户端的机器上
+	// 通过回环端口连接现有会话（不启动、不托管客户端）。它们是一整组：
+	// 要么全部带上，要么整组省略——半包会让工作台在运行期才发现缺 helper。
+	"doubao-runtime/bridge.py":        0644,
+	"doubao-runtime/managed.py":       0644,
+	"doubao-runtime/stream_bridge.py": 0644,
+	"doubao-runtime/runtime.js":       0644,
+	"doubao-runtime/tasks_runtime.js": 0644,
+	"doubao-runtime/work_runtime.js":  0644,
+	"doubao-runtime/stream_runtime.js": 0644,
+	"doubao-runtime/probe_runtime.js": 0644,
+	"doubao-runtime/probe_cleanup.js": 0644,
+	"doubao-runtime/requirements.txt": 0644,
 }
+
+// doubaoRuntimeFiles is the optional group above. Bundles released before the
+// group existed carry only legacyRuntimeFiles; accepting them keeps the
+// upgrade path of the v3.16.1 baseline intact.
+var doubaoRuntimeFiles = map[string]bool{
+	"doubao-runtime/bridge.py": true, "doubao-runtime/managed.py": true,
+	"doubao-runtime/stream_bridge.py": true, "doubao-runtime/runtime.js": true,
+	"doubao-runtime/tasks_runtime.js": true, "doubao-runtime/work_runtime.js": true,
+	"doubao-runtime/stream_runtime.js": true, "doubao-runtime/probe_runtime.js": true,
+	"doubao-runtime/probe_cleanup.js": true, "doubao-runtime/requirements.txt": true,
+}
+
+func legacyRuntimeFileCount() int { return len(runtimeFiles) - len(doubaoRuntimeFiles) }
 
 type runtimeManifest struct {
 	Format  int               `json:"format"`
@@ -67,6 +93,20 @@ func extractRuntimeBundle(archive string, release Release, dir string) (binary s
 	defer root.Close()
 	if err := root.Mkdir("scripts", 0700); err != nil {
 		return "", err
+	}
+	// Runtime members may live in nested directories (scripts/, doubao-runtime/).
+	// os.Root.OpenFile does not create parents, so the package layout decides
+	// which directories exist. Create them from the allowlist instead of
+	// hard-coding one path: a member whose parent is missing would otherwise
+	// fail with a bare "cannot find the path" after the archive was accepted.
+	for name := range runtimeFiles {
+		dir := filepath.Dir(filepath.FromSlash(name))
+		if dir == "." {
+			continue
+		}
+		if err := root.MkdirAll(dir, 0700); err != nil {
+			return "", err
+		}
 	}
 	decoded := &io.LimitedReader{R: gz, N: 256<<20 + 1}
 	reader := tar.NewReader(decoded)
@@ -145,10 +185,29 @@ func extractRuntimeBundle(archive string, release Release, dir string) (binary s
 	if !manifestSeen || manifest.Format != 1 || manifest.OS != "linux" || manifest.Arch != runtime.GOARCH || strings.TrimPrefix(manifest.Version, "v") != strings.TrimPrefix(release.Tag, "v") {
 		return "", fmt.Errorf("runtime manifest does not match release/platform")
 	}
-	if len(manifest.Files) != len(runtimeFiles) || len(hashes) != len(runtimeFiles) {
+	// The Doubao helper group is optional as a whole: bundles released before
+	// it existed (the v3.16.1 upgrade path) carry only the legacy members.
+	// Half a group is never acceptable — that would start a workbench whose
+	// login path is missing a helper only at runtime.
+	present := 0
+	for name := range doubaoRuntimeFiles {
+		if manifest.Files[name] != "" || hashes[name] != "" {
+			present++
+		}
+	}
+	expected := len(runtimeFiles)
+	if present == 0 {
+		expected = legacyRuntimeFileCount()
+	} else if present != len(doubaoRuntimeFiles) {
+		return "", fmt.Errorf("runtime bundle has a partial optional component group")
+	}
+	if len(manifest.Files) != expected || len(hashes) != expected {
 		return "", fmt.Errorf("runtime bundle is missing required files")
 	}
 	for name := range runtimeFiles {
+		if manifest.Files[name] == "" && present == 0 && doubaoRuntimeFiles[name] {
+			continue
+		}
 		if len(manifest.Files[name]) != 64 || !strings.EqualFold(manifest.Files[name], hashes[name]) {
 			return "", fmt.Errorf("runtime digest mismatch for %s", name)
 		}

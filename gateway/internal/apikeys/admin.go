@@ -46,6 +46,13 @@ func parseExpiry(raw *string) (*time.Time, error) {
 	return &parsed, nil
 }
 
+// AdminBodyLimit 是密钥管理接口允许的最大请求体字节数。
+//
+// 不能用更小的固定值：密钥库本身允许 64 项 × 每项最多 256 字节的模型绑定，
+// 外加名称/备注/有效期，合法请求体可以到十几 KiB。上限只负责挡住明显异常的大包，
+// 字段级约束仍由 Store 的校验承担。
+const AdminBodyLimit = 64 << 10
+
 func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 	guardDefault := true
 	if len(defaultGuard) > 0 {
@@ -172,7 +179,7 @@ func (s *Store) AdminHandler(defaultGuard ...bool) http.Handler {
 }
 
 func readBody(w http.ResponseWriter, r *http.Request, out any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	r.Body = http.MaxBytesReader(w, r.Body, AdminBodyLimit)
 	defer r.Body.Close()
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -184,7 +191,7 @@ func readBody(w http.ResponseWriter, r *http.Request, out any) bool {
 		}
 	}
 	if err != nil {
-		reply(w, 400, map[string]any{"ok": false, "message": "请输入有效的密钥信息（请求体最多 8 KiB）"})
+		reply(w, 400, map[string]any{"ok": false, "message": "请输入有效的密钥信息（请求体最多 64 KiB）"})
 		return false
 	}
 	return true

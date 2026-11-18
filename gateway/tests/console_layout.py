@@ -36,7 +36,7 @@ def main():
   page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
   for width in (1440,1024,768,390,320):
    page.set_viewport_size({'width':width,'height':1000 if width>900 else 844})
-   for route in ('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','settings'):
+   for route in ('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings'):
     stage=f'{width}:{route}';nav(route);bounds();report['pages']+=1
     if width<=900:assert not page.locator('#navigation').is_visible()
     assert page.locator('.hero,.metrics,.card,.eyebrow').count()==0
@@ -48,7 +48,7 @@ def main():
     if (width,route) in ((1440,'overview'),(1440,'models'),(390,'models'),(390,'overview'),(1024,'providers')):shot(f'layout-{width}-{route}.png')
    if width<=900:
     page.locator('#navigation-toggle').click();links=page.locator('#navigation a')
-    assert links.count()==10
+    assert links.count()==len(('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings'))
     sidebar=page.locator('#sidebar').bounding_box()
     assert sidebar['x']==0 and sidebar['height']>=page.viewport_size['height']-sidebar['y']-1
     for link in links.all():
@@ -62,10 +62,12 @@ def main():
    if width<=700:
     assert page.locator('#model-account').is_visible()
     assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
-   stage=f'{width}:plan-dialog';nav('schedules');page.locator('[data-action=new-schedule]').click();page.locator('#plan-provider').select_option('doubao');page.locator('#plan-next:not([disabled])').wait_for();page.locator('#plan-task').select_option('fixture-check');page.locator('input[name=plan-account]').first.check();plan_timing(page);plan_times(page,['08:20','18:20']);plan_review(page)
+   stage=f'{width}:plan-dialog';nav('tasks');choose_provider(page,'#task-provider','doubao');page.locator('[data-task]').first.wait_for()
+   page.locator('[data-action=select-task-group]').first.click();page.locator('#task-detail [data-action=task-schedule-group]').wait_for();page.locator('#task-detail [data-action=task-schedule-group]').click()
+   plan_times(page,['08:20','18:20'])
    bounds();assert page.locator('#dialog').evaluate('(d)=>d.scrollWidth<=d.clientWidth+1')
    assert page.locator('#plan-save').is_visible();page.locator('#plan-save').scroll_into_view_if_needed()
-   page.locator('#plan-enabled').scroll_into_view_if_needed()
+   page.locator('#plan-enabled-quick').scroll_into_view_if_needed()
    title=page.locator('#dialog-title').bounding_box();assert title and title['y']>=0 and title['y']+title['height']<page.viewport_size['height']
    b=page.locator('#plan-save').bounding_box();assert b['x']>=0 and b['x']+b['width']<=width
    if width==390:page.screenshot(path=str(out/'layout-mobile-plan-dialog.png'),full_page=False);report['screenshots'].append('layout-mobile-plan-dialog.png')

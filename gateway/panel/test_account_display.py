@@ -23,6 +23,42 @@ class AccountDisplayTests(unittest.TestCase):
         self.app_py = read("app.py")
         self.index = read("index.html")
 
+    def test_unparsable_credentials_are_never_shown_as_a_normal_disabled_account(self):
+        """凭证文件解析失败必须显式标出，不能与「停用/不在池」混为一谈。
+
+        服务端 `AuthSummary.parsable=false` 表示这个账号文件网关根本不会加载
+        （readAuthDoc 解析失败返回空 map）。旧面板不看这个字段，`acctState()`
+        会把它渲染成「不在池中」——看起来像「还没加载」，用户不知道该重新登录；
+        更糟的是按「账号可用」排序时它与真正的健康号无从区分。新控制台
+        （authSummaryRow/credentialWarning）已修，旧面板（WB2API_PANEL_GO=0
+        的兼容出口）此前遗漏。
+        """
+        self.assertIn("parsable", self.app_js)
+        self.assertIn("凭证无法解析", self.app_js)
+        self.assertIn("凭证无法解析", self.index)
+
+    def test_enterprise_id_is_rendered_when_the_server_provides_it(self):
+        """WorkBuddy 账号带 enterpriseId（企业租户），面板此前整体丢弃。
+
+        多租户部署下同名账号/同昵称很常见，没有企业标识就无法区分；Trae 侧
+        也有它自己的 enterpriseId。字段缺失时不能显示空标签。
+        """
+        self.assertIn("enterpriseId", self.app_js)
+        self.assertIn("enterpriseId", self.index)
+
+    def test_account_search_also_matches_mobile_and_enterprise(self):
+        """账号搜索必须能按手机号/企业命中。
+
+        Trae 的 uid 是内部数字、WorkBuddy 的昵称可能重复；运维手上只有手机号或
+        企业名时，搜索框只比 nickname/uid 就等于搜不到。旧面板与新控制台
+        （account-summary 修复时加了 mobile/enterpriseId）此处必须一致。
+        """
+        self.assertIn("a.mobile || ''", self.app_js)
+        self.assertIn("a.enterpriseId || ''", self.app_js)
+        self.assertIn("a.mobile || ''", self.index)
+        self.assertIn("a.enterpriseId || ''", self.index)
+
+
     def test_state_exposes_cooldown_ledger(self):
         # 面板需要冷却剩余、冷却类别、原因与累计计数才能渲染状态列。
         for field in ("coolRemaining", "coolKind", "reason", "successCount", "errTotal"):

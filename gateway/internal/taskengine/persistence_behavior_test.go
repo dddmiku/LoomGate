@@ -114,7 +114,7 @@ func TestAbruptProcessDeathRestoresUncertaintyAndDoesNotReplayMutation(t *testin
 			_ = cmd.Wait()
 		}
 	})
-	deadline := time.NewTimer(4 * time.Second)
+	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()

@@ -9,16 +9,19 @@ import (
 )
 
 type persisted struct {
-	Version         int                      `json:"version"`
-	Schedules       map[string]Schedule      `json:"schedules"`
-	Runs            []Run                    `json:"runs"`
-	Completed       map[string]time.Time     `json:"completed"`
-	Uncertain       map[string]Stage         `json:"uncertain"`
-	PendingTasks    map[string]Task          `json:"pending_tasks,omitempty"`
-	Receipts        map[string]actionReceipt `json:"receipts,omitempty"`
-	LegacyCompleted map[string]time.Time     `json:"legacy_completed,omitempty"`
-	Work            map[string]runWork       `json:"work,omitempty"`
-	Attempts        map[string]actionReceipt `json:"attempts,omitempty"`
+	Version                  int                      `json:"version"`
+	Schedules                map[string]Schedule      `json:"schedules"`
+	Runs                     []Run                    `json:"runs"`
+	Completed                map[string]time.Time     `json:"completed"`
+	Uncertain                map[string]Stage         `json:"uncertain"`
+	PendingTasks             map[string]Task          `json:"pending_tasks,omitempty"`
+	Receipts                 map[string]actionReceipt `json:"receipts,omitempty"`
+	LegacyCompleted          map[string]time.Time     `json:"legacy_completed,omitempty"`
+	Work                     map[string]runWork       `json:"work,omitempty"`
+	Attempts                 map[string]actionReceipt `json:"attempts,omitempty"`
+	LegacyScheduleImportDone bool                     `json:"legacy_schedule_import_done,omitempty"`
+	ScheduleDefaultImports   map[string]bool          `json:"schedule_default_imports,omitempty"`
+	DeletedSchedules         map[string]bool          `json:"deleted_schedules,omitempty"`
 }
 
 type runWork struct {
@@ -30,8 +33,13 @@ type runWork struct {
 	CancelRequested bool            `json:"cancel_requested,omitempty"`
 }
 
+// errStoreCorrupt marks bytes that are not valid JSON at all. Only this class
+// is safe to isolate: no semantic check ever ran, so there is no receipt to
+// trust or distrust. Every other readState error stays fail-closed.
+var errStoreCorrupt = errors.New("task_store_corrupt")
+
 func newState() persisted {
-	return persisted{Version: 4, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}, Work: map[string]runWork{}, Attempts: map[string]actionReceipt{}}
+	return persisted{Version: 4, Schedules: map[string]Schedule{}, Runs: []Run{}, Completed: map[string]time.Time{}, Uncertain: map[string]Stage{}, PendingTasks: map[string]Task{}, Receipts: map[string]actionReceipt{}, Work: map[string]runWork{}, Attempts: map[string]actionReceipt{}, ScheduleDefaultImports: map[string]bool{}, DeletedSchedules: map[string]bool{}}
 }
 func readState(path string) (persisted, error) {
 	s := newState()
@@ -42,7 +50,10 @@ func readState(path string) (persisted, error) {
 	if err != nil {
 		return s, errors.New("task_store_unreadable")
 	}
-	if len(b) > 32<<20 || json.Unmarshal(b, &s) != nil || (s.Version < 1 || s.Version > 4) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
+	if len(b) > 32<<20 || !json.Valid(b) {
+		return s, errStoreCorrupt
+	}
+	if json.Unmarshal(b, &s) != nil || (s.Version < 1 || s.Version > 4) || s.Schedules == nil || s.Completed == nil || s.Uncertain == nil {
 		return s, errors.New("task_store_invalid")
 	}
 	if s.Version == 1 {
@@ -64,6 +75,12 @@ func readState(path string) (persisted, error) {
 	s.Version = 4
 	if s.Attempts == nil {
 		s.Attempts = map[string]actionReceipt{}
+	}
+	if s.ScheduleDefaultImports == nil {
+		s.ScheduleDefaultImports = map[string]bool{}
+	}
+	if s.DeletedSchedules == nil {
+		s.DeletedSchedules = map[string]bool{}
 	}
 	if s.Work == nil {
 		s.Work = map[string]runWork{}
@@ -212,6 +229,12 @@ func cloneState(s persisted) persisted {
 	b, _ := json.Marshal(s)
 	var copy persisted
 	_ = json.Unmarshal(b, &copy)
+	if copy.ScheduleDefaultImports == nil {
+		copy.ScheduleDefaultImports = map[string]bool{}
+	}
+	if copy.DeletedSchedules == nil {
+		copy.DeletedSchedules = map[string]bool{}
+	}
 	return copy
 }
 
@@ -228,6 +251,18 @@ func openState(path string) (*os.File, persisted, error) {
 		return nil, persisted{}, ErrBusy
 	}
 	s, err := readState(path)
+	if errors.Is(err, errStoreCorrupt) {
+		// Syntax-level corruption (unparseable bytes) cannot be trusted for
+		// anything, but it also cannot be a forged receipt — every semantic
+		// check below never ran. Preserve the bytes and start clean so the
+		// gateway still boots. Semantic failures (bad binding, orphan receipt,
+		// invalid work) stay fail-closed: those can indicate tampering.
+		if isolateErr := isolateCorruptStore(path); isolateErr != nil {
+			lock.Close()
+			return nil, persisted{}, err
+		}
+		s, err = newState(), nil
+	}
 	if err == nil {
 		err = writeState(path, s)
 	}
@@ -236,4 +271,14 @@ func openState(path string) (*os.File, persisted, error) {
 		return nil, persisted{}, err
 	}
 	return lock, s, nil
+}
+
+// isolateCorruptStore moves a damaged state file aside so the engine can start
+// with an empty state. One fixed backup slot is used (no unbounded timestamps):
+// the first corrupt file is kept for audit, later ones replace that single slot
+// only after the previous one was already unusable anyway.
+func isolateCorruptStore(path string) error {
+	backup := path + ".corrupt"
+	_ = os.Remove(backup)
+	return os.Rename(path, backup)
 }

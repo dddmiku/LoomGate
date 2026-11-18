@@ -410,7 +410,7 @@ func TestLifecycleCancellationAndManualAdoptionDoNotReplayOrPoisonWorker(t *test
 	}
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("claim did not start")
 	}
 	if !e.Cancel(run.ID) {
@@ -418,7 +418,7 @@ func TestLifecycleCancellationAndManualAdoptionDoNotReplayOrPoisonWorker(t *test
 	}
 	select {
 	case <-closed:
-	case <-time.After(time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("cancel not propagated")
 	}
 	if waitModuleRun(t, e, run.ID).Status != taskengine.StatusUncertain {

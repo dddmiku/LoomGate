@@ -46,6 +46,26 @@ type Options struct {
 	Concurrency     int
 	DoubaoInference bool
 	DoubaoMultiTurn bool
+	// DoubaoBinding returns only the verified, non-secret display facts of a
+	// bound Doubao account (official BotID + verification time). Sessions,
+	// cookies and the encrypted profile never leave the vault. A missing
+	// binding reports ok=false so the UI can say "未提供" instead of inventing
+	// a nickname from the account ID (P1-04).
+	DoubaoBinding func(id string) (botID string, verifiedAt time.Time, ok bool)
+}
+
+// AccountView is the safe account row DTO returned by /workbench/accounts.
+// It carries the vault metadata plus only verified, non-secret display facts.
+type AccountView struct {
+	ID         string     `json:"id"`
+	Provider   string     `json:"provider"`
+	Revision   uint64     `json:"revision"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	Enabled    bool       `json:"enabled"`
+	Nickname   string     `json:"nickname,omitempty"`
+	BotID      string     `json:"bot_id,omitempty"`
+	VerifiedAt *time.Time `json:"verified_at,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 type Service struct {
 	opts  Options
@@ -104,6 +124,27 @@ func (s *Service) accounts() ([]accountvault.Account, error) {
 	return out, nil
 }
 
+// accountViews maps vault rows to the safe display DTO. Nickname is left empty
+// when the provider has no verified human-readable name: the UI must fall back
+// to "未提供" rather than showing the raw account ID as a nickname.
+func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
+	out := make([]AccountView, 0, len(rows))
+	for _, a := range rows {
+		view := AccountView{ID: a.ID, Provider: a.Provider, Revision: a.Revision, UpdatedAt: a.UpdatedAt, Enabled: a.Enabled}
+		if s.opts.DoubaoBinding != nil && a.Provider == "doubao" {
+			if botID, verifiedAt, ok := s.opts.DoubaoBinding(a.ID); ok {
+				view.BotID = botID
+				if !verifiedAt.IsZero() {
+					value := verifiedAt
+					view.VerifiedAt = &value
+				}
+			}
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
 // Route reports whether it owns the management path; authorization is applied
 // once by the caller's internal management boundary.
 func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
@@ -143,7 +184,7 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if r.URL.Path == "/workbench/accounts" {
-		write(w, 200, map[string]any{"accounts": accounts})
+		write(w, 200, map[string]any{"accounts": s.accountViews(accounts)})
 		return true
 	}
 	s.models(w, r, accounts)

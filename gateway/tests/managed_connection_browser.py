@@ -151,15 +151,16 @@ def main():
             stage = 'late_confirmation'
             mode('success')
             page.locator('#connection-recover-session').click()
-            page.locator('#connection-commit').wait_for()
+            # Recovery verifies read-only and the drawer then saves automatically
+            # (the explicit 保存 button was removed); assert the authoritative flow
+            # instead of waiting for a control that no longer exists.
+            page.wait_for_function("document.getElementById('dialog-title')?.textContent.includes('账号已接入')", timeout=20000)
             recovery = flows()[-1]
             assert recovery['method'] == 'desktop' and recovery['authentication'] == 'existing_session'
-            assert recovery['status'] == 'verified' and current(expired['id'])['status'] == 'expired'
+            assert recovery['status'] == 'succeeded' and current(expired['id'])['status'] == 'expired'
             assert '没有新发起登录' in page.locator('#dialog-body').inner_text()
             assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
             page.screenshot(path=str(out/'late-login-mobile-synthetic.png'), full_page=True)
-            page.locator('#connection-commit').click()
-            page.wait_for_function("document.getElementById('dialog-title')?.textContent.includes('账号已接入')")
             saved = current(recovery['id'])
             assert saved['status'] == 'succeeded' and current(expired['id'])['status'] == 'expired'
             accounts = get('workbench/accounts')['accounts']

@@ -25,6 +25,8 @@
 
 三个配置必须同时有效；配置错误直接终止该开发工作台启动。仅设置这些变量不会启动或修改豆包客户端。暂时开启调试前应保存原启动命令，验证结束后恢复原命令并核对端口关闭；不需要代理或证书变更。
 
+受控模式（只设 Python/helper，不设端口）会由 `managed.py` 启动并托管独立的 Windows 官方客户端，因此只在 Windows 网关上构造。Linux/Android/macOS 等平台即使打包了 helper 也不会创建该 runtime 或 `official-client` 目录，账号页的豆包登录方式会保持不可用。此类环境必须显式配置 `LOOMGATE_DOUBAO_DESKTOP_PORT` 指向已经运行官方客户端的回环调试端口，才能连接现有会话；否则需要改用 Windows 桌面版网关完成官方登录。客户端资源只读可用于静态分析，不能替代客户端进程本身。
+
 `cmd/doubao-desktop-inspect` 默认只读验证。`--bot-profile` 指向本机受保护的官方目录请求文件，程序只取其中的 `post_data.bot_id`，不复用签名或 Cookie。当前还没有动态 bot ID 发现入口，这是后续工作。
 
 显式传入 `--import-vault` 时，工具在指定的隔离 vault 创建身份绑定；使用统一身份派生的账号 ID，已有记录会冲突退出，不覆盖旧账号。此操作不是生产迁移。没有真实账号凭据的合成测试不得使用该选项指向真实 vault。
