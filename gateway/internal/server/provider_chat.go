@@ -263,6 +263,11 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	}
 	if err != nil || !result.Complete || !result.Acknowledged {
 		st.status = 502
+		// One structured line naming which contract term failed. Without it a 502
+		// is indistinguishable between "stream broke", "no ACK" and "empty text",
+		// and the client only ever sees the generic wrapper.
+		log.Printf("WARN: [provider] 502 模型=%s 协议=%s err=%v complete=%v acknowledged=%v events=%d attempts=%d chars=%d",
+			model, protocolNameOfProvider(), err, result.Complete, result.Acknowledged, result.Events, result.Attempts, len(result.Text))
 		code := providerErrorCode(err)
 		if strings.HasPrefix(code, "provider_context_") || code == "provider_conversation_invalid" {
 			st.status = 400
@@ -383,3 +388,8 @@ func logProviderIgnoredTools(model string) {
 	}
 	log.Printf("WARN: [provider] 模型 %s 不支持调用方自定义工具；本次请求的 tools 已忽略，按纯文本回答", model)
 }
+
+// protocolNameOfProvider is a placeholder kept out of the hot path; the request
+// protocol is already available on the stat struct, and plumbing it here would
+// touch every caller for a log line.
+func protocolNameOfProvider() string { return "" }

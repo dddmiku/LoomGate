@@ -28,7 +28,7 @@
     const legacy={checkin:'每日签到',balance:'余额刷新',travel:'Buddy 旅行',keepalive:'账号会话保活',growth:'成长任务',redemption:'连登奖励兑换',redeem:'连登奖励兑换',makeup:'日历补登',resources:'成长资源状态',compensation:'补偿领取',lottery:'盲盒抽奖',buddy_box:'Buddy 盲盒'};
     return legacy[key]||key;
   }
-  const routes = {overview:['','工作台','先处理需要关注的事项。'], providers:['CONNECTIONS','服务接入','按服务查看已接入账号与真实可用能力。'], accounts:['IDENTITIES','账号','集中查看服务账号的启用状态、会话有效期和目录入口。'], models:['MODEL LIBRARY','模型目录','从上游获取可选模型。能力与可用范围以当前账号的响应为准。'], tasks:['AUTOMATION','任务','按分区查看任务、定时与运行状态。'], runs:['ACTIVITY','执行记录','查看每次派发、执行与服务端复核的结果。'], usage:['OBSERVABILITY','用量','查看网关累计请求与上游报告的用量。'], logs:['REQUEST HISTORY','请求记录','按请求查看模型、状态和耗时，不展示消息内容。'], keys:['API KEYS','访问密钥','创建、限额与停用，密钥只在创建时显示一次。'], migration:['MIGRATION','迁移','只读核对迁移标记与工具状态；导入需离线确认。'], settings:['PREFERENCES','工作区设置','管理显示偏好、会话与迁移准备。']};
+  const routes = {overview:['','工作台','先处理需要关注的事项。'], providers:['CONNECTIONS','服务接入','按服务查看已接入账号与真实可用能力。'], accounts:['IDENTITIES','账号','集中查看服务账号的启用状态、会话有效期和目录入口。'], models:['MODEL LIBRARY','模型目录','从上游获取可选模型。能力与可用范围以当前账号的响应为准。'], tasks:['AUTOMATION','任务','按分区查看任务、定时与运行状态。'], runs:['ACTIVITY','执行记录','查看每次派发、执行与服务端复核的结果。'], usage:['OBSERVABILITY','用量','查看网关累计请求与上游报告的用量。'], logs:['REQUEST HISTORY','请求记录','按请求查看模型、状态和耗时，不展示消息内容。'], keys:['API KEYS','API 密钥','用于调用模型接口的密钥；与面板登录账号无关。'], migration:['MIGRATION','迁移','只读核对迁移标记与工具状态；导入需离线确认。'], settings:['PREFERENCES','工作区设置','管理显示偏好、会话与迁移准备。']};
   const labels = {ready:'目录已同步',stale:'旧缓存',unavailable:'暂不可用',disabled:'已停用',queued:'等待执行',running:'执行中',succeeded:'已核验完成',failed:'失败',canceled:'已取消',uncertain:'待复核',skipped:'已跳过',manual_action:'需要人工',discover:'发现',inspect:'检查',execute:'执行',claim:'领取',verify:'复核'};
   const errorLabels = {desktop_unavailable:'官方豆包客户端未连接，请打开客户端并检查本机连接设置。',desktop_identity_mismatch:'客户端当前账号与已绑定账号不同，请切回原账号后刷新。',desktop_login_required:'请先在官方豆包客户端完成登录。',desktop_version_unsupported:'当前客户端版本尚未适配，请更新连接组件。',desktop_timeout:'官方客户端响应超时，请稍后刷新。',desktop_busy:'官方客户端正在处理目录请求，请稍后刷新。',desktop_upstream_rejected:'官方服务拒绝目录请求，请在客户端检查登录状态。',login_required:'登录已失效，请在官方客户端重新登录。',accounts_unavailable:'账号存储读取失败，请检查服务状态。',catalog_timeout:'目录读取超时，请稍后重试。',migration_timeout:'迁移预检超时：旧工作区可能过大或磁盘较慢，未写入任何文件；可改为在命令行离线执行预检。',catalog_failed:'目录读取失败，请稍后重试。',catalog_unavailable:'上游目录暂不可用。',account_not_found:'账号已不存在，请刷新账号列表。',schedule_not_saved:'计划未保存，请检查时间、时区和任务范围。',run_rejected:'执行请求未被接受，可能已有任务正在运行。',unauthorized:'管理会话已过期，请重新登录。'};
   Object.assign(errorLabels,{desktop_cleanup_uncertain:'客户端清理状态未确认，请检查官方客户端后再试。',desktop_ownership_lost:'本次连接的归属已变化，请重新连接官方客户端。',desktop_submission_uncertain:'请求可能已提交，请先核对官方服务状态，避免重复提交。',composer_not_empty:'官方客户端有未发送内容，请先保留或处理草稿。',desktop_model_unavailable:'当前账号的实时目录中没有此模型，请刷新目录。',desktop_native_tools_unsupported:'该请求需要官方任务运行时，但当前选择或任务上下文不匹配，未发送。',provider_output_budget_unsupported:'官方签名请求没有可兑现的输出 token 上限，本次未发送。',provider_system_instructions_unsupported:'官方签名构造器没有可验证的系统指令字段，本次未发送。'});
@@ -142,7 +142,7 @@
     const work=await api('workbench'),ps=state.providers,schedules=work.schedules||[],rows=work.runs||[];
     state.runs=rows;
     const attention=rows.filter(r=>['uncertain','failed','running','queued'].includes(r.status));
-    $('#view').innerHTML=heading(button('reload','刷新状态','','quiet'))+`<div class="agenda-summary"><strong>${ps.reduce((n,p)=>n+p.accounts.total,0)}</strong> 个账号，<strong>${schedules.filter(s=>s.enabled).length}</strong> 个计划已启用。</div><div class="agenda-layout"><div><section class="work-section" data-workspace-agenda><div class="section-heading"><h2>需要关注</h2><a href="#tasks">打开任务</a></div>${attention.length?attention.slice(0,6).map(r=>`<div class="attention-line">${badge(r.status)}<div class="line-content"><h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p>${esc(providerName(r.provider_id))}，${esc(labels[r.stage]||'等待派发')}。${r.status==='uncertain'?'结果未确认，请先核验，避免重复提交。':''}</p></div>${button('run-detail','查看',`data-index="${rows.indexOf(r)}"`,'quiet')}</div>`).join(''):empty('当前没有待处理的执行','可以到任务中心发现工作，或为已有任务安排计划。')}</section><section class="work-section"><div class="section-heading"><h2>最近执行</h2><a href="#runs">查看全部</a></div>${rows.length?runTimeline(rows.slice(0,6)):empty('还没有执行记录','首次执行后，这里会显示经过服务端核验的结果。')}</section></div><aside class="service-aside"><h2>服务与账号</h2>${ps.map(p=>`<div class="service-note"><div><h3>${esc(p.name)}</h3><p>${p.accounts.enabled} / ${p.accounts.total} 个账号启用<br>${p.inference_available?'已接入推理':'目录已接入，推理待接通'}</p></div>${button('provider-models','查看目录',`data-provider="${esc(p.id)}"`,'text-link')}</div>`).join('')}</aside></div>`;
+    $('#view').innerHTML=heading(button('reload','刷新状态','','quiet'))+`<div class="agenda-summary"><strong>${ps.reduce((n,p)=>n+p.accounts.total,0)}</strong> 个账号，<strong>${schedules.filter(s=>s.enabled).length}</strong> 个计划已启用。</div><div class="agenda-layout"><div><section class="work-section" data-workspace-agenda><div class="section-heading"><h2>需要关注</h2><a href="#tasks">打开任务</a></div>${attention.length?attention.slice(0,6).map(r=>`<div class="attention-line">${badge(r.status)}<div class="line-content"><h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p>${esc(providerName(r.provider_id))}，${esc(labels[r.stage]||'等待派发')}。${r.status==='uncertain'?'结果未确认，请先核验，避免重复提交。':''}</p></div>${button('run-detail','查看',`data-index="${rows.indexOf(r)}"`,'quiet')}</div>`).join(''):empty('当前没有待处理的执行','可以到任务中心发现工作，或为已有任务安排计划。')}</section><section class="work-section"><div class="section-heading"><h2>最近执行</h2><a href="#tasks">到任务里查看</a></div>${rows.length?runTimeline(rows.slice(0,6)):empty('还没有执行记录','首次执行后，这里会显示经过服务端核验的结果。')}</section></div><aside class="service-aside"><h2>服务与账号</h2>${ps.map(p=>`<div class="service-note"><div><h3>${esc(p.name)}</h3><p>${p.accounts.enabled} / ${p.accounts.total} 个账号启用<br>${p.inference_available?'已接入推理':'目录已接入，推理待接通'}</p></div>${button('provider-models','查看目录',`data-provider="${esc(p.id)}"`,'text-link')}</div>`).join('')}</aside></div>`;
   }
   async function services() {
     $('#view').innerHTML=heading(button('reload','同步服务','','quiet'))+`<div class="service-list">${state.providers.map(p=>`<article class="service-entry" data-provider="${esc(p.id)}"><div><h2>${esc(p.name)}</h2><p>${p.catalog_scope==='account'?'目录随账号变化':'服务级模型目录'}</p></div><div><dl><div><dt>已连接账号</dt><dd>${p.accounts.total}</dd></div><div><dt>已启用</dt><dd>${p.accounts.enabled}</dd></div></dl><p>${p.inference_available?'消息推理已接入。请求仍受账号余额和上游可用性限制。':'模型目录可读取；此服务的消息转发尚未接通。'}</p>${p.error_code?notice(errorLabels[p.error_code]||'服务状态读取失败','error'):''}</div><div class="actions">${button('provider-models','查看模型',`data-provider="${esc(p.id)}"`,'quiet')}${button('provider-accounts','查看账号',`data-provider="${esc(p.id)}"`,'quiet')}</div></article>`).join('')}</div>`;
@@ -312,7 +312,7 @@
   async function tasks() {
     state.taskProvider=state.taskProvider||state.providers[0]?.id||'';
     const generation=state.version;
-    $('#view').innerHTML=heading(button('reload','刷新','','quiet')+button('open-runs','执行记录','','quiet'))+
+    $('#view').innerHTML=heading(button('reload','刷新','','quiet')+button('open-runs','回到任务列表','','quiet'))+
       `<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}</div><div id="task-list" class="loading">正在发现任务…<p class="small muted">正在读取各分区的任务目录；较慢的模块不会阻止其他任务显示。</p></div>`;
     bindProviderFilter('task-provider',value=>{state.taskProvider=value;});
     const [accounts,work]=await Promise.all([accountsFor(state.taskProvider),api('workbench')]);
@@ -405,36 +405,58 @@
     state.taskGroupIndex=index;
     document.querySelectorAll('[data-action=select-task-group]').forEach((b,i)=>b.setAttribute('aria-selected',String(i===index)));
     const c=groupPhaseCounts(g),actionable=g.accounts.filter(t=>!t.manual_only);
-    $('#task-detail').innerHTML=`${button('task-back','返回任务列表','','detail-back')}<div class="detail-subtitle">${esc(providerName(g.provider_id))} / ${g.once?'一次性工作':g.once_per_day?'每日工作':'按需执行'} · ${g.accounts.length} 个账号</div><h2 class="detail-title">${esc(g.name)}</h2><p class="detail-body">${esc(g.description)}</p>${g.accounts.some(t=>t.pending_verification)?notice('上次操作结果尚未确认。系统会先核验服务端状态，并阻止重复提交。','warn'):''}<dl class="detail-specs"><div><dt>上游状态</dt><dd data-task-state="${esc(g.accounts.every(t=>t.state?.phase==='manual')?'manual':g.accounts.every(t=>t.state?.phase==='done')?'done':g.accounts.some(t=>t.state?.phase==='claimable')?'claimable':'pending')}">${esc(g.accounts.length===1&&taskPhases[g.accounts[0].state?.phase]?taskPhases[g.accounts[0].state?.phase]:'按账号核验')}</dd></div></dl><div class="phase-summary">${[['claimable','可领取',c.claimable],['ready','待执行',c.ready],['done','已完成',c.done],['manual','需人工',c.manual],['blocked','暂不可用',c.blocked]].filter(([, ,n])=>n).map(([id,label,n])=>`<span class="phase-chip" data-phase="${id}">${label} ${n}</span>`).join('')||'<span class="phase-chip">等待核验</span>'}</div><div class="actions">${actionable.length?button('run-task-group','为全部 '+actionable.length+' 个账号执行',`data-index="${index}"`,'primary'):''}${actionable.length?button('task-schedule-group','为 '+actionable.length+' 个可执行账号安排计划',`data-index="${index}"`,'quiet'):''}${button('open-runs','查看执行记录','','quiet')}</div><h3 class="section-gap">账号明细</h3><div class="account-task-list">${g.accounts.map(t=>{const ti=state.tasks.indexOf(t),phase=t.state?.phase;return `<div class="account-task-row" data-account-task="${esc(t.account_id)}"><div><strong>${esc(t.account_id)}</strong><p class="small muted">${esc(taskPhases[phase]||'待核验')}${t.state?.total?' · '+number(t.state.current||0)+' / '+number(t.state.total):''}${t.state?.summary?' · '+esc(t.state.summary):''}${t.pending_verification?' · 上次结果未确认':''}</p></div><div class="actions">${button(t.manual_only?'manual-task':'run-task',t.manual_only?'查看所需操作':t.pending_verification?'核验上次操作':phase==='claimable'?'领取奖励':phase==='done'?'再次核验':phase==='manual'?'核验进度':phase==='pending'?'核验状态':'执行任务',`data-task-index="${ti}"`,'compact')}${!t.manual_only?button('task-schedule','安排计划',`data-task-index="${ti}"`,'quiet compact'):''}</div></div>`;}).join('')}</div><p class="detail-note">${g.manual_only?'按要求提供真实内容。完成与奖励以服务端核验为准。':'任务会进入执行队列；已提交不代表已完成。结果在执行记录中保留。'}</p>`;
+    $('#task-detail').innerHTML=`${button('task-back','返回任务列表','','detail-back')}<div class="detail-subtitle">${esc(providerName(g.provider_id))} / ${g.once?'一次性工作':g.once_per_day?'每日工作':'按需执行'} · ${g.accounts.length} 个账号</div><h2 class="detail-title">${esc(g.name)}</h2><p class="detail-body">${esc(g.description)}</p>${g.accounts.some(t=>t.pending_verification)?notice('上次操作结果尚未确认。系统会先核验服务端状态，并阻止重复提交。','warn'):''}<dl class="detail-specs"><div><dt>上游状态</dt><dd data-task-state="${esc(g.accounts.every(t=>t.state?.phase==='manual')?'manual':g.accounts.every(t=>t.state?.phase==='done')?'done':g.accounts.some(t=>t.state?.phase==='claimable')?'claimable':'pending')}">${esc(g.accounts.length===1&&taskPhases[g.accounts[0].state?.phase]?taskPhases[g.accounts[0].state?.phase]:'按账号核验')}</dd></div></dl><div class="phase-summary">${[['claimable','可领取',c.claimable],['ready','待执行',c.ready],['done','已完成',c.done],['manual','需人工',c.manual],['blocked','暂不可用',c.blocked]].filter(([, ,n])=>n).map(([id,label,n])=>`<span class="phase-chip" data-phase="${id}">${label} ${n}</span>`).join('')||'<span class="phase-chip">等待核验</span>'}</div><div class="actions">${actionable.length?button('run-task-group','为全部 '+actionable.length+' 个账号执行',`data-index="${index}"`,'primary'):''}${actionable.length?button('task-schedule-group','为 '+actionable.length+' 个可执行账号安排计划',`data-index="${index}"`,'quiet'):''}${button('open-runs','回到任务列表','','quiet')}</div><h3 class="section-gap">账号明细</h3><div class="account-task-list">${g.accounts.map(t=>{const ti=state.tasks.indexOf(t),phase=t.state?.phase;return `<div class="account-task-row" data-account-task="${esc(t.account_id)}"><div><strong>${esc(t.account_id)}</strong><p class="small muted">${esc(taskPhases[phase]||'待核验')}${t.state?.total?' · '+number(t.state.current||0)+' / '+number(t.state.total):''}${t.state?.summary?' · '+esc(t.state.summary):''}${t.pending_verification?' · 上次结果未确认':''}</p></div><div class="actions">${button(t.manual_only?'manual-task':'run-task',t.manual_only?'查看所需操作':t.pending_verification?'核验上次操作':phase==='claimable'?'领取奖励':phase==='done'?'再次核验':phase==='manual'?'核验进度':phase==='pending'?'核验状态':'执行任务',`data-task-index="${ti}"`,'compact')}${!t.manual_only?button('task-schedule','安排计划',`data-task-index="${ti}"`,'quiet compact'):''}</div></div>`;}).join('')}</div><p class="detail-note">${g.manual_only?'按要求提供真实内容。完成与奖励以服务端核验为准。':'任务会进入执行队列；已提交不代表已完成。结果在执行记录中保留。'}</p>`;
     if(open){$('#task-browser').classList.add('detail-open');$('#task-detail').focus({preventScroll:true});}
   }
-  // The task log lives inside the row, not on another page: an operator checking
-  // "did today's check-in run" should not lose their place in the task list. It
-  // shows the most recent runs for this task key and region, newest first.
-  async function toggleTaskLog(index){
-    const g=state.taskGroups[index];
+  // The task log is the old run-detail dialog: pick the task's most recent run and
+  // show the same complete breakdown the standalone log page used to show (steps,
+  // per-step result, failure reason, discovery issues). Nothing navigates away.
+  async function openTaskLog(g){
     if(!g)return;
-    const row=document.querySelector(`tr[data-task-group="${index}"]`);
-    if(!row)return;
-    const existing=row.nextElementSibling;
-    if(existing?.classList.contains('task-log-row')){existing.remove();row.querySelector('[data-action=task-log]')?.setAttribute('aria-expanded','false');return;}
-    const tbody=document.createElement('tbody');
-    tbody.innerHTML=`<tr class="task-log-row"><td colspan="6"><div class="log-detail"><p class="muted small">正在读取该项任务的最近执行记录…</p></div></td></tr>`;
-    row.after(tbody.firstElementChild);
-    row.querySelector('[data-action=task-log]')?.setAttribute('aria-expanded','true');
+    openDialog(`${g.name} · 执行详情`,'<p class="muted">正在读取该项任务的执行记录…</p>');
     try{
-      const data=await api('workbench');
-      const runs=(data.runs||[]).filter(r=>r.provider_id===g.provider_id&&(r.task_key||'')===g.key).slice(0,10);
-      const box=row.nextElementSibling?.querySelector('.log-detail');
-      if(!box)return;
-      box.innerHTML=runs.length
-        ? `<p class="small muted">最近 ${runs.length} 次执行（仅本项任务）</p>`+table(['时间','状态','账号范围','说明'],runs.map(r=>[esc(date(r.started_at)),badge(r.status),esc((r.account_ids||[]).join('、')||'全部已启用账号'),`${esc(labels[r.stage]||'')}${r.discovery_issues?.length?' · '+r.discovery_issues.length+' 项发现失败':''}${r.steps?.length?' · '+r.steps.length+' 步':''}`]))
-        : '<p class="muted">这项任务还没有执行记录。点「运行」后结果会出现在这里。</p>';
+      const data=await api('workbench',{signal:null});
+      const runs=(data.runs||[]).filter(r=>r.provider_id===g.provider_id&&(r.task_key||'')===g.key);
+      if(!runs.length){
+        $('#dialog-body').innerHTML=`<div class="form"><p class="muted">这项任务还没有执行记录。点「运行」后结果会出现在这里。</p><div class="actions"><button data-action="close">关闭</button></div></div>`;
+        $('#dialog-body [data-action=close]').onclick=closeDialog;
+        return;
+      }
+      state.taskLogRuns=runs;
+      showTaskRunDetail(runs,0);
     }catch(e){
-      const box=row.nextElementSibling?.querySelector('.log-detail');
-      if(box)box.innerHTML=`<p class="notice error">${esc(e instanceof APIError?e.message:'执行记录读取失败')}</p>`;
+      closeDialog();
+      toast(e instanceof APIError?e.message:'执行记录读取失败');
     }
   }
+  // Renders one run exactly like the old detail dialog: a run picker at the top
+  // when there is more than one, then the full step table.
+  function showTaskRunDetail(runs,index){
+    const r=runs[index];
+    if(!r)return;
+    const picker=runs.length>1?`<label>执行批次<select id="task-log-run">${runs.map((x,i)=>`<option value="${i}" ${i===index?'selected':''}>${esc(date(x.started_at))} · ${esc(labels[x.status]||x.status)}</option>`).join('')}</select></label>`:'';
+    const steps=r.steps||[];
+    $('#dialog-body').innerHTML=`<div class="form run-detail-dialog">
+      ${picker}
+      <dl class="detail-specs">
+        <div><dt>任务</dt><dd>${esc(taskLabel(r.provider_id,'',r.task_key))}</dd></div>
+        <div><dt>服务</dt><dd>${esc(providerName(r.provider_id))}</dd></div>
+        <div><dt>账号范围</dt><dd>${esc((r.account_ids||[]).join('、')||'全部已启用账号')}</dd></div>
+        <div><dt>状态</dt><dd>${badge(r.status)}</dd></div>
+        <div><dt>开始时间</dt><dd>${esc(date(r.started_at))}</dd></div>
+        <div><dt>执行标识</dt><dd><code>${esc(r.id)}</code></dd></div>
+      </dl>
+      ${r.status==='uncertain'?notice('上游操作结果尚未确认，请先核验服务端状态，不要重复执行。','warn'):''}
+      ${runDiscoveryIssues(r.discovery_issues)}
+      <h3 class="section-gap">执行步骤</h3>
+      ${steps.length?(()=>{const columns=runStepColumns(steps),withTask=columns.length===4;return table(columns,steps.map(s=>runStepCells(s,withTask)));})():empty('尚无执行步骤','任务可能仍在等待派发。')}
+      <div class="actions"><button data-action="close" class="primary">关闭</button></div>
+    </div>`;
+    $('#dialog-body [data-action=close]').onclick=closeDialog;
+    const select=document.getElementById('task-log-run');
+    if(select)select.onchange=e=>showTaskRunDetail(runs,Number(e.target.value));
+  }
+
   function taskForGroup(g){
     return {provider_id:g.provider_id,key:g.key,name:g.name,account_ids:g.accounts.filter(t=>!t.manual_only).map(t=>t.account_id),realm:g.realm};
   }
@@ -446,9 +468,9 @@
     const scope=explicit;
     const req={provider_id:task?.provider_id || state.taskProvider,task_key:task?.key || '*',account_ids:scope};
     if(!scope.length){toast('没有可执行的账号范围，已取消。');return;}
-    if(sessionStorage.getItem('loomgate.unconfirmedRun')) {toast('上次执行请求结果未确认。请在执行记录核对后再继续，避免重复操作。');location.hash='runs';return;}
+    if(sessionStorage.getItem('loomgate.unconfirmedRun')) {toast('上次执行请求结果未确认。请到任务列表核对后继续，避免重复操作。');location.hash='tasks';return;}
     openDialog('确认执行范围',`<form id="run-form" class="form"><p>${esc(task?.name || '当前范围内的全部任务')}</p><div class="notice">服务：${esc(providerName(req.provider_id))}<br>账号：${esc(scope.join('、') || '全部已启用账号')}<br>执行可能产生上游操作。需要人工的任务会保留待处理状态，奖励以服务端复核为准。</div><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认执行</button></div></form>`);
-    $('#run-form').onsubmit=e=>{e.preventDefault();if(state.pending.has('run'))return;sessionStorage.setItem('loomgate.unconfirmedRun','1');mutate('run','workbench/run',req,async data=>{if(!data.run?.id)throw new APIError('request_failed',502);sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();toast('已进入执行队列，结果以执行记录为准。');location.hash='runs';});};
+    $('#run-form').onsubmit=e=>{e.preventDefault();if(state.pending.has('run'))return;sessionStorage.setItem('loomgate.unconfirmedRun','1');mutate('run','workbench/run',req,async data=>{if(!data.run?.id)throw new APIError('request_failed',502);sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();toast('已进入执行队列，结果可在该项任务的「日志」里查看。');location.hash='tasks';});};
   }
 
   async function schedules() {
@@ -617,7 +639,7 @@
         ${tile('总请求',number(scopedTotals.requests),`${number(scopedTotals.failed_requests||0)} 次失败 · ${number(scopedTotals.unreported_requests||0)} 次未报告用量`)}
         ${tile('总 Token',number(scopedTotals.total_tokens),`输入 ${number(scopedTotals.prompt_tokens)} / 输出 ${number(scopedTotals.completion_tokens)}${scopedTotals.cached_tokens?` / 缓存 ${number(scopedTotals.cached_tokens)}`:''}`)}
         ${tile('已报告消耗',number(scopedTotals.credit),'只累计上游明确报告的数值')}
-        ${tile('调用方',number(keys.length),'按访问密钥统计')}
+        ${tile('调用方',number(keys.length),'按 API 密钥统计')}
       </div>`+
       `<div class="usage-grid">
         <section class="usage-card">
@@ -625,8 +647,8 @@
           ${segments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(segments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
         </section>
         <section class="usage-card">
-          <div class="usage-card-head"><h2>调用方分布</h2><span class="small muted">按 Token</span></div>
-          ${keys.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(keys.slice(0,6).map((k,i)=>({value:k.totals?.total_tokens||0,color:palette[i%palette.length]})))}"></div><table class="donut-legend"><thead><tr><th>调用方</th><th>请求</th><th>Token</th></tr></thead><tbody>${keys.slice(0,8).map(k=>`<tr><td>${esc(k.name||k.masked_key||k.key_id||'未命名')}</td><td>${number(k.totals?.requests||0)}</td><td>${number(k.totals?.total_tokens||0)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无调用方用量','按调用密钥统计。')}
+          <div class="usage-card-head"><h2>调用方</h2><span class="small muted">按 Token</span></div>
+          ${keys.length?table(['调用方','请求','Token'],[...keys].sort((a,b)=>(b.totals?.total_tokens||0)-(a.totals?.total_tokens||0)).slice(0,10).map(k=>[esc(k.name||k.masked_key||k.key_id||'未命名'),number(k.totals?.requests||0),number(k.totals?.total_tokens||0)])):empty('暂无调用方用量','按 API 密钥统计。')}
         </section>
       </div>`+
       `<section class="usage-card">
@@ -649,19 +671,27 @@
   }
   function requestRow(r,i,open){
     const tone=statusTone(r.status);
+    const secs=ms=>ms==null?'—':(ms/1000).toFixed(1)+'s';
+    const tps=r.output_tokens!=null&&r.duration_ms>0?Math.round(r.output_tokens/(r.duration_ms/1000)*10)/10:null;
+    // The log records one cached-token figure; Anthropic splits it into write and
+    // read tiers, which this ledger does not separate. Showing one number is
+    // honest; inventing a second would not be.
+    const hit=r.cached_tokens!=null?number(r.cached_tokens):'—';
     return `<tr class="log-row" data-request-row="${i}">
       <td class="log-expander"><button type="button" data-action="request-expand" data-index="${i}" aria-expanded="${open?'true':'false'}" aria-label="展开日志详情">${open?'▾':'▸'}</button></td>
       <td><time>${esc(date(r.started_at))}</time></td>
       <td><code>${esc(r.key_name||r.key_id||'—')}</code></td>
-      <td><span class="small">${esc(providerName((r.model||'').split(':')[0])||'—')}</span></td>
       <td><span class="small">${esc(protocolName(r.protocol))}</span></td>
       <td><strong>${esc(r.model||'—')}</strong></td>
-      <td>${tokensCell(r)}</td>
-      <td>${r.duration_ms!=null?number(r.duration_ms)+' ms':'—'}${r.stream?'<span class="log-stream">流</span>':''}</td>
+      <td>${secs(r.ttfb_ms)} / ${secs(r.duration_ms)}</td>
+      <td>${r.input_tokens==null?'—':number(r.input_tokens)}</td>
+      <td>${hit}</td>
+      <td>${r.output_tokens==null?'—':number(r.output_tokens)}</td>
+      <td>${tps==null?'—':tps+' tok/s'}</td>
       <td>${badge(tone,r.status||'未知')}${r.error_code?`<p class="small muted">${esc(r.error_code)}</p>`:''}</td>
       <td>${r.credit==null?'—':String(r.credit)}</td>
       <td><code class="small">${esc(r.request_id||'—')}</code></td>
-    </tr>`+(open?`<tr class="log-detail-row"><td colspan="11">${requestDetailHtml(r)}</td></tr>`:'');
+    </tr>`+(open?`<tr class="log-detail-row"><td colspan="13">${requestDetailHtml(r)}</td></tr>`:'');
   }
   // Detail is rendered from the list row itself, which already carries attempts
   // and timing. The expanded panel only ever shows metadata — never message text.
@@ -695,7 +725,7 @@
     if(!Array.isArray(rows))throw new APIError('request_failed',503);
     state.requestRows=rows;
     state.logOpen=new Set();
-    const head=['','时间','调用方','服务','协议','模型','Token','用时','状态','花费','请求 ID'];
+    const head=['','时间','调用方','协议','模型','TTFB / total','输入','缓存命中','输出','tok/s','状态','花费','请求 ID'];
     $('#view').innerHTML=heading(button('reload','刷新记录','','quiet'))+
       (rows.length?`<div class="log-table-wrap"><table class="log-table"><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map((r,i)=>requestRow(r,i,false)).join('')}</tbody></table></div>`:empty('暂无请求记录','记录由网关真实请求生成，不包括面板的目录读取。'))+
       `<div class="pagination"><span>共 ${number(data.total)} 条</span><div class="actions">${button('logs-prev','上一页',!state.logOffset?'disabled':'')}${button('logs-next','下一页',(state.logOffset || 0)+50>=data.total?'disabled':'')}</div></div>`;
@@ -806,7 +836,7 @@
         </dl>
         <p class="small muted">鉴权用下面任意一把密钥作为 Bearer token；模型名形如 <code>doubao:1:0</code>，可在「模型目录」里查看。</p>
       </section>`+
-      (rows.length?table(['名称','密钥','状态','有效期','限流','累计 Token','操作'],rows):empty('还没有访问密钥','创建第一把密钥后才能通过 OpenAI / Anthropic / Gemini 兼容接口调用网关。'))+
+      (rows.length?table(['名称','密钥','状态','有效期','限流','累计 Token','操作'],rows):empty('还没有 API 密钥','创建第一把密钥后才能通过 OpenAI / Anthropic / Gemini 兼容接口调用网关。'))+
       notice('密钥明文只在创建或「显示密钥」时返回一次；列表只显示掩码。停用会立即生效，删除不可恢复。','warn');
   }
   async function keyEditDialog(id) {
@@ -819,7 +849,7 @@
     form.onsubmit=e=>{e.preventDefault();const f=new FormData(form);const body={id:key.id,name:String(f.get('name')||'').trim(),note:String(f.get('note')||'').trim(),models:picker.values()};const rpm=Number(f.get('requests_per_minute')||0),conc=Number(f.get('max_concurrent')||0),queue=Number(f.get('queue_timeout_seconds')||0);body.limits=(rpm||conc||queue)?{requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue}:null;mutate('key-edit','keys/update',body,async()=>{const saved=(await api('keys')).keys.find(k=>k.id===key.id);if(!saved||saved.name!==body.name||JSON.stringify(saved.models||[])!==JSON.stringify(body.models))throw new APIError('request_failed',502,'保存后读回与提交不一致。');closeDialog();toast('密钥已更新，并从服务端读回。');await reload();});};
   }
   async function keyNewDialog() {
-    openDialog('创建访问密钥',`<form id="key-form" class="form"><p class="muted">模型绑定使用服务端当前客户端目录及其真实倍率。留空表示不限模型。</p><label>名称<input name="name" required maxlength="80" autofocus></label><label>备注<input name="note" maxlength="200"></label><input type="hidden" name="models"><section class="key-model-picker-section"><h3>绑定模型</h3><div data-model-picker></div></section><fieldset><legend>限流</legend><label>每分钟请求数（0 不限）<input name="requests_per_minute" type="number" min="0" max="60000" value="0"></label><label>并发上限（0 不限）<input name="max_concurrent" type="number" min="0" max="256" value="0"></label><label>排队秒数（0 不排队）<input name="queue_timeout_seconds" type="number" min="0" max="30" value="0"></label></fieldset><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">创建</button></div></form>`);
+    openDialog('创建 API 密钥',`<form id="key-form" class="form"><p class="muted">模型绑定使用服务端当前客户端目录及其真实倍率。留空表示不限模型。</p><label>名称<input name="name" required maxlength="80" autofocus></label><label>备注<input name="note" maxlength="200"></label><input type="hidden" name="models"><section class="key-model-picker-section"><h3>绑定模型</h3><div data-model-picker></div></section><fieldset><legend>限流</legend><label>每分钟请求数（0 不限）<input name="requests_per_minute" type="number" min="0" max="60000" value="0"></label><label>并发上限（0 不限）<input name="max_concurrent" type="number" min="0" max="256" value="0"></label><label>排队秒数（0 不排队）<input name="queue_timeout_seconds" type="number" min="0" max="30" value="0"></label></fieldset><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">创建</button></div></form>`);
     const form=$('#key-form'),picker=LoomModelPicker.mount(form,{api,esc,selected:[]});
     form.onsubmit=e=>{e.preventDefault();const f=new FormData(form);const body={name:String(f.get('name')||'').trim(),note:String(f.get('note')||'').trim(),models:picker.values()};const rpm=Number(f.get('requests_per_minute')||0),conc=Number(f.get('max_concurrent')||0),queue=Number(f.get('queue_timeout_seconds')||0);if(rpm||conc||queue)body.limits={requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue};mutate('key-new','keys',body,async data=>{if(!data.key)throw new APIError('request_failed',502,'服务端没有返回完整密钥。');const secret=String(data.key);$('#dialog-body').innerHTML=`<p>密钥已创建。请立即复制，关闭后无法再次查看。</p><label>密钥<textarea readonly rows="3">${esc(secret)}</textarea></label><div class="actions">${button('close','我已保存')}</div>`;const closeButton=$('#dialog [data-action=close]');if(closeButton)closeButton.onclick=()=>{closeDialog();reload().catch(()=>{});};toast('密钥已创建，请立即保存。');});};
   }
@@ -867,7 +897,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     $('#password-form').onsubmit=e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.password!==body.confirm){$('#form-message').textContent='两次新密码不一致。';$('#form-message').hidden=false;return;}mutate('password','auth/password',body,async()=>{closeDialog();toast('管理账号已更新。');await reload();});};
   }
   document.addEventListener('keydown',e=>{const row=e.target.closest('.selection-row');if(!row||!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;const rows=[...row.closest('[role=listbox]').querySelectorAll('.selection-row')],i=rows.indexOf(row),next=e.key==='Home'?0:e.key==='End'?rows.length-1:Math.max(0,Math.min(rows.length-1,i+(e.key==='ArrowDown'?1:-1)));e.preventDefault();if(row.dataset.action==='select-model-group')selectModelGroup(next,false);else selectTaskGroup(next,false);rows[next].focus();});
-  const renderers={overview,providers:services,accounts,models:modelPage,tasks,schedules:tasks,runs,usage,logs,keys:keyPage,migration,settings};
+  const renderers={overview,providers:services,accounts,models:modelPage,tasks,schedules:tasks,runs:tasks,usage,logs,keys:keyPage,migration,settings};
   async function reload() {state.providers=null;state.pollStarted=0;await navigate();}
   async function action(element) {
     const name=element.dataset.action;
@@ -894,9 +924,9 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='connection-help'){openDialog('账号接入状态',notice('账号状态来自真实后端。WorkBuddy 支持扫码/短信登录与重新连接；豆包登录基于官方客户端会话。只有在服务确认需要人工操作时才会发起对应流程。','')+'<p class="muted">登录流程需要真实扫码或验证码时，界面会显示明确步骤；不会在后台静默重试已成功的操作。</p>');return;}
     if(name==='manual-task'){const t=state.tasks[index];openDialog('所需人工操作',`<h3>${esc(t.name)}</h3><p class="section-gap">${esc(t.description)}</p>${notice('请在对应官方服务完成要求的内容或操作。完成与奖励以服务端核验为准。','warn')}`);return;}
     if(name==='run-task' || name==='run-all'){confirmRun(name==='run-task'?state.tasks[index]:null);return;}
-    if(name==='open-runs'){location.hash='runs';return;}
+    if(name==='open-runs'){location.hash='tasks';return;}
     if(name==='run-task-group'){const g=state.taskGroups[index];if(!g)return;confirmRun(taskForGroup(g));return;}
-    if(name==='task-log'){await toggleTaskLog(index);return;}
+    if(name==='task-log'){await openTaskLog(state.taskGroups[index]);return;}
     if(name==='review-submission'){openDialog('核对未确认的提交',`<form id="review-form" class="form"><p>请先检查执行记录和官方服务状态。解除保护不会重试或取消原请求。</p><label class="check"><input type="checkbox" required>我已核对上次提交，确认不会重复执行已有操作</label><div class="actions">${button('close','返回')}<button type="submit">解除提交保护</button></div></form>`);$('#review-form').onsubmit=e=>{e.preventDefault();sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();reload();};return;}
     if(name==='new-schedule'){location.hash='tasks';return;}if(name==='edit-schedule' || name==='task-schedule'){await scheduleEditor(name==='edit-schedule'?state.schedules[index]:null,name==='task-schedule'?state.tasks[index]:null);return;}
     if(name==='task-schedule-group'){const g=state.taskGroups[index];if(!g)return;await scheduleEditor(null,taskForGroup(g));return;}
@@ -917,7 +947,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='key-edit'){await keyEditDialog(element.dataset.id);return;}
     if(name==='key-copy'){const id=element.dataset.id;await mutate('key-copy','keys/copy',{id},async data=>{if(!data.key)throw new APIError('request_failed',502,'服务端没有返回密钥。');openDialog('显示密钥',`<p>此密钥只在此刻显示。关闭后可再次点击「显示密钥」。</p><label>密钥<textarea readonly rows="3">${esc(String(data.key))}</textarea></label><div class="actions">${button('close','关闭')}</div>`);});return;}
     if(name==='key-toggle'){const id=element.dataset.id,want=element.dataset.enabled!=='1';await mutate('key-toggle','keys/update',{id,enabled:want},async()=>{const saved=(await api('keys')).keys.find(k=>k.id===id);if(!saved||saved.enabled!==want)throw new APIError('request_failed',502);toast(want?'密钥已启用。':'密钥已停用。');await reload();});return;}
-    if(name==='key-delete'){const id=element.dataset.id;openDialog('删除访问密钥',`<form id="key-delete-form" class="form"><p>删除后使用该密钥的客户端会立即收到鉴权失败，且不可恢复。</p><label class="check"><input type="checkbox" required>我确认要删除这把密钥</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="danger">删除</button></div></form>`);$('#key-delete-form').onsubmit=e=>{e.preventDefault();mutate('key-delete','keys/delete',{id},async()=>{if((await api('keys')).keys.some(k=>k.id===id))throw new APIError('request_failed',502);closeDialog();toast('密钥已删除，并从服务端读回。');await reload();});};return;}
+    if(name==='key-delete'){const id=element.dataset.id;openDialog('删除 API 密钥',`<form id="key-delete-form" class="form"><p>删除后使用该密钥的客户端会立即收到鉴权失败，且不可恢复。</p><label class="check"><input type="checkbox" required>我确认要删除这把密钥</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="danger">删除</button></div></form>`);$('#key-delete-form').onsubmit=e=>{e.preventDefault();mutate('key-delete','keys/delete',{id},async()=>{if((await api('keys')).keys.some(k=>k.id===id))throw new APIError('request_failed',502);closeDialog();toast('密钥已删除，并从服务端读回。');await reload();});};return;}
     if(name==='migration-check'){await reload();return;}
     if(name==='password')passwordDialog();
   }
