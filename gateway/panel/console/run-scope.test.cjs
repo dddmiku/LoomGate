@@ -39,9 +39,12 @@ test('single task execution uses its own account only', () => {
   const r = drive({provider_id: 'workbuddy', key: 'checkin', account_id: 'a-fixture'});
   assert.deepEqual([...r.req.account_ids], ['a-fixture']);
 });
-test('scope-wide execution still uses the selected account scope', () => {
+// 账号范围选择器已从任务页移除：任务页按分区展示，没有「当前选中账号」这种状态。
+// 无任务参数的调用必须取消，绝不能退化成「全部已启用账号」（那是范围放大）。
+test('a run without an explicit account range is cancelled', () => {
   const r = drive(null);
-  assert.deepEqual([...r.req.account_ids], ['scope-account-default']);
+  assert.equal(r.opened, false, 'no confirmation dialog without an explicit range');
+  assert.ok(/没有可执行的账号范围/.test(r.toast || ''));
 });
 test('a task without any account range is cancelled, never widened to all', () => {
   const r = drive({provider_id: 'workbuddy', key: 'balance'});

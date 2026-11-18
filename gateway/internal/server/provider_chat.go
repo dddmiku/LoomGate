@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/inference"
@@ -84,11 +86,17 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 	return rows, issues
 }
 
-// This initial provider capability is deliberately explicit: one ordinary text
-// message. Unsupported fields are rejected before any upstream submission.
+// This provider is text-only: it can carry one ordinary text conversation and
+// nothing else. Fields the official wire format genuinely has no place for are
+// accepted and ignored rather than rejected, because every mainstream OpenAI
+// client sends at least one of them on every request; rejecting turned the whole
+// provider into a permanent 400 for those clients. The model is never told the
+// tools exist, and /v1/models reports supports_tool_call=false, so an ignored
+// tools block degrades to a plain text answer instead of a false capability.
 func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []byte, model string, streaming bool, st *chatStat, provider inference.Provider) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(body, &fields)
+	ignoredTools := false
 	for key := range fields {
 		switch key {
 		case "model", "messages", "stream", "stream_options", "n":
@@ -98,18 +106,21 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			// does not publish is down-graded to its highest published level at or
 			// below the request (never a 400).
 		case "tools", "tool_choice", "functions", "function_call", "parallel_tool_calls":
-			st.status = 400
-			writeOpenAIError(w, 400, "provider_tools_unsupported", "official work tools are distinct from caller-defined functions; caller tools are not supported by this provider")
-			return
-		case "max_tokens", "max_completion_tokens", "max_output_tokens":
-			st.status = 400
-			writeOpenAIError(w, 400, "provider_output_budget_unsupported", "the signed official chat request has no verified output-token limit field; the request was not sent upstream")
-			return
+			// No verified carrier exists in the official request body, so these
+			// cannot be honored. Ignore them; the reply is plain text.
+			ignoredTools = true
+		case "max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed", "user", "metadata", "store", "logprobs", "top_logprobs", "response_format", "service_tier":
+			// No verified wire field. Ignoring a limit or a sampling hint changes
+			// only how the answer is produced, never whether it is correct, and it
+			// keeps ordinary clients usable.
 		default:
 			st.status = 400
 			writeOpenAIError(w, 400, "provider_parameter_unsupported", "the request contains a parameter that the official provider cannot honor")
 			return
 		}
+	}
+	if ignoredTools {
+		logProviderIgnoredTools(model)
 	}
 	var messages []struct {
 		Role    string          `json:"role"`
@@ -146,47 +157,53 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		}
 	}
 	dialogueProvider, hasDialogue := provider.(inference.DialogueProvider)
-	validMessages := json.Unmarshal(fields["messages"], &messages) == nil && len(messages) > 0 && len(messages) <= 101 && len(messages)%2 == 1
+	if json.Unmarshal(fields["messages"], &messages) != nil {
+		st.status = 400
+		writeOpenAIError(w, 400, "provider_input_unsupported", "messages must be an array of role and content objects")
+		return
+	}
+	// A system/developer role has no separate wire field, so its text is prepended
+	// to the first user turn. The instruction still reaches the model; only the
+	// role boundary is flattened. Rejecting it would make the provider unusable
+	// from any client that always sends a system prompt.
+	systemPrefix := ""
+	turns := make([]struct {
+		Role    string
+		Content json.RawMessage
+	}, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == "system" || m.Role == "developer" {
+			if inline := textOfContent(m.Content); strings.TrimSpace(inline) != "" {
+				systemPrefix += inline + "\n\n"
+			}
+			continue
+		}
+		turns = append(turns, struct {
+			Role    string
+			Content json.RawMessage
+		}{m.Role, m.Content})
+	}
+	validMessages := len(turns) > 0 && len(turns) <= 101 && len(turns)%2 == 1
 	parsed := []inference.Message{}
 	total := 0
-	for i, m := range messages {
-		// System instructions have no verified carrier in the signed official
-		// chat builder. Reject them explicitly instead of flattening them into
-		// user text and pretending the model received a system prompt.
-		if m.Role == "system" || m.Role == "developer" {
-			st.status = 400
-			writeOpenAIError(w, 400, "provider_system_instructions_unsupported", "this provider cannot carry a separate system instruction through the official client; the request was not sent upstream")
-			return
-		}
+	text = ""
+	for i, m := range turns {
 		expected := "user"
 		if i%2 == 1 {
 			expected = "assistant"
 		}
-		var value string
-		contentErr := json.Unmarshal(m.Content, &value)
-		if contentErr != nil {
-			var parts []map[string]json.RawMessage
-			if json.Unmarshal(m.Content, &parts) == nil && len(parts) > 0 {
-				value = ""
-				contentErr = nil
-				for _, part := range parts {
-					var kind, text string
-					if len(part) != 2 || json.Unmarshal(part["type"], &kind) != nil || kind != "text" || json.Unmarshal(part["text"], &text) != nil {
-						contentErr = errors.New("content_not_text")
-						break
-					}
-					value += text
-				}
-			}
-		}
-		if m.Role != expected || contentErr != nil || strings.TrimSpace(value) == "" || len(value) > 65536 {
+		value := textOfContent(m.Content)
+		if m.Role != expected || strings.TrimSpace(value) == "" || len(value) > 65536 {
 			validMessages = false
 		}
 		total += len(value)
+		if i == 0 && systemPrefix != "" {
+			value = systemPrefix + value
+		}
 		parsed = append(parsed, inference.Message{Role: m.Role, Content: value})
 		text = value
 	}
-	if !validMessages || total > 1<<20 || (!hasDialogue && len(messages) != 1) {
+	if !validMessages || total > 1<<20 || (!hasDialogue && len(turns) != 1) {
 		st.status = 400
 		writeOpenAIError(w, 400, "provider_input_unsupported", "expected alternating user and assistant text messages ending with user; unsupported roles, content or size")
 		return
@@ -359,4 +376,38 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	if err != nil {
 		st.status = 502
 	}
+}
+
+// textOfContent extracts plain text from an OpenAI message content value, which
+// may be a string or an array of text parts. Unsupported parts contribute
+// nothing rather than failing the whole request.
+func textOfContent(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		return value
+	}
+	var parts []map[string]json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		var kind, text string
+		if len(part) != 2 || json.Unmarshal(part["type"], &kind) != nil || kind != "text" || json.Unmarshal(part["text"], &text) != nil {
+			continue
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+// ignoredToolLogs keeps the "tools ignored" notice to one line per model so a
+// chatty client cannot flood the log.
+var ignoredToolLogs sync.Map
+
+func logProviderIgnoredTools(model string) {
+	if _, loaded := ignoredToolLogs.LoadOrStore(model, struct{}{}); loaded {
+		return
+	}
+	log.Printf("WARN: [provider] 模型 %s 不支持调用方自定义工具；本次请求的 tools 已忽略，按纯文本回答", model)
 }

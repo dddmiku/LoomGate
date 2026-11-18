@@ -88,13 +88,25 @@ func TestProviderUsesExistingAuthModelPolicyAndAdmission(t *testing.T) {
 }
 func TestProviderIncompleteFailureAndUnsupportedInputDoNotSucceed(t *testing.T) {
 	h, p, key, _ := providerFixture(t, nil)
-	for _, body := range []string{`{"model":"fixture:dynamic","messages":[{"role":"system","content":"synthetic"}]}`, `{"model":"fixture:dynamic","messages":[{"role":"user","content":"synthetic"}],"temperature":1}`, `{"model":"fixture:dynamic","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image"}}]}]}`} {
+	// Inputs that cannot be carried at all (no text survives) are still rejected
+	// before any upstream call.
+	for _, body := range []string{`{"model":"fixture:dynamic","messages":[{"role":"system","content":"synthetic"}]}`, `{"model":"fixture:dynamic","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image"}}]}]}`} {
 		if w := providerRequest(h, key, body); w.Code != 400 {
 			t.Fatal("unsupported input was silently altered")
 		}
 	}
-	if p.calls.Load() != 0 {
-		t.Fatal("unsupported request sent upstream")
+	// Sampling and budget hints cannot be carried either, but ignoring them only
+	// changes how an answer is produced, so they must not fail the request: every
+	// mainstream client sends at least one of them.
+	for _, body := range []string{`{"model":"fixture:dynamic","messages":[{"role":"user","content":"synthetic"}],"temperature":1}`, `{"model":"fixture:dynamic","messages":[{"role":"user","content":"synthetic"}],"max_tokens":64}`} {
+		if w := providerRequest(h, key, body); w.Code != 200 {
+			t.Fatalf("ignorable hint rejected: %d %s", w.Code, w.Body.String())
+		}
+	}
+	// Two ignorable-hint requests were answered above; only the rejected ones
+	// must have stayed local.
+	if p.calls.Load() != 2 {
+		t.Fatalf("unexpected upstream calls: %d", p.calls.Load())
 	}
 	body := `{"model":"fixture:dynamic","messages":[{"role":"user","content":"synthetic"}],"stream":true}`
 	p.complete = false

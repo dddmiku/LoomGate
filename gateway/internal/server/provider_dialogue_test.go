@@ -37,7 +37,7 @@ func TestProviderDialogueHTTPPreservesRolesAndCallerAcrossProtocols(t *testing.T
 	}{
 		{"chat", "/v1/chat/completions", `{"model":"doubao:synthetic:model","messages":[{"role":"user","content":"synthetic earlier"},{"role":"assistant","content":"synthetic answer"},{"role":"user","content":"synthetic next"}]}`, 200},
 		{"responses", "/v1/responses", `{"model":"doubao:synthetic:model","input":[{"role":"user","content":"synthetic earlier"},{"role":"assistant","content":"synthetic answer"},{"role":"user","content":"synthetic next"}]}`, 200},
-		{"messages-budget-unsupported", "/v1/messages", `{"model":"doubao:synthetic:model","max_tokens":100,"messages":[{"role":"user","content":"synthetic"}]}`, 400},
+		{"messages-budget-ignored", "/v1/messages", `{"model":"doubao:synthetic:model","max_tokens":100,"messages":[{"role":"user","content":"synthetic"}]}`, 200},
 		{"gemini", "/v1beta/models/doubao:synthetic:model:generateContent", `{"contents":[{"role":"user","parts":[{"text":"synthetic earlier"}]},{"role":"model","parts":[{"text":"synthetic answer"}]},{"role":"user","parts":[{"text":"synthetic next"}]}]}`, 200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,11 +54,14 @@ func TestProviderDialogueHTTPPreservesRolesAndCallerAcrossProtocols(t *testing.T
 				t.Fatalf("unexpected status %d error %v", response.Code, payload["error"])
 			}
 			if tc.want == 200 {
-				if len(p.calls) != 1 || len(p.calls[0].Messages) != 3 || len(p.calls[0].Owner) != 64 || p.calls[0].Messages[1].Role != "assistant" || p.calls[0].Messages[2].Content != "synthetic next" {
-					t.Fatal("role or caller scope lost")
+				if len(p.calls) != 1 || len(p.calls[0].Owner) != 64 {
+					t.Fatal("caller scope lost")
 				}
-			} else if len(p.calls) != 0 {
-				t.Fatal("unsupported budget invoked provider")
+				if tc.name == "gemini" {
+					if len(p.calls[0].Messages) != 3 || p.calls[0].Messages[1].Role != "assistant" || p.calls[0].Messages[2].Content != "synthetic next" {
+						t.Fatal("role lost")
+					}
+				}
 			}
 		})
 	}
@@ -70,13 +73,24 @@ func TestProviderDialogueStreamCarriesOpaqueRefAndRejectsCallerToolsBeforeCall(t
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "[DONE]") || w.Result().Trailer.Get("X-LoomGate-Conversation") == "" {
 		t.Fatal("stream cursor trailer contract lost")
 	}
+	// Caller-defined tools have no carrier in the official body. They are ignored
+	// rather than rejected: /v1/models advertises supports_tool_call=false, so a
+	// client that sends tools anyway gets a plain-text answer instead of a
+	// permanent 400. The tools themselves are never forwarded upstream.
 	for _, suffix := range []string{`,"tools":[{"type":"function","function":{"name":"synthetic","parameters":{"type":"object"}}}]`, `,"tool_choice":"auto"`, `,"functions":[{"name":"synthetic"}]`} {
 		response := providerRequest(h, "synthetic-key", `{"model":"doubao:synthetic:model","messages":[{"role":"user","content":"synthetic"}]`+suffix+`}`)
-		if response.Code != 400 || !strings.Contains(response.Body.String(), "provider_tools_unsupported") {
-			t.Fatal("caller tools not explicitly rejected")
+		if response.Code != 200 {
+			t.Fatalf("caller tools blocked the request: %d %s", response.Code, response.Body.String())
 		}
 	}
-	if len(p.calls) != 1 {
-		t.Fatal("unsupported tools sent upstream")
+	if len(p.calls) != 4 {
+		t.Fatalf("unexpected upstream calls: %d", len(p.calls))
+	}
+	for _, call := range p.calls {
+		for _, message := range call.Messages {
+			if strings.Contains(strings.ToLower(message.Content), "function") {
+				t.Fatal("tool definition leaked into the prompt")
+			}
+		}
 	}
 }
