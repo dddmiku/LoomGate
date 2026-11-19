@@ -425,6 +425,20 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			message["tool_calls"] = calls
 		}
 		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}}}
+		// Report the upstream's own counts when it gave them. Omitted rather
+		// than zero-filled when it did not: clients read a missing usage as
+		// unknown, and a fabricated 0 would look like a real measurement.
+		if result.UsageReported {
+			usage := map[string]any{
+				"prompt_tokens":     result.PromptTokens,
+				"completion_tokens": result.CompletionTokens,
+				"total_tokens":      result.PromptTokens + result.CompletionTokens,
+			}
+			if result.PromptTokens >= result.CachedTokens && result.CachedTokens > 0 {
+				usage["prompt_tokens_details"] = map[string]any{"cached_tokens": result.CachedTokens}
+			}
+			response["usage"] = usage
+		}
 		if result.ConversationRef != "" {
 			response["loomgate_conversation"] = result.ConversationRef
 		}

@@ -238,6 +238,20 @@ func (s *providerStreamSink) finish(result inference.Result) error {
 		reason = "tool_calls"
 	}
 	last := s.chunk(map[string]string{}, reason)
+	// The final chunk is where OpenAI-compatible clients read usage from.
+	// Omitted when the upstream reported none, so a client never sees a
+	// fabricated zero.
+	if result.UsageReported {
+		usage := map[string]any{
+			"prompt_tokens":     result.PromptTokens,
+			"completion_tokens": result.CompletionTokens,
+			"total_tokens":      result.PromptTokens + result.CompletionTokens,
+		}
+		if result.CachedTokens > 0 && result.CachedTokens <= result.PromptTokens {
+			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": result.CachedTokens}
+		}
+		last["usage"] = usage
+	}
 	if result.ConversationRef != "" {
 		last["loomgate_conversation"] = result.ConversationRef
 	}
