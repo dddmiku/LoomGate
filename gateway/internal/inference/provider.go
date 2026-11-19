@@ -21,26 +21,65 @@ type Result struct {
 	Attempted, Acknowledged, Complete bool
 	Events, Attempts                  int
 	// Missing usage remains unknown; providers must not estimate billed tokens.
+	//
+	// UsageReported says the upstream told us the counts; the counts themselves
+	// live below. A provider that reports nothing must leave all three at zero
+	// and UsageReported false, so the log shows "unknown" rather than a
+	// fabricated 0.
 	UsageReported   bool
+	PromptTokens    int
+	CompletionTokens int
+	CachedTokens    int
 	AttemptRecords  []Attempt
 	ConversationRef string
+	// ToolCalls is set when the model answered by requesting tools instead of
+	// (or in addition to) prose. Empty means a plain text answer.
+	ToolCalls       []ToolCall
 	// MessageID is private attribution metadata for a bound work task. It must
 	// never appear in a public provider response.
 	MessageID string `json:"-"`
 	Recovery        []byte `json:"-"`
 }
 
-// Dialogue contains caller roles, never a flattened prompt. Owner is an opaque
-// authenticated caller scope; upstream conversation identifiers are not public.
+// Message is one conversation turn.
+//
+// Content is the plain text. ToolCalls is set on an assistant turn that asked
+// the caller to run tools, and ToolCallID identifies the call this turn answers
+// when Role is "tool". Providers that cannot carry tools simply ignore both.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
+
+// ToolCall is one requested function invocation, in OpenAI shape.
+type ToolCall struct {
+	ID        string           `json:"id"`
+	Type      string           `json:"type"`
+	Function  ToolCallFunction `json:"function"`
+	Index     *int             `json:"index,omitempty"`
+}
+
+// ToolCallFunction carries the name and the JSON-encoded arguments.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolDefinition is one tool the caller offers, in OpenAI shape. It is kept as
+// raw JSON because the provider forwards it verbatim: rewriting a schema it
+// does not interpret only risks breaking the caller's contract.
+type ToolDefinition map[string]any
 type Dialogue struct {
 	Model, Owner, ConversationRef string
 	AccountID, AccountRevision    string
 	Messages                      []Message
 	IdempotencyKey                string
+	// Tools is the caller's tool catalog, forwarded verbatim to providers that
+	// support tool calling. Empty means a plain text request.
+	Tools      []ToolDefinition
+	ToolChoice any
 }
 
 func (Dialogue) String() string   { return "inference.Dialogue[redacted]" }
@@ -62,6 +101,33 @@ type DialogueProvider interface {
 type ReasoningProvider interface {
 	DialogueProvider
 	CompleteDialogueReasoning(context.Context, Dialogue, func(string) error, func(string) error) (Result, error)
+}
+
+// ToolProvider is an optional capability for a model that can call caller
+// supplied tools. The transcript then has to be forwarded verbatim — an
+// assistant turn that requested a tool and the tool turn answering it lose
+// their meaning when flattened to text — and the answer can come back as tool
+// calls instead of prose.
+type ToolProvider interface {
+	DialogueProvider
+	SupportsTools() bool
+}
+
+// ToolCallDelta is one incremental tool-call fragment as the upstream streams
+// it. The first fragment for an index carries the id and function name; later
+// ones append to Arguments. Consumers reassemble by Index.
+type ToolCallDelta struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// ToolCapableProvider streams tool-call fragments in addition to text. A
+// provider that answers with tool calls emits no text for that turn.
+type ToolCapableProvider interface {
+	ToolProvider
+	CompleteDialogueTools(context.Context, Dialogue, func(ToolCallDelta) error) (Result, error)
 }
 type Attempt struct {
 	StartedAt, FinishedAt time.Time

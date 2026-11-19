@@ -127,14 +127,23 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	}
 	dialogueProvider, hasDialogue := provider.(inference.DialogueProvider)
 	var messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string            `json:"role"`
+		Content    json.RawMessage   `json:"content"`
+		ToolCalls  []json.RawMessage `json:"tool_calls"`
+		ToolCallID string            `json:"tool_call_id"`
 	}
 	if json.Unmarshal(fields["messages"], &messages) != nil {
 		st.status = 400
 		writeOpenAIError(w, 400, "provider_input_unsupported", "messages must be an array of role and content objects")
 		return
 	}
+	// A provider that can carry tools must receive the transcript verbatim: an
+	// assistant turn that asked for a tool and the "tool" turn answering it are
+	// only meaningful with their ids and call structure intact. Flattening them
+	// to text (the default below) silently turns a tool loop into one paragraph,
+	// which is why an agent client saw a single sentence and then nothing.
+	_, carriesTools := provider.(inference.ToolProvider)
+	carriesTools = carriesTools && len(fields["tools"]) > 0
 	// A system/developer role has no separate wire field, so its text is prepended
 	// to the first user turn. The instruction still reaches the model; only the
 	// role boundary is flattened. Rejecting it would make the provider unusable
@@ -163,22 +172,51 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	parsed := []inference.Message{}
 	total := 0
 	text = ""
-	for i, m := range turns {
-		value := textOfContent(m.Content)
-		if strings.TrimSpace(value) == "" {
-			continue
+	if carriesTools {
+		// Tool-aware path: keep roles, order, call ids and call structure.
+		// Empty text is legal on an assistant turn that only requests tools and
+		// on a tool turn, so the text emptiness check does not apply here.
+		for _, m := range messages {
+			value := textOfContent(m.Content)
+			total += len(value)
+			if total > 1<<20 {
+				break
+			}
+			msg := inference.Message{Role: m.Role, Content: value, ToolCallID: m.ToolCallID}
+			for _, rawCall := range m.ToolCalls {
+				var call inference.ToolCall
+				if json.Unmarshal(rawCall, &call) == nil {
+					if call.Type == "" {
+						call.Type = "function"
+					}
+					msg.ToolCalls = append(msg.ToolCalls, call)
+				}
+			}
+			parsed = append(parsed, msg)
 		}
-		total += len(value)
-		if total > 1<<20 {
-			break
+	} else {
+		for i, m := range turns {
+			value := textOfContent(m.Content)
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			total += len(value)
+			if total > 1<<20 {
+				break
+			}
+			if i == 0 && systemPrefix != "" {
+				value = systemPrefix + value
+			}
+			parsed = append(parsed, inference.Message{Role: m.Role, Content: value})
+			text = value
 		}
-		if i == 0 && systemPrefix != "" {
-			value = systemPrefix + value
-		}
-		parsed = append(parsed, inference.Message{Role: m.Role, Content: value})
-		text = value
 	}
-	if len(parsed) == 0 || total > 1<<20 || len(parsed) > 101 || (!hasDialogue && len(parsed) != 1) {
+	if len(parsed) == 0 || total > 1<<20 || len(parsed) > 101 || (!hasDialogue && !carriesTools && len(parsed) != 1) {
+		st.status = 400
+		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
+		return
+	}
+	if !carriesTools && text == "" {
 		st.status = 400
 		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
 		return
@@ -204,6 +242,20 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			owner = fmt.Sprintf("%x", sha256.Sum256([]byte("credential:"+credential)))
 		}
 		q := inference.Dialogue{Model: model, Owner: owner, ConversationRef: r.Header.Get("X-LoomGate-Conversation"), Messages: parsed, IdempotencyKey: r.Header.Get("Idempotency-Key")}
+		if carriesTools {
+			var defs []inference.ToolDefinition
+			var rawTools []inference.ToolDefinition
+			if json.Unmarshal(fields["tools"], &rawTools) == nil {
+				defs = rawTools
+			}
+			q.Tools = defs
+			if raw := fields["tool_choice"]; len(raw) > 0 {
+				var choice any
+				if json.Unmarshal(raw, &choice) == nil {
+					q.ToolChoice = choice
+				}
+			}
+		}
 		var emit func(string) error
 		if streaming {
 			sink = newProviderStreamSink(w, r, model, st)
@@ -214,7 +266,12 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		// sitting blank through the whole think phase. Fall back to the
 		// effort-aware path (reasoning_effort passthrough) when the provider
 		// does not expose reasoning deltas.
-		if reasoning, ok := provider.(inference.ReasoningProvider); ok && emit != nil {
+		if toolCapable, ok := provider.(inference.ToolCapableProvider); ok && carriesTools && emit != nil {
+			// Tool turns stream tool_call fragments, not prose; the sink emits
+			// them as OpenAI tool_calls deltas so an agent client can continue
+			// its loop instead of stopping after one sentence.
+			result, err = providerStreamToolsSafely(r.Context(), toolCapable, q, sink.emitToolDelta)
+		} else if reasoning, ok := provider.(inference.ReasoningProvider); ok && emit != nil {
 			result, err = providerStreamReasoningSafely(r.Context(), reasoning, q, emit, sink.emitReasoning)
 		} else if aware, ok := effortAware(provider); ok && effort != "" {
 			result, err = providerEffortDialogueSafely(r.Context(), aware, q, effort, emit)
@@ -254,6 +311,19 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	st.upstreamStarted = result.Attempted
 	st.uid = result.AccountRef
 	st.unreported = !result.UsageReported
+	// Carry the upstream's own counts into the request log. Without this the
+	// provider path recorded only "usage was reported" and every row showed a
+	// dash for input/output/cached, even when the upstream had sent exact
+	// numbers.
+	if result.UsageReported {
+		st.prompt = result.PromptTokens
+		st.toks = result.CompletionTokens
+		if result.CachedTokens > 0 {
+			st.cached = result.CachedTokens
+		}
+	} else {
+		st.prompt, st.toks, st.cached = 0, -1, -1
+	}
 	if st.trace != nil {
 		st.trace.account = result.AccountRef
 		st.trace.model = model
@@ -329,8 +399,32 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	w.Header().Set("X-Gateway-Upstream-Complete", "true")
 	w.Header().Set("X-Gateway-Upstream-Ack", "true")
 	w.Header().Set("X-Gateway-Upstream-Request-Digest", result.RequestDigest)
+	if result.UsageReported {
+		w.Header().Set("X-Gateway-Usage-Status", "reported")
+	}
 	if !streaming {
-		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]string{"role": "assistant", "content": result.Text}, "finish_reason": "stop"}}}
+		message := map[string]any{"role": "assistant", "content": result.Text}
+		finishReason := "stop"
+		if len(result.ToolCalls) > 0 {
+			finishReason = "tool_calls"
+			calls := make([]any, 0, len(result.ToolCalls))
+			for _, call := range result.ToolCalls {
+				callType := call.Type
+				if callType == "" {
+					callType = "function"
+				}
+				calls = append(calls, map[string]any{
+					"id":   call.ID,
+					"type": callType,
+					"function": map[string]any{
+						"name":      call.Function.Name,
+						"arguments": call.Function.Arguments,
+					},
+				})
+			}
+			message["tool_calls"] = calls
+		}
+		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}}}
 		if result.ConversationRef != "" {
 			response["loomgate_conversation"] = result.ConversationRef
 		}

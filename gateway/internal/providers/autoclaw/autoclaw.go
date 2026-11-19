@@ -187,8 +187,13 @@ func (p *Provider) Stream(ctx context.Context, model, text string, emit func(str
 }
 
 func (p *Provider) CompleteDialogue(ctx context.Context, q inference.Dialogue, emit func(string) error) (inference.Result, error) {
-	return p.complete(ctx, q.Model, q.Messages, emit, q.AccountID)
+	return p.completeTurn(ctx, q, emit, nil, nil)
 }
+
+// SupportsTools reports that this upstream honours an OpenAI tools array. A
+// probe with a tools definition returned finish_reason=tool_calls and a real
+// tool_calls delta, so the capability is verified rather than assumed.
+func (*Provider) SupportsTools() bool { return true }
 
 // CompleteDialogueReasoning implements inference.ReasoningProvider. The
 // upstream streams reasoning_content deltas for roughly the first second and
@@ -198,22 +203,30 @@ func (p *Provider) CompleteDialogueReasoning(ctx context.Context, q inference.Di
 	if emit == nil {
 		return inference.Result{}, inference.ErrStreamContract
 	}
-	return p.completeWithReasoning(ctx, q.Model, q.Messages, emit, emitReasoning, q.AccountID)
+	return p.completeTurn(ctx, q, emit, emitReasoning, nil)
+}
+
+// CompleteDialogueTools implements the tool-carrying path: the full transcript
+// (including assistant tool_calls and tool results) plus the caller's tool
+// catalog go upstream, and tool_call deltas come back to the caller.
+func (p *Provider) CompleteDialogueTools(ctx context.Context, q inference.Dialogue, emit func(inference.ToolCallDelta) error) (inference.Result, error) {
+	return p.completeTurn(ctx, q, nil, nil, emit)
 }
 
 // complete runs one turn against the account pool. It rotates accounts only on
 // failures that are plausibly account-scoped (auth, quota); a client error is
 // returned as-is because another account cannot fix it.
 func (p *Provider) complete(ctx context.Context, model string, messages []inference.Message, emit func(string) error, expectedAccount string) (inference.Result, error) {
-	return p.completeWithReasoning(ctx, model, messages, emit, nil, expectedAccount)
+	return p.completeTurn(ctx, inference.Dialogue{Model: model, Messages: messages, AccountID: expectedAccount}, emit, nil, nil)
 }
 
-// completeWithReasoning is complete() plus a separate sink for thinking deltas.
-// emitReasoning may be nil, in which case reasoning is counted but not sent.
-func (p *Provider) completeWithReasoning(ctx context.Context, model string, messages []inference.Message, emit, emitReasoning func(string) error, expectedAccount string) (inference.Result, error) {
-	if len(messages) == 0 {
+// completeTurn is the single entry point for every request shape. Exactly one
+// output mode is active: plain text, text+reasoning, or tool calls.
+func (p *Provider) completeTurn(ctx context.Context, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (inference.Result, error) {
+	if len(q.Messages) == 0 {
 		return inference.Result{}, errors.New("autoclaw_messages_required")
 	}
+	expectedAccount := q.AccountID
 	rows, err := p.accounts()
 	if err != nil {
 		return inference.Result{}, err
@@ -249,7 +262,7 @@ func (p *Provider) completeWithReasoning(ctx context.Context, model string, mess
 		byID[row.ID] = row
 	}
 	return providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
-		return p.turnWithReasoning(ctx, byID[id], model, messages, emit, emitReasoning)
+		return p.turnWith(ctx, byID[id], q, emit, emitReasoning, emitTool)
 	})
 }
 
@@ -279,16 +292,15 @@ type emptyAnswerError struct{}
 
 func (e *emptyAnswerError) Error() string { return "autoclaw_empty_answer" }
 
-func (p *Provider) turn(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit func(string) error) (inference.Result, error) {
-	return p.turnWithReasoning(ctx, row, model, messages, emit, nil)
-}
 
-func (p *Provider) turnWithReasoning(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit, emitReasoning func(string) error) (inference.Result, error) {
+
+func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (inference.Result, error) {
+	model, messages := q.Model, q.Messages
 	s, err := p.session(row.ID)
 	if err != nil {
 		return inference.Result{}, err
 	}
-	body, err := buildBody(model, messages, emit != nil)
+	body, err := buildDialogueBody(model, messages, q.Tools, q.ToolChoice, emit != nil || emitTool != nil)
 	if err != nil {
 		return inference.Result{}, err
 	}
@@ -323,21 +335,28 @@ func (p *Provider) turnWithReasoning(ctx context.Context, row accountvault.Accou
 			return result, err
 		}
 		result.Text = text
-		result.UsageReported = usage
+		result.UsageReported = usage.PromptSeen || usage.CompletionSeen
+		result.PromptTokens = usage.Prompt
+		result.CompletionTokens = usage.Completion
+		result.CachedTokens = usage.Cached
 		result.Complete = true
 		result.Acknowledged = true
 		result.Events = 1
 		return result, nil
 	}
 
-	text, events, usage, err := streamSSE(resp.Body, emit, emitReasoning)
+	text, events, usage, toolCalls, err := streamSSEWithTools(resp.Body, emit, emitReasoning, emitTool)
 	result.Text = text
 	result.Events = events
 	result.Attempted = true
 	result.UsageReported = usage.PromptSeen || usage.CompletionSeen
+	result.PromptTokens = usage.Prompt
+	result.CompletionTokens = usage.Completion
+	result.CachedTokens = usage.Cached
 	if err != nil {
 		return result, err
 	}
+	result.ToolCalls = toolCalls
 	result.Complete = true
 	result.Acknowledged = true
 	return result, nil
@@ -378,6 +397,14 @@ var foreignIdentities = []string{
 // comes back as a 406 with no body, so all three are handled here rather than
 // being diagnosed from a response.
 func buildBody(model string, messages []inference.Message, stream bool) ([]byte, error) {
+	return buildDialogueBody(model, messages, nil, nil, stream)
+}
+
+// buildDialogueBody also carries the caller's tool catalog. Tools and tool
+// choice are forwarded verbatim: the upstream honours an OpenAI tools array
+// (verified: a probe returned finish_reason=tool_calls), and rewriting a schema
+// the gateway does not interpret would only break the caller's contract.
+func buildDialogueBody(model string, messages []inference.Message, tools []inference.ToolDefinition, toolChoice any, stream bool) ([]byte, error) {
 	msgs := make([]map[string]any, 0, len(messages)+1)
 	hasBanner := false
 	for _, m := range messages {
@@ -398,12 +425,40 @@ func buildBody(model string, messages []inference.Message, stream bool) ([]byte,
 		if role == "system" {
 			content = neutraliseIdentity(content)
 		}
-		msgs = append(msgs, map[string]any{"role": role, "content": content})
+		entry := map[string]any{"role": role, "content": content}
+		if len(m.ToolCalls) > 0 {
+			calls := make([]any, 0, len(m.ToolCalls))
+			for _, call := range m.ToolCalls {
+				callType := call.Type
+				if callType == "" {
+					callType = "function"
+				}
+				calls = append(calls, map[string]any{
+					"id":   call.ID,
+					"type": callType,
+					"function": map[string]any{
+						"name":      call.Function.Name,
+						"arguments": call.Function.Arguments,
+					},
+				})
+			}
+			entry["tool_calls"] = calls
+		}
+		if m.ToolCallID != "" {
+			entry["tool_call_id"] = m.ToolCallID
+		}
+		msgs = append(msgs, entry)
 	}
 	payload := map[string]any{
 		"model":    within(model),
 		"messages": msgs,
 		"stream":   stream,
+	}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+		if toolChoice != nil {
+			payload["tool_choice"] = toolChoice
+		}
 	}
 	for _, field := range forbiddenBodyFields {
 		delete(payload, field)
@@ -489,9 +544,9 @@ func newTraceID() string {
 }
 
 // aggregate folds an SSE body into plain text, for non-streaming callers.
-func aggregate(raw []byte) (string, bool, error) {
+func aggregate(raw []byte) (string, streamUsage, error) {
 	var text strings.Builder
-	usage := false
+	var usage streamUsage
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data:") {
@@ -516,7 +571,7 @@ func aggregate(raw []byte) (string, bool, error) {
 			text.WriteString(c.Delta.Content)
 		}
 		if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
-			usage = true
+			usage = parseUsage(chunk.Usage, usage)
 		}
 	}
 	if text.Len() == 0 {
@@ -532,8 +587,17 @@ func aggregate(raw []byte) (string, bool, error) {
 // through onReasoning (when set) so the caller is not blind for the whole
 // thinking phase, but they are never appended to the answer text.
 func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string) error) (string, int, streamUsage, error) {
+	text, events, usage, _, err := streamSSEWithTools(body, emit, onReasoning, nil)
+	return text, events, usage, err
+}
+
+// streamSSEWithTools additionally forwards tool_call fragments. Tool-call turns
+// carry no answer text, so an empty text buffer is legal when the upstream
+// reported any tool call.
+func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning func(string) error, onTool func(inference.ToolCallDelta) error) (string, int, streamUsage, []inference.ToolCall, error) {
 	var text strings.Builder
 	var usage streamUsage
+	var toolCalls []inference.ToolCall
 	events := 0
 	// Read line by line: SSE frames are newline delimited and deltas must be
 	// forwarded immediately, not buffered until the stream ends.
@@ -562,6 +626,15 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 						Delta struct {
 							Content          string `json:"content"`
 							ReasoningContent string `json:"reasoning_content"`
+							ToolCalls []struct {
+								Index    *int   `json:"index"`
+								ID       string `json:"id"`
+								Type     string `json:"type"`
+								Function struct {
+									Name      string `json:"name"`
+									Arguments string `json:"arguments"`
+								} `json:"function"`
+							} `json:"tool_calls"`
 						} `json:"delta"`
 					} `json:"choices"`
 					Usage json.RawMessage `json:"usage"`
@@ -573,10 +646,37 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 					usage = parseUsage(chunk.Usage, usage)
 				}
 				for _, c := range chunk.Choices {
+					for _, tc := range c.Delta.ToolCalls {
+						index := 0
+						if tc.Index != nil {
+							index = *tc.Index
+						}
+						for len(toolCalls) <= index {
+							toolCalls = append(toolCalls, inference.ToolCall{Type: "function"})
+						}
+						if tc.ID != "" {
+							toolCalls[index].ID = tc.ID
+						}
+						if tc.Function.Name != "" {
+							toolCalls[index].Function.Name += tc.Function.Name
+						}
+						toolCalls[index].Function.Arguments += tc.Function.Arguments
+						if onTool != nil {
+							if err := onTool(inference.ToolCallDelta{
+								Index:     index,
+								ID:        tc.ID,
+								Name:      tc.Function.Name,
+								Arguments: tc.Function.Arguments,
+							}); err != nil {
+								return text.String(), events, usage, toolCalls, err
+							}
+						}
+						events++
+					}
 					if c.Delta.ReasoningContent != "" {
 						if onReasoning != nil {
 							if err := onReasoning(c.Delta.ReasoningContent); err != nil {
-								return text.String(), events, usage, err
+								return text.String(), events, usage, toolCalls, err
 							}
 						}
 						events++
@@ -585,7 +685,7 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 						continue
 					}
 					if err := emit(c.Delta.Content); err != nil {
-						return text.String(), events, usage, err
+						return text.String(), events, usage, toolCalls, err
 					}
 					text.WriteString(c.Delta.Content)
 					events++
@@ -596,13 +696,15 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return text.String(), events, usage, err
+			return text.String(), events, usage, toolCalls, err
 		}
 	}
-	if text.Len() == 0 {
-		return "", events, usage, &emptyAnswerError{}
+	// A turn that asked for tools has no prose by design. Treating that as an
+	// empty answer made every agent loop die after its first tool request.
+	if text.Len() == 0 && len(toolCalls) == 0 {
+		return "", events, usage, toolCalls, &emptyAnswerError{}
 	}
-	return text.String(), events, usage, nil
+	return text.String(), events, usage, toolCalls, nil
 }
 
 // streamUsage carries the upstream-reported token counts. A field is unknown

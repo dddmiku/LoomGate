@@ -28,6 +28,11 @@ type ProbeAccount struct {
 type ProbeReport struct {
 	Model string `json:"model"`
 
+	// ToolCallFrames counts tool_calls deltas the upstream returned, so we can
+	// tell "upstream accepts tools" from "upstream ignored them".
+	ToolCallFrames int `json:"tool_call_frames"`
+	FinishReason   string `json:"finish_reason,omitempty"`
+
 	// HeaderMS is how long the upstream took to return response headers. If
 	// this alone is huge, the upstream is queueing us before doing any work.
 	HeaderMS int64 `json:"header_ttfb_ms"`
@@ -75,13 +80,50 @@ type probeError struct{ code string }
 
 func (e *probeError) Error() string { return e.code }
 
+// ProbeOptions controls what the probe puts on the wire.
+type ProbeOptions struct {
+	// WithTools sends an OpenAI-style tools array, to find out whether the
+	// upstream honours it or silently ignores it.
+	WithTools bool
+}
+
 // Probe sends exactly one streaming chat request and records the timings of
 // each phase. It never retries: the point is to measure one honest call.
 func Probe(ctx context.Context, account ProbeAccount, model, prompt string) (ProbeReport, error) {
+	return ProbeWith(ctx, account, model, prompt, ProbeOptions{})
+}
+
+func ProbeWith(ctx context.Context, account ProbeAccount, model, prompt string, opts ProbeOptions) (ProbeReport, error) {
 	report := ProbeReport{Model: model}
 	started := time.Now()
 
-	body, err := buildBody(model, []inference.Message{{Role: "user", Content: prompt}}, true)
+	var messages []inference.Message
+	messages = append(messages, inference.Message{Role: "user", Content: prompt})
+	body, err := buildBody(model, messages, true)
+	if err != nil {
+		return report, err
+	}
+	if opts.WithTools {
+		var payload map[string]any
+		if json.Unmarshal(body, &payload) == nil {
+			payload["tools"] = []any{map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "get_weather",
+					"description": "Get the current weather for a city",
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{"city": map[string]any{"type": "string"}},
+						"required":   []string{"city"},
+					},
+				},
+			}}
+			payload["tool_choice"] = "auto"
+			if b, err := json.Marshal(payload); err == nil {
+				body = b
+			}
+		}
+	}
 	if err != nil {
 		return report, err
 	}
@@ -138,7 +180,9 @@ func Probe(ctx context.Context, account ProbeAccount, model, prompt string) (Pro
 						Delta struct {
 							Content          string `json:"content"`
 							ReasoningContent string `json:"reasoning_content"`
+							ToolCalls        []json.RawMessage `json:"tool_calls"`
 						} `json:"delta"`
+						FinishReason string `json:"finish_reason"`
 					} `json:"choices"`
 					Usage json.RawMessage `json:"usage"`
 				}
@@ -161,6 +205,12 @@ func Probe(ctx context.Context, account ProbeAccount, model, prompt string) (Pro
 					}
 				}
 				for _, c := range chunk.Choices {
+					if len(c.Delta.ToolCalls) > 0 {
+						report.ToolCallFrames++
+					}
+					if c.FinishReason != "" {
+						report.FinishReason = c.FinishReason
+					}
 					if c.Delta.ReasoningContent != "" {
 						report.ReasoningFrames++
 						if report.FirstReasoningMS == 0 {

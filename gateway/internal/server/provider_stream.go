@@ -21,6 +21,16 @@ func providerStreamSafely(ctx context.Context, p inference.StreamingProvider, mo
 	return p.Stream(ctx, model, text, emit)
 }
 
+func providerStreamToolsSafely(ctx context.Context, p inference.ToolCapableProvider, q inference.Dialogue, emit func(inference.ToolCallDelta) error) (result inference.Result, err error) {
+	defer func() {
+		if recover() != nil {
+			result = inference.Result{Attempted: true}
+			err = inference.ErrStreamContract
+		}
+	}()
+	return p.CompleteDialogueTools(ctx, q, emit)
+}
+
 func providerStreamReasoningSafely(ctx context.Context, p inference.ReasoningProvider, q inference.Dialogue, emit, emitReasoning func(string) error) (result inference.Result, err error) {
 	defer func() {
 		if recover() != nil {
@@ -43,7 +53,10 @@ type providerStreamSink struct {
 	// reasoning accumulates thinking deltas so validate() can tell an answer
 	// from a think-only stream; it is never part of result.Text.
 	reasoning strings.Builder
-	err       error
+	// sawToolCalls marks a turn whose answer is a tool request; such a turn
+	// legitimately carries no prose.
+	sawToolCalls bool
+	err          error
 	stat      *chatStat
 }
 
@@ -107,6 +120,53 @@ func (s *providerStreamSink) emit(delta string) error {
 	return nil
 }
 
+// emitToolDelta forwards one tool-call fragment as an OpenAI tool_calls delta.
+// The first fragment for an index carries id and function name; the rest
+// append arguments, exactly as the client expects to reassemble them.
+func (s *providerStreamSink) emitToolDelta(delta inference.ToolCallDelta) error {
+	if s.err != nil {
+		return s.err
+	}
+	first := !s.started
+	if first {
+		s.w.Header().Set("Content-Type", "text/event-stream")
+		s.w.Header().Set("Cache-Control", "no-cache")
+		s.w.Header().Set("X-Accel-Buffering", "no")
+		s.w.Header().Set("X-Gateway-Streaming", "incremental")
+		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
+		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
+		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
+		s.started = true
+	}
+	index := delta.Index
+	call := map[string]any{
+		"index": index,
+		"type":  "function",
+		"function": map[string]any{
+			"name":      delta.Name,
+			"arguments": delta.Arguments,
+		},
+	}
+	if delta.ID != "" {
+		call["id"] = delta.ID
+	}
+	deltaMap := map[string]any{"tool_calls": []any{call}}
+	if first {
+		deltaMap["role"] = "assistant"
+	}
+	if err := s.frame(map[string]any{
+		"id": s.id, "object": "chat.completion.chunk", "created": s.created, "model": s.model,
+		"choices": []any{map[string]any{"index": 0, "delta": deltaMap, "finish_reason": nil}},
+	}); err != nil {
+		return err
+	}
+	s.sawToolCalls = true
+	if first {
+		s.stat.ttfb = time.Since(s.stat.start)
+	}
+	return nil
+}
+
 // emitReasoning forwards a thinking delta. It opens the stream and sets TTFB
 // exactly as emit does, because the client has genuinely received bytes at
 // that moment — the model is working, and staying silent until the answer
@@ -155,6 +215,11 @@ func (s *providerStreamSink) validate(result inference.Result) error {
 	if s.err != nil {
 		return s.err
 	}
+	// A tool-call turn has no answer text by design, so the text comparison
+	// only applies to prose turns.
+	if s.sawToolCalls {
+		return nil
+	}
 	if !s.started || s.text.Len() == 0 || s.text.String() != result.Text {
 		return inference.ErrStreamContract
 	}
@@ -166,7 +231,13 @@ func (s *providerStreamSink) fail(code string) {
 	_ = s.frame(map[string]any{"error": map[string]string{"type": "upstream_error", "code": code, "message": "provider stream did not complete; discard the incomplete answer and inspect status before resubmitting"}})
 }
 func (s *providerStreamSink) finish(result inference.Result) error {
-	last := s.chunk(map[string]string{}, "stop")
+	// The finish_reason tells an agent client what to do next: tool_calls means
+	// "run these and send the results back", stop means the turn is complete.
+	reason := "stop"
+	if s.sawToolCalls || len(result.ToolCalls) > 0 {
+		reason = "tool_calls"
+	}
+	last := s.chunk(map[string]string{}, reason)
 	if result.ConversationRef != "" {
 		last["loomgate_conversation"] = result.ConversationRef
 	}

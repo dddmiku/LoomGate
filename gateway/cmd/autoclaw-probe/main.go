@@ -32,6 +32,7 @@ func main() {
 	vaultDir := flag.String("vault", "/app/data/provider-accounts", "provider vault directory")
 	model := flag.String("model", "zai_glm-5.3-flash", "upstream model id")
 	prompt := flag.String("prompt", "你好", "user prompt")
+	withTools := flag.Bool("with-tools", false, "send an OpenAI tools array to see if the upstream honours it")
 	timeout := flag.Duration("timeout", 5*time.Minute, "overall timeout")
 	flag.Parse()
 
@@ -66,7 +67,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	report, err := autoclaw.Probe(ctx, account, *model, *prompt)
+	report, err := autoclaw.ProbeWith(ctx, account, *model, *prompt, autoclaw.ProbeOptions{WithTools: *withTools})
 	out, _ := json.MarshalIndent(report, "", "  ")
 	fmt.Println(string(out))
 	if err != nil {

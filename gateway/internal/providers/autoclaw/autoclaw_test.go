@@ -102,8 +102,11 @@ func TestNonStreamAggregatesSSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text != "答案" || !usage {
-		t.Fatalf("text=%q usage=%v", text, usage)
+	if text != "答案" {
+		t.Fatalf("text=%q", text)
+	}
+	if !usage.PromptSeen || usage.Prompt != 3 || !usage.CompletionSeen || usage.Completion != 2 {
+		t.Fatalf("usage not captured: %+v", usage)
 	}
 }
 
@@ -248,5 +251,114 @@ func TestHeadersCarryClientTraceIdentifiers(t *testing.T) {
 	setHeaders(other, "token", "zai_glm-5.3-flash")
 	if other.Header.Get("x-request-id") == req.Header.Get("x-request-id") {
 		t.Error("trace identifiers are not per-request")
+	}
+}
+
+// The upstream honours an OpenAI tools array: a probe with a tools definition
+// returned finish_reason=tool_calls and a real tool_calls delta. Forwarding the
+// catalog and the tool transcript is what lets an agent client continue its
+// loop instead of stopping after one sentence.
+func TestToolCatalogIsForwardedVerbatim(t *testing.T) {
+	tools := []inference.ToolDefinition{{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "get_weather",
+			"description": "Get the current weather",
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+		},
+	}}
+	body, err := buildDialogueBody("autoclaw:glm-5.3-flash",
+		[]inference.Message{{Role: "user", Content: "北京天气"}}, tools, "auto", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if json.Unmarshal(body, &decoded) != nil {
+		t.Fatal("invalid body")
+	}
+	got, ok := decoded["tools"].([]any)
+	if !ok || len(got) != 1 {
+		t.Fatalf("tools not forwarded: %v", decoded["tools"])
+	}
+	if decoded["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice not forwarded: %v", decoded["tool_choice"])
+	}
+	// The forbidden budget fields must still be absent on a tools request.
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if _, present := decoded[field]; present {
+			t.Errorf("tools request still forwards %q", field)
+		}
+	}
+}
+
+// A tool transcript must survive as structure: the assistant's call and the
+// tool result are only meaningful with their ids.
+func TestToolTranscriptKeepsStructure(t *testing.T) {
+	messages := []inference.Message{
+		{Role: "user", Content: "北京天气"},
+		{Role: "assistant", ToolCalls: []inference.ToolCall{{
+			ID: "call_1", Type: "function",
+			Function: inference.ToolCallFunction{Name: "get_weather", Arguments: `{"city":"北京"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_1", Content: `{"temp":3}`},
+	}
+	body, err := buildDialogueBody("autoclaw:glm-5.3-flash", messages, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if json.Unmarshal(body, &decoded) != nil {
+		t.Fatal("invalid body")
+	}
+	var assistant, tool map[string]any
+	for _, m := range decoded.Messages {
+		switch m["role"] {
+		case "assistant":
+			assistant = m
+		case "tool":
+			tool = m
+		}
+	}
+	if assistant == nil || assistant["tool_calls"] == nil {
+		t.Fatalf("assistant tool_calls dropped: %v", assistant)
+	}
+	if tool == nil || tool["tool_call_id"] != "call_1" {
+		t.Fatalf("tool result lost its call id: %v", tool)
+	}
+}
+
+// A tool-call turn carries no prose; that must not be reported as an empty
+// answer, and finish_reason must say tool_calls.
+func TestToolCallStreamIsNotAnEmptyAnswer(t *testing.T) {
+	frames := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":9}}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	var deltas []inference.ToolCallDelta
+	text, _, usage, calls, err := streamSSEWithTools(strings.NewReader(frames),
+		func(string) error { return nil }, nil,
+		func(d inference.ToolCallDelta) error { deltas = append(deltas, d); return nil })
+	if err != nil {
+		t.Fatalf("a tool-call turn was rejected as empty: %v", err)
+	}
+	if text != "" {
+		t.Fatalf("tool turn produced prose: %q", text)
+	}
+	if len(calls) != 1 || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("tool call not reassembled: %+v", calls)
+	}
+	if calls[0].Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("arguments not concatenated: %q", calls[0].Function.Arguments)
+	}
+	if len(deltas) < 2 {
+		t.Fatalf("fragments were not streamed: %d", len(deltas))
+	}
+	if !usage.CompletionSeen || usage.Completion != 9 {
+		t.Fatalf("usage lost on a tool turn: %+v", usage)
 	}
 }
