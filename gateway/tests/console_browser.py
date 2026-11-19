@@ -79,7 +79,7 @@ def main():
         page.locator('#username').fill(fields['username'].strip())
         page.locator('#password').fill(fields['password'].strip())
         page.locator('#login-submit').click()
-        page.locator('[data-workspace-agenda]').wait_for()
+        page.locator('[data-workspace-overview]').wait_for()
         assert page.locator('script[src="console/app.js"]').count()==1
         assert page.locator('#tabs').count()==0
         done('independent_login_and_console_entry')

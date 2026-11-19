@@ -33,6 +33,26 @@ type Classified interface {
 	RetryClass() Class
 }
 
+// Cooldowner is an optional extension: a provider error may ask for a longer
+// rest than the default (a quota exhaustion is not fixed by 30 seconds).
+type Cooldowner interface {
+	CooldownDuration() time.Duration
+}
+
+// cooldownFor returns the rest an error asks for, or the default when it does
+// not say. A non-positive value means "no opinion".
+func cooldownFor(err error) time.Duration {
+	var c Cooldowner
+	if errors.As(err, &c) {
+		if d := c.CooldownDuration(); d > 0 {
+			return d
+		}
+	}
+	return defaultCooldown
+}
+
+const defaultCooldown = 30 * time.Second
+
 func classOf(err error) Class {
 	var c Classified
 	if errors.As(err, &c) {
@@ -149,7 +169,7 @@ func Run[T any](ctx context.Context, accounts []string, budget int, cool *Cooldo
 				// The account is healthy; stop trying this one but do not cool it.
 				goto next
 			case RetryAccount:
-				cool.Set(account, 30*time.Second)
+				cool.Set(account, cooldownFor(err))
 				goto next
 			}
 			goto next

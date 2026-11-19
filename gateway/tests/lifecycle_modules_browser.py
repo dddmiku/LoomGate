@@ -22,13 +22,13 @@ def main():
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
    page.locator('#navigation a[href="#'+route+'"]').click()
   def tasks():
-   nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');page.locator('[data-task=balance]').first.wait_for();choose_account(page,'#task-account','1001');page.locator('[data-task=compensation]').wait_for()
+   nav('overview');page.locator('[data-workspace-overview]').wait_for();nav('tasks');page.locator('[data-task=balance]').first.wait_for();choose_account(page,'#task-account','1001');page.locator('[data-task=compensation]').wait_for()
   def run(key,status):
    select_task(page,key,'run-task')
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:page.locator('#run-form button[type=submit]').click()
    assert response.value.status==202;rid=response.value.json()['run']['id'];page.locator('#dialog').wait_for(state='hidden');return wait_run(page.request,base+'/admin/api/workbench',rid,status,timeout=20)
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   stage='directory';tasks();catalog=api('workbench/catalog?provider=workbuddy&accounts=1001');assert not catalog['issues']
   expected=['travel/depart','travel/claim','redeem/fixture-future','makeup','resources','compensation'];assert all(any(t['key']==key and t.get('state') for t in catalog['tasks']) for key in expected)
   assert all(stats().get(k,0)==0 for k in ['travel_departures','travel_claims','redemptions','makeups','compensation_claims']);report['actions'].append('read_only_dynamic_lifecycle_directory_and_progress')

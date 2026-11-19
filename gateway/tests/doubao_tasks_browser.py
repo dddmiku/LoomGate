@@ -52,14 +52,14 @@ def main():
    def stats():return page.request.get(base+'/__fixture/work-stats').json()
    def tasks():
     if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
-    page.locator('#navigation a[href="#overview"]').click();page.locator('[data-workspace-agenda]').wait_for()
+    page.locator('#navigation a[href="#overview"]').click();page.locator('[data-workspace-overview]').wait_for()
     page.locator('#navigation a[href="#tasks"]').click();choose_provider(page,'#task-provider','doubao');choose_account(page,'#task-account','a-fixture');page.locator('[data-task="synthetic-work-group:synthetic-work-task"]').wait_for()
    def run(expected):
     select_task(page,'synthetic-work-group:synthetic-work-task','run-task')
     with page.expect_response(lambda r:r.url.endswith('/workbench/run') and r.request.method=='POST') as reply:page.locator('#run-form button[type=submit]').click()
     assert reply.value.status==202;rid=reply.value.json()['run']['id'];page.locator('#dialog').wait_for(state='hidden');return wait_run(page.request,base+'/admin/api/workbench',rid,expected,timeout=15)
    fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
    stage='task-directory';tasks();task=next(t for t in api('workbench/catalog?provider=doubao')['tasks'] if t['account_id']=='a-fixture');assert task['state']['phase']=='ready';assert 'work_configurable' not in task
    assert page.locator('[data-action="configure-work"]').count()==0
    for route in ['works','work-status','artifact','work-input']:

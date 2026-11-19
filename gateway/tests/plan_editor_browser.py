@@ -22,7 +22,7 @@ def main():
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
    page.locator('#navigation a[href="#'+route+'"]').click();page.locator('#view>.loading').wait_for(state='detached')
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   baseline=api()['schedules'];writes=[]
   page.on('request',lambda r:writes.append('schedule') if r.url.endswith('/api/workbench/schedule') and r.method=='POST' else None)
   stage='existing-task-entry';nav('schedules');page.locator('[data-action=new-schedule]').click();page.wait_for_function("location.hash==='#tasks'")

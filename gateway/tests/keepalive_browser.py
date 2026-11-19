@@ -25,12 +25,12 @@ def main():
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
    page.locator('#navigation a[href="#'+route+'"]').click();page.locator('#view > .loading').wait_for(state='detached')
   def tasks(provider='workbuddy'):
-   nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');choose_provider(page,'#task-provider',provider);page.locator('#task-list.loading').wait_for(state='detached')
+   nav('overview');page.locator('[data-workspace-overview]').wait_for();nav('tasks');choose_provider(page,'#task-provider',provider);page.locator('#task-list.loading').wait_for(state='detached')
   def submit():
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:page.locator('#run-form button[type=submit]').click()
    assert response.value.status==202;rid=response.value.json()['run']['id'];page.locator('#dialog').wait_for(state='hidden');return wait_run(page.request,base+'/admin/api/workbench',rid,'succeeded',timeout=15)
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   stage='discovery';tasks();rows=api('workbench/catalog?provider=workbuddy')['tasks'];assert {x['key'] for x in rows}=={'keepalive'} and {x['account_id'] for x in rows}=={'4101','4102','4103'}
   assert stats()['workbuddy_refreshes']==0;report['actions'].append('real_directory_excludes_manual_review_but_includes_session_recovery')
   stage='run-all';page.locator('[data-action=run-all]').click();run=submit();s=stats();assert s['workbuddy_refreshes']==3

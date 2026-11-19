@@ -96,7 +96,7 @@ def main():
             page.locator('#username').fill(fields['username'].strip())
             page.locator('#password').fill(fields['password'].strip())
             page.locator('#login-submit').click()
-            page.locator('[data-workspace-agenda]').wait_for()
+            page.locator('[data-workspace-overview]').wait_for()
             done('independent_login')
 
             def show(envelope, name):

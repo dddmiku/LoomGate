@@ -350,6 +350,12 @@ func (e *accountError) Error() string { return "autoclaw upstream: " + e.code }
 
 // RetryClass keeps the same policy the legacy path uses: auth/quota/rate-limit
 // and server faults implicate the account, a client error does not.
+//
+// 429/402 (rate limit, quota exhausted) get the long cooldown: retrying them
+// after 30s just burns the same wall-clock wait again. 401/403 get the short
+// one because the request path already tried a token renewal; reaching here
+// means the account itself is bad, and the operator needs to see it fail
+// rather than have it disappear for ten minutes.
 func (e *accountError) RetryClass() providerretry.Class {
 	switch {
 	case e.status == 401 || e.status == 403 || e.status == 429 || e.status == 402 || e.status == 409:
@@ -358,6 +364,14 @@ func (e *accountError) RetryClass() providerretry.Class {
 		return providerretry.RetryAccount
 	}
 	return providerretry.Fatal
+}
+
+// CooldownDuration lets a failure ask for a longer rest than the default.
+func (e *accountError) CooldownDuration() time.Duration {
+	if e.status == 429 || e.status == 402 {
+		return 10 * time.Minute
+	}
+	return 0
 }
 
 // RetryClass for an empty answer: the account is fine, the upstream hiccupped.
@@ -434,7 +448,9 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 	}
 	defer resp.Body.Close()
 
-	result := inference.Result{Attempted: true, Attempts: 1}
+	// AccountRef is what the request log attributes the attempt to; without it
+	// every AutoClaw row showed uid=- and the provider could not be audited.
+	result := inference.Result{Attempted: true, Attempts: 1, AccountRef: row.ID}
 	// A tool turn has no text emitter but still needs the streaming parser:
 	// tool_calls arrive as deltas, so buffering the body and aggregating text
 	// would drop the call and report an empty answer.

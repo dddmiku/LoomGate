@@ -33,7 +33,7 @@ def main():
    if target_route=='tasks':page.locator('#task-list.loading').wait_for(state='detached')
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
   page.goto(base+'/admin/');page.locator('#login-submit').wait_for();bounds();shot('layout-login-desktop.png')
-  page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   for width in (1440,1024,768,390,320):
    page.set_viewport_size({'width':width,'height':1000 if width>900 else 844})
    for route in ('overview','providers','accounts','models','tasks','usage','logs','keys','migration','settings'):

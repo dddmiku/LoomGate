@@ -9,8 +9,9 @@ import (
 	"workbuddy2api/internal/taskengine"
 )
 
-// 任务日志必须来自真实执行记录：阶段、账号、结果与安全摘要逐行渲染，
-// 而不是给面板一个空结构体再让它自己猜。
+// 任务日志必须来自真实执行记录，并按旧版脚本的写法渲染成一行一句人话：
+// 时间 + 账号标签 + 摘要。阶段/状态不再作为列宽固定出现在每行（用户明确
+// 反馈那种「检查状态 | 账号 uuid | 成功」的表格看不懂）。
 func TestTaskLogRendersRunSteps(t *testing.T) {
 	e := openBehaviorEngine(t, taskengine.Options{})
 	task := syntheticTask("fake", "account-a", "growth/accept/1")
@@ -32,9 +33,16 @@ func TestTaskLogRendersRunSteps(t *testing.T) {
 		t.Error("ended time not reported")
 	}
 	text := strings.Join(res.Lines, "\n")
-	for _, want := range []string{"开始", "结束", "检查状态", "账号 account-a", "官方状态已确认完成。"} {
+	for _, want := range []string{"开始执行", "结束", "官方状态已确认完成。", "[account]"} {
 		if !strings.Contains(text, want) {
-			t.Errorf("log missing %q:\n%s", want, text)
+			t.Errorf("log missing %q: %s", want, text)
+		}
+	}
+	// The old version never printed a stage column or a full account uuid;
+	// both are what made the newer dialog unreadable.
+	for _, unwanted := range []string{"检查状态", "账号 account-a", " | "} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("log reintroduced %q: %s", unwanted, text)
 		}
 	}
 	if r.Status != taskengine.StatusSucceeded {

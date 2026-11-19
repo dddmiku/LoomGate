@@ -24,7 +24,7 @@ def main():
    result=response.value.json();rid=result['run']['id'];page.locator('#dialog').wait_for(state='hidden')
    return wait_run(page.request,base+'/admin/api/workbench',rid,status)
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   page.request.post(base+'/__fixture/mode/success');initial=stats()
   stage='discover';nav('tasks');page.locator('[data-task=balance]').first.wait_for()
   # The task list is grouped by provider+realm+task key: one row per task and
@@ -46,7 +46,7 @@ def main():
   assert len(run['discovery_issues'])==2;assert any(x['task_key']=='balance' for x in run['steps']);assert stats()['balance_reads']>=initial['balance_reads']+4;done('partial_failure_visible_and_other_modules_still_execute')
   stage='schedule';nav('tasks');page.locator('[data-task=balance]').first.wait_for();select_task(page,'balance','task-schedule',first=True);page.locator('#plan-save').wait_for();assert page.locator('[data-plan-step="0"]').is_hidden() and page.locator('#plan-task').is_hidden();plan_timing(page);plan_times(page,['08:00','20:00'],'UTC');plan_review(page);page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden');plan=next(s for s in api('workbench')['schedules'] if s['task_key']=='balance');assert plan['timezone']=='UTC' and plan['hours']==[8,20] and not plan['enabled'];done('module_task_schedule_persists_without_engine_specific_code')
   stage='mobile';nav('tasks');page.locator('[data-discovery-issues]').wait_for();page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.screenshot(path=str(out/'tasks-partial-mobile.png'),full_page=True);done('partial_catalog_mobile_layout')
-  stage='recover';page.request.post(base+'/__fixture/mode/success');nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');page.locator('[data-task="growth/fixture-growth"]').first.wait_for();assert page.locator('[data-discovery-issues]').count()==0
+  stage='recover';page.request.post(base+'/__fixture/mode/success');nav('overview');page.locator('[data-workspace-overview]').wait_for();nav('tasks');page.locator('[data-task="growth/fixture-growth"]').first.wait_for();assert page.locator('[data-discovery-issues]').count()==0
   choose_account(page,'#task-account','1001');select_task(page,'growth/fixture-growth','run-task');submit('succeeded');assert stats()['claims']<=initial['claims']+1;done('growth_recovery_claim_and_authoritative_verification')
   nav('schedules');page.locator('[data-schedule-id="'+plan['id']+'"]').wait_for();page.locator('[data-schedule-id]').filter(has=page.get_by_text(plan['id'],exact=True)).locator('[data-action=delete-schedule]').click();page.locator('#delete-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden');assert not api('workbench')['schedules'];done('synthetic_schedule_cleanup')
   assert not report['page_errors'] and not report['console_errors'] and not report['external_requests'];b.close()

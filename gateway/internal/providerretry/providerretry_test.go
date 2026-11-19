@@ -147,3 +147,28 @@ func TestContextCancelStopsImmediately(t *testing.T) {
 		t.Fatalf("calls=%d want 0 after cancellation", calls)
 	}
 }
+
+// A quota exhaustion needs a longer rest than a transient failure. The default
+// 30s made a rate-limited account come back and get rate-limited again on
+// repeat, burning a rotation slot each time.
+func TestCooldownDurationIsHonoured(t *testing.T) {
+	cool := NewCooldown()
+	_, err := Run(context.Background(), []string{"a", "b"}, 1, cool, func(_ context.Context, account string) (struct{}, error) {
+		if account == "a" {
+			return struct{}{}, longCoolingError{}
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cool.Ready("a") {
+		t.Fatal("long-cooldown account was immediately ready again")
+	}
+}
+
+type longCoolingError struct{}
+
+func (longCoolingError) Error() string             { return "quota exhausted" }
+func (longCoolingError) RetryClass() Class         { return RetryAccount }
+func (longCoolingError) CooldownDuration() time.Duration { return time.Hour }

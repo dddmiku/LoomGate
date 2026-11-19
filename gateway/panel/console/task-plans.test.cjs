@@ -87,3 +87,17 @@ test('a saved plan scope wins over the catalog, and an unread catalog never wide
   const unread = context.planRunTask({plan: {provider_id: 'workbuddy', task_key: 'checkin'}, groups: []});
   assert.deepEqual([...unread.account_ids], []);
 });
+
+// 首页必须回到旧版结构：指标卡 + 账号池/积分两块面板。用户明确否定了
+// 「需要关注 / 最近执行」那种时间线，因为看不懂也找不到重点。
+test('the overview renders legacy-style metric cards and two panels', () => {
+  const start = source.indexOf('  async function overview(');
+  const end = source.indexOf('  async function services(', start);
+  assert.ok(start > 0 && end > start, 'overview must exist');
+  const body = source.slice(start, end);
+  assert.match(body, /metricCard\(/, 'overview needs metric cards');
+  assert.match(body, /账号池/);
+  assert.match(body, /积分/);
+  assert.doesNotMatch(body, /需要关注/, 'the attention timeline was rejected by the user');
+  assert.doesNotMatch(body, /最近执行/, 'the recent-runs timeline was rejected by the user');
+});

@@ -84,7 +84,7 @@ def main():
             page.locator('#username').fill(fields['username'].strip())
             page.locator('#password').fill(fields['password'].strip())
             page.locator('#login-submit').click()
-            page.locator('[data-workspace-agenda]').wait_for()
+            page.locator('[data-workspace-overview]').wait_for()
 
             def mode(value):
                 assert page.request.post(base+'/__fixture/mode/'+value).status == 204

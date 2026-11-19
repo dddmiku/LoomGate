@@ -22,13 +22,13 @@ def main():
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
    page.locator('#navigation a[href="#'+route+'"]').click()
   def tasks():
-   nav('overview');page.locator('[data-workspace-agenda]').wait_for();nav('tasks');choose_provider(page,'#task-provider','trae');page.locator('[data-task=balance]').wait_for()
+   nav('overview');page.locator('[data-workspace-overview]').wait_for();nav('tasks');choose_provider(page,'#task-provider','trae');page.locator('[data-task=balance]').wait_for()
   def run(key,status):
    select_task(page,key,'run-task')
    with page.expect_response(lambda r:r.url.endswith('/api/workbench/run') and r.request.method=='POST') as response:page.locator('#run-form button[type=submit]').click()
    assert response.value.status==202;rid=response.value.json()['run']['id'];page.locator('#dialog').wait_for(state='hidden');return wait_run(page.request,base+'/admin/api/workbench',rid,status,timeout=20)
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   stage='directory';tasks();rows=api('workbench/catalog?provider=trae')['tasks'];assert {x['key'] for x in rows}=={'checkin','balance'} and all(x['account_id']=='3001' for x in rows);assert stats()['claims']==0;report['actions'].append('trae_only_directory_with_independent_balance')
   stage='rate';mode('trae-rate');first=run('checkin','manual_action');assert stats()['claims']==1;assert any(s.get('action_outcome')=='rejected' and s.get('upstream_code')==9074 for s in first['steps']);tasks();select_task(page,'checkin');page.get_by_text('退避中',exact=False).wait_for();assert not next(t for t in api('workbench/catalog?provider=trae')['tasks'] if t['key']=='checkin').get('pending_verification');report['actions'].append('explicit_9074_refusal_audited_without_fake_success_or_unknown_lock')
   stage='balance';tasks();before=stats();run('balance','succeeded');s=stats();assert s['reads']==before['reads']+1 and s['claims']==1 and s['credits']==800 and s['expiring']==400;report['actions'].append('actual_pool_balance_and_expiry_refresh_during_checkin_backoff')

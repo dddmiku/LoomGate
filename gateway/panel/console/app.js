@@ -146,11 +146,101 @@
     try { await providers(); await renderers[state.route](); $('#view').dataset.loadState='ready'; } catch(e) {fail(e);}
   }
 
+  // 首页按旧版结构：一排指标卡 + 「账号池 / 积分」两块面板。
+  // 不列「需要关注 / 最近执行」那种时间线——运维打开面板第一眼要看的是
+  // 「多少个号可用、还剩多少积分、有没有冷却或停用」，而不是一串任务标题。
+  const num = v => typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v)) ? Number(v) : null);
+  function metricCard(label, value, unit, sub, tone = '') {
+    return `<div class="ov-metric"><div class="ov-k">${esc(label)}</div>` +
+      `<div class="ov-v"><b>${esc(value)}</b>${unit ? `<small>${esc(unit)}</small>` : ''}</div>` +
+      (sub ? `<div class="ov-s ${tone}">${esc(sub)}</div>` : '') + '</div>';
+  }
+  // 分域明细：cn / global / trae 固定顺序，只显示后端确实给了的域。
+  function realmRows(totals, render) {
+    const order = [['cn', '国内区'], ['global', '国际区'], ['trae', 'Trae']];
+    const rows = order.filter(([id]) => totals && totals[id] !== undefined)
+      .map(([id, name]) => render(id, name, totals[id]));
+    return rows.length ? `<div class="ov-realms">${rows.join('')}</div>` : '';
+  }
   async function overview() {
-    const work=await api('workbench'),ps=state.providers,schedules=work.schedules||[],rows=work.runs||[];
-    state.runs=rows;
-    const attention=rows.filter(r=>['uncertain','failed','running','queued'].includes(r.status));
-    $('#view').innerHTML=heading(button('reload','刷新状态','','quiet'))+`<div class="agenda-summary"><strong>${ps.reduce((n,p)=>n+p.accounts.total,0)}</strong> 个账号，<strong>${schedules.filter(s=>s.enabled).length}</strong> 个计划已启用。</div><div class="agenda-layout"><div><section class="work-section" data-workspace-agenda><div class="section-heading"><h2>需要关注</h2><a href="#tasks">打开任务</a></div>${attention.length?attention.slice(0,6).map(r=>`<div class="attention-line">${badge(r.status)}<div class="line-content"><h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p>${esc(providerName(r.provider_id))}，${esc(labels[r.stage]||'等待派发')}。${r.status==='uncertain'?'结果未确认，请先核验，避免重复提交。':''}</p></div>${button('run-detail','查看',`data-index="${rows.indexOf(r)}"`,'quiet')}</div>`).join(''):empty('当前没有待处理的执行','可以到任务中心发现工作，或为已有任务安排计划。')}</section><section class="work-section"><div class="section-heading"><h2>最近执行</h2><a href="#tasks">到任务里查看</a></div>${rows.length?runTimeline(rows.slice(0,6)):empty('还没有执行记录','首次执行后，这里会显示经过服务端核验的结果。')}</section></div><aside class="service-aside"><h2>服务与账号</h2>${ps.map(p=>`<div class="service-note"><div><h3>${esc(p.name)}</h3><p>${p.accounts.enabled} / ${p.accounts.total} 个账号启用<br>${p.inference_available?'已接入推理':'目录已接入，推理待接通'}</p></div>${button('provider-models','查看目录',`data-provider="${esc(p.id)}"`,'text-link')}</div>`).join('')}</aside></div>`;
+    const [work, snap] = await Promise.allSettled([api('workbench'), api('state')]);
+    const schedules = work.status === 'fulfilled' ? (work.value.schedules || []) : [];
+    const rows = work.status === 'fulfilled' ? (work.value.runs || []) : [];
+    state.runs = rows;
+    const st = snap.status === 'fulfilled' ? snap.value : null;
+    // 池数据缺失时不能显示成 0/0「全部可用」——那读起来像一切正常，实际是还不知道。
+    const pool = st && st.pool ? st.pool : {};
+    const totalActive = state.providers.reduce((n, p) => n + (p.accounts.total || 0), 0);
+    const enabledActive = state.providers.reduce((n, p) => n + (p.accounts.enabled || 0), 0);
+    const total = num(pool.total), healthy = num(pool.healthy);
+    const cooling = num(pool.cooling) || 0, disabled = num(pool.disabled) || 0;
+    const exhausted = num(pool.creditsExhausted) || 0;
+    const poolSub = total === null ? (st ? '正在读取…' : '未读取')
+      : total === 0 ? '池中没有账号'
+      : healthy === total ? '全部可用'
+      : `${healthy} / ${total} 可用`;
+    const poolTone = total === null ? '' : (total > 0 && healthy === total ? 'ok' : (healthy ? 'warn' : 'bad'));
+    const running = rows.filter(r => r.status === 'running' || r.status === 'queued').length;
+    const unconfirmed = rows.filter(r => r.status === 'uncertain').length;
+    const enabledPlans = schedules.filter(s => s.enabled).length;
+    // 积分合计：直接读后端已经汇总好的 creditTotals，不在前端重算。
+    const credit = st && st.creditTotals ? st.creditTotals : null;
+    const remain = credit ? num(credit.remain) : null;
+    const size = credit ? num(credit.size) : null;
+    const expiring = credit ? num(credit.expiring) : null;
+    const creditAccounts = credit ? num(credit.accounts) : null;
+    const creditOk = credit ? num(credit.ok) : null;
+    // 过期窗口是后端配置的（pool.expiring_soon，默认 7 天），文案跟着它走，
+    // 否则会出现「面板说 3 天、网关其实按 7 天加权」的错位。
+    const expiryHours = credit ? num(credit.expiring_window_hours) : null;
+    const expiryLabel = expiryHours && expiryHours % 24 === 0 ? `${expiryHours / 24} 天内过期` : '快过期积分';
+    const creditSub = !st ? '未读取'
+      : st.creditPending && remain === null ? '查询中'
+      : st.creditError && remain === null ? '查询失败'
+      : remain === null ? '暂无数据'
+      : (size && size > 0 ? `已用 ${Math.round((size - remain) / size * 100)}%` : '');
+    const pct = size && size > 0 && remain !== null ? Math.max(0, Math.min(100, Math.round(remain / size * 100))) : null;
+    const metrics = [
+      metricCard('已启用账号', String(enabledActive), `/ ${totalActive}`, state.providers.length ? `${state.providers.length} 个服务` : ''),
+      metricCard('账号池', total === null ? '—' : String(healthy === null ? 0 : healthy), total === null ? '' : `/ ${total}`, poolSub, poolTone),
+      metricCard('剩余积分', remain === null ? '—' : remain.toLocaleString('zh-CN'), size ? `/ ${size.toLocaleString('zh-CN')}` : '', creditSub),
+      metricCard('启用计划', String(enabledPlans), `/ ${schedules.length}`, running ? `${running} 个正在执行` : (unconfirmed ? `${unconfirmed} 个待复核` : ''), unconfirmed ? 'warn' : ''),
+    ].join('');
+    const poolPanel = total === null
+      ? `<div class="ov-empty">${st ? '正在读取账号池…' : '未读取到账号池状态'}</div>`
+      : `<div class="ov-big"><span>${healthy === null ? 0 : healthy}</span><small>/ ${total} 健康</small></div>
+         <div class="ov-bar"><i class="a" style="width:${total ? Math.round((healthy || 0) / total * 100) : 0}%"></i></div>
+         <div class="ov-cells">
+           <div><span>池内总数</span><b>${total}</b></div>
+           <div><span>熔断中</span><b class="${cooling ? 'warn' : ''}">${cooling}</b></div>
+           <div><span>已停用</span><b class="${disabled ? 'bad' : ''}">${disabled}</b></div>
+           <div><span>余额不足</span><b class="${exhausted ? 'warn' : ''}">${exhausted}</b></div>
+         </div>
+         ${realmRows(pool.realmTotals, (id, name, v) => {
+           const t = num(v.total), h = num(v.healthy);
+           return `<div class="ov-realm"><span>${esc(name)}</span><b>${h === null ? '—' : h}${t === null ? '' : ` / ${t}`}</b></div>`;
+         })}`;
+    const creditPanel = remain === null
+      ? `<div class="ov-empty">${esc(creditSub || '暂无积分数据')}</div>`
+      : `<div class="ov-big"><span>${remain.toLocaleString('zh-CN')}</span><small>剩余</small></div>
+         ${pct === null ? '' : `<div class="ov-bar"><i class="a" style="width:${pct}%"></i></div>`}
+         <div class="ov-cells">
+           <div><span>总量</span><b>${size === null ? '—' : size.toLocaleString('zh-CN')}</b></div>
+           <div><span>已用</span><b>${size === null ? '—' : (size - remain).toLocaleString('zh-CN')}</b></div>
+           <div><span>${expiryLabel}</span><b class="${expiring ? 'warn' : ''}">${expiring === null ? '—' : expiring.toLocaleString('zh-CN')}</b></div>
+           <div><span>取到积分</span><b>${creditOk === null ? '—' : `${creditOk} / ${creditAccounts === null ? '—' : creditAccounts}`}</b></div>
+         </div>`;
+    const notes = [];
+    if (unconfirmed) notes.push(notice(`有 ${unconfirmed} 次执行结果未确认。请先核验官方状态，不要直接重复提交。`, 'warn'));
+    if (st && st.creditError && remain === null) notes.push(notice('积分数据读取失败：' + String(st.creditError), 'warn'));
+    if (st && st.pendingRestart) notes.push(notice('有账号变更尚未生效，重启网关后生效。', 'warn'));
+    $('#view').innerHTML = heading(button('reload', '刷新状态', '', 'quiet')) +
+      notes.join('') + `<div data-workspace-overview><div class="ov-metrics">${metrics}</div>` +
+      `<div class="ov-pairs">
+         <section class="ov-panel"><div class="ov-ph"><h2>账号池</h2><span>按区域</span></div>${poolPanel}</section>
+         <section class="ov-panel"><div class="ov-ph"><h2>积分</h2><span>全部账号合计</span></div>${creditPanel}</section>
+       </div>` +
+      `<div class="ov-links"><a href="#tasks">任务与定时 →</a><a href="#accounts">账号管理 →</a><a href="#logs">请求记录 →</a></div></div>`;
   }
   async function services() {
     $('#view').innerHTML=heading(button('reload','同步服务','','quiet'))+`<div class="service-list">${state.providers.map(p=>`<article class="service-entry" data-provider="${esc(p.id)}"><div><h2>${esc(p.name)}</h2><p>${p.catalog_scope==='account'?'目录随账号变化':'服务级模型目录'}</p></div><div><dl><div><dt>已连接账号</dt><dd>${p.accounts.total}</dd></div><div><dt>已启用</dt><dd>${p.accounts.enabled}</dd></div></dl><p>${p.inference_available?'消息推理已接入。请求仍受账号余额和上游可用性限制。':'模型目录可读取；此服务的消息转发尚未接通。'}</p>${p.error_code?notice(errorLabels[p.error_code]||'服务状态读取失败','error'):''}</div><div class="actions">${button('provider-models','查看模型',`data-provider="${esc(p.id)}"`,'quiet')}${button('provider-accounts','查看账号',`data-provider="${esc(p.id)}"`,'quiet')}</div></article>`).join('')}</div>`;

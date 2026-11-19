@@ -169,6 +169,12 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	// prompt by the provider, so a client that sends two user turns in a row, a
 	// trailing assistant prefill or an assistant-first history still works. Only
 	// empty turns and size limits are enforced.
+	// The catalog advertises a 1M-token window; a 1 MiB character cap made
+	// that unreachable and rejected legitimate long-context calls with a 400
+	// that looked like a client mistake. The cap is a guard against unbounded
+	// request bodies (the server's own byte limit already applies) rather than
+	// a model-side context decision, so it must not contradict the catalog.
+	const maxDialogueChars = 8 << 20
 	parsed := []inference.Message{}
 	total := 0
 	text = ""
@@ -178,8 +184,8 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		// on a tool turn, so the text emptiness check does not apply here.
 		for _, m := range messages {
 			value := textOfContent(m.Content)
-			total += len(value)
-			if total > 1<<20 {
+			total += len(value) + len(m.ToolCallID)
+			if total > maxDialogueChars {
 				break
 			}
 			msg := inference.Message{Role: m.Role, Content: value, ToolCallID: m.ToolCallID}
@@ -201,7 +207,7 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 				continue
 			}
 			total += len(value)
-			if total > 1<<20 {
+			if total > maxDialogueChars {
 				break
 			}
 			if i == 0 && systemPrefix != "" {
@@ -211,7 +217,7 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			text = value
 		}
 	}
-	if len(parsed) == 0 || total > 1<<20 || len(parsed) > 101 || (!hasDialogue && !carriesTools && len(parsed) != 1) {
+	if len(parsed) == 0 || total > maxDialogueChars || len(parsed) > 101 || (!hasDialogue && !carriesTools && len(parsed) != 1) {
 		st.status = 400
 		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
 		return

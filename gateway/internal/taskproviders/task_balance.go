@@ -8,6 +8,7 @@ package taskproviders
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/taskengine"
@@ -56,7 +57,12 @@ func (m *balanceModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.
 	}
 	m.owner.Pool.SetCreditsDetailed(a.UID, remain, buckets.Expiring)
 	m.owner.Pool.ReenableIfCredits(a.UID, remain)
-	return taskengine.Observation{Phase: "done", Current: remain}, nil
+	// 日志是给人看的：写清余额和快过期部分，而不是只留一个「已完成」。
+	summary := fmt.Sprintf("余额 %d", remain)
+	if buckets.Expiring > 0 {
+		summary += fmt.Sprintf("，其中 %d 快过期", buckets.Expiring)
+	}
+	return taskengine.Observation{Phase: "done", Current: remain, Summary: summary}, nil
 }
 
 func (m *balanceModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {

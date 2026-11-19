@@ -41,7 +41,7 @@ def main():
   def post_api(path,payload):
    return page.request.post(base+'/admin/api/'+path,data=json.dumps(payload),headers={'X-Admin-Request':'1','Origin':base,'Content-Type':'application/json'})
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+  page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
   page.locator('#navigation a[href="#accounts"]').click();choose_provider(page,'#account-provider','doubao');page.locator('#account-list').wait_for()
   before=len(snapshot())
   report['actions'].append('account_page_renders_without_a_client_bridge')

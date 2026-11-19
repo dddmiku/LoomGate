@@ -107,8 +107,83 @@ func logTrigger(trigger string) string {
 	return trigger
 }
 
-// taskLogLines 把一次执行记录渲染成逐行文本。每行以本地时间开头，和旧版脚本
-// 日志的观感一致；阶段、账号、结果、摘要都在同一行，便于直接复制给他人核对。
+// shortAccount is the account label a log line carries, in the shape the old
+// task scripts printed: enough to tell accounts apart, not the full identifier.
+// A uuid keeps its first segment; an AutoClaw id is a phone number, so it is
+// masked instead of printed.
+func shortAccount(id string) string {
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "autoclaw-") {
+		phone := strings.TrimPrefix(id, "autoclaw-")
+		if len(phone) == 11 {
+			return "autoclaw " + phone[:3] + "****" + phone[7:]
+		}
+		return "autoclaw"
+	}
+	if len(id) <= 8 {
+		return id
+	}
+	if i := strings.IndexByte(id, '-'); i >= 6 {
+		return id[:i]
+	}
+	return id[:8]
+}
+
+// stepLine renders one step the way the old scripts did: a time, an account
+// tag, and one human sentence. Stage and status are not columns to read — they
+// only appear when they add something the sentence does not already say.
+func stepLine(stamp func(time.Time) string, s Step) string {
+	var b strings.Builder
+	b.WriteString(stamp(s.StartedAt))
+	b.WriteString("  ")
+	if tag := shortAccount(s.AccountID); tag != "" {
+		b.WriteString("[")
+		b.WriteString(tag)
+		b.WriteString("] ")
+	}
+	text := strings.TrimSpace(s.Summary)
+	switch s.Status {
+	case StatusSucceeded:
+		// Nothing to announce: the sentence itself says what happened.
+	case StatusSkipped:
+		if text == "" {
+			return b.String() + "本次条件不满足，跳过"
+		}
+		return b.String() + text + "（已跳过）"
+	case StatusManual:
+		if text == "" {
+			return b.String() + "需要人工处理"
+		}
+		return b.String() + text + "（需要人工）"
+	case StatusUncertain:
+		if text == "" {
+			text = "操作结果尚未确认，请先核验，不要重复提交"
+		}
+		return b.String() + text + "（结果未确认）"
+	case StatusCanceled:
+		return b.String() + "已取消"
+	case StatusFailed:
+		if text == "" {
+			text = "未完成"
+		}
+		return b.String() + text
+	}
+	if text == "" {
+		// A step with no summary still needs to say something readable; the
+		// stage is the only fact left, and only as a fallback.
+		if stage, ok := logStageText[s.Stage]; ok {
+			text = stage
+		} else {
+			text = "已完成"
+		}
+	}
+	return b.String() + text
+}
+
+// taskLogLines renders one run as the plain output the old task scripts
+// produced: a header, then one short sentence per account.
 func taskLogLines(r Run) []string {
 	location, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -121,40 +196,25 @@ func taskLogLines(r Run) []string {
 		return t.In(location).Format("15:04:05")
 	}
 	lines := []string{
-		fmt.Sprintf("%s 开始 · %s · %s", stamp(r.StartedAt), logTrigger(r.Trigger), logStatus(r.Status)),
-	}
-	if r.FinishedAt != nil {
-		lines = append(lines, fmt.Sprintf("%s 结束 · 耗时 %s", stamp(*r.FinishedAt), r.FinishedAt.Sub(r.StartedAt).Round(time.Second)))
+		fmt.Sprintf("%s 开始执行（%s）", stamp(r.StartedAt), logTrigger(r.Trigger)),
 	}
 	if r.Status == StatusQueued {
 		lines = append(lines, "等待执行槽位；开始后会继续追加输出。")
 		return lines
 	}
-	if len(r.Steps) == 0 {
-		lines = append(lines, "本次执行还没有步骤记录。")
-	}
 	steps := append([]Step{}, r.Steps...)
 	sort.SliceStable(steps, func(i, j int) bool { return steps[i].StartedAt.Before(steps[j].StartedAt) })
 	for _, s := range steps {
-		parts := []string{stamp(s.StartedAt)}
-		if stage, ok := logStageText[s.Stage]; ok {
-			parts = append(parts, stage)
-		} else if s.Stage != "" {
-			parts = append(parts, string(s.Stage))
-		}
-		if s.AccountID != "" {
-			parts = append(parts, "账号 "+s.AccountID)
-		}
-		parts = append(parts, logStatus(s.Status))
-		if s.Summary != "" {
-			parts = append(parts, "· "+s.Summary)
-		} else if s.ErrorCode != "" {
-			parts = append(parts, "· "+s.ErrorCode)
-		}
-		lines = append(lines, strings.Join(parts, " | "))
+		lines = append(lines, stepLine(stamp, s))
+	}
+	if r.FinishedAt != nil {
+		lines = append(lines, fmt.Sprintf("%s 结束，耗时 %s，%s",
+			stamp(*r.FinishedAt), r.FinishedAt.Sub(r.StartedAt).Round(time.Second), logStatus(r.Status)))
+	} else if r.Status != StatusRunning {
+		lines = append(lines, "结果："+logStatus(r.Status))
 	}
 	if r.Summary != "" {
-		lines = append(lines, "总结 · "+r.Summary)
+		lines = append(lines, r.Summary)
 	}
 	// 与执行记录本身的 2000 步上限同量级；日志是给人看的，再多也没有价值。
 	if len(lines) > 2000 {
