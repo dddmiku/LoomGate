@@ -209,8 +209,8 @@ func (p *Provider) CompleteDialogueReasoning(ctx context.Context, q inference.Di
 // CompleteDialogueTools implements the tool-carrying path: the full transcript
 // (including assistant tool_calls and tool results) plus the caller's tool
 // catalog go upstream, and tool_call deltas come back to the caller.
-func (p *Provider) CompleteDialogueTools(ctx context.Context, q inference.Dialogue, emit func(inference.ToolCallDelta) error) (inference.Result, error) {
-	return p.completeTurn(ctx, q, nil, nil, emit)
+func (p *Provider) CompleteDialogueTools(ctx context.Context, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (inference.Result, error) {
+	return p.completeTurn(ctx, q, emit, emitReasoning, emitTool)
 }
 
 // complete runs one turn against the account pool. It rotates accounts only on

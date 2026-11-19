@@ -1,6 +1,7 @@
 package taskengine_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -114,5 +115,42 @@ func TestWorkbenchHTTPPreservesAcceptedRunAndValidTrailingWhitespace(t *testing.
 	}
 	if !body.OK || body.Run.ID == "" || body.Run.Trigger != "manual" || body.Run.ScheduleID != "" {
 		t.Errorf("invalid accepted-run metadata: %+v", body.Run)
+	}
+}
+
+// 面板的任务「日志」按钮读 /workbench/task/log。它必须返回文本行与运行状态，
+// 且对空键返回 400 而不是静默成功——否则前端会显示一个空白的日志窗口。
+func TestWorkbenchHTTPTaskLog(t *testing.T) {
+	e := openBehaviorEngine(t, taskengine.Options{})
+	task := syntheticTask("fake", "account-a", "checkin")
+	task.SideEffect = false
+	a := singleAdapter(task)
+	a.inspect = func(ctx context.Context, task taskengine.Task) (taskengine.Observation, error) {
+		return taskengine.Observation{Phase: "done", Summary: "官方状态已确认完成。"}, nil
+	}
+	registerBehavior(t, e, "fake", a)
+	awaitBehaviorRun(t, e, submitBehavior(t, e, taskengine.Request{ProviderID: "fake", TaskKey: "checkin"}).ID)
+
+	w := workbenchHTTP(t, e, http.MethodGet, "/workbench/task/log?key=checkin", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		OK      bool     `json:"ok"`
+		Lines   []string `json:"lines"`
+		Running bool     `json:"running"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.OK || len(payload.Lines) == 0 || payload.Running {
+		t.Fatalf("unexpected log payload: %+v", payload)
+	}
+	if !strings.Contains(strings.Join(payload.Lines, "\n"), "官方状态已确认完成。") {
+		t.Error("log lines lost the step summary")
+	}
+
+	if w := workbenchHTTP(t, e, http.MethodGet, "/workbench/task/log?key=", ""); w.Code != http.StatusBadRequest {
+		t.Errorf("empty key status=%d, want 400", w.Code)
 	}
 }

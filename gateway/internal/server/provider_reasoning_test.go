@@ -118,3 +118,67 @@ func TestReasoningFramesStayOutOfTheAnswerStream(t *testing.T) {
 		t.Fatalf("missing frames: reasoning=%v answer=%v\n%s", sawReasoning, sawAnswer, rec.Body.String())
 	}
 }
+
+// reasoningAndToolsProvider emits reasoning first, then a tool call — the shape
+// a thinking model produces. Enabling tools used to replace the reasoning sink
+// with nil, so the client lost every progress frame until the call arrived.
+type reasoningAndToolsProvider struct{ reasoningProvider }
+
+func (reasoningAndToolsProvider) SupportsTools() bool { return true }
+
+func (p reasoningAndToolsProvider) CompleteDialogueTools(_ context.Context, _ inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (inference.Result, error) {
+	if emitReasoning != nil {
+		if err := emitReasoning("先想"); err != nil {
+			return inference.Result{Attempted: true}, err
+		}
+	}
+	if emitTool != nil {
+		if err := emitTool(inference.ToolCallDelta{Index: 0, ID: "call_1", Name: "get_weather", Arguments: `{"city":"北京"}`}); err != nil {
+			return inference.Result{Attempted: true}, err
+		}
+	}
+	return inference.Result{
+		Attempted: true, Acknowledged: true, Complete: true, Events: 2,
+		ToolCalls: []inference.ToolCall{{ID: "call_1", Type: "function",
+			Function: inference.ToolCallFunction{Name: "get_weather", Arguments: `{"city":"北京"}`}}},
+	}, nil
+}
+
+func TestReasoningStillStreamsOnAToolTurn(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	sink := newProviderStreamSink(rec, req, "thinking:model", &chatStat{})
+
+	provider := reasoningAndToolsProvider{}
+	if _, err := provider.CompleteDialogueTools(context.Background(), inference.Dialogue{Model: "thinking:model"},
+		sink.emit, sink.emitReasoning, sink.emitToolDelta); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	reasoningAt := strings.Index(body, `"reasoning_content":"先想"`)
+	toolAt := strings.Index(body, `"tool_calls"`)
+	if reasoningAt < 0 {
+		t.Fatalf("reasoning was dropped on a tool turn; the client sees no progress until the call:\n%s", body)
+	}
+	if toolAt < 0 {
+		t.Fatalf("tool call missing:\n%s", body)
+	}
+	if reasoningAt > toolAt {
+		t.Fatal("reasoning must arrive before the tool call, matching the upstream order")
+	}
+}
+
+// Non-streaming tool requests have no sink. The handler used to build method
+// values off a nil sink anyway; the first delta would then panic. A buffered
+// tool turn must reach the provider with nil emitters and still return calls.
+func TestNonStreamingToolTurnUsesNilEmitters(t *testing.T) {
+	provider := reasoningAndToolsProvider{}
+	result, err := provider.CompleteDialogueTools(context.Background(), inference.Dialogue{Model: "thinking:model"},
+		nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("buffered tool turn lost the call: %+v", result)
+	}
+}

@@ -21,14 +21,14 @@ func providerStreamSafely(ctx context.Context, p inference.StreamingProvider, mo
 	return p.Stream(ctx, model, text, emit)
 }
 
-func providerStreamToolsSafely(ctx context.Context, p inference.ToolCapableProvider, q inference.Dialogue, emit func(inference.ToolCallDelta) error) (result inference.Result, err error) {
+func providerStreamToolsSafely(ctx context.Context, p inference.ToolCapableProvider, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (result inference.Result, err error) {
 	defer func() {
 		if recover() != nil {
 			result = inference.Result{Attempted: true}
 			err = inference.ErrStreamContract
 		}
 	}()
-	return p.CompleteDialogueTools(ctx, q, emit)
+	return p.CompleteDialogueTools(ctx, q, emit, emitReasoning, emitTool)
 }
 
 func providerStreamReasoningSafely(ctx context.Context, p inference.ReasoningProvider, q inference.Dialogue, emit, emitReasoning func(string) error) (result inference.Result, err error) {

@@ -270,7 +270,19 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			// Tool turns stream tool_call fragments, not prose; the sink emits
 			// them as OpenAI tool_calls deltas so an agent client can continue
 			// its loop instead of stopping after one sentence.
-			result, err = providerStreamToolsSafely(r.Context(), toolCapable, q, sink.emitToolDelta)
+			// Reasoning must keep flowing on a tool turn too: a thinking model
+			// reasons first, and dropping that sink made the client lose all
+			// progress until the tool call finally arrived.
+			//
+			// Non-streaming requests have no sink at all: passing a method
+			// value off the nil sink would dereference it on the first delta.
+			// They use the buffered path (all nil emitters) instead.
+			var textEmit, reasoningEmit func(string) error
+			var toolEmit func(inference.ToolCallDelta) error
+			if streaming && sink != nil {
+				textEmit, reasoningEmit, toolEmit = sink.emit, sink.emitReasoning, sink.emitToolDelta
+			}
+			result, err = providerStreamToolsSafely(r.Context(), toolCapable, q, textEmit, reasoningEmit, toolEmit)
 		} else if reasoning, ok := provider.(inference.ReasoningProvider); ok && emit != nil {
 			result, err = providerStreamReasoningSafely(r.Context(), reasoning, q, emit, sink.emitReasoning)
 		} else if aware, ok := effortAware(provider); ok && effort != "" {

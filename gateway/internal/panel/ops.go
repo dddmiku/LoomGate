@@ -581,8 +581,33 @@ func (s *Server) gatewayAdmin(w http.ResponseWriter, r *http.Request, method, en
 }
 
 // taskLog 读某个任务的最近日志。
+//
+// 两条来源、优先新引擎：
+//  1. 新任务引擎（/workbench/task/log）把一次执行的持久化步骤渲染成文本行；
+//     它认识随包计划里的所有任务键（growth/、redeem/、buddy_box…）。
+//  2. 旧调度器（/tasks/<key>/log）只在旧运行模式下存在——旧版模式里
+//     新引擎根本没启动，所以那时才会落到这里。
+//
+// 之前只走第 2 条，于是新引擎模式下面板永远得到「网关未接入排程」：任务页
+// 明明列着任务，日志却一条都打不开。
 func (s *Server) taskLog(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "lines": []any{},
+			"message": "缺少任务标识。"})
+		return
+	}
+	if payload := s.gateway.Get(r.Context(), "/workbench/task/log?key="+url.QueryEscape(key)); payload != nil {
+		if lines, ok := payload["lines"].([]any); ok {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "key": key, "lines": lines, "count": len(lines),
+				"running": jsonBool(payload["running"], false),
+				"endedAt": jsonString(payload["ended_at"]),
+				"message": jsonString(payload["message"]),
+			})
+			return
+		}
+	}
 	if !KnownTask(key) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "lines": []any{},
 			"message": formatMessage("未知任务：%s", key)})

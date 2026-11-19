@@ -125,9 +125,13 @@ type ToolCallDelta struct {
 
 // ToolCapableProvider streams tool-call fragments in addition to text. A
 // provider that answers with tool calls emits no text for that turn.
+//
+// Tools and reasoning coexist: a thinking model reasons first even when the
+// turn ends in a tool call. Both sinks are therefore always supplied, and a
+// provider forwards whichever deltas it receives.
 type ToolCapableProvider interface {
 	ToolProvider
-	CompleteDialogueTools(context.Context, Dialogue, func(ToolCallDelta) error) (Result, error)
+	CompleteDialogueTools(context.Context, Dialogue, func(string) error, func(string) error, func(ToolCallDelta) error) (Result, error)
 }
 type Attempt struct {
 	StartedAt, FinishedAt time.Time

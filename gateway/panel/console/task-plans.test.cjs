@@ -70,3 +70,20 @@ test('running a plan uses exactly the catalog accounts, never all accounts', () 
   assert.equal(task.key, 'checkin');
   assert.equal(context.planRunTask({plan: null, groups: []}), null);
 });
+
+test('a saved plan scope wins over the catalog, and an unread catalog never widens the run', () => {
+  // 计划自己保存过账号范围时以它为准：目录后来新增/停用账号不能悄悄扩大范围。
+  const body = source.slice(source.indexOf('  function planRunTask('), source.indexOf('  // Renders one run exactly like the old detail dialog'));
+  const context = {taskLabel: (p, r, k) => k, Set, Object, Array};
+  vm.createContext(context);
+  vm.runInContext(body + '\nthis.planRunTask = planRunTask;', context);
+  const saved = context.planRunTask({
+    plan: {provider_id: 'workbuddy', task_key: 'checkin', account_ids: ['pinned']},
+    groups: [{accounts: [{account_id: 'other', manual_only: false}]}],
+  });
+  assert.deepEqual([...saved.account_ids], ['pinned']);
+  // 目录本轮没读到时范围为空——空不等于全部，confirmRun 会拒绝发起请求，
+  // 而不是拿一次不可见执行去赌。
+  const unread = context.planRunTask({plan: {provider_id: 'workbuddy', task_key: 'checkin'}, groups: []});
+  assert.deepEqual([...unread.account_ids], []);
+});

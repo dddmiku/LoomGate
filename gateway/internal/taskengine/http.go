@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Handler must be mounted behind the gateway's internal-management boundary.
@@ -34,6 +35,26 @@ func (e *Engine) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /workbench", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]any{"providers": e.Providers(), "schedules": e.Schedules(), "runs": e.Runs()})
+	})
+	mux.HandleFunc("GET /workbench/task/log", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		res, err := e.TaskLog(key)
+		if err != nil {
+			respond(w, 400, map[string]any{"ok": false, "lines": []string{}, "error": "invalid_request", "message": "任务标识无效。"})
+			return
+		}
+		lines := res.Lines
+		if lines == nil {
+			lines = []string{}
+		}
+		body := map[string]any{"ok": true, "key": key, "lines": lines, "count": len(lines), "running": res.Running}
+		if res.Message != "" {
+			body["message"] = res.Message
+		}
+		if !res.EndedAt.IsZero() {
+			body["ended_at"] = res.EndedAt.UTC().Format(time.RFC3339)
+		}
+		respond(w, 200, body)
 	})
 	mux.HandleFunc("GET /workbench/catalog", func(w http.ResponseWriter, r *http.Request) {
 		ids := []string{}

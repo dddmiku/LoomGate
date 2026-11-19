@@ -174,6 +174,12 @@ pre.code{display:block;max-width:100%;overflow-x:auto;white-space:pre;padding:14
 .task-log-row>td{background:var(--soft);padding:0!important}
 .task-log-row .log-detail{padding:14px 18px}
 .task-log-row table{font-size:12px}
+/* 任务日志弹窗：顶栏一行状态 + 刷新，正文是一整块等宽可滚动的输出（旧版形态）。 */
+.task-log-dialog{display:grid;gap:0}
+.task-log-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:10px;min-height:28px}
+.task-log-status{font-size:12px;color:var(--muted)}
+.task-log-output{margin:0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:var(--canvas);color:var(--text);font:12px/1.65 Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:min(58vh,520px);min-height:120px;overflow:auto;overscroll-behavior:contain}
+#dialog-body:has(.task-log-dialog){padding-bottom:20px}
 /* 日期范围筛选条（替代逐日列表） */
 .usage-filter{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:18px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
 .usage-quick{display:flex;gap:4px;padding:3px;border-radius:9px;background:var(--soft)}

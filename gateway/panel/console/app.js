@@ -3,6 +3,14 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const date = value => value && !String(value).startsWith('0001-') ? new Date(typeof value === 'number' ? value * 1000 : value).toLocaleString('zh-CN', {hour12:false}) : '—';
+  // 旧版任务日志的顶栏口径：「最近一次 11-09 22:26」，不带年份与秒。
+  const shortTime = value => {
+    if(!value||String(value).startsWith('0001-')) return '—';
+    const d = new Date(typeof value === 'number' ? value * 1000 : value);
+    if(isNaN(d.getTime())) return '—';
+    const p = n => String(n).padStart(2,'0');
+    return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
   const number = value => typeof value === 'number' ? value.toLocaleString('zh-CN') : '—';
   const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], usageRange:null, taskCache:null, schedules:[], runs:[], pending:new Set(), poll:null};
   // Task names are a display convenience, not state: remember the last names the
@@ -117,8 +125,8 @@
     return (data.accounts || []).map(a=>({...a,realm:a.realm||(/trae/i.test(a.domain||'')?'trae':/workbuddy\.ai/i.test(a.domain||'')?'global':'cn')})).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(authSummaryRow);
   }
   function fail(e) { if(e.name==='AbortError') return; $('#view').innerHTML=heading()+notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取')+(e.status===401?' <a href="login">重新登录 →</a>':''); $('#view').dataset.loadState='failed'; }
-  function openDialog(title, html, style='') { $('#dialog').className=style; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
-  function closeDialog() { $('#dialog').close();$('#dialog').className=''; $('#dialog-body').replaceChildren(); }
+  function openDialog(title, html, style='') { $('#dialog').className=style; delete $('#dialog').dataset.taskLog; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
+  function closeDialog() { $('#dialog').close();$('#dialog').className='';delete $('#dialog').dataset.taskLog;$('#dialog-body').replaceChildren(); }
   async function mutate(key, path, body, after) {
     if(state.pending.has(key)) return;
     state.pending.add(key);
@@ -346,18 +354,40 @@
   // and switchable even when discovery is down. The 状态 cell is the schedule
   // switch itself, so pausing a task is one click and one verified write.
   async function tasks() {
+    // 默认选中真正的任务服务：workbench/providers 的排列里 workbuddy/trae 是
+    // 服务级目录，autoclaw/doubao 没有随包计划。取第一个「有随包计划」的服务，
+    // 否则会默认落在一个永远空表的服务上。
     state.taskProvider=state.taskProvider||state.providers[0]?.id||'';
     const generation=state.version;
     $('#view').innerHTML=heading(button('reload','刷新','','quiet'))+
-      `<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}</div><div id="task-list" class="loading">正在读取任务…<p class="small muted">任务与定时随版本发布；账号状态来自实时目录。</p></div><div id="task-guard"></div>`;
-    bindProviderFilter('task-provider',value=>{state.taskProvider=value;});
-    const [accounts,work]=await Promise.all([accountsFor(state.taskProvider),api('workbench')]);
+      `<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}</div><div id="task-list" class="loading">正在读取任务…</div><div id="task-guard"></div>`;
+    bindProviderFilter('task-provider',value=>{state.taskProviderPicked=true;state.taskProvider=value;});
+    // 三个读取各自独立：账号列表读不到不该让任务表消失；计划读取失败则没有
+    // 东西可画，必须如实说明，而不是永远停在「正在读取任务…」。
+    let accounts=[],work={schedules:[],runs:[]},workFailed=false;
+    const [a,w]=await Promise.allSettled([accountsFor(state.taskProvider),api('workbench')]);
     if(generation!==state.version)return;
+    if(a.status==='fulfilled')accounts=a.value;
+    if(w.status==='fulfilled')work=w.value||work;
+    else if(w.reason?.name!=='AbortError')workFailed=true;
+    // 选中的服务没有随包计划时（例如误停在 autoclaw），自动落到第一个有计划的服务，
+    // 但只在操作员没有手动切过服务时这么做。
+    if(!state.taskProviderPicked&&!workFailed&&!(work.schedules||[]).some(s=>s.provider_id===state.taskProvider)){
+      const fallback=(work.schedules||[])[0]?.provider_id;
+      if(fallback){state.taskProvider=fallback;await tasks();return;}
+    }
     state.schedules=(work.schedules||[]).filter(s=>s.provider_id===state.taskProvider);
     state.runs=work.runs||[];
-    let data={tasks:[],issues:[]},catalogFailed=false;
+    // 任务页先按「随包发布的计划」立刻画出整张表：任务名、定时、开关都来自
+    // 本地，不依赖任何一次上游目录读取。账号状态是唯一需要实时目录的列，
+    // 它晚到就晚填、失败就写「状态未读取」，绝不拿加载占位或错误墙顶掉任务表。
+    state.tasks=[];
+    state.taskGroups=[];
+    paintTaskList([],'pending',accounts,workFailed);
+    // Account state is enrichment only, loaded after the table is already up.
+    let data={tasks:[],issues:[]},catalogState='ready';
     try{data=await api('workbench/catalog?'+new URLSearchParams({provider:state.taskProvider}));}
-    catch(e){if(e.name==='AbortError')return;catalogFailed=true;}
+    catch(e){if(e.name==='AbortError')return;catalogState='failed';}
     if(generation!==state.version)return;
     state.tasks=data.tasks||[];
     state.taskGroups=groupTasks(state.tasks);
@@ -367,7 +397,7 @@
       state.taskNames.set(t.provider_id+'\u0000\u0000'+t.key,t.name);
     }
     saveTaskNames(state.taskNames);
-    paintTaskList(data.issues||[],catalogFailed,accounts);
+    paintTaskList(data.issues||[],catalogState,accounts,workFailed);
   }
   // A discovered task belongs to a plan when the plan's key covers it. Module
   // plans use a trailing slash ("growth/") and match every task under it.
@@ -383,13 +413,16 @@
     if(!s)return '';
     return (s.hours||[]).map(h=>String(h).padStart(2,'0')+':'+String(s.minute||0).padStart(2,'0')).join('、');
   }
-  function planSummary(groups,catalogFailed){
-    if(!groups.length)return catalogFailed?'目录不可用':'目录暂无此任务';
+  // catalogState: 'pending'（表格已画出、账号状态还在读）| 'ready' | 'failed'。
+  // 三种「没有目录行」的原因必须分开写：把「还在读」或「读取失败」显示成
+  // 「目录暂无此任务」，等于告诉用户这个任务不存在——而它明明就在表里。
+  function planSummary(groups,catalogState){
+    if(!groups.length)return catalogState==='pending'?'正在读取账号状态':catalogState==='failed'?'账号状态未读取':'目录暂无此任务';
     const counts={claimable:0,pending:0,ready:0,manual:0,blocked:0,done:0,unknown:0};
     for(const g of groups)for(const t of g.accounts){const p=t.state?.phase;counts[p&&counts[p]!==undefined?p:'unknown']++;}
     return [counts.claimable?counts.claimable+' 可领取':counts.ready?counts.ready+' 待执行':counts.done?counts.done+' 已完成':counts.manual?counts.manual+' 需人工':'',counts.blocked?counts.blocked+' 暂不可用':''].filter(Boolean).join(' · ')||'等待核验';
   }
-  function paintTaskList(issues,catalogFailed,accounts=[]){
+  function paintTaskList(issues,catalogState,accounts=[],workFailed=false){
     const box=$('#task-discovery-notice');if(box)box.remove();
     const unconfirmed=sessionStorage.getItem('loomgate.unconfirmedRun')?notice('上次执行请求结果未确认。请核对执行时间、服务和账号；不要直接重复提交。','warn')+button('review-submission','核对后解除提交保护'):'';
     const guard=$('#task-guard');if(guard)guard.innerHTML=unconfirmed;
@@ -401,6 +434,10 @@
       $('#task-list').before(notice);
     }
     $('#task-list').classList.remove('loading');
+    if(workFailed){
+      $('#task-list').innerHTML=notice('任务计划本次未能从服务读取。任务表与开关都来自服务端保存的计划，不会凭空生成，也不会在读取失败时显示成「没有任务」。','warn')+button('reload','重新读取');
+      return;
+    }
     if(!state.schedules.length && !state.taskGroups.length){
       $('#task-list').innerHTML=empty('当前没有可管理的任务','任务与定时随版本发布；账号目录本轮也没有返回任务。');
       return;
@@ -418,7 +455,7 @@
       rows.push(`<tr class="task-section"><th colspan="6">${esc(label)}<span class="small muted"> · ${plans.length} 项任务 · ${totalAccounts} 个账号</span></th></tr>`);
       for(const plan of plans){
         const groups=groupsForPlan(plan);
-        const summary=planSummary(groups,catalogFailed);
+        const summary=planSummary(groups,catalogState);
         const pending=groups.some(g=>g.accounts.some(t=>t.pending_verification));
         const name=taskLabel(plan.provider_id,'',plan.task_key);
         const idx=state.planRows.length;
@@ -447,7 +484,7 @@
         rows.push(`<tr data-task="${esc(g.key)}">
           <td class="log-expander" data-label=""><button type="button" data-action="task-log" data-plan-index="${idx}" aria-expanded="false" aria-label="展开最近执行日志">▸</button></td>
           <td data-label="任务"><strong>${esc(g.name)}</strong><p class="small muted">${g.once?'一次性':g.once_per_day?'每日':'按需'}${g.manual_only?' · 需要人工':''}</p></td>
-          <td data-label="账号状态"><span class="small">${esc(planSummary([g],catalogFailed))}</span></td>
+          <td data-label="账号状态"><span class="small">${esc(planSummary([g],catalogState))}</span></td>
           <td data-label="定时"><span class="muted">未定时</span></td>
           <td data-label="状态">${badge('neutral','—')}</td>
           <td data-label="操作"><div class="actions">${g.manual_only?button('manual-plan','查看要求',`data-plan-index="${idx}"`,'quiet compact'):button('run-plan','运行',`data-plan-index="${idx}"`,'compact')}${button('task-log','日志',`data-plan-index="${idx}"`,'quiet compact')}</div></td>
@@ -455,7 +492,7 @@
       }
     }
     // 任务页只列任务与计划。执行历史在「执行记录」页；任务输出日志在每行的「日志」里。
-    $('#task-list').innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogFailed?'<p class="small muted">任务目录本轮读取失败；计划与开关仍来自本地。</p>':'');
+    $('#task-list').innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogState==='failed'?'<p class="small muted">账号状态本轮未读取；任务、定时与开关仍来自本地，照常可用。</p>':'');
   }
   const taskErrors={provider_rejected:'官方服务拒绝了此操作',operation_unconfirmed:'操作结果未确认',account_identity_changed:'账号或绑定发生变化',authentication_required:'需要重新登录',task_expired:'任务标识已过期',operation_not_eligible:'当前尚不满足操作条件',provider_busy:'官方客户端正忙',upstream_failed:'上游操作未成功'};
   // 「日志」显示任务自己的输出（旧版行为）：最近一次运行的文本行，而不是
@@ -466,51 +503,62 @@
     const provider=planRow.plan?planRow.plan.provider_id:planRow.groups[0]?.provider_id;
     const key=planRow.plan?planRow.plan.task_key:planRow.groups[0]?.key;
     if(!key){toast('这个条目没有可读取的任务日志。');return;}
-    openDialog(`${taskLabel(provider,'',key)} · 输出日志`,'<p class="muted">正在读取最近一次执行日志…</p>');
-    let timer=null;
+    // 与旧版一致：标题「任务日志 · <任务名>」，副标题只写「运行中…」或
+    // 「最近一次 MM-DD HH:MM」；正文是一整块等宽、可滚动的文本。
+    openDialog(`任务日志 · ${taskLabel(provider,'',key)}`,
+      `<div class="task-log-dialog"><div class="task-log-head"><span class="task-log-status" role="status" aria-live="polite"></span><button type="button" data-action="task-log-refresh" class="quiet compact" aria-label="刷新日志">刷新</button></div><pre class="task-log-output" id="task-log-body" role="log" tabindex="0">加载中…</pre></div>`);
+    $('#dialog').dataset.taskLog='1';
+    let timer=null,lastSig='',running=false;
     const currentDialogOpen=()=>document.getElementById('dialog')?.open===true;
-    const paint=(data)=>{
-      const lines=Array.isArray(data.lines)?data.lines:[];
-      const meta=[data.running?'正在运行':'最近一次执行', data.endedAt?date(data.endedAt):''].filter(Boolean).join(' · ');
-      $('#dialog-body').innerHTML=`<div class="form task-log-dialog">
-        <p class="muted small">${esc(meta)}</p>
-        ${lines.length?`<pre class="task-log-output" role="log">${esc(lines.join("\n"))}</pre>`:`<p class="muted">${esc(data.message||'这项任务还没有输出日志。运行一次后日志会出现在这里。')}</p>`}
-        <div class="actions"><button data-action="task-log-refresh">刷新</button><button data-action="close" class="primary">关闭</button></div>
-      </div>`;
-      $('#dialog-body [data-action=close]').onclick=()=>{clearTimeout(timer);closeDialog();};
-      $('#dialog-body [data-action=task-log-refresh]').onclick=()=>load();
-      // 任务在跑时日志还在增长：只在弹窗仍打开且任务未结束时续刷。
-      if(data.running&&currentDialogOpen())timer=setTimeout(()=>load(),2500);
-    };
+    const statusText=data=>data.running?'运行中…':(data.endedAt?'最近一次 '+shortTime(data.endedAt):'');
     const load=async()=>{
       clearTimeout(timer);
       try{
-        const data=await api('tasks/'+encodeURIComponent(key)+'/log',{signal:null});
+        const data=await api('task/log?key='+encodeURIComponent(key),{signal:null});
         if(!currentDialogOpen())return;
-        if(data.ok===false&&!(data.lines||[]).length){
-          $('#dialog-body').innerHTML=`<div class="form"><p class="muted">${esc(data.message||'暂时读不到任务日志。')}</p><div class="actions"><button data-action="close" class="primary">关闭</button></div></div>`;
-          $('#dialog-body [data-action=close]').onclick=closeDialog;
-          return;
+        running=!!data.running;
+        const lines=Array.isArray(data.lines)?data.lines:[];
+        const status=$('#dialog-body .task-log-status');
+        if(status)status.textContent=statusText(data);
+        // 内容没变就不重写 DOM：自动刷新有间隔，重写会打断选取与滚动位置。
+        const sig=lines.length+'|'+(lines[lines.length-1]||'')+'|'+running;
+        if(sig!==lastSig){
+          lastSig=sig;
+          const body=$('#task-log-body');
+          if(body){
+            const atBottom=body.scrollTop+body.clientHeight>=body.scrollHeight-24;
+            body.textContent=lines.length?lines.join("\n"):(data.message||'这个任务还没有运行记录。点「运行」后，输出会出现在这里。');
+            if(atBottom)body.scrollTop=body.scrollHeight;
+          }
         }
-        paint(data);
       }catch(e){
         if(!currentDialogOpen())return;
-        $('#dialog-body').innerHTML=`<div class="form"><p class="notice warn">${esc(e instanceof APIError?e.message:'任务日志读取失败。')}</p><div class="actions"><button data-action="close" class="primary">关闭</button></div></div>`;
-        $('#dialog-body [data-action=close]').onclick=closeDialog;
+        running=false;
+        const body=$('#task-log-body');
+        if(body)body.textContent='拉取失败：'+(e instanceof APIError?e.message:'任务日志读取失败。');
       }
+      // 运行中 2 秒一刷（日志还在长），结束后 5 秒一刷（等下一次触发）。
+      if(currentDialogOpen())timer=setTimeout(()=>load(),running?2000:5000);
     };
+    $('#dialog-body [data-action=task-log-refresh]').onclick=()=>load();
     await load();
   }
 
-  // A plan row runs exactly the accounts the live catalog exposes for that plan.
-  // Nothing is widened: no catalog rows means nothing to run, not "all".
+  // 一条计划「运行」时作用在哪些账号上：
+  //   1. 计划自己保存了账号范围 → 就用它（操作员显式选择过）；
+  //   2. 否则用实时目录里这条计划覆盖到的账号；
+  //   3. 目录本轮不可用（没有账号行）→ 返回空数组。**空绝不等于全部**：
+  //      看不到账号就不知道会动谁，宁可拒绝并说明原因，也不扩大执行范围。
   function planRunTask(planRow){
     if(!planRow)return null;
     const plan=planRow.plan;
     const provider=plan?plan.provider_id:planRow.groups[0]?.provider_id;
     const key=plan?plan.task_key:planRow.groups[0]?.key;
     if(!provider||!key)return null;
-    const accountIDs=[...new Set(planRow.groups.flatMap(g=>g.accounts.filter(t=>!t.manual_only).map(t=>t.account_id)))];
+    const planScope=Array.isArray(plan?.account_ids)?plan.account_ids.filter(Boolean):[];
+    const groups=planRow.groups||[];
+    const catalogScope=[...new Set(groups.flatMap(g=>(g.accounts||[]).filter(t=>!t.manual_only).map(t=>t.account_id)))];
+    const accountIDs=planScope.length?planScope:catalogScope;
     return {provider_id:provider,key,name:taskLabel(provider,'',key),account_ids:accountIDs};
   }
   // Renders one run exactly like the old detail dialog: a run picker at the top
@@ -547,7 +595,9 @@
     const explicit=Array.isArray(task?.account_ids)?task.account_ids.filter(Boolean):task?.account_id?[task.account_id]:[];
     const scope=explicit;
     const req={provider_id:task?.provider_id || state.taskProvider,task_key:task?.key || '*',account_ids:scope};
-    if(!scope.length){toast('没有可执行的账号范围，已取消。');return;}
+    // 空范围不发起请求：看不到账号时按「全部」跑就是放大范围。目录暂时读不到
+    // 时应先刷新目录，而不是拿一次不可见执行去赌。
+    if(!scope.length){toast('没有可执行的账号范围：账号状态尚未读取，请先刷新任务目录再运行。');return;}
     if(sessionStorage.getItem('loomgate.unconfirmedRun')) {toast('上次执行请求结果未确认。请到任务列表核对后继续，避免重复操作。');location.hash='tasks';return;}
     openDialog('确认执行范围',`<form id="run-form" class="form"><p>${esc(task?.name || '当前范围内的全部任务')}</p><div class="notice">服务：${esc(providerName(req.provider_id))}<br>账号：${esc(scope.join('、') || '全部已启用账号')}<br>执行可能产生上游操作。需要人工的任务会保留待处理状态，奖励以服务端复核为准。</div><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认执行</button></div></form>`);
     $('#run-form').onsubmit=e=>{e.preventDefault();if(state.pending.has('run'))return;sessionStorage.setItem('loomgate.unconfirmedRun','1');mutate('run','workbench/run',req,async data=>{if(!data.run?.id)throw new APIError('request_failed',502);sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();toast('已进入执行队列，结果可在执行记录里查看。');await reload();});};
@@ -934,7 +984,12 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
   }
   document.addEventListener('keydown',e=>{const row=e.target.closest('.selection-row');if(!row||!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;const rows=[...row.closest('[role=listbox]').querySelectorAll('.selection-row')],i=rows.indexOf(row),next=e.key==='Home'?0:e.key==='End'?rows.length-1:Math.max(0,Math.min(rows.length-1,i+(e.key==='ArrowDown'?1:-1)));e.preventDefault();if(row.dataset.action==='select-model-group')selectModelGroup(next,false);else return;rows[next].focus();});
   const renderers={overview,providers:services,accounts,models:modelPage,tasks,schedules:tasks,runs:tasks,usage,logs,keys:keyPage,migration,settings};
-  async function reload() {state.providers=null;state.pollStarted=0;await navigate();}
+  // 原地刷新当前页：重跑本页渲染器，不进入 navigate 的整页加载态。
+  //
+  // 之前这里清空 providers 再走 navigate()，于是点一次「运行」或「检查更新」
+  // 都会把整页换成「正在读取工作区…」再重画——视觉上就是页面被刷新了一遍。
+  // 数据本来就要重取，但页面骨架不该消失。
+  async function reload() {state.pollStarted=0;try{await providers();await renderers[state.route]();$('#view').dataset.loadState='ready';}catch(e){fail(e);}}
   async function action(element) {
     const name=element.dataset.action;
     // 组详情里的行内动作用 data-task-index 指回扁平任务数组；

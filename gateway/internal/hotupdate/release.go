@@ -365,6 +365,63 @@ func armAssetName(goarm string) string {
 }
 
 // Latest 查询最新发布版本（含本机架构的二进制资产）。
+// queryRelease fetches the release metadata, falling back to the download
+// proxy when the API refuses us.
+//
+// The proxy was only ever applied to asset downloads, but api.github.com
+// rate-limits anonymous callers hard (403 per IP per hour). A build with no
+// token then cannot see any release at all — the check fails with an opaque
+// 403 while the assets themselves would have downloaded fine. The mirror
+// proxies api.github.com too (verified: it returns the same release JSON), so
+// the same prefixed URL is tried before giving up.
+func (c *Client) queryRelease(ctx context.Context, url string) (*http.Response, error) {
+	attempt := func(target string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "workbuddy2api-self-update")
+		return c.do(req)
+	}
+
+	resp, err := attempt(url)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		return resp, nil
+	}
+	// Keep the first failure so a genuinely broken endpoint still reports
+	// something meaningful rather than the last mirror's error.
+	var firstErr error
+	var firstStatus int
+	var firstBody string
+	if err != nil {
+		firstErr = err
+	} else {
+		firstStatus = resp.StatusCode
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		firstBody = strings.TrimSpace(string(body))
+		resp.Body.Close()
+	}
+	for _, base := range c.proxyBases() {
+		mirrored := c.proxiedVia(base, url)
+		if mirrored == "" {
+			continue
+		}
+		mresp, merr := attempt(mirrored)
+		if merr != nil {
+			continue
+		}
+		if mresp.StatusCode == http.StatusOK {
+			return mresp, nil
+		}
+		mresp.Body.Close()
+	}
+	if firstErr != nil {
+		return nil, fmt.Errorf("query latest release: %w", firstErr)
+	}
+	return nil, fmt.Errorf("query latest release: HTTP %d %s", firstStatus, firstBody)
+}
+
 func (c *Client) Latest(ctx context.Context) (Release, error) {
 	name, err := assetName()
 	if err != nil {
@@ -381,21 +438,11 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 		return Release{}, errors.New("invalid update repository")
 	}
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", c.apiBase(), c.Repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := c.queryRelease(ctx, url)
 	if err != nil {
 		return Release{}, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "workbuddy2api-self-update")
-	resp, err := c.do(req)
-	if err != nil {
-		return Release{}, fmt.Errorf("query latest release: %w", err)
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return Release{}, fmt.Errorf("query latest release: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
 	var payload struct {
 		TagName     string    `json:"tag_name"`
 		Name        string    `json:"name"`

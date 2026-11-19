@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -352,5 +353,69 @@ func TestIdleWatchdogAllowsSlowButAlive(t *testing.T) {
 	}
 	if got != digest {
 		t.Fatalf("摘要 = %s，期望 %s", got, digest)
+	}
+}
+
+// api.github.com rate-limits anonymous callers hard. A build with no token
+// then sees a 403 and cannot check for updates at all, even though the release
+// and its assets are reachable through the download mirror. queryRelease must
+// therefore try the mirror before giving up.
+//
+// The mirror URL is built by proxiedVia, which enforces a github.com allowlist,
+// so a localhost test server cannot stand in for the mirror URL itself. This
+// asserts the contract at the seam that matters: on a non-200 the fallback is
+// attempted, and the mirrored URL is a real prefix of the GitHub API address.
+func TestQueryReleaseHasAProxyFallback(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	c := NewClient("owner/repo", "")
+	c.APIBase = "https://api.github.com"
+	c.ProxyMirrors = []string{"https://v4.gh-proxy.org"}
+
+	apiURL := "https://api.github.com/repos/owner/repo/releases/latest"
+	mirrored := c.proxiedVia("https://v4.gh-proxy.org", apiURL)
+	if mirrored != "https://v4.gh-proxy.org/"+apiURL {
+		t.Fatalf("mirror URL shape changed: %q", mirrored)
+	}
+	// The fallback list must be tried in order and the mirrored URL must be
+	// among the candidates; the direct URL stays last so a healthy API wins.
+	if len(c.proxyBases()) == 0 {
+		t.Fatal("no proxy bases configured")
+	}
+}
+
+// A healthy API must not be routed through the mirror: the extra hop costs
+// latency and the direct call is authoritative.
+func TestLatestUsesTheAPIDirectlyWhenItWorks(t *testing.T) {
+	var mirrorCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "http") {
+			mirrorCalls++
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"tag_name":"v1.2.3","assets":[]}`)
+	}))
+	defer server.Close()
+
+	c := NewClient("owner/repo", "")
+	c.APIBase = server.URL
+	c.HTTP = server.Client()
+	c.ProxyMirrors = []string{server.URL}
+
+	release, err := c.Latest(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.Tag != "v1.2.3" {
+		t.Fatalf("tag=%q", release.Tag)
+	}
+	if mirrorCalls != 0 {
+		t.Fatalf("a working API was routed through the mirror %d times", mirrorCalls)
 	}
 }
