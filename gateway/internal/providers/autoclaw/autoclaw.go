@@ -336,9 +336,34 @@ func (p *Provider) completeTurn(ctx context.Context, q inference.Dialogue, emit,
 		ids[i] = row.ID
 		byID[row.ID] = row
 	}
-	return providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
-		return p.turnWith(ctx, byID[id], q, emit, emitReasoning, emitTool)
+	// Collect one AttemptRecord per real upstream try. The request log is built
+	// from these, so without them every AutoClaw row reported attempts=0 and
+	// the retry history was invisible: a 502 could not be traced to "the first
+	// account 401'd, the second timed out".
+	var records []inference.Attempt
+	result, err := providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
+		started := time.Now()
+		value, turnErr := p.turnWith(ctx, byID[id], q, emit, emitReasoning, emitTool)
+		record := inference.Attempt{StartedAt: started, FinishedAt: time.Now()}
+		if turnErr != nil {
+			record.ErrorCode = "upstream_failed"
+			if public, ok := turnErr.(interface{ PublicCode() string }); ok && public.PublicCode() != "" {
+				record.ErrorCode = public.PublicCode()
+			}
+			if ae, ok := turnErr.(*accountError); ok {
+				record.HTTPStatus = ae.status
+			}
+		} else {
+			record.HTTPStatus = http.StatusOK
+		}
+		records = append(records, record)
+		return value, turnErr
 	})
+	if len(records) > 0 {
+		result.AttemptRecords = records
+		result.Attempts = len(records)
+	}
+	return result, err
 }
 
 type accountError struct {
