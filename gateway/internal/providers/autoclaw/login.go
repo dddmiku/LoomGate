@@ -67,6 +67,10 @@ type loginState struct {
 	// flow's encrypted Secret between submit_code and commit; the tokens reach
 	// the vault on commit and never enter a public response.
 	Profile json.RawMessage `json:"profile,omitempty"`
+	// InviteCode is what the operator typed when starting the login. Empty
+	// means "use the provider default"; it is carried in the encrypted secret
+	// so the first step can collect it and commit can use it.
+	InviteCode string `json:"invite_code,omitempty"`
 }
 
 func (d *LoginDriver) client() *http.Client {
@@ -100,7 +104,11 @@ func (d *LoginDriver) Start(ctx context.Context, r authflow.Request) (authflow.R
 
 // sendCodeFlow performs the SMS send after the phone has been validated.
 func (d *LoginDriver) sendCodeFlow(ctx context.Context, phone, device string) (authflow.Result, error) {
-	st := loginState{Phone: phone, DeviceID: device, Stage: "code_requested"}
+	return d.sendCodeFlowWith(ctx, phone, device, "")
+}
+
+func (d *LoginDriver) sendCodeFlowWith(ctx context.Context, phone, device, inviteCode string) (authflow.Result, error) {
+	st := loginState{Phone: phone, DeviceID: device, Stage: "code_requested", InviteCode: inviteCode}
 	secret, _ := json.Marshal(st)
 	if err := d.sendCode(ctx, phone, device); err != nil {
 		var gate *sliderGate
@@ -137,7 +145,17 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 			return authflow.Result{Status: "waiting_phone", InputMode: "phone",
 				Notice: "手机号格式不正确，请输入 11 位大陆手机号。"}, nil
 		}
-		return d.sendCodeFlow(ctx, phone, st.DeviceID)
+		// Optional referral code typed by the operator. Blank keeps the
+		// provider default; it is remembered in the encrypted secret so the
+		// commit step can bind it without asking again.
+		if code := strings.TrimSpace(input.InviteCode); code != "" {
+			if !isInviteCode(code) {
+				return authflow.Result{Status: "waiting_phone", InputMode: "phone",
+					Notice: "邀请码格式不正确，请检查后重新输入，或留空使用默认邀请码。"}, nil
+			}
+			st.InviteCode = code
+		}
+		return d.sendCodeFlowWith(ctx, phone, st.DeviceID, st.InviteCode)
 	case "resend":
 		if !isPhone(st.Phone) {
 			return authflow.Result{Status: "waiting_phone", InputMode: "phone",
@@ -191,7 +209,7 @@ func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Resu
 		return authflow.Result{}, err
 	}
 	notice := "登录成功，账号已保存到 AutoClaw 账号池。"
-	if code := d.inviteCode(); code != "" {
+	if code := d.inviteCode(st.InviteCode); code != "" {
 		var s stored
 		if json.Unmarshal(st.Profile, &s) == nil {
 			if bindErr := fissionBind(ctx, s.AccessToken, code, s.DeviceID, d.client()); bindErr != nil {
@@ -208,7 +226,13 @@ func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Resu
 }
 
 // inviteCode resolves the referral code to bind after login.
-func (d *LoginDriver) inviteCode() string {
+// inviteCode resolves the referral code to bind after login. A code the
+// operator typed during this flow wins; otherwise the provider default
+// applies. "-" disables binding for an explicitly opted-out deployment.
+func (d *LoginDriver) inviteCode(userCode string) string {
+	if code := strings.TrimSpace(userCode); code != "" {
+		return code
+	}
 	code := strings.TrimSpace(d.InviteCode)
 	if code == "-" {
 		return ""
@@ -461,6 +485,22 @@ func isPhone(v string) bool {
 		}
 	}
 	return v[0] == '1'
+}
+
+// isInviteCode accepts the referral-code shape the service uses: letters and
+// digits only, bounded length. Blank is handled by the caller as "use default".
+func isInviteCode(v string) bool {
+	if len(v) < 4 || len(v) > 32 {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isCode(v string) bool {

@@ -454,34 +454,54 @@
         </tr>`);
       }
     }
-    // 窄屏（320/390）下任务表按自身横向滚动，不能让页面整体溢出。
-    const journal=state.runs.length?`<section class="run-journal" id="run-journal"><div class="section-heading"><h2>执行记录</h2><span class="small muted">最近 ${state.runs.length} 次</span></div><ol class="execution-journal">${state.runs.slice(0,20).map((r,i)=>`<li data-run-id="${esc(r.id)}"><time>${esc(date(r.started_at))}</time><div class="journal-content"><h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p>${esc(providerName(r.provider_id))}，${esc(r.account_ids?.join('、')||'全部已启用账号')}</p><p>${esc(labels[r.stage]||'等待派发')}</p><code>${esc(r.id)}</code></div><div>${badge(r.status)}<div class="actions">${button('run-detail','详情',`data-index="${i}"`,'quiet')}${['queued','running'].includes(r.status)?button('cancel-run','取消',`data-index="${i}" data-lock`,'quiet danger'):''}</div></div></li>`).join('')}</ol></section>`:'';
-    $('#task-list').innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogFailed?'<p class="small muted">任务目录本轮读取失败；计划与开关仍来自本地。</p>':'')+journal;
+    // 任务页只列任务与计划。执行历史在「执行记录」页；任务输出日志在每行的「日志」里。
+    $('#task-list').innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogFailed?'<p class="small muted">任务目录本轮读取失败；计划与开关仍来自本地。</p>':'');
   }
   const taskErrors={provider_rejected:'官方服务拒绝了此操作',operation_unconfirmed:'操作结果未确认',account_identity_changed:'账号或绑定发生变化',authentication_required:'需要重新登录',task_expired:'任务标识已过期',operation_not_eligible:'当前尚不满足操作条件',provider_busy:'官方客户端正忙',upstream_failed:'上游操作未成功'};
-  // The task log is the old run-detail dialog, scoped to a plan: a module plan
-  // ("growth/") shows every run whose task key falls under that module, in the
-  // same complete breakdown the standalone log page used to show.
+  // 「日志」显示任务自己的输出（旧版行为）：最近一次运行的文本行，而不是
+  // 结构化步骤表。每个任务把日志写在 data/task-logs/<key>.json，服务端读回
+  // 最近一次执行的行；任务正在跑时继续刷新。
   async function openPlanLog(planRow){
     if(!planRow)return;
     const provider=planRow.plan?planRow.plan.provider_id:planRow.groups[0]?.provider_id;
     const key=planRow.plan?planRow.plan.task_key:planRow.groups[0]?.key;
-    openDialog(`${taskLabel(provider,'',key)} · 执行详情`,'<p class="muted">正在读取该项任务的执行记录…</p>');
-    try{
-      const data=await api('workbench',{signal:null});
-      const runs=(data.runs||[]).filter(r=>r.provider_id===provider&&planKeyMatches(key,r.task_key||''));
-      if(!runs.length){
-        $('#dialog-body').innerHTML=`<div class="form"><p class="muted">这项任务还没有执行记录。点「运行」后结果会出现在这里。</p><div class="actions"><button data-action="close">关闭</button></div></div>`;
+    if(!key){toast('这个条目没有可读取的任务日志。');return;}
+    openDialog(`${taskLabel(provider,'',key)} · 输出日志`,'<p class="muted">正在读取最近一次执行日志…</p>');
+    let timer=null;
+    const currentDialogOpen=()=>document.getElementById('dialog')?.open===true;
+    const paint=(data)=>{
+      const lines=Array.isArray(data.lines)?data.lines:[];
+      const meta=[data.running?'正在运行':'最近一次执行', data.endedAt?date(data.endedAt):''].filter(Boolean).join(' · ');
+      $('#dialog-body').innerHTML=`<div class="form task-log-dialog">
+        <p class="muted small">${esc(meta)}</p>
+        ${lines.length?`<pre class="task-log-output" role="log">${esc(lines.join("\n"))}</pre>`:`<p class="muted">${esc(data.message||'这项任务还没有输出日志。运行一次后日志会出现在这里。')}</p>`}
+        <div class="actions"><button data-action="task-log-refresh">刷新</button><button data-action="close" class="primary">关闭</button></div>
+      </div>`;
+      $('#dialog-body [data-action=close]').onclick=()=>{clearTimeout(timer);closeDialog();};
+      $('#dialog-body [data-action=task-log-refresh]').onclick=()=>load();
+      // 任务在跑时日志还在增长：只在弹窗仍打开且任务未结束时续刷。
+      if(data.running&&currentDialogOpen())timer=setTimeout(()=>load(),2500);
+    };
+    const load=async()=>{
+      clearTimeout(timer);
+      try{
+        const data=await api('tasks/'+encodeURIComponent(key)+'/log',{signal:null});
+        if(!currentDialogOpen())return;
+        if(data.ok===false&&!(data.lines||[]).length){
+          $('#dialog-body').innerHTML=`<div class="form"><p class="muted">${esc(data.message||'暂时读不到任务日志。')}</p><div class="actions"><button data-action="close" class="primary">关闭</button></div></div>`;
+          $('#dialog-body [data-action=close]').onclick=closeDialog;
+          return;
+        }
+        paint(data);
+      }catch(e){
+        if(!currentDialogOpen())return;
+        $('#dialog-body').innerHTML=`<div class="form"><p class="notice warn">${esc(e instanceof APIError?e.message:'任务日志读取失败。')}</p><div class="actions"><button data-action="close" class="primary">关闭</button></div></div>`;
         $('#dialog-body [data-action=close]').onclick=closeDialog;
-        return;
       }
-      state.taskLogRuns=runs;
-      showTaskRunDetail(runs,0);
-    }catch(e){
-      closeDialog();
-      toast(e instanceof APIError?e.message:'执行记录读取失败');
-    }
+    };
+    await load();
   }
+
   // A plan row runs exactly the accounts the live catalog exposes for that plan.
   // Nothing is widened: no catalog rows means nothing to run, not "all".
   function planRunTask(planRow){

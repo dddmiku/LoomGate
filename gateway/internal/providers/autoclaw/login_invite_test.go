@@ -206,3 +206,74 @@ func TestSaveFailureIsReported(t *testing.T) {
 		t.Fatal("a save failure was swallowed")
 	}
 }
+
+// The referral code is optional at login. A code the operator types wins; a
+// blank field falls back to the provider default, so the built-in code is a
+// default rather than the only choice.
+func TestOperatorInviteCodeOverridesTheDefault(t *testing.T) {
+	tr := &inviteTransport{}
+	d := &LoginDriver{HTTP: &http.Client{Transport: tr},
+		Save: func(context.Context, []byte) (string, error) { return "autoclaw-1", nil }}
+
+	// The operator types a code with the phone number.
+	flow := authflowFlowFor("13800000000")
+	verified, err := d.Step(context.Background(), flow, "send_code",
+		authflow.Input{Phone: "13800000000", InviteCode: "MYCODE99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Status != "waiting_code" {
+		t.Fatalf("status=%q", verified.Status)
+	}
+	// Continue with the secret the driver produced (it carries the code).
+	verified, err = d.Step(context.Background(), flowWithSecret(verified.Secret), "submit_code", authflowInputFor("123456"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{}); err != nil {
+		t.Fatal(err)
+	}
+	if tr.bindBody == nil || tr.bindBody["invite_code"] != "MYCODE99" {
+		t.Fatalf("operator code not used: %v", tr.bindBody)
+	}
+}
+
+// A blank field keeps the provider default.
+func TestBlankInviteCodeUsesTheDefault(t *testing.T) {
+	tr := &inviteTransport{}
+	d := &LoginDriver{HTTP: &http.Client{Transport: tr},
+		Save: func(context.Context, []byte) (string, error) { return "autoclaw-1", nil }}
+	flow := authflowFlowFor("13800000000")
+	verified, err := d.Step(context.Background(), flow, "send_code",
+		authflow.Input{Phone: "13800000000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err = d.Step(context.Background(), flowWithSecret(verified.Secret), "submit_code", authflowInputFor("123456"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{}); err != nil {
+		t.Fatal(err)
+	}
+	if tr.bindBody == nil || tr.bindBody["invite_code"] != DefaultInviteCode {
+		t.Fatalf("default not applied: %v", tr.bindBody)
+	}
+}
+
+// A malformed code must not silently fall back to the default: the operator
+// would believe their code was used.
+func TestMalformedInviteCodeIsRejectedNotIgnored(t *testing.T) {
+	d := &LoginDriver{HTTP: stubHTTP(t, nil)}
+	got, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "send_code",
+		authflow.Input{Phone: "13800000000", InviteCode: "bad code!"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "waiting_phone" {
+		t.Fatalf("a malformed invite code was accepted: status=%q", got.Status)
+	}
+	if !strings.Contains(got.Notice, "邀请码") {
+		t.Fatalf("notice does not mention the invite code: %q", got.Notice)
+	}
+}

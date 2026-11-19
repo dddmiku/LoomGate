@@ -36,6 +36,9 @@ type Input struct {
 	Phone    string `json:"phone,omitempty"`
 	Code     string `json:"code,omitempty"`
 	Callback string `json:"callback,omitempty"`
+	// InviteCode is an optional referral code the operator types while adding
+	// an account. Empty means the provider's own default applies.
+	InviteCode string `json:"invite_code,omitempty"`
 }
 
 func (Input) String() string   { return "authflow.Input[redacted]" }
@@ -364,7 +367,7 @@ func allowed(status, action string) bool {
 	return false
 }
 func (s *Service) Step(ctx context.Context, id, action string, input Input) (View, error) {
-	if len(input.Phone) > 64 || len(input.Code) > 32 || len(input.Callback) > 16384 {
+	if len(input.Phone) > 64 || len(input.Code) > 32 || len(input.Callback) > 16384 || len(input.InviteCode) > 64 {
 		return View{}, ErrInvalid
 	}
 	if _, err := s.List(); err != nil {
