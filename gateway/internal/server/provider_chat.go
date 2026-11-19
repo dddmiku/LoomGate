@@ -340,8 +340,18 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		st.trace.account = result.AccountRef
 		st.trace.model = model
 		st.trace.record.UpstreamStarted = result.Attempted
-		st.trace.record.AttemptCount = len(result.AttemptRecords)
-		for i, a := range result.AttemptRecords {
+		records := result.AttemptRecords
+		// Providers that speak a vendor protocol report usage on the result
+		// itself and never build per-attempt records. The request log is
+		// aggregated from attempts, so with zero records every row showed a
+		// dash for input/output/cached even though the gateway log line had the
+		// real numbers. Synthesize the single attempt that actually happened;
+		// it carries the same counts the response already returned.
+		if len(records) == 0 && result.Attempted {
+			records = []inference.Attempt{{HTTPStatus: 200}}
+		}
+		st.trace.record.AttemptCount = len(records)
+		for i, a := range records {
 			status := requestlog.StatusError
 			if a.HTTPStatus == 200 && a.ErrorCode == "" {
 				status = requestlog.StatusSuccess
@@ -349,7 +359,22 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			if a.ErrorCode == "client_canceled" {
 				status = requestlog.StatusCanceled
 			}
-			st.trace.record.Attempts = append(st.trace.record.Attempts, requestlog.Attempt{Number: i + 1, AccountID: result.AccountRef, Model: model, StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, DurationMS: max(0, a.FinishedAt.Sub(a.StartedAt).Milliseconds()), HTTPStatus: a.HTTPStatus, Status: status, ErrorCode: traceCode(a.ErrorCode), UsageState: requestlog.UsageMissing, UsageReason: "usage_not_reported"})
+			attempt := requestlog.Attempt{Number: i + 1, AccountID: result.AccountRef, Model: model, StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, DurationMS: max(0, a.FinishedAt.Sub(a.StartedAt).Milliseconds()), HTTPStatus: a.HTTPStatus, Status: status, ErrorCode: traceCode(a.ErrorCode)}
+			// A vendor provider's counts live on the result, not on the attempt.
+			if i == len(records)-1 && result.UsageReported {
+				prompt, completion := int64(result.PromptTokens), int64(result.CompletionTokens)
+				attempt.InputTokens = &prompt
+				attempt.OutputTokens = &completion
+				if result.CachedTokens > 0 {
+					cached := int64(result.CachedTokens)
+					attempt.CachedTokens = &cached
+				}
+				attempt.UsageState = requestlog.UsageComplete
+			} else {
+				attempt.UsageState = requestlog.UsageMissing
+				attempt.UsageReason = "usage_not_reported"
+			}
+			st.trace.record.Attempts = append(st.trace.record.Attempts, attempt)
 		}
 		if len(st.trace.record.Attempts) > 0 {
 			st.trace.last = &st.trace.record.Attempts[len(st.trace.record.Attempts)-1]

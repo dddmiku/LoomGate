@@ -187,3 +187,52 @@ func TestProviderAttemptAuditKeepsUsageUnknownAndExcludesContent(t *testing.T) {
 		t.Fatal("provider usage or attempt attribution incorrect")
 	}
 }
+
+// usageOnlyProvider reports real token counts on the result but, like the
+// vendor-protocol providers (AutoClaw/Doubao), never builds per-attempt
+// records. The request log aggregates attempts, so without synthesizing one
+// every row showed a dash for input/output/cached.
+type usageOnlyProvider struct{ fixtureProvider }
+
+func (p *usageOnlyProvider) Complete(ctx context.Context, model, text string) (inference.Result, error) {
+	p.calls.Add(1)
+	return inference.Result{
+		Text: "synthetic final reply", Attempted: true, Acknowledged: true, Complete: true,
+		AccountRef: "synthetic-ref", UsageReported: true,
+		PromptTokens: 1234, CompletionTokens: 56, CachedTokens: 100,
+	}, nil
+}
+
+func TestProviderUsageReachesTheRequestLogWithoutAttemptRecords(t *testing.T) {
+	h, _, key, _ := providerFixture(t, nil)
+	h.cfg.Inference["fixture"] = &usageOnlyProvider{}
+	store, err := requestlog.Open(filepath.Join(t.TempDir(), "requests.jsonl"), requestlog.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	h.cfg.Requests = store
+	w := providerRequest(h, key, `{"model":"fixture:dynamic","messages":[{"role":"user","content":"synthetic"}]}`)
+	if w.Code != 200 {
+		t.Fatalf("request failed: %d %s", w.Code, w.Body.String())
+	}
+	page, err := store.List(requestlog.Query{})
+	if err != nil || page.Total != 1 {
+		t.Fatal("provider request missing from history")
+	}
+	record, err := store.Get(page.Items[0].RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.UpstreamStarted || record.AttemptCount != 1 || len(record.Attempts) != 1 {
+		t.Fatalf("provider attempt missing: %+v", record)
+	}
+	a := record.Attempts[0]
+	if a.UsageState != requestlog.UsageComplete || a.InputTokens == nil || *a.InputTokens != 1234 ||
+		a.OutputTokens == nil || *a.OutputTokens != 56 || a.CachedTokens == nil || *a.CachedTokens != 100 {
+		t.Fatalf("reported usage did not reach the request log: %+v", a)
+	}
+	if page.Items[0].InputTokens == nil || *page.Items[0].InputTokens != 1234 || page.Items[0].UsageState != requestlog.UsageComplete {
+		t.Fatalf("summary lost the usage: %+v", page.Items[0])
+	}
+}
