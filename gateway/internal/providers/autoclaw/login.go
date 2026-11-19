@@ -68,7 +68,7 @@ func (d *LoginDriver) Start(ctx context.Context, r authflow.Request) (authflow.R
 	st := loginState{DeviceID: loginDeviceID, Stage: "awaiting_phone"}
 	secret, _ := json.Marshal(st)
 	return authflow.Result{
-		Status: "waiting_input", InputMode: "phone", Secret: secret,
+		Status: "waiting_phone", InputMode: "phone", Secret: secret,
 		Notice: "请输入 AutoClaw 账号绑定的手机号（11 位）。",
 	}, nil
 }
@@ -92,7 +92,7 @@ func (d *LoginDriver) sendCodeFlow(ctx context.Context, phone, device string) (a
 		}, nil
 	}
 	return authflow.Result{
-		Status: "waiting_input", InputMode: "code", Secret: secret,
+		Status: "waiting_code", InputMode: "code", Secret: secret,
 		Notice: "验证码已发送到 " + maskPhone(phone) + "，请输入收到的 6 位验证码。",
 	}, nil
 }
@@ -106,33 +106,33 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 		st.DeviceID = loginDeviceID
 	}
 	switch action {
-	case "phone", "submit_phone":
+	case "send_code", "phone", "submit_phone":
 		phone := strings.TrimSpace(input.Phone)
 		if !isPhone(phone) {
-			return authflow.Result{Status: "waiting_input", InputMode: "phone",
+			return authflow.Result{Status: "waiting_phone", InputMode: "phone",
 				Notice: "手机号格式不正确，请输入 11 位大陆手机号。"}, nil
 		}
 		return d.sendCodeFlow(ctx, phone, st.DeviceID)
 	case "resend":
 		if !isPhone(st.Phone) {
-			return authflow.Result{Status: "waiting_input", InputMode: "phone",
+			return authflow.Result{Status: "waiting_phone", InputMode: "phone",
 				Notice: "请先输入手机号。"}, nil
 		}
 		if err := d.sendCode(ctx, st.Phone, st.DeviceID); err != nil {
 			return authflow.Result{Status: "failed", ErrorCode: "code_send_failed", Notice: "重新发送失败：" + err.Error()}, nil
 		}
 		b, _ := json.Marshal(st)
-		return authflow.Result{Status: "waiting_input", InputMode: "code", Secret: b,
+		return authflow.Result{Status: "waiting_code", InputMode: "code", Secret: b,
 			Notice: "验证码已重新发送到 " + maskPhone(st.Phone) + "。"}, nil
-	case "submit", "verify":
+	case "submit_code", "submit", "verify":
 		code := strings.TrimSpace(input.Code)
 		if !isCode(code) {
-			return authflow.Result{Status: "waiting_input", InputMode: "code",
+			return authflow.Result{Status: "waiting_code", InputMode: "code",
 				Notice: "请输入 6 位数字验证码。"}, nil
 		}
 		profile, err := d.login(ctx, st.Phone, code, st.DeviceID)
 		if err != nil {
-			return authflow.Result{Status: "waiting_input", InputMode: "code",
+			return authflow.Result{Status: "waiting_code", InputMode: "code",
 				ErrorCode: "code_rejected", Notice: "验证码不正确或已过期：" + err.Error()}, nil
 		}
 		if d.Save == nil {
