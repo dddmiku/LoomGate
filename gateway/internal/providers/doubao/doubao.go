@@ -242,9 +242,55 @@ func (p *Provider) complete(ctx context.Context, model string, messages []infere
 	return inference.Result{}, lastErr
 }
 
-type accountError struct{ status int }
+type accountError struct {
+	status int
+	body   string
+}
 
-func (e *accountError) Error() string { return "doubao upstream http=" + strconv.Itoa(e.status) }
+func (e *accountError) Error() string {
+	if e.body == "" {
+		return "doubao upstream http=" + strconv.Itoa(e.status)
+	}
+	return "doubao upstream http=" + strconv.Itoa(e.status) + " " + e.body
+}
+
+// summarizeBody keeps a short, non-secret fingerprint of an unexpected response
+// so a failing shape can be diagnosed without logging a full payload. Only the
+// code/message fields are surfaced; the body is otherwise discarded.
+func summarizeBody(raw []byte) string {
+	if len(raw) == 0 {
+		return "empty"
+	}
+	var probe struct {
+		Code     int    `json:"code"`
+		Message  string `json:"message"`
+		Msg      string `json:"msg"`
+		ErrorMsg string `json:"error_msg"`
+	}
+	if json.Unmarshal(raw, &probe) == nil {
+		switch {
+		case probe.Message != "":
+			return "code=" + strconv.Itoa(probe.Code) + " msg=" + truncate(probe.Message, 120)
+		case probe.Msg != "":
+			return "code=" + strconv.Itoa(probe.Code) + " msg=" + truncate(probe.Msg, 120)
+		case probe.ErrorMsg != "":
+			return "code=" + strconv.Itoa(probe.Code) + " msg=" + truncate(probe.ErrorMsg, 120)
+		}
+	}
+	prefix := string(raw)
+	if len(prefix) > 80 {
+		prefix = prefix[:80]
+	}
+	return "content-type-not-event-stream prefix=" + truncate(strings.TrimSpace(prefix), 80)
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
 
 func retryable(err error) bool {
 	var ae *accountError
@@ -254,16 +300,8 @@ func retryable(err error) bool {
 	return false
 }
 
-func (p *Provider) turn(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit func(string) error) (inference.Result, error) {
-	s, err := p.session(row.ID)
-	if err != nil {
-		return inference.Result{}, err
-	}
-	m := resolve(model)
-	body, err := buildBody(s, m, messages)
-	if err != nil {
-		return inference.Result{}, err
-	}
+// send issues one work-mode request with the stored session identity.
+func (p *Provider) send(ctx context.Context, s Stored, body []byte) (*http.Response, error) {
 	query := baseQuery
 	if len(s.Query) > 0 {
 		query = mergeQuery(baseQuery, s.Query)
@@ -271,7 +309,7 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 	u := "https://www.doubao.com/chat/completion?" + query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
-		return inference.Result{}, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
@@ -291,16 +329,36 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 			req.Header.Set(key, v)
 		}
 	}
+	return p.httpClient().Do(req)
+}
 
-	resp, err := p.httpClient().Do(req)
+func (p *Provider) turn(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit func(string) error) (inference.Result, error) {
+	s, err := p.session(row.ID)
+	if err != nil {
+		return inference.Result{}, err
+	}
+	m := resolve(model)
+	body, err := buildBody(s, m, messages)
+	if err != nil {
+		return inference.Result{}, err
+	}
+	resp, err := p.send(ctx, s, body)
 	if err != nil {
 		return inference.Result{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		_ = raw
-		return inference.Result{}, &accountError{status: resp.StatusCode}
+		return inference.Result{}, &accountError{status: resp.StatusCode, body: summarizeBody(raw)}
+	}
+
+	// A 200 that is not an event stream is a protocol mismatch, not an empty
+	// answer. Record its fingerprint so the failure is diagnosable instead of
+	// being reported as "upstream returned nothing".
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); !strings.Contains(ct, "event-stream") {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return inference.Result{Attempted: true, Attempts: 1},
+			&accountError{status: resp.StatusCode, body: "non-sse content-type=" + ct + " " + summarizeBody(raw)}
 	}
 
 	result := inference.Result{Attempted: true, Attempts: 1}
