@@ -31,6 +31,7 @@ import (
 
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/inference"
+	"workbuddy2api/internal/providerretry"
 )
 
 // Upstream facts. These are protocol constants of the AutoClaw desktop client,
@@ -113,6 +114,7 @@ type Provider struct {
 
 	mu     sync.Mutex
 	cursor int
+	cool   *providerretry.Cooldown
 }
 
 func (p *Provider) httpClient() *http.Client {
@@ -120,6 +122,16 @@ func (p *Provider) httpClient() *http.Client {
 		return p.Client
 	}
 	return &http.Client{Timeout: 10 * time.Minute}
+}
+
+// cooldown returns the provider's cool-down table, creating it on first use.
+func (p *Provider) cooldown() *providerretry.Cooldown {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cool == nil {
+		p.cool = providerretry.NewCooldown()
+	}
+	return p.cool
 }
 
 // accounts returns every enabled AutoClaw account in a stable order.
@@ -205,25 +217,21 @@ func (p *Provider) complete(ctx context.Context, model string, messages []infere
 	p.cursor = (p.cursor + 1) % len(rows)
 	p.mu.Unlock()
 
-	var lastErr error
-	for i := 0; i < len(rows); i++ {
-		row := rows[(start+i)%len(rows)]
-		result, err := p.turn(ctx, row, model, messages, emit)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if !retryable(err) {
-			return result, err
-		}
+	order := make([]accountvault.Account, len(rows))
+	for i := range rows {
+		order[i] = rows[(start+i)%len(rows)]
 	}
-	if lastErr == nil {
-		lastErr = errors.New("autoclaw_all_accounts_failed")
+	ids := make([]string, len(order))
+	byID := make(map[string]accountvault.Account, len(order))
+	for i, row := range order {
+		ids[i] = row.ID
+		byID[row.ID] = row
 	}
-	return inference.Result{}, lastErr
+	return providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
+		return p.turn(ctx, byID[id], model, messages, emit)
+	})
 }
 
-// retryable reports whether another account could plausibly succeed.
 type accountError struct {
 	status int
 	code   string
@@ -231,13 +239,24 @@ type accountError struct {
 
 func (e *accountError) Error() string { return "autoclaw upstream: " + e.code }
 
-func retryable(err error) bool {
-	var ae *accountError
-	if errors.As(err, &ae) {
-		return ae.status == 401 || ae.status == 403 || ae.status == 429 || ae.status == 402 || ae.status == 409 || ae.status >= 500
+// RetryClass keeps the same policy the legacy path uses: auth/quota/rate-limit
+// and server faults implicate the account, a client error does not.
+func (e *accountError) RetryClass() providerretry.Class {
+	switch {
+	case e.status == 401 || e.status == 403 || e.status == 429 || e.status == 402 || e.status == 409:
+		return providerretry.RetryAccount
+	case e.status >= 500:
+		return providerretry.RetryAccount
 	}
-	return false
+	return providerretry.Fatal
 }
+
+// RetryClass for an empty answer: the account is fine, the upstream hiccupped.
+func (e *emptyAnswerError) RetryClass() providerretry.Class { return providerretry.RetryTransient }
+
+type emptyAnswerError struct{}
+
+func (e *emptyAnswerError) Error() string { return "autoclaw_empty_answer" }
 
 func (p *Provider) turn(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit func(string) error) (inference.Result, error) {
 	s, err := p.session(row.ID)
@@ -382,7 +401,7 @@ func aggregate(raw []byte) (string, bool, error) {
 		}
 	}
 	if text.Len() == 0 {
-		return "", usage, errors.New("autoclaw_empty_answer")
+		return "", usage, &emptyAnswerError{}
 	}
 	return text.String(), usage, nil
 }
@@ -447,7 +466,7 @@ func streamSSE(body io.Reader, emit func(string) error) (string, int, error) {
 	}
 	_ = buf
 	if text.Len() == 0 {
-		return "", events, errors.New("autoclaw_empty_answer")
+		return "", events, &emptyAnswerError{}
 	}
 	return text.String(), events, nil
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/inference"
+	"workbuddy2api/internal/providerretry"
 )
 
 // TestBuildBodyHasNoConversationFields is the core promise of this provider:
@@ -108,19 +109,21 @@ func TestEmptyAnswerIsAnError(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorRotatesAccountsOnlyWhenAccountScoped checks the rotation
-// policy: auth/quota errors move to the next account, client errors do not.
-func TestUpstreamErrorRotatesAccountsOnlyWhenAccountScoped(t *testing.T) {
+// TestUpstreamErrorClassifiesForRotation checks the rotation policy: auth,
+// quota and server errors implicate the account; a client error does not.
+func TestUpstreamErrorClassifiesForRotation(t *testing.T) {
 	for _, tc := range []struct {
 		status int
-		retry  bool
+		want   providerretry.Class
 	}{
-		{401, true}, {403, true}, {429, true}, {402, true}, {500, true}, {503, true},
-		{400, false}, {404, false}, {422, false},
+		{401, providerretry.RetryAccount}, {403, providerretry.RetryAccount},
+		{429, providerretry.RetryAccount}, {402, providerretry.RetryAccount},
+		{500, providerretry.RetryAccount}, {503, providerretry.RetryAccount},
+		{400, providerretry.Fatal}, {404, providerretry.Fatal}, {422, providerretry.Fatal},
 	} {
-		got := retryable(&accountError{status: tc.status})
-		if got != tc.retry {
-			t.Errorf("status %d retryable=%v want %v", tc.status, got, tc.retry)
+		got := (&accountError{status: tc.status}).RetryClass()
+		if got != tc.want {
+			t.Errorf("status %d class=%v want %v", tc.status, got, tc.want)
 		}
 	}
 }

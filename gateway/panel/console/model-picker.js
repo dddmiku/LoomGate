@@ -4,7 +4,12 @@
 window.LoomModelPicker = (() => {
   function rate(raw) {
     if(raw===null||raw===undefined||raw==='')return null;
-    const match=String(raw).trim().match(/^(?:[x×]\s*)?(\d+(?:\.\d+)?)(?:\s*credits?)?$/i);
+    // The gateway emits the multiplier in the form the upstream publishes it:
+    // "0.01x", "1x", "x0.11 credits", or the word 免费. Accept both the prefix
+    // and suffix spellings, and treat 免费 as zero.
+    const text=String(raw).trim();
+    if(text==='免费'||text.toLowerCase()==='free')return 0;
+    const match=text.match(/^(?:[x×]\s*)?(\d+(?:\.\d+)?)\s*(?:x|credits?)?$/i);
     if(!match)return null;
     const value=Number(match[1]);return Number.isFinite(value)&&value>=0?value:null;
   }

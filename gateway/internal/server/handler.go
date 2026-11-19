@@ -433,9 +433,19 @@ func modelAllowedByKey(info apikeys.Info, requestModel string) bool {
 	if len(info.Models) == 0 {
 		return true
 	}
+	// Clients such as NarraFork prefix the model with the product name
+	// (workbuddy:doubao:...). The binding is stored against the real id, so the
+	// bare form must be accepted too; otherwise a correctly bound model is
+	// rejected before routing.
+	candidates := []string{requestModel}
+	if first, rest, ok := strings.Cut(requestModel, ":"); ok && first == "workbuddy" && rest != "" {
+		candidates = append(candidates, rest)
+	}
 	for _, allowed := range info.Models {
-		if allowed == requestModel {
-			return true
+		for _, candidate := range candidates {
+			if allowed == candidate {
+				return true
+			}
 		}
 	}
 	return false
@@ -1694,9 +1704,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
-	if namespace, _, ok := strings.Cut(peek.Model, ":"); ok && namespace != "" {
+	// 有些客户端（实测 NarraFork）把「服务名」当成模型名前缀再发一次，例如
+	// workbuddy:doubao:deepseek-v4-flash。第一段是网关自己的产品名时不代表任何
+	// provider，剥掉它再按真实命名空间路由，否则请求会落到旧通道并以上游 502 收场。
+	routeModel := peek.Model
+	if first, rest, ok := strings.Cut(routeModel, ":"); ok && first == "workbuddy" && rest != "" {
+		if second, _, ok := strings.Cut(rest, ":"); ok && h.cfg.Inference[second] != nil {
+			routeModel = rest
+			peek.Model = rest
+		}
+	}
+	if namespace, _, ok := strings.Cut(routeModel, ":"); ok && namespace != "" {
 		if provider := h.cfg.Inference[namespace]; provider != nil {
-			h.providerChat(w, r, providerBody, peek.Model, peek.Stream, st, provider)
+			h.providerChat(w, r, providerBody, routeModel, peek.Stream, st, provider)
 			return
 		}
 		// Unknown prefixes are not provider namespaces unless a provider is

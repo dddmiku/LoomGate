@@ -18,6 +18,7 @@ package doubao
 import (
 	"bytes"
 	"context"
+	"log"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -33,6 +34,7 @@ import (
 
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/inference"
+	"workbuddy2api/internal/providerretry"
 )
 
 const (
@@ -125,6 +127,17 @@ type Provider struct {
 
 	mu     sync.Mutex
 	cursor int
+	cool   *providerretry.Cooldown
+}
+
+// cooldown returns the provider's cool-down table, creating it on first use.
+func (p *Provider) cooldown() *providerretry.Cooldown {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cool == nil {
+		p.cool = providerretry.NewCooldown()
+	}
+	return p.cool
 }
 
 func (p *Provider) httpClient() *http.Client {
@@ -224,22 +237,22 @@ func (p *Provider) complete(ctx context.Context, model string, messages []infere
 	p.cursor = (p.cursor + 1) % len(rows)
 	p.mu.Unlock()
 
-	var lastErr error
-	for i := 0; i < len(rows); i++ {
-		row := rows[(start+i)%len(rows)]
-		result, err := p.turn(ctx, row, model, messages, emit)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if !retryable(err) {
-			return result, err
-		}
+	order := make([]accountvault.Account, len(rows))
+	for i := range rows {
+		order[i] = rows[(start+i)%len(rows)]
 	}
-	if lastErr == nil {
-		lastErr = errors.New("doubao_all_accounts_failed")
+	ids := make([]string, len(order))
+	byID := make(map[string]accountvault.Account, len(order))
+	for i, row := range order {
+		ids[i] = row.ID
+		byID[row.ID] = row
 	}
-	return inference.Result{}, lastErr
+	// A transient empty answer is retried on the same account (the caller saw
+	// nothing yet, so no duplicate output is possible); account-scoped failures
+	// rotate, and the shared runner keeps both bounded.
+	return providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
+		return p.turn(ctx, byID[id], model, messages, emit)
+	})
 }
 
 type accountError struct {
@@ -292,13 +305,22 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-func retryable(err error) bool {
-	var ae *accountError
-	if errors.As(err, &ae) {
-		return ae.status == 401 || ae.status == 403 || ae.status == 429 || ae.status >= 500
+// RetryClass keeps the same policy the legacy path uses.
+func (e *accountError) RetryClass() providerretry.Class {
+	if e.status == 401 || e.status == 403 || e.status == 429 || e.status >= 500 {
+		return providerretry.RetryAccount
 	}
-	return false
+	return providerretry.Fatal
 }
+
+// emptyAnswer is a transient upstream hiccup: the turn was acknowledged and
+// then produced nothing. The account itself is healthy.
+type emptyAnswer struct{}
+
+func (emptyAnswer) Error() string                    { return "doubao_empty_answer" }
+func (emptyAnswer) RetryClass() providerretry.Class { return providerretry.RetryTransient }
+
+var errEmptyAnswer = emptyAnswer{}
 
 // send issues one work-mode request with the stored session identity.
 func (p *Provider) send(ctx context.Context, s Stored, body []byte) (*http.Response, error) {
@@ -367,6 +389,9 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 		if err != nil {
 			return result, err
 		}
+		if strings.TrimSpace(text) == "" {
+			return result, errEmptyAnswer
+		}
 		result.Text = text
 		result.Complete = true
 		result.Acknowledged = conv != ""
@@ -388,7 +413,7 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 		return result, err
 	}
 	if strings.TrimSpace(text) == "" {
-		return result, errors.New("doubao_empty_answer")
+		return result, errEmptyAnswer
 	}
 	return result, nil
 }
@@ -732,17 +757,29 @@ func parseFrame(frame string) (event, data string) {
 	return event, strings.Join(dataLines, "\n")
 }
 
+// rememberConversation stores the server-assigned conversation id so later
+// turns reuse it instead of opening another one in the user's Doubao app.
+//
+// The write is best effort for the current request (the answer is already in
+// hand), but a failure is logged: silently losing it means the next turn
+// creates a second conversation, which is the exact symptom an operator would
+// report as "it keeps creating conversations".
 func rememberConversation(vault *accountvault.Vault, accountID, conversation string) {
 	if vault == nil || conversation == "" {
 		return
 	}
 	a, plain, err := vault.Get(accountID)
 	if err != nil {
+		log.Printf("WARN: [doubao] 未能读取账号以固定会话：%v", err)
 		return
 	}
 	defer wipe(plain)
 	var s Stored
-	if json.Unmarshal(plain, &s) != nil || s.Conversation == conversation {
+	if json.Unmarshal(plain, &s) != nil {
+		log.Printf("WARN: [doubao] 账号会话结构无法解析，未固定会话")
+		return
+	}
+	if s.Conversation == conversation {
 		return
 	}
 	s.Conversation = conversation
@@ -750,7 +787,10 @@ func rememberConversation(vault *accountvault.Vault, accountID, conversation str
 	if err != nil {
 		return
 	}
-	_, _ = vault.Put(a, b, a.Revision)
+	defer wipe(b)
+	if _, err := vault.Put(a, b, a.Revision); err != nil {
+		log.Printf("WARN: [doubao] 固定会话失败（下次调用可能新建会话）：%v", err)
+	}
 }
 
 func mustJSON(v any) string {
