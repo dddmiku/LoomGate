@@ -266,7 +266,7 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		// sitting blank through the whole think phase. Fall back to the
 		// effort-aware path (reasoning_effort passthrough) when the provider
 		// does not expose reasoning deltas.
-		if toolCapable, ok := provider.(inference.ToolCapableProvider); ok && carriesTools && emit != nil {
+		if toolCapable, ok := provider.(inference.ToolCapableProvider); ok && carriesTools {
 			// Tool turns stream tool_call fragments, not prose; the sink emits
 			// them as OpenAI tool_calls deltas so an agent client can continue
 			// its loop instead of stopping after one sentence.

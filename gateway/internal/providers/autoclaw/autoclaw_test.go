@@ -417,3 +417,30 @@ func TestAggregateKeepsToolCalls(t *testing.T) {
 		t.Fatalf("usage lost: %+v", usage)
 	}
 }
+
+// A non-streaming tool turn must carry the catalog. The handler used to pick
+// the tool path only when a stream sink existed, so stream:false fell back to
+// the plain dialogue call: no tools went upstream and a tool-only answer came
+// back as an empty reply.
+func TestNonStreamingToolTurnKeepsTheCatalog(t *testing.T) {
+	tools := []inference.ToolDefinition{{
+		"type":     "function",
+		"function": map[string]any{"name": "get_weather"},
+	}}
+	// stream=false is exactly what the handler passes for a non-streaming turn.
+	body, err := buildDialogueBody("autoclaw:glm-5.3-flash",
+		[]inference.Message{{Role: "user", Content: "北京天气"}}, tools, "auto", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if json.Unmarshal(body, &decoded) != nil {
+		t.Fatal("invalid body")
+	}
+	if decoded["stream"] != false {
+		t.Fatalf("stream flag changed: %v", decoded["stream"])
+	}
+	if decoded["tools"] == nil {
+		t.Fatal("a non-streaming tool turn dropped the tools catalog")
+	}
+}
