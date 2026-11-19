@@ -362,3 +362,32 @@ func TestToolCallStreamIsNotAnEmptyAnswer(t *testing.T) {
 		t.Fatalf("usage lost on a tool turn: %+v", usage)
 	}
 }
+
+// A tool turn has no prose emitter, so the request runs in "tools only" mode.
+// Buffering the body and aggregating text in that mode reads no tool_calls and
+// reports an empty answer — the loop dies with a 502 even though the upstream
+// answered correctly. The tool path must still be parsed as a stream.
+func TestToolsOnlyModeStillParsesToolCalls(t *testing.T) {
+	frames := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	// emit is a no-op (no downstream text), emitTool nil: the shape the
+	// tool-only path produces internally.
+	text, _, _, calls, err := streamSSEWithTools(strings.NewReader(frames),
+		func(string) error { return nil }, nil, nil)
+	if err != nil {
+		t.Fatalf("tools-only parse rejected a valid tool turn: %v", err)
+	}
+	if text != "" {
+		t.Fatalf("prose leaked: %q", text)
+	}
+	if len(calls) != 1 || calls[0].ID != "call_9" || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("tool call lost: %+v", calls)
+	}
+	if calls[0].Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("arguments=%q", calls[0].Function.Arguments)
+	}
+}

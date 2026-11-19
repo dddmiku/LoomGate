@@ -325,7 +325,10 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 	}
 
 	result := inference.Result{Attempted: true, Attempts: 1}
-	if emit == nil {
+	// A tool turn has no text emitter but still needs the streaming parser:
+	// tool_calls arrive as deltas, so buffering the body and aggregating text
+	// would drop the call and report an empty answer.
+	if emit == nil && emitTool == nil {
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 		if err != nil {
 			return result, err
@@ -345,6 +348,10 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 		return result, nil
 	}
 
+	if emit == nil {
+		// parseToolCallsOnly consumes the stream without forwarding prose.
+		emit = func(string) error { return nil }
+	}
 	text, events, usage, toolCalls, err := streamSSEWithTools(resp.Body, emit, emitReasoning, emitTool)
 	result.Text = text
 	result.Events = events
