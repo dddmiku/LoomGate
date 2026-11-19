@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -449,6 +450,26 @@ func streamSSE(body io.Reader, emit func(string) error) (string, int, error) {
 		return "", events, errors.New("autoclaw_empty_answer")
 	}
 	return text.String(), events, nil
+}
+
+// tokenExpiry reads the JWT `exp` claim. Tokens that are not JWTs return 0,
+// which the store treats as "unknown" rather than as expired.
+func tokenExpiry(token string) int64 {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return 0
+	}
+	return claims.Exp
 }
 
 func wipe(b []byte) {

@@ -46,6 +46,10 @@ type Options struct {
 	Console bool
 	// ConnectionDrivers overrides authentication drivers in isolated integration tests.
 	ConnectionDrivers map[string]authflow.Driver
+	// ProviderVaultDir is the encrypted provider-account vault shared with the
+	// inference layer. Login drivers that create accounts write here so the new
+	// credential is immediately usable by the model endpoint.
+	ProviderVaultDir string
 	// AdminDir 存 credentials.json / initial-password.txt。
 	AdminDir string
 	// AuthDir 是账号文件目录（网关的 auths）。

@@ -69,8 +69,9 @@ func goPanelOptions(layout unifiedLayout) panel.Options {
 		AdminAllowCIDRs: strings.TrimSpace(os.Getenv("WB2API_ADMIN_ALLOW_CIDRS")),
 		LogPath:         opts.LogPath,
 		Assets:          panelassets.FrontendFiles(),
-		HelperPaths:     helperPaths(opts.RuntimeDir),
-		SessionTTL:      sessionTTLForHost(),
+		HelperPaths:      helperPaths(opts.RuntimeDir),
+		SessionTTL:       sessionTTLForHost(),
+		ProviderVaultDir: filepath.Join(opts.BaseDir, "provider-accounts"),
 	}
 }
 

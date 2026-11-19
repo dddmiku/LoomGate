@@ -13,14 +13,27 @@ import (
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/authflow"
+	"workbuddy2api/internal/providers/autoclaw"
 	"workbuddy2api/internal/upstream/trae"
 )
 
 type connections struct {
-	once    sync.Once
-	service *authflow.Service
-	vault   *accountvault.Vault
-	err     error
+	once          sync.Once
+	service       *authflow.Service
+	vault         *accountvault.Vault
+	providerVault *accountvault.Vault
+	err           error
+}
+
+// autoclawSaveProfile returns the callback that persists a verified AutoClaw
+// login into the provider vault, so the account is callable immediately.
+func autoclawSaveProfile(s *Server) func(context.Context, []byte) (string, error) {
+	return func(ctx context.Context, profile []byte) (string, error) {
+		if s.connections.providerVault == nil {
+			return "", errors.New("provider_vault_unavailable")
+		}
+		return autoclaw.SaveProfile(s.connections.providerVault)(ctx, profile)
+	}
 }
 
 func (s *Server) connectionsService() (*authflow.Service, error) {
@@ -30,7 +43,13 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 			s.connections.err = errors.New("authentication_storage_unavailable")
 			return
 		}
-		drivers := map[string]authflow.Driver{"workbuddy": &legacyConnection{s: s, provider: "workbuddy"}, "trae": &legacyConnection{s: s, provider: "trae"}}
+		drivers := map[string]authflow.Driver{
+			"workbuddy": &legacyConnection{s: s, provider: "workbuddy"},
+			"trae":      &legacyConnection{s: s, provider: "trae"},
+			// AutoClaw logs in with a phone number + SMS code against its own
+			// upstream. No token import and no desktop client are required.
+			"autoclaw": &autoclaw.LoginDriver{Save: autoclawSaveProfile(s)},
+		}
 		for id, d := range s.opts.ConnectionDrivers {
 			drivers[id] = d
 		}
@@ -42,12 +61,20 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 		}
 		s.connections.vault = v
 		s.connections.service = service
+		if s.opts.ProviderVaultDir != "" {
+			if pv, err := accountvault.Open(s.opts.ProviderVaultDir); err == nil {
+				s.connections.providerVault = pv
+			}
+		}
 	})
 	return s.connections.service, s.connections.err
 }
 
 // Close releases the optional authentication vault; it does not change account data.
 func (s *Server) Close() error {
+	if s.connections.providerVault != nil {
+		_ = s.connections.providerVault.Close()
+	}
 	if s.connections.vault != nil {
 		return s.connections.vault.Close()
 	}

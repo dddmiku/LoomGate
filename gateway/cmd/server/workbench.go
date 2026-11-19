@@ -15,6 +15,7 @@ import (
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/providercatalog"
 	"workbuddy2api/internal/providers/autoclaw"
+	"workbuddy2api/internal/providers/doubao"
 	"workbuddy2api/internal/taskengine"
 	"workbuddy2api/internal/taskproviders"
 	"workbuddy2api/internal/upstream"
@@ -128,16 +129,23 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 		return nil, nil, err
 	}
 	autoclawProvider := &autoclaw.Provider{Vault: vault}
+	doubaoProvider := &doubao.Provider{Vault: vault}
 	workbench := &workbenchRuntime{
 		engine:    e,
 		vault:     vault,
 		taskVault: taskVault,
-		inference: map[string]inference.Provider{"autoclaw": autoclawProvider},
+		inference: map[string]inference.Provider{
+			"autoclaw": autoclawProvider,
+			"doubao":   doubaoProvider,
+		},
 	}
 	base := e.Handler()
 	catalogs := providercatalog.New(providercatalog.Options{
 		Accounts: vault,
-		Sources:  []providercatalog.ProviderSource{autoclaw.Source{Vault: vault}},
+		Sources: []providercatalog.ProviderSource{
+			autoclaw.Source{Vault: vault},
+			doubao.Source{Vault: vault},
+		},
 		LegacyProviders: []providercatalog.Provider{
 			{ID: "workbuddy", Name: "WorkBuddy", CatalogScope: "provider", Inference: true, Login: true},
 			{ID: "trae", Name: "Trae", CatalogScope: "provider", Inference: true, Login: true},
