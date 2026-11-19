@@ -216,11 +216,20 @@ func (s *providerStreamSink) validate(result inference.Result) error {
 		return s.err
 	}
 	// A tool-call turn has no answer text by design, so the text comparison
-	// only applies to prose turns.
+	// only applies to prose turns. A think-only turn is the same: the model
+	// produced output, it just went out as reasoning_content.
 	if s.sawToolCalls {
 		return nil
 	}
-	if !s.started || s.text.Len() == 0 || s.text.String() != result.Text {
+	if s.text.Len() == 0 {
+		if s.reasoning.Len() > 0 {
+			// Reasoning was already streamed; treating this as a contract
+			// violation would fail a turn the client watched succeed.
+			return nil
+		}
+		return inference.ErrStreamContract
+	}
+	if !s.started || s.text.String() != result.Text {
 		return inference.ErrStreamContract
 	}
 	return nil
@@ -233,9 +242,13 @@ func (s *providerStreamSink) fail(code string) {
 func (s *providerStreamSink) finish(result inference.Result) error {
 	// The finish_reason tells an agent client what to do next: tool_calls means
 	// "run these and send the results back", stop means the turn is complete.
+	// The upstream's own cause wins when it reported one: rewriting "length" or
+	// "content_filter" to "stop" hid a truncated answer from the caller.
 	reason := "stop"
 	if s.sawToolCalls || len(result.ToolCalls) > 0 {
 		reason = "tool_calls"
+	} else if result.FinishReason != "" {
+		reason = result.FinishReason
 	}
 	last := s.chunk(map[string]string{}, reason)
 	// The final chunk is where OpenAI-compatible clients read usage from.

@@ -460,6 +460,10 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 				})
 			}
 			message["tool_calls"] = calls
+		} else if result.FinishReason != "" {
+			// The upstream's own cause (length / content_filter) must not be
+			// rewritten to "stop": that hides a truncated answer.
+			finishReason = result.FinishReason
 		}
 		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}}}
 		// Report the upstream's own counts when it gave them. Omitted rather

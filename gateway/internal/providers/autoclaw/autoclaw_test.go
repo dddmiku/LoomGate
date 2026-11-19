@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/providerretry"
 )
@@ -217,17 +219,49 @@ func TestStreamSeparatesReasoningFromAnswer(t *testing.T) {
 	}
 }
 
-// A reasoning-only stream is not an answer: it must report the empty-answer
-// error rather than pretending to have succeeded.
-func TestReasoningOnlyStreamIsAnEmptyAnswer(t *testing.T) {
+// A reasoning-only stream produced real output. It used to be classified as an
+// empty answer, which made the request retry, rotate accounts and finally tell
+// the client to discard a perfectly good think phase. It is now a valid turn:
+// no answer text, but nothing failed either.
+func TestReasoningOnlyStreamIsAValidTurn(t *testing.T) {
 	frames := `data: {"choices":[{"delta":{"reasoning_content":"想了很久"}}]}` + "\n\n"
-	text, _, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
-	if text != "" {
-		t.Fatalf("text=%q", text)
+	text, events, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("reasoning-only stream rejected as %v", err)
 	}
+	if text != "" {
+		t.Fatalf("reasoning leaked into the answer: text=%q", text)
+	}
+	if events != 1 {
+		t.Fatalf("events=%d want 1", events)
+	}
+}
+
+// A stream with neither prose, tools nor reasoning is still an empty answer.
+func TestStreamWithNoOutputAtAllIsAnEmptyAnswer(t *testing.T) {
+	frames := `data: {"choices":[{"delta":{}}]}` + "\n\n"
+	_, _, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
 	var empty *emptyAnswerError
 	if !errors.As(err, &empty) {
-		t.Fatalf("err=%v; a reasoning-only stream must be treated as an empty answer", err)
+		t.Fatalf("err=%v; a stream with no output must be an empty answer", err)
+	}
+}
+
+// The upstream's finish_reason is carried through instead of being flattened to
+// "stop": a length-truncated answer must stay visibly truncated.
+func TestFinishReasonIsCarriedThrough(t *testing.T) {
+	frames := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	_, _, usage, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.FinishReason != "length" {
+		t.Fatalf("finish_reason=%q want length", usage.FinishReason)
 	}
 }
 
@@ -466,5 +500,75 @@ func TestProviderAlwaysRequestsUpstreamStreaming(t *testing.T) {
 	}
 	if decoded["stream"] != true {
 		t.Fatalf("upstream request is not streaming: %v", decoded["stream"])
+	}
+}
+
+// An expired access token used to cool the account down for 30s and then
+// re-select it with the same dead token, forever. A 401 must trigger exactly
+// one renewal, persist the new pair, and retry with it.
+func TestExpiredTokenIsRenewedOnceAndRetried(t *testing.T) {
+	vaultDir := t.TempDir()
+	vault, err := accountvault.Open(vaultDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vault.Close()
+	profile, _ := json.Marshal(stored{AccessToken: "STALE_TOKEN", RefreshToken: "REFRESH_1", Phone: "13800000000"})
+	if _, err := vault.Put(accountvault.Account{ID: "autoclaw-test", Provider: "autoclaw", Enabled: true}, profile, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var renewals atomic.Int32
+	previous := refreshAccessToken
+	refreshAccessToken = func(context.Context, string) (string, string, error) {
+		renewals.Add(1)
+		return "FRESH_TOKEN", "REFRESH_2", nil
+	}
+	t.Cleanup(func() { refreshAccessToken = previous })
+
+	p := &Provider{Vault: vault}
+	renewed, err := p.refreshAccount(context.Background(), "autoclaw-test", "REFRESH_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewals.Load() != 1 {
+		t.Fatalf("renewals=%d want 1", renewals.Load())
+	}
+	if renewed.AccessToken != "FRESH_TOKEN" || renewed.RefreshToken != "REFRESH_2" {
+		t.Fatalf("renewal did not adopt the new pair: %+v", renewed)
+	}
+	// The new pair must be durable, or the next request uses the dead token again.
+	_, plain, err := vault.Get("autoclaw-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted stored
+	if json.Unmarshal(plain, &persisted) != nil || persisted.AccessToken != "FRESH_TOKEN" || persisted.RefreshToken != "REFRESH_2" {
+		t.Fatalf("renewed token was not persisted: %+v", persisted)
+	}
+	// A token-free account must not be treated as renewable.
+	if _, err := p.refreshAccount(context.Background(), "autoclaw-test", ""); err == nil {
+		t.Fatal("empty refresh token was accepted")
+	}
+}
+
+// Only authentication failures are renewal candidates; a client error must not
+// burn the single-use refresh token.
+func TestOnlyAuthFailuresTriggerRenewal(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{401, `{"code":401}`, true},
+		{403, `forbidden`, true},
+		{400, `{"code":400,"msg":"bad model"}`, false},
+		{422, `invalid request`, false},
+		{429, `rate limited`, false},
+		{500, `server error`, false},
+	} {
+		if got := needsTokenRefresh(tc.status, tc.body); got != tc.want {
+			t.Errorf("needsTokenRefresh(%d,%q)=%v want %v", tc.status, tc.body, got, tc.want)
+		}
 	}
 }

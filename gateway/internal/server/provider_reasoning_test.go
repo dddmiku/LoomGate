@@ -182,3 +182,25 @@ func TestNonStreamingToolTurnUsesNilEmitters(t *testing.T) {
 		t.Fatalf("buffered tool turn lost the call: %+v", result)
 	}
 }
+
+// A think-only turn delivered reasoning frames and nothing else. It must pass
+// the stream contract: the client watched the model work, and failing the turn
+// after that tells it to discard a valid response.
+func TestThinkOnlyTurnSatisfiesTheStreamContract(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	sink := newProviderStreamSink(rec, req, "thinking:model", &chatStat{})
+	if err := sink.emitReasoning("想了很久"); err != nil {
+		t.Fatal(err)
+	}
+	result := inference.Result{Attempted: true, Acknowledged: true, Complete: true, Events: 1}
+	if err := sink.validate(result); err != nil {
+		t.Fatalf("think-only turn failed the contract: %v", err)
+	}
+	if err := sink.finish(result); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"reasoning_content":"想了很久"`) {
+		t.Fatalf("reasoning frame missing:\n%s", rec.Body.String())
+	}
+}

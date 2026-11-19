@@ -32,9 +32,13 @@ type Result struct {
 	CachedTokens    int
 	AttemptRecords  []Attempt
 	ConversationRef string
+	// FinishReason is the upstream's own termination cause (stop, length,
+	// content_filter, tool_calls). Empty means the provider does not report
+	// one, in which case the caller falls back to "stop".
+	FinishReason string
 	// ToolCalls is set when the model answered by requesting tools instead of
 	// (or in addition to) prose. Empty means a plain text answer.
-	ToolCalls       []ToolCall
+	ToolCalls []ToolCall
 	// MessageID is private attribution metadata for a bound work task. It must
 	// never appear in a public provider response.
 	MessageID string `json:"-"`

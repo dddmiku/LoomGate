@@ -169,6 +169,81 @@ func (p *Provider) session(id string) (stored, error) {
 	return s, nil
 }
 
+// refreshAccessToken is the renewal call itself. It is a variable so the
+// renewal path (retry decision + vault write-back) can be tested without
+// reaching the real upstream; production always uses RefreshToken.
+var refreshAccessToken = RefreshToken
+
+// refreshAccount renews one account's access token and persists the new pair.
+//
+// Without this the provider used the access token until the upstream rejected
+// it and then cooled the account for 30s, so an expired account re-entered
+// rotation forever and never worked again. The refresh token is single-use:
+// the response may carry a new one, and it must be written back before the
+// next request or the chain breaks.
+func (p *Provider) refreshAccount(ctx context.Context, id, refreshToken string) (stored, error) {
+	if strings.TrimSpace(refreshToken) == "" {
+		return stored{}, errors.New("autoclaw_refresh_unavailable")
+	}
+	access, refresh, err := refreshAccessToken(ctx, refreshToken)
+	if err != nil {
+		return stored{}, err
+	}
+	_, plain, err := p.Vault.Get(id)
+	if err != nil {
+		return stored{}, err
+	}
+	var next stored
+	marshalErr := json.Unmarshal(plain, &next)
+	wipe(plain)
+	if marshalErr != nil {
+		return stored{}, errors.New("autoclaw_session_invalid")
+	}
+	next.AccessToken = access
+	if refresh != "" {
+		next.RefreshToken = refresh
+	}
+	if exp := tokenExpiry(access); exp > 0 {
+		next.ExpiresAt = exp
+	}
+	profile, err := json.Marshal(next)
+	if err != nil {
+		return stored{}, err
+	}
+	defer wipe(profile)
+	rows, err := p.Vault.List()
+	if err != nil {
+		return stored{}, err
+	}
+	var revision uint64
+	for _, row := range rows {
+		if row.ID == id {
+			revision = row.Revision
+			break
+		}
+	}
+	if revision == 0 {
+		return stored{}, errors.New("autoclaw_account_not_found")
+	}
+	if _, err := p.Vault.Put(accountvault.Account{ID: id, Provider: "autoclaw", Enabled: true}, profile, revision); err != nil {
+		return stored{}, err
+	}
+	return next, nil
+}
+
+// needsTokenRefresh reports whether a failed call should be retried after renewing the
+// access token rather than cooling the account down. Authentication failures
+// and expired-token rejections are both renewal candidates; anything else is a
+// genuine account fault.
+func needsTokenRefresh(status int, body string) bool {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return true
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "token expired") || strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "access_token")
+}
+
 // Models reports the fixed catalog. It never needs an account to answer, so the
 // console can show the available models before one is added.
 func (p *Provider) Models(context.Context) ([]inference.Model, error) {
@@ -310,25 +385,54 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 	if err != nil {
 		return inference.Result{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+chatPath, bytes.NewReader(body))
+	// send performs one upstream call with the given token. The body is rebuilt
+	// for every attempt because a bytes.Reader cannot be replayed.
+	send := func(token string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+chatPath, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		setHeaders(req, token, within(model))
+		return p.httpClient().Do(req)
+	}
+	resp, err := send(s.AccessToken)
 	if err != nil {
 		return inference.Result{}, err
 	}
-	setHeaders(req, s.AccessToken, within(model))
-
-	resp, err := p.httpClient().Do(req)
-	if err != nil {
-		return inference.Result{}, err
-	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		status := resp.StatusCode
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
 		code := strings.TrimSpace(string(raw))
 		if len(code) > 300 {
 			code = code[:300]
 		}
-		return inference.Result{}, &accountError{status: resp.StatusCode, code: "http=" + strconv.Itoa(resp.StatusCode) + " " + code}
+		// An authentication rejection is not an account fault: renew the token
+		// once and retry. Without this an expired account cooled down for 30s,
+		// came back with the same dead token, and never worked again.
+		if needsTokenRefresh(status, code) && s.RefreshToken != "" {
+			if renewed, refreshErr := p.refreshAccount(ctx, row.ID, s.RefreshToken); refreshErr == nil {
+				s = renewed
+				resp, err = send(s.AccessToken)
+				if err != nil {
+					return inference.Result{}, err
+				}
+				if resp.StatusCode != http.StatusOK {
+					status = resp.StatusCode
+					raw, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
+					resp.Body.Close()
+					code = strings.TrimSpace(string(raw))
+					if len(code) > 300 {
+						code = code[:300]
+					}
+				}
+			}
+		}
+		if resp.StatusCode != http.StatusOK {
+			return inference.Result{}, &accountError{status: status, code: "http=" + strconv.Itoa(status) + " " + code}
+		}
 	}
+	defer resp.Body.Close()
 
 	result := inference.Result{Attempted: true, Attempts: 1}
 	// A tool turn has no text emitter but still needs the streaming parser:
@@ -349,6 +453,7 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 		result.PromptTokens = usage.Prompt
 		result.CompletionTokens = usage.Completion
 		result.CachedTokens = usage.Cached
+		result.FinishReason = usage.FinishReason
 		result.Complete = true
 		result.Acknowledged = true
 		result.Events = 1
@@ -367,6 +472,7 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 	result.PromptTokens = usage.Prompt
 	result.CompletionTokens = usage.Completion
 	result.CachedTokens = usage.Cached
+	result.FinishReason = usage.FinishReason
 	if err != nil {
 		return result, err
 	}
@@ -566,7 +672,9 @@ func aggregate(raw []byte) (string, streamUsage, []inference.ToolCall, error) {
 	if err != nil {
 		var empty *emptyAnswerError
 		if errors.As(err, &empty) && len(toolCalls) > 0 {
-			// A tool-only answer is not an empty answer.
+			// A tool-only answer is not an empty answer. (A reasoning-only
+			// answer never reaches this branch: reasoningSeen already makes
+			// the stream a valid turn.)
 			return "", usage, toolCalls, nil
 		}
 		return text0, usage, toolCalls, err
@@ -588,11 +696,16 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 
 // streamSSEWithTools additionally forwards tool_call fragments. Tool-call turns
 // carry no answer text, so an empty text buffer is legal when the upstream
-// reported any tool call.
+// reported any tool call — and so is a turn that only reasoned.
 func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning func(string) error, onTool func(inference.ToolCallDelta) error) (string, int, streamUsage, []inference.ToolCall, error) {
 	var text strings.Builder
 	var usage streamUsage
 	var toolCalls []inference.ToolCall
+	reasoningSeen := false
+	// finishReason carries the upstream's own termination cause (stop, length,
+	// content_filter, tool_calls). It used to be dropped, so a truncated answer
+	// was reported to the caller as a clean "stop".
+	finishReason := ""
 	events := 0
 	// Read line by line: SSE frames are newline delimited and deltas must be
 	// forwarded immediately, not buffered until the stream ends.
@@ -631,6 +744,7 @@ func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning fun
 								} `json:"function"`
 							} `json:"tool_calls"`
 						} `json:"delta"`
+						FinishReason string `json:"finish_reason"`
 					} `json:"choices"`
 					Usage json.RawMessage `json:"usage"`
 				}
@@ -674,7 +788,13 @@ func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning fun
 								return text.String(), events, usage, toolCalls, err
 							}
 						}
+						// Tracked even when nobody consumes the reasoning: a turn
+						// that only thought is not an empty answer.
+						reasoningSeen = true
 						events++
+					}
+					if c.FinishReason != "" {
+						finishReason = c.FinishReason
 					}
 					if c.Delta.Content == "" {
 						continue
@@ -696,9 +816,14 @@ func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning fun
 	}
 	// A turn that asked for tools has no prose by design. Treating that as an
 	// empty answer made every agent loop die after its first tool request.
-	if text.Len() == 0 && len(toolCalls) == 0 {
+	// The same is true of a turn that only reasoned: the model produced output
+	// and the client already received it as reasoning_content. Calling that an
+	// empty answer made the request retry, rotate accounts and finally emit an
+	// in-stream error that told the client to discard a perfectly good think.
+	if text.Len() == 0 && len(toolCalls) == 0 && !reasoningSeen {
 		return "", events, usage, toolCalls, &emptyAnswerError{}
 	}
+	usage.FinishReason = finishReason
 	return text.String(), events, usage, toolCalls, nil
 }
 
@@ -709,6 +834,9 @@ type streamUsage struct {
 	Prompt, Completion, Cached int
 	PromptSeen, CompletionSeen bool
 	CachedSeen                 bool
+	// FinishReason is the upstream's termination cause for this turn. Empty
+	// means the upstream did not report one.
+	FinishReason string
 }
 
 // parseUsage merges one chunk's usage object into the accumulated counts.
@@ -768,7 +896,8 @@ func wipe(b []byte) {
 }
 
 // RefreshToken exchanges a refresh token for a fresh access token. It mirrors
-// the desktop gateway's renewal and is used by the panel's "reconnect" action.
+// the desktop gateway's renewal; the provider calls it on an authentication
+// rejection (see refreshAccount) so an expired account recovers by itself.
 func RefreshToken(ctx context.Context, refreshToken string) (access, refresh string, err error) {
 	body, _ := json.Marshal(map[string]any{"refresh_token": refreshToken, "source_id": "autoclaw"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+refreshPt, bytes.NewReader(body))
