@@ -25,6 +25,10 @@ func authflowInputFor(code string) authflow.Input {
 	return authflow.Input{Code: code}
 }
 
+func flowWithSecret(secret json.RawMessage) authflow.Flow {
+	return authflow.Flow{Secret: secret}
+}
+
 // inviteTransport answers the login endpoints and records the fission bind.
 type inviteTransport struct {
 	bindPath string
@@ -85,12 +89,22 @@ func TestSaveUsesTheSharedVaultHandle(t *testing.T) {
 		},
 	}
 	flow := authflowFlowFor("13800000000")
-	got, err := d.Step(context.Background(), flow, "submit_code", authflowInputFor("123456"))
+	verified, err := d.Step(context.Background(), flow, "submit_code", authflowInputFor("123456"))
 	if err != nil {
-		t.Fatalf("save through shared vault failed: %v", err)
+		t.Fatalf("verify step failed: %v", err)
 	}
-	if got.Status != "verified" {
-		t.Fatalf("status=%q want verified", got.Status)
+	if verified.Status != "verified" {
+		t.Fatalf("status=%q want verified before commit", verified.Status)
+	}
+	if verified.AccountID != "" {
+		t.Fatal("submit_code must not claim an account before commit")
+	}
+	got, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{})
+	if err != nil {
+		t.Fatalf("commit through shared vault failed: %v", err)
+	}
+	if got.Status != "succeeded" {
+		t.Fatalf("status=%q want succeeded", got.Status)
 	}
 	if got.AccountID != "autoclaw-13800000000" {
 		t.Fatalf("account id=%q", got.AccountID)
@@ -104,11 +118,15 @@ func TestLoginBindsDefaultInviteCode(t *testing.T) {
 		HTTP: &http.Client{Transport: tr},
 		Save: func(context.Context, []byte) (string, error) { return "autoclaw-1", nil },
 	}
-	got, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
+	verified, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "verified" {
+	got, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "succeeded" {
 		t.Fatalf("status=%q", got.Status)
 	}
 	if tr.bindBody == nil {
@@ -135,11 +153,15 @@ func TestInviteBindFailureKeepsTheAccount(t *testing.T) {
 		HTTP: &http.Client{Transport: tr},
 		Save: func(context.Context, []byte) (string, error) { return "autoclaw-1", nil },
 	}
-	got, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
+	verified, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "verified" || got.AccountID != "autoclaw-1" {
+	got, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "succeeded" || got.AccountID != "autoclaw-1" {
 		t.Fatalf("a failed bind dropped the account: status=%q id=%q", got.Status, got.AccountID)
 	}
 	if !strings.Contains(got.Notice, "绑定失败") {
@@ -155,7 +177,11 @@ func TestInviteCodeCanBeDisabled(t *testing.T) {
 		InviteCode: "-",
 		Save:       func(context.Context, []byte) (string, error) { return "autoclaw-1", nil },
 	}
-	if _, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456")); err != nil {
+	verified, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{}); err != nil {
 		t.Fatal(err)
 	}
 	if tr.bindBody != nil {
@@ -172,7 +198,11 @@ func TestSaveFailureIsReported(t *testing.T) {
 		InviteCode: "-",
 		Save:       func(context.Context, []byte) (string, error) { return "", errors.New("vault_busy") },
 	}
-	if _, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456")); err == nil {
+	verified, err := d.Step(context.Background(), authflowFlowFor("13800000000"), "submit_code", authflowInputFor("123456"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Step(context.Background(), flowWithSecret(verified.Secret), "commit", authflow.Input{}); err == nil {
 		t.Fatal("a save failure was swallowed")
 	}
 }

@@ -7,6 +7,7 @@ package autoclaw
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,10 +73,10 @@ func TestSSEStreamEmitsDeltasImmediately(t *testing.T) {
 		"",
 	}, "\n")
 	var got []string
-	text, events, err := streamSSE(strings.NewReader(frames), func(s string) error {
+	text, events, _, err := streamSSE(strings.NewReader(frames), func(s string) error {
 		got = append(got, s)
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,5 +171,77 @@ func TestCompleteRequiresAnAccount(t *testing.T) {
 	p := &Provider{}
 	if _, err := p.Complete(context.Background(), "autoclaw:glm-5.3-flash", "hi"); err == nil {
 		t.Fatal("missing vault was not reported")
+	}
+}
+
+// The upstream streams reasoning before content — the desktop client renders
+// that as "思考 Ns". Dropping those frames silently lost the whole thinking
+// phase; the answer itself must still be the content deltas only.
+func TestStreamSeparatesReasoningFromAnswer(t *testing.T) {
+	frames := strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"先想"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":"一想"}}]}`,
+		`data: {"choices":[{"delta":{"content":"答案"}}]}`,
+		`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	var answer, thinking []string
+	text, events, usage, err := streamSSE(strings.NewReader(frames),
+		func(s string) error { answer = append(answer, s); return nil },
+		func(s string) error { thinking = append(thinking, s); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(thinking, "") != "先想一想" {
+		t.Fatalf("reasoning not surfaced: %v", thinking)
+	}
+	if text != "答案" || strings.Join(answer, "") != "答案" {
+		t.Fatalf("reasoning leaked into the answer: text=%q answer=%v", text, answer)
+	}
+	if events != 3 {
+		t.Fatalf("events=%d want 3 (2 reasoning + 1 content)", events)
+	}
+	if !usage.PromptSeen || usage.Prompt != 10 || !usage.CompletionSeen || usage.Completion != 2 {
+		t.Fatalf("usage not captured: %+v", usage)
+	}
+}
+
+// A reasoning-only stream is not an answer: it must report the empty-answer
+// error rather than pretending to have succeeded.
+func TestReasoningOnlyStreamIsAnEmptyAnswer(t *testing.T) {
+	frames := `data: {"choices":[{"delta":{"reasoning_content":"想了很久"}}]}` + "\n\n"
+	text, _, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
+	if text != "" {
+		t.Fatalf("text=%q", text)
+	}
+	var empty *emptyAnswerError
+	if !errors.As(err, &empty) {
+		t.Fatalf("err=%v; a reasoning-only stream must be treated as an empty answer", err)
+	}
+}
+
+// The upstream gate expects the same per-request identifiers the desktop
+// client stamps; their absence put us on the upstream's slow path.
+func TestHeadersCarryClientTraceIdentifiers(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/chat", nil)
+	setHeaders(req, "token", "zai_glm-5.3-flash")
+	for _, name := range []string{"x-query-id", "x-request-id", "x-session-id", "x-trace-id", "x_trace_id", "x-agent-id", "accept-language"} {
+		if req.Header.Get(name) == "" {
+			t.Errorf("missing header %q", name)
+		}
+	}
+	if req.Header.Get("x_trace_id") != "autoclaw-desktop" {
+		t.Errorf("x_trace_id=%q", req.Header.Get("x_trace_id"))
+	}
+	// request-id and trace-id share one value in the client.
+	if req.Header.Get("x-request-id") != req.Header.Get("x-trace-id") {
+		t.Error("x-request-id and x-trace-id must carry the same value, as the client sends them")
+	}
+	// Two requests must not reuse the same ids.
+	other, _ := http.NewRequest(http.MethodPost, "https://example.invalid/chat", nil)
+	setHeaders(other, "token", "zai_glm-5.3-flash")
+	if other.Header.Get("x-request-id") == req.Header.Get("x-request-id") {
+		t.Error("trace identifiers are not per-request")
 	}
 }

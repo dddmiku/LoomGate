@@ -50,6 +50,19 @@ type DialogueProvider interface {
 	Provider
 	CompleteDialogue(context.Context, Dialogue, func(string) error) (Result, error)
 }
+
+// ReasoningProvider is an optional capability for a model that thinks before
+// it answers. The upstream streams those thinking deltas first and stays
+// otherwise silent, so a client that only receives answer content sees nothing
+// for the entire thinking phase — which looks like a hang when the model thinks
+// for a long time. Providers that can surface reasoning implement this.
+//
+// The reasoning text never becomes part of Result.Text: it is a separate
+// channel, and a client that ignores it still receives the identical answer.
+type ReasoningProvider interface {
+	DialogueProvider
+	CompleteDialogueReasoning(context.Context, Dialogue, func(string) error, func(string) error) (Result, error)
+}
 type Attempt struct {
 	StartedAt, FinishedAt time.Time
 	HTTPStatus            int

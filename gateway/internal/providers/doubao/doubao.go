@@ -18,7 +18,6 @@ package doubao
 import (
 	"bytes"
 	"context"
-	"log"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -64,8 +63,11 @@ var Models = []Model{
 	{ID: "auto", Upstream: "9", Name: "自动", Window: 256000, Profile: "256k", Credits: "免费"},
 	{ID: "doubao-2.1-lite", Upstream: "seed-lite-7b", Name: "豆包 2.1 Lite", Window: 256000, Profile: "256k", Credits: "0.01x"},
 	{ID: "doubao-2.1-pro", Upstream: "5", Name: "豆包 2.1 Pro", Window: 256000, Profile: "256k", Credits: "0.65x"},
-	{ID: "deepseek-v4-flash", Upstream: "person-deepseek-v4-1-flash-261017", Name: "DeepSeek V4.1 Flash", Window: 300000, Profile: "300k_230", Credits: "0.01x"},
-	{ID: "deepseek-v4-pro", Upstream: "person-deepseek-v4-pro-ga-260813", Name: "DeepSeek V4.1 Pro", Window: 300000, Profile: "300k_230", Credits: "0.46x"},
+	// Ids and names come from the service's own catalog
+	// (evidence/doubao-model-catalog-safe.json). Note that Flash is V4.1 while
+	// Pro is plain V4 — the upstream really does name them differently.
+	{ID: "deepseek-v4.1-flash", Upstream: "person-deepseek-v4-1-flash-261017", Name: "DeepSeek V4.1 Flash", Window: 300000, Profile: "300k_230", Credits: "0.01x"},
+	{ID: "deepseek-v4-pro", Upstream: "person-deepseek-v4-pro-ga-260813", Name: "DeepSeek V4 Pro", Window: 300000, Profile: "300k_230", Credits: "0.46x"},
 	{ID: "kimi-k3", Upstream: "person-kimi-k3-261111", Name: "Kimi K3", Window: 300000, Profile: "300k_230", Credits: "1.48x"},
 	{ID: "kimi-k3.1-pro", Upstream: "person-kimi-k3-1-pro-261111", Name: "Kimi K3.1 Pro", Window: 300000, Profile: "300k_230", Credits: "0.95x"},
 	{ID: "kimi-k3.1-pro-fast", Upstream: "person-kimi-k3-1-pro-highspeed-261111", Name: "Kimi K3.1 Pro 极速", Window: 300000, Profile: "300k_230", Credits: "1.44x"},
@@ -73,7 +75,16 @@ var Models = []Model{
 	{ID: "glm-5.3-flash", Upstream: "person-glm-5-3-flash-261111", Name: "GLM-5.3 Flash", Window: 300000, Profile: "300k_230", Credits: "0.08x"},
 }
 
-const defaultModel = "deepseek-v4-flash"
+const defaultModel = "deepseek-v4.1-flash"
+
+// legacyAliases maps ids that were in use before the catalog names were
+// corrected onto the current ids. A client configured with an old spelling
+// keeps working instead of silently falling back to the default model.
+var legacyAliases = map[string]string{
+	"deepseek-v4-flash": "deepseek-v4.1-flash",
+	"deepseek-v4.1-pro": "deepseek-v4-pro",
+	"deepseek-v4":       "deepseek-v4-pro",
+}
 
 // query is the fixed client identity the endpoint expects. These are protocol
 // parameters, not secrets: the same values ship in every client build.
@@ -208,6 +219,9 @@ func (p *Provider) CompleteDialogue(ctx context.Context, q inference.Dialogue, e
 
 func resolve(model string) Model {
 	name := strings.TrimPrefix(model, "doubao:")
+	if canonical, ok := legacyAliases[name]; ok {
+		name = canonical
+	}
 	for _, m := range Models {
 		if m.ID == name {
 			return m
@@ -322,6 +336,13 @@ func (emptyAnswer) RetryClass() providerretry.Class { return providerretry.Retry
 
 var errEmptyAnswer = emptyAnswer{}
 
+// ErrStreamTruncated means the reply stream ended without the terminal
+// SSE_REPLY_END (end_type=3). Any text received before that point is partial:
+// the model had not finished when the connection closed. It is not retryable —
+// the user already saw the partial answer — and it must never be reported as a
+// completed turn.
+var ErrStreamTruncated = errors.New("doubao_stream_truncated")
+
 // send issues one work-mode request with the stored session identity.
 func (p *Provider) send(ctx context.Context, s Stored, body []byte) (*http.Response, error) {
 	query := baseQuery
@@ -385,7 +406,7 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 
 	result := inference.Result{Attempted: true, Attempts: 1}
 	if emit == nil {
-		text, conv, err := pumpAll(resp.Body)
+		text, _, err := pumpAll(resp.Body)
 		if err != nil {
 			return result, err
 		}
@@ -394,21 +415,15 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 		}
 		result.Text = text
 		result.Complete = true
-		result.Acknowledged = conv != ""
-		if conv != "" {
-			rememberConversation(p.Vault, row.ID, conv)
-		}
+		result.Acknowledged = true
 		result.Events = 1
 		return result, nil
 	}
-	text, conv, events, err := pumpStream(resp.Body, emit)
+	text, _, events, err := pumpStream(resp.Body, emit)
 	result.Text = text
 	result.Events = events
 	result.Complete = err == nil
-	result.Acknowledged = conv != ""
-	if conv != "" {
-		rememberConversation(p.Vault, row.ID, conv)
-	}
+	result.Acknowledged = true
 	if err != nil {
 		return result, err
 	}
@@ -430,7 +445,14 @@ func buildBody(s Stored, m Model, messages []inference.Message) ([]byte, error) 
 	if bot == "" {
 		bot = defaultBotID
 	}
-	convID := s.Conversation
+	// Every request starts its own conversation. The service always creates a
+	// conversation for a chat turn — there is no storage-off switch and no
+	// delete endpoint — so pinning one id per account only meant that every
+	// caller's prompt landed in a single shared conversation in the user's
+	// Doubao app. Emptying it here makes each call independent: the app still
+	// records the turn, but unrelated callers never see each other's history
+	// and nothing overwrites the user's own chats.
+	convID := ""
 
 	block := map[string]any{
 		"block_type": 10000,
@@ -611,9 +633,16 @@ func localAppID(s Stored) string {
 // pumpStream forwards text as it arrives. `sawChunkDelta` mirrors the reference
 // implementation: when the service uses CHUNK_DELTA the STREAM_CHUNK text is a
 // duplicate snapshot and must not be emitted twice.
+//
+// The stream is only complete on SSE_REPLY_END with end_type=3 (ReplyFinish).
+// end_type=1 (MsgFinish) closes one message, 2 (AnswerFinish) closes the answer
+// stage; neither marks the reply terminal. Treating a bare EOF as success made
+// a mid-reply disconnect look like a finished answer, so the caller gets the
+// partial text with ErrStreamTruncated instead.
 func pumpStream(r io.Reader, emit func(string) error) (text, conversation string, events int, err error) {
 	var out strings.Builder
 	sawDelta := false
+	sawReplyFinish := false
 	tmp := make([]byte, 16<<10)
 	pending := ""
 	flush := func(frame string) error {
@@ -622,6 +651,13 @@ func pumpStream(r io.Reader, emit func(string) error) (text, conversation string
 			return nil
 		}
 		switch ev {
+		case "SSE_REPLY_END":
+			var d struct {
+				EndType int `json:"end_type"`
+			}
+			if json.Unmarshal([]byte(data), &d) == nil && d.EndType == 3 {
+				sawReplyFinish = true
+			}
 		case "CHUNK_DELTA":
 			var d struct {
 				Text string `json:"text"`
@@ -698,6 +734,9 @@ func pumpStream(r io.Reader, emit func(string) error) (text, conversation string
 						return out.String(), conversation, events, err
 					}
 				}
+				if !sawReplyFinish {
+					return out.String(), conversation, events, ErrStreamTruncated
+				}
 				return out.String(), conversation, events, nil
 			}
 			return out.String(), conversation, events, readErr
@@ -757,41 +796,11 @@ func parseFrame(frame string) (event, data string) {
 	return event, strings.Join(dataLines, "\n")
 }
 
-// rememberConversation stores the server-assigned conversation id so later
-// turns reuse it instead of opening another one in the user's Doubao app.
-//
-// The write is best effort for the current request (the answer is already in
-// hand), but a failure is logged: silently losing it means the next turn
-// creates a second conversation, which is the exact symptom an operator would
-// report as "it keeps creating conversations".
-func rememberConversation(vault *accountvault.Vault, accountID, conversation string) {
-	if vault == nil || conversation == "" {
-		return
-	}
-	a, plain, err := vault.Get(accountID)
-	if err != nil {
-		log.Printf("WARN: [doubao] 未能读取账号以固定会话：%v", err)
-		return
-	}
-	defer wipe(plain)
-	var s Stored
-	if json.Unmarshal(plain, &s) != nil {
-		log.Printf("WARN: [doubao] 账号会话结构无法解析，未固定会话")
-		return
-	}
-	if s.Conversation == conversation {
-		return
-	}
-	s.Conversation = conversation
-	b, err := json.Marshal(s)
-	if err != nil {
-		return
-	}
-	defer wipe(b)
-	if _, err := vault.Put(a, b, a.Revision); err != nil {
-		log.Printf("WARN: [doubao] 固定会话失败（下次调用可能新建会话）：%v", err)
-	}
-}
+// Conversation ids are deliberately not persisted: each request starts its own
+// conversation so one caller's prompts never land in another caller's history.
+// The service still records every turn in the account's app — that is a
+// protocol property, not a setting — but the gateway no longer funnels everyone
+// into a single pinned conversation.
 
 func mustJSON(v any) string {
 	b, err := json.Marshal(v)

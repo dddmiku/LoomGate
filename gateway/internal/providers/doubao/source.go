@@ -35,6 +35,9 @@ func (Source) StaticModels() []providercatalog.Model {
 
 // Display reports only whether the account has a stored conversation binding;
 // no cookie material and no bot identity are exposed.
+// Display reports whether the stored profile can actually make a call. It used
+// to require a pinned conversation id, which no longer exists now that every
+// request opens its own conversation; a stored session Cookie is what matters.
 func (s Source) Display(id string) (mobile, nickname, botID string, verifiedAt time.Time, ok bool) {
 	if s.Vault == nil {
 		return "", "", "", time.Time{}, false
@@ -48,7 +51,7 @@ func (s Source) Display(id string) (mobile, nickname, botID string, verifiedAt t
 	if json.Unmarshal(plain, &p) != nil {
 		return "", "", "", time.Time{}, false
 	}
-	if p.Conversation == "" {
+	if sessionCookie(p) == "" {
 		return "", "", "", time.Time{}, false
 	}
 	return "", "", "", time.Time{}, true

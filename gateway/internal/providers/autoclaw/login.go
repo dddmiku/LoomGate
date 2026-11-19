@@ -62,6 +62,10 @@ type loginState struct {
 	// Stage tracks how far this flow has gone so a lost response before the code
 	// was sent is never mistaken for one that was.
 	Stage string `json:"stage"`
+	// Profile is the login result awaiting commit. It lives only inside the
+	// flow's encrypted Secret between submit_code and commit; the tokens reach
+	// the vault on commit and never enter a public response.
+	Profile json.RawMessage `json:"profile,omitempty"`
 }
 
 func (d *LoginDriver) client() *http.Client {
@@ -113,7 +117,7 @@ func (d *LoginDriver) sendCodeFlow(ctx context.Context, phone, device string) (a
 	}
 	return authflow.Result{
 		Status: "waiting_code", InputMode: "code", Secret: secret,
-		Notice: "验证码已发送到 " + maskPhone(phone) + "，请输入收到的 6 位验证码。",
+		Notice: "验证码已发送到 " + maskPhone(phone) + "，请输入收到的验证码。",
 	}, nil
 }
 
@@ -155,30 +159,51 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 			return authflow.Result{Status: "waiting_code", InputMode: "code",
 				ErrorCode: "code_rejected", Notice: "验证码不正确或已过期：" + err.Error()}, nil
 		}
-		if d.Save == nil {
-			return authflow.Result{}, errors.New("autoclaw_login_storage_unavailable")
-		}
-		id, err := d.Save(ctx, profile)
-		if err != nil {
-			return authflow.Result{}, err
-		}
-		notice := "登录成功，账号已保存到 AutoClaw 账号池。"
-		if code := d.inviteCode(); code != "" {
-			var s stored
-			if json.Unmarshal(profile, &s) == nil {
-				if bindErr := fissionBind(ctx, s.AccessToken, code, s.DeviceID, d.client()); bindErr != nil {
-					// A failed referral bind must not fail the login: the
-					// account already works for inference.
-					notice += "（邀请码 " + code + " 绑定失败：" + bindErr.Error() + "）"
-				} else {
-					notice += "已绑定邀请码 " + code + "。"
-				}
-			}
-		}
-		return authflow.Result{Status: "verified", AccountID: id, Notice: notice}, nil
+		// Identity is proven but nothing is written yet. authflow requires an
+		// explicit commit before an account exists, exactly as the Doubao
+		// passport does; returning "succeeded" here is rejected as
+		// authentication_commit_required and the flow lands on uncertain.
+		st.Profile = profile
+		b, _ := json.Marshal(st)
+		return authflow.Result{Status: "verified", Secret: b,
+			Notice: "验证码已通过。正在核验账号并保存…"}, nil
+	case "commit":
+		return d.commit(ctx, &st)
 	default:
 		return authflow.Result{}, authflow.ErrInvalid
 	}
+}
+
+// commit persists the profile proven by submit_code and binds the referral
+// code. It is idempotent: re-running it with the same phone updates the
+// existing vault row instead of creating a second account.
+func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Result, error) {
+	if len(st.Profile) == 0 {
+		return authflow.Result{Status: "manual_action", ErrorCode: "resume_requires_login",
+			Notice: "上次登录的凭证已失效，请重新获取验证码。"}, nil
+	}
+	if d.Save == nil {
+		return authflow.Result{}, errors.New("autoclaw_login_storage_unavailable")
+	}
+	id, err := d.Save(ctx, st.Profile)
+	if err != nil {
+		return authflow.Result{}, err
+	}
+	notice := "登录成功，账号已保存到 AutoClaw 账号池。"
+	if code := d.inviteCode(); code != "" {
+		var s stored
+		if json.Unmarshal(st.Profile, &s) == nil {
+			if bindErr := fissionBind(ctx, s.AccessToken, code, s.DeviceID, d.client()); bindErr != nil {
+				// A failed referral bind must not fail the login: the account
+				// already works for inference.
+				notice += "（邀请码 " + code + " 绑定失败：" + bindErr.Error() + "）"
+			} else {
+				notice += "已绑定邀请码 " + code + "。"
+			}
+		}
+	}
+	st.Profile = nil
+	return authflow.Result{Status: "succeeded", AccountID: id, Notice: notice}, nil
 }
 
 // inviteCode resolves the referral code to bind after login.
@@ -465,7 +490,7 @@ func isDeviceID(v string) bool {
 
 func maskPhone(v string) string {
 	if len(v) != 11 {
-		return "***"
+		return v
 	}
 	return v[:3] + "****" + v[7:]
 }

@@ -19,7 +19,7 @@ func (Source) ID() string           { return "autoclaw" }
 func (Source) Name() string         { return "AutoClaw" }
 func (Source) CatalogScope() string { return "account" }
 func (Source) Inference() bool      { return true }
-func (Source) Login() bool          { return false }
+func (Source) Login() bool          { return true }
 
 func (Source) StaticModels() []providercatalog.Model {
 	out := make([]providercatalog.Model, 0, len(Models))
@@ -37,6 +37,11 @@ func (Source) StaticModels() []providercatalog.Model {
 // Display exposes the account's phone number only when the stored profile has
 // one. It never returns tokens and never decrypts anything the profile does not
 // already carry as a display fact.
+//
+// The number is masked: the account list is a persistent, shoulder-surfable
+// page, and the full number is only needed while typing it into the login
+// form (where it stays visible for checking). maskPhone keeps enough digits to
+// tell two accounts apart without printing a contactable number on screen.
 func (s Source) Display(id string) (mobile, nickname, botID string, verifiedAt time.Time, ok bool) {
 	if s.Vault == nil {
 		return "", "", "", time.Time{}, false
@@ -52,5 +57,5 @@ func (s Source) Display(id string) (mobile, nickname, botID string, verifiedAt t
 	if json.Unmarshal(plain, &p) != nil || p.Phone == "" {
 		return "", "", "", time.Time{}, false
 	}
-	return p.Phone, "", "", time.Time{}, true
+	return maskPhone(p.Phone), "", "", time.Time{}, true
 }

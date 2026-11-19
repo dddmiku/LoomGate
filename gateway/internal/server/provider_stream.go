@@ -21,6 +21,16 @@ func providerStreamSafely(ctx context.Context, p inference.StreamingProvider, mo
 	return p.Stream(ctx, model, text, emit)
 }
 
+func providerStreamReasoningSafely(ctx context.Context, p inference.ReasoningProvider, q inference.Dialogue, emit, emitReasoning func(string) error) (result inference.Result, err error) {
+	defer func() {
+		if recover() != nil {
+			result = inference.Result{Attempted: true}
+			err = inference.ErrStreamContract
+		}
+	}()
+	return p.CompleteDialogueReasoning(ctx, q, emit, emitReasoning)
+}
+
 // All writes occur on the request goroutine. The outer boundedResponseWriter
 // applies a deadline to each write/flush and cancels the provider on failure.
 type providerStreamSink struct {
@@ -30,6 +40,9 @@ type providerStreamSink struct {
 	created   int64
 	started   bool
 	text      strings.Builder
+	// reasoning accumulates thinking deltas so validate() can tell an answer
+	// from a think-only stream; it is never part of result.Text.
+	reasoning strings.Builder
 	err       error
 	stat      *chatStat
 }
@@ -88,6 +101,51 @@ func (s *providerStreamSink) emit(delta string) error {
 		return err
 	}
 	s.text.WriteString(delta)
+	if first {
+		s.stat.ttfb = time.Since(s.stat.start)
+	}
+	return nil
+}
+
+// emitReasoning forwards a thinking delta. It opens the stream and sets TTFB
+// exactly as emit does, because the client has genuinely received bytes at
+// that moment — the model is working, and staying silent until the answer
+// starts made a 3-second think look like a two-minute hang.
+//
+// Reasoning is reported as reasoning_content, the field OpenAI-compatible
+// clients already understand for models that think before answering. It never
+// enters the answer text, so a client that ignores the field still gets the
+// same final content it would have without it.
+func (s *providerStreamSink) emitReasoning(delta string) error {
+	if s.err != nil {
+		return s.err
+	}
+	if delta == "" {
+		return nil
+	}
+	if !utf8.ValidString(delta) || s.reasoning.Len()+len(delta) > 8<<20 {
+		s.err = inference.ErrStreamContract
+		return s.err
+	}
+	first := !s.started
+	if first {
+		s.w.Header().Set("Content-Type", "text/event-stream")
+		s.w.Header().Set("Cache-Control", "no-cache")
+		s.w.Header().Set("X-Accel-Buffering", "no")
+		s.w.Header().Set("X-Gateway-Streaming", "incremental")
+		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
+		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
+		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
+		s.started = true
+	}
+	content := map[string]string{"reasoning_content": delta}
+	if first {
+		content["role"] = "assistant"
+	}
+	if err := s.frame(s.chunk(content, nil)); err != nil {
+		return err
+	}
+	s.reasoning.WriteString(delta)
 	if first {
 		s.stat.ttfb = time.Since(s.stat.start)
 	}

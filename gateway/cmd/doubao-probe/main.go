@@ -18,6 +18,7 @@ import (
 func main() {
 	vaultDir := flag.String("vault", "/app/data/provider-accounts", "provider vault directory")
 	prompt := flag.String("prompt", "只回复两个字：收到", "prompt to send")
+	fresh := flag.Bool("fresh", false, "start a new conversation instead of reusing the stored one")
 	flag.Parse()
 
 	vault, err := accountvault.Open(*vaultDir)
@@ -40,7 +41,7 @@ func main() {
 		fail("no enabled doubao account")
 	}
 
-	report, err := doubao.Probe(context.Background(), vault, accountID, *prompt)
+	report, err := doubao.ProbeWith(context.Background(), vault, accountID, *prompt, doubao.ProbeSession{Fresh: *fresh})
 	if err != nil {
 		fail("probe: %v", err)
 	}

@@ -30,11 +30,29 @@ type ProbeReport struct {
 	ElapsedMS      int64          `json:"elapsed_ms"`
 }
 
+// ProbeSession selects which conversation the probe opens.
+type ProbeSession struct {
+	// Fresh starts a brand-new conversation instead of reusing the stored one.
+	// This is the "detached from the user's Doubao app" question: if the
+	// service answers with conversation_id empty, every request can be its own
+	// conversation and nothing accumulates in the user's app.
+	Fresh bool
+}
+
 func Probe(ctx context.Context, vault *accountvault.Vault, accountID, prompt string) (ProbeReport, error) {
+	return ProbeWith(ctx, vault, accountID, prompt, ProbeSession{})
+}
+
+func ProbeWith(ctx context.Context, vault *accountvault.Vault, accountID, prompt string, opts ProbeSession) (ProbeReport, error) {
 	p := &Provider{Vault: vault, Client: &http.Client{Timeout: 0}}
 	s, err := p.session(accountID)
 	if err != nil {
 		return ProbeReport{}, err
+	}
+	if opts.Fresh {
+		// Drop the pinned conversation id only; every other protocol field stays
+		// exactly as the working request sends it.
+		s.Conversation = ""
 	}
 	m := resolve(defaultModel)
 	body, err := buildBody(s, m, []inference.Message{{Role: "user", Content: prompt}})

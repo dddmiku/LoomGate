@@ -16,6 +16,7 @@ package autoclaw
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -49,11 +50,16 @@ const (
 
 // Models is the fixed published set. AutoClaw does not expose a discovery
 // endpoint, so the list is declared here and aliases map onto it.
+// The AutoClaw channel serves the GLM-5.3 family, whose context window is 1M
+// tokens. This is the window reported in the model picker; it is not a
+// request-size cap and does not describe the output budget.
+const contextWindow = 1_000_000
+
 var Models = []inference.Model{
-	{ID: "autoclaw:zai_glm-5.3-flash", Name: "GLM-5.3 Flash", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
-	{ID: "autoclaw:zai_auto", Name: "GLM Auto", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
-	{ID: "autoclaw:zaicoding_glm-5.3", Name: "GLM-5.3 Coding", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
-	{ID: "autoclaw:zai_glm-5.3-flashx-legal", Name: "GLM-5.3 FlashX", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zai_glm-5.3-flash", Name: "GLM-5.3 Flash", ContextWindow: contextWindow, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zai_auto", Name: "GLM Auto", ContextWindow: contextWindow, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zaicoding_glm-5.3", Name: "GLM-5.3 Coding", ContextWindow: contextWindow, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zai_glm-5.3-flashx-legal", Name: "GLM-5.3 FlashX", ContextWindow: contextWindow, Incremental: true, MultiTurn: true, Credits: "1x"},
 }
 
 var aliases = map[string]string{
@@ -184,10 +190,27 @@ func (p *Provider) CompleteDialogue(ctx context.Context, q inference.Dialogue, e
 	return p.complete(ctx, q.Model, q.Messages, emit, q.AccountID)
 }
 
+// CompleteDialogueReasoning implements inference.ReasoningProvider. The
+// upstream streams reasoning_content deltas for roughly the first second and
+// only then starts the answer, so forwarding them is what makes the client
+// show progress instead of a blank screen.
+func (p *Provider) CompleteDialogueReasoning(ctx context.Context, q inference.Dialogue, emit, emitReasoning func(string) error) (inference.Result, error) {
+	if emit == nil {
+		return inference.Result{}, inference.ErrStreamContract
+	}
+	return p.completeWithReasoning(ctx, q.Model, q.Messages, emit, emitReasoning, q.AccountID)
+}
+
 // complete runs one turn against the account pool. It rotates accounts only on
 // failures that are plausibly account-scoped (auth, quota); a client error is
 // returned as-is because another account cannot fix it.
 func (p *Provider) complete(ctx context.Context, model string, messages []inference.Message, emit func(string) error, expectedAccount string) (inference.Result, error) {
+	return p.completeWithReasoning(ctx, model, messages, emit, nil, expectedAccount)
+}
+
+// completeWithReasoning is complete() plus a separate sink for thinking deltas.
+// emitReasoning may be nil, in which case reasoning is counted but not sent.
+func (p *Provider) completeWithReasoning(ctx context.Context, model string, messages []inference.Message, emit, emitReasoning func(string) error, expectedAccount string) (inference.Result, error) {
 	if len(messages) == 0 {
 		return inference.Result{}, errors.New("autoclaw_messages_required")
 	}
@@ -226,7 +249,7 @@ func (p *Provider) complete(ctx context.Context, model string, messages []infere
 		byID[row.ID] = row
 	}
 	return providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
-		return p.turn(ctx, byID[id], model, messages, emit)
+		return p.turnWithReasoning(ctx, byID[id], model, messages, emit, emitReasoning)
 	})
 }
 
@@ -257,6 +280,10 @@ type emptyAnswerError struct{}
 func (e *emptyAnswerError) Error() string { return "autoclaw_empty_answer" }
 
 func (p *Provider) turn(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit func(string) error) (inference.Result, error) {
+	return p.turnWithReasoning(ctx, row, model, messages, emit, nil)
+}
+
+func (p *Provider) turnWithReasoning(ctx context.Context, row accountvault.Account, model string, messages []inference.Message, emit, emitReasoning func(string) error) (inference.Result, error) {
 	s, err := p.session(row.ID)
 	if err != nil {
 		return inference.Result{}, err
@@ -303,10 +330,11 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 		return result, nil
 	}
 
-	text, events, err := streamSSE(resp.Body, emit)
+	text, events, usage, err := streamSSE(resp.Body, emit, emitReasoning)
 	result.Text = text
 	result.Events = events
 	result.Attempted = true
+	result.UsageReported = usage.PromptSeen || usage.CompletionSeen
 	if err != nil {
 		return result, err
 	}
@@ -348,7 +376,10 @@ func buildBody(model string, messages []inference.Message, stream bool) ([]byte,
 
 func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "*")
 	req.Header.Set("Content-Type", "application/json")
+	// "node" is what the desktop client sends; the upstream gate is known to
+	// be picky about it.
 	req.Header.Set("User-Agent", "node")
 	req.Header.Set("X-Agent-Id", "main")
 	// Only attach the bearer pair when there is a token. The login and
@@ -366,7 +397,33 @@ func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("x-tm", "win")
 	req.Header.Set("x-version", version)
 	req.Header.Set("accept-encoding", "identity")
+
+	// The released desktop gateway stamps four fresh ids plus a desktop trace
+	// marker on every chat request. Omitting them is not a hard rejection, but
+	// it makes each request look like an untagged bot call, and the upstream
+	// then serves it on the slow path — the exact shape of our 120s TTFB
+	// against the client's 9s.
+	//
+	// requestID and traceID share one value in the client, so they do here.
+	requestID := newTraceID()
+	req.Header.Set("x-query-id", newTraceID())
+	req.Header.Set("x-request-id", requestID)
+	req.Header.Set("x-session-id", newTraceID())
+	req.Header.Set("x-trace-id", requestID)
+	req.Header.Set("x_trace_id", "autoclaw-desktop")
 	setSign(req)
+}
+
+// newTraceID returns a random UUIDv4 in the canonical hyphenated form the
+// client uses for its per-request identifiers.
+func newTraceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // aggregate folds an SSE body into plain text, for non-streaming callers.
@@ -407,14 +464,17 @@ func aggregate(raw []byte) (string, bool, error) {
 }
 
 // streamSSE forwards each text delta as it arrives and returns the joined text.
-func streamSSE(body io.Reader, emit func(string) error) (string, int, error) {
-	dec := json.NewDecoder(body)
-	_ = dec
+//
+// The upstream streams reasoning_content deltas before any content: the desktop
+// client renders those as "思考 Ns". They are counted as events and reported
+// through onReasoning (when set) so the caller is not blind for the whole
+// thinking phase, but they are never appended to the answer text.
+func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string) error) (string, int, streamUsage, error) {
 	var text strings.Builder
+	var usage streamUsage
 	events := 0
 	// Read line by line: SSE frames are newline delimited and deltas must be
 	// forwarded immediately, not buffered until the stream ends.
-	buf := make([]byte, 0, 32<<10)
 	tmp := make([]byte, 8192)
 	pending := ""
 	for {
@@ -438,19 +498,32 @@ func streamSSE(body io.Reader, emit func(string) error) (string, int, error) {
 				var chunk struct {
 					Choices []struct {
 						Delta struct {
-							Content string `json:"content"`
+							Content          string `json:"content"`
+							ReasoningContent string `json:"reasoning_content"`
 						} `json:"delta"`
 					} `json:"choices"`
+					Usage json.RawMessage `json:"usage"`
 				}
 				if json.Unmarshal([]byte(payload), &chunk) != nil {
 					continue
 				}
+				if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
+					usage = parseUsage(chunk.Usage, usage)
+				}
 				for _, c := range chunk.Choices {
+					if c.Delta.ReasoningContent != "" {
+						if onReasoning != nil {
+							if err := onReasoning(c.Delta.ReasoningContent); err != nil {
+								return text.String(), events, usage, err
+							}
+						}
+						events++
+					}
 					if c.Delta.Content == "" {
 						continue
 					}
 					if err := emit(c.Delta.Content); err != nil {
-						return text.String(), events, err
+						return text.String(), events, usage, err
 					}
 					text.WriteString(c.Delta.Content)
 					events++
@@ -461,14 +534,52 @@ func streamSSE(body io.Reader, emit func(string) error) (string, int, error) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return text.String(), events, err
+			return text.String(), events, usage, err
 		}
 	}
-	_ = buf
 	if text.Len() == 0 {
-		return "", events, &emptyAnswerError{}
+		return "", events, usage, &emptyAnswerError{}
 	}
-	return text.String(), events, nil
+	return text.String(), events, usage, nil
+}
+
+// streamUsage carries the upstream-reported token counts. A field is unknown
+// until a chunk reports it; zero is a real value ("none cached"), so the
+// presence flags decide what may be reported.
+type streamUsage struct {
+	Prompt, Completion, Cached int
+	PromptSeen, CompletionSeen bool
+	CachedSeen                 bool
+}
+
+// parseUsage merges one chunk's usage object into the accumulated counts.
+// Upstream sends it once, in the final chunk, but merging makes a repeated or
+// split usage harmless.
+func parseUsage(raw json.RawMessage, acc streamUsage) streamUsage {
+	var u struct {
+		PromptTokens        *int `json:"prompt_tokens"`
+		CompletionTokens    *int `json:"completion_tokens"`
+		PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens *int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	}
+	if json.Unmarshal(raw, &u) != nil {
+		return acc
+	}
+	if u.PromptTokens != nil {
+		acc.Prompt, acc.PromptSeen = *u.PromptTokens, true
+	}
+	if u.CompletionTokens != nil {
+		acc.Completion, acc.CompletionSeen = *u.CompletionTokens, true
+	}
+	if u.PromptCacheHitTokens != nil {
+		acc.Cached, acc.CachedSeen = *u.PromptCacheHitTokens, true
+	}
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil {
+		acc.Cached, acc.CachedSeen = *u.PromptTokensDetails.CachedTokens, true
+	}
+	return acc
 }
 
 // tokenExpiry reads the JWT `exp` claim. Tokens that are not JWTs return 0,

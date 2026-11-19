@@ -209,9 +209,14 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			sink = newProviderStreamSink(w, r, model, st)
 			emit = sink.emit
 		}
-		// Prefer the effort-aware dialogue path when the provider offers one;
-		// this is what carries reasoning_effort through to the captured body.
-		if aware, ok := effortAware(provider); ok && effort != "" {
+		// Prefer the reasoning-aware path: a thinking model streams its
+		// reasoning first, and forwarding it is what keeps the client from
+		// sitting blank through the whole think phase. Fall back to the
+		// effort-aware path (reasoning_effort passthrough) when the provider
+		// does not expose reasoning deltas.
+		if reasoning, ok := provider.(inference.ReasoningProvider); ok && emit != nil {
+			result, err = providerStreamReasoningSafely(r.Context(), reasoning, q, emit, sink.emitReasoning)
+		} else if aware, ok := effortAware(provider); ok && effort != "" {
 			result, err = providerEffortDialogueSafely(r.Context(), aware, q, effort, emit)
 		} else {
 			result, err = providerDialogueSafely(r.Context(), dialogueProvider, q, emit)
@@ -221,6 +226,10 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		}
 	} else if progressive, ok := provider.(inference.StreamingProvider); streaming && ok {
 		sink = newProviderStreamSink(w, r, model, st)
+		// A provider whose model thinks before answering can stream those
+		// deltas too. Without this the client sits silent for the whole
+		// thinking phase, which is what turned a 3-second think into a
+		// two-minute "hang" in the request log.
 		if aware, ok := effortAware(provider); ok && effort != "" {
 			result, err = providerStreamSafelyWithEffort(r.Context(), aware, model, text, effort, sink.emit)
 		} else {
