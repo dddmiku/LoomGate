@@ -32,6 +32,10 @@ type Model struct {
 	ContextWindow      int64  `json:"context_length,omitempty"`
 	InferenceAvailable bool   `json:"inference_available"`
 	SupportsMultiTurn  bool   `json:"supports_multi_turn"`
+	// Credits is the upstream billing multiplier ("0.65x", "0.01x", "免费").
+	// Empty means the provider does not publish one; the console must show
+	// "倍率未知" rather than inventing a number.
+	Credits string `json:"credits,omitempty"`
 }
 
 // Catalog is one account's model snapshot.

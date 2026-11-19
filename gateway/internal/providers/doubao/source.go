@@ -27,6 +27,7 @@ func (Source) StaticModels() []providercatalog.Model {
 			ID:            "doubao:" + m.ID,
 			Name:          m.Name,
 			ContextWindow: m.Window,
+			Credits:       m.Credits,
 		})
 	}
 	return out

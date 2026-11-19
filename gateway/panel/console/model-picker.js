@@ -10,11 +10,17 @@ window.LoomModelPicker = (() => {
   }
   function rateText(raw){const value=rate(raw);return value===null?'倍率未知':value===0?'免费':'x'+value;}
   function matches(model,query){const hay=[model.id,model.name,model.vendor].filter(Boolean).join(' ').toLowerCase();return query.trim().toLowerCase().split(/\s+/).every(part=>hay.includes(part));}
-  function mount(form,{api,esc,selected=[]}) {
+  const CHANNEL_LABELS={cn:'国内版',global:'国际版',trae:'Trae',autoclaw:'AutoClaw',doubao:'豆包工作'};
+  function channelLabel(id,providers){
+    const hit=(providers||[]).find(p=>p.id===id);
+    if(hit&&hit.name)return hit.name;
+    return CHANNEL_LABELS[id]||id;
+  }
+  function mount(form,{api,esc,selected=[],providers=[]}) {
     const root=form.querySelector('[data-model-picker]'),input=form.querySelector('[name=models]');
     const chosen=new Set(selected),controller=new AbortController();
     let items=[],loading=false,failed=false,notice='',revision=0;
-    root.innerHTML=`<div class="model-picker-tags" aria-label="已绑定模型"></div><div class="model-picker-toolbar"><label class="model-picker-search"><span class="sr-only">搜索可选模型</span><input type="search" data-model-query placeholder="搜索模型名称或渠道" autocomplete="off"></label><button type="button" data-model-clear>清空</button><button type="button" data-model-refresh>刷新</button></div><div class="model-picker-channels" role="group" aria-label="模型渠道">${[['','全部'],['cn','国内版'],['global','国际版'],['trae','Trae'],['autoclaw','AutoClaw']].map(([id,name])=>`<button type="button" data-model-channel="${id}" aria-pressed="${id===''}">${name}</button>`).join('')}</div><p class="model-picker-status small muted" role="status"></p><div class="model-picker-options" role="listbox" aria-multiselectable="true" aria-label="可绑定的客户端模型"></div>`;
+    root.innerHTML=`<div class="model-picker-tags" aria-label="已绑定模型"></div><div class="model-picker-toolbar"><label class="model-picker-search"><span class="sr-only">搜索可选模型</span><input type="search" data-model-query placeholder="搜索模型名称或渠道" autocomplete="off"></label><button type="button" data-model-clear>清空</button><button type="button" data-model-refresh>刷新</button></div><div class="model-picker-channels" role="group" aria-label="模型渠道" data-model-channels></div><p class="model-picker-status small muted" role="status"></p><div class="model-picker-options" role="listbox" aria-multiselectable="true" aria-label="可绑定的客户端模型"></div>`;
     const query=root.querySelector('[data-model-query]'),list=root.querySelector('.model-picker-options'),tags=root.querySelector('.model-picker-tags'),status=root.querySelector('[role=status]'),refresh=root.querySelector('[data-model-refresh]');
     let channel='';
     function badge(model){const n=rate(model?.credits);return `<span class="model-rate ${n===null?'unknown':n===0?'free':n<.5?'low':'high'}">${esc(rateText(model?.credits))}</span>`;}
@@ -23,6 +29,13 @@ window.LoomModelPicker = (() => {
       input.value=[...chosen].join(',');
       const byID=new Map(items.map(m=>[m.id,m]));
       tags.innerHTML=chosen.size?[...chosen].map(id=>`<span class="model-picker-tag"><span>${esc(id)}</span>${badge(byID.get(id))}<button type="button" data-model-remove="${esc(id)}" aria-label="移除 ${esc(id)}">×</button></span>`).join(''):'<span class="small muted">未绑定模型 · 不限制可用模型</span>';
+      const channelRow=root.querySelector('[data-model-channels]');
+      if(channelRow){
+        const present=[...new Set(items.map(m=>m.id.split(':')[0]).filter(Boolean))];
+        const chosenChannel=present.includes(channel)?channel:'';
+        if(chosenChannel!==channel)channel=chosenChannel;
+        channelRow.innerHTML=[['','全部'],...present.map(id=>[id,channelLabel(id,providers)])].map(([id,name])=>`<button type="button" data-model-channel="${esc(id)}" aria-pressed="${id===channel}">${esc(name)}</button>`).join('');
+      }
       const visible=items.filter(m=>(!channel||m.id.startsWith(channel+':'))&&matches(m,query.value));
       status.textContent=loading?'正在获取客户端模型和倍率…':failed?(notice||'模型列表读取失败。已有绑定保留，可稍后刷新。'):notice||`当前 ${visible.length} / ${items.length} 个可选模型，已选 ${chosen.size} 个`;
       status.classList.toggle('error',failed);

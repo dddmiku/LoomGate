@@ -80,6 +80,9 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 			if m.ContextWindow > 0 {
 				entry["context_length"] = m.ContextWindow
 			}
+			if m.Credits != "" {
+				entry["credits"] = m.Credits
+			}
 			rows = append(rows, entry)
 		}
 	}

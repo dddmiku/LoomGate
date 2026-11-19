@@ -50,22 +50,25 @@ type Model struct {
 	Name     string
 	Window   int64
 	Profile  string
+	// Credits is the published billing multiplier, exactly as the service
+	// states it ("免费", "0.01x", "0.65x"). Empty = not published.
+	Credits string
 }
 
 // Models is the published catalog. The keys are the values the desktop client
 // sees today; an unknown requested name falls back to the default model rather
 // than erroring, matching the reference gateway.
 var Models = []Model{
-	{ID: "auto", Upstream: "9", Name: "自动", Window: 256000, Profile: "256k"},
-	{ID: "doubao-2.1-lite", Upstream: "seed-lite-7b", Name: "豆包 2.1 Lite", Window: 256000, Profile: "256k"},
-	{ID: "doubao-2.1-pro", Upstream: "5", Name: "豆包 2.1 Pro", Window: 256000, Profile: "256k"},
-	{ID: "deepseek-v4-flash", Upstream: "person-deepseek-v4-1-flash-261017", Name: "DeepSeek V4.1 Flash", Window: 300000, Profile: "300k_230"},
-	{ID: "deepseek-v4-pro", Upstream: "person-deepseek-v4-pro-ga-260813", Name: "DeepSeek V4.1 Pro", Window: 300000, Profile: "300k_230"},
-	{ID: "kimi-k3", Upstream: "person-kimi-k3-261111", Name: "Kimi K3", Window: 300000, Profile: "300k_230"},
-	{ID: "kimi-k3.1-pro", Upstream: "person-kimi-k3-1-pro-261111", Name: "Kimi K3.1 Pro", Window: 300000, Profile: "300k_230"},
-	{ID: "kimi-k3.1-pro-fast", Upstream: "person-kimi-k3-1-pro-highspeed-261111", Name: "Kimi K3.1 Pro 极速", Window: 300000, Profile: "300k_230"},
-	{ID: "glm-5.3", Upstream: "person-glm-5-3-261111", Name: "GLM-5.3", Window: 300000, Profile: "300k_230"},
-	{ID: "glm-5.3-flash", Upstream: "person-glm-5-3-flash-261111", Name: "GLM-5.3 Flash", Window: 300000, Profile: "300k_230"},
+	{ID: "auto", Upstream: "9", Name: "自动", Window: 256000, Profile: "256k", Credits: "免费"},
+	{ID: "doubao-2.1-lite", Upstream: "seed-lite-7b", Name: "豆包 2.1 Lite", Window: 256000, Profile: "256k", Credits: "0.01x"},
+	{ID: "doubao-2.1-pro", Upstream: "5", Name: "豆包 2.1 Pro", Window: 256000, Profile: "256k", Credits: "0.65x"},
+	{ID: "deepseek-v4-flash", Upstream: "person-deepseek-v4-1-flash-261017", Name: "DeepSeek V4.1 Flash", Window: 300000, Profile: "300k_230", Credits: "0.01x"},
+	{ID: "deepseek-v4-pro", Upstream: "person-deepseek-v4-pro-ga-260813", Name: "DeepSeek V4.1 Pro", Window: 300000, Profile: "300k_230", Credits: "0.46x"},
+	{ID: "kimi-k3", Upstream: "person-kimi-k3-261111", Name: "Kimi K3", Window: 300000, Profile: "300k_230", Credits: "1.48x"},
+	{ID: "kimi-k3.1-pro", Upstream: "person-kimi-k3-1-pro-261111", Name: "Kimi K3.1 Pro", Window: 300000, Profile: "300k_230", Credits: "0.95x"},
+	{ID: "kimi-k3.1-pro-fast", Upstream: "person-kimi-k3-1-pro-highspeed-261111", Name: "Kimi K3.1 Pro 极速", Window: 300000, Profile: "300k_230", Credits: "1.44x"},
+	{ID: "glm-5.3", Upstream: "person-glm-5-3-261111", Name: "GLM-5.3", Window: 300000, Profile: "300k_230", Credits: "0.80x"},
+	{ID: "glm-5.3-flash", Upstream: "person-glm-5-3-flash-261111", Name: "GLM-5.3 Flash", Window: 300000, Profile: "300k_230", Credits: "0.08x"},
 }
 
 const defaultModel = "deepseek-v4-flash"
@@ -169,7 +172,7 @@ func (p *Provider) Models(context.Context) ([]inference.Model, error) {
 	for _, m := range Models {
 		out = append(out, inference.Model{
 			ID: "doubao:" + m.ID, Name: m.Name, ContextWindow: m.Window,
-			Incremental: true, MultiTurn: true,
+			Incremental: true, MultiTurn: true, Credits: m.Credits,
 		})
 	}
 	return out, nil

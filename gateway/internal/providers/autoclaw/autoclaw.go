@@ -51,10 +51,10 @@ const (
 // Models is the fixed published set. AutoClaw does not expose a discovery
 // endpoint, so the list is declared here and aliases map onto it.
 var Models = []inference.Model{
-	{ID: "autoclaw:zai_glm-5.3-flash", Name: "GLM-5.3 Flash", ContextWindow: 200000, Incremental: true, MultiTurn: true},
-	{ID: "autoclaw:zai_auto", Name: "GLM Auto", ContextWindow: 200000, Incremental: true, MultiTurn: true},
-	{ID: "autoclaw:zaicoding_glm-5.3", Name: "GLM-5.3 Coding", ContextWindow: 200000, Incremental: true, MultiTurn: true},
-	{ID: "autoclaw:zai_glm-5.3-flashx-legal", Name: "GLM-5.3 FlashX", ContextWindow: 200000, Incremental: true, MultiTurn: true},
+	{ID: "autoclaw:zai_glm-5.3-flash", Name: "GLM-5.3 Flash", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zai_auto", Name: "GLM Auto", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zaicoding_glm-5.3", Name: "GLM-5.3 Coding", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
+	{ID: "autoclaw:zai_glm-5.3-flashx-legal", Name: "GLM-5.3 FlashX", ContextWindow: 200000, Incremental: true, MultiTurn: true, Credits: "1x"},
 }
 
 var aliases = map[string]string{

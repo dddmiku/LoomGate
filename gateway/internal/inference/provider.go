@@ -12,6 +12,9 @@ type Model struct {
 	ContextWindow int64
 	Incremental   bool
 	MultiTurn     bool
+	// Credits is the upstream billing multiplier ("0.65x", "免费"). Empty means
+	// the provider does not publish one.
+	Credits string
 }
 type Result struct {
 	Text, AccountRef, RequestDigest   string
