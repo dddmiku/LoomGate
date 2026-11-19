@@ -16,9 +16,7 @@ package autoclaw
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -353,7 +351,13 @@ func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "node")
 	req.Header.Set("X-Agent-Id", "main")
-	req.Header.Set("X-Authorization", "Bearer "+accessToken)
+	// Only attach the bearer pair when there is a token. The login and
+	// refresh endpoints are unauthenticated, and sending "Bearer " with an
+	// empty token is a malformed credential rather than an absent one.
+	if accessToken != "" {
+		req.Header.Set("X-Authorization", "Bearer "+accessToken)
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 	req.Header.Set("x-channel", "cakegrowth")
 	req.Header.Set("x-client-type", "pc")
 	req.Header.Set("x-lang", "zh-CN")
@@ -362,11 +366,7 @@ func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("x-tm", "win")
 	req.Header.Set("x-version", version)
 	req.Header.Set("accept-encoding", "identity")
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sum := md5.Sum([]byte(appID + "&" + ts + "&" + appKey))
-	req.Header.Set("x-auth-appid", appID)
-	req.Header.Set("x-auth-sign", hex.EncodeToString(sum[:]))
-	req.Header.Set("x-auth-timestamp", ts)
+	setSign(req)
 }
 
 // aggregate folds an SSE body into plain text, for non-streaming callers.

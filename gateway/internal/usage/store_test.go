@@ -542,7 +542,10 @@ func TestLedgerRenameSyncsDirectory(t *testing.T) {
 		t.Fatal("rename 后未同步父目录：崩溃时新账本可能丢失")
 	}
 	for _, got := range synced {
-		if got != dir {
+		// Compare cleaned paths: t.TempDir() may carry a different separator
+		// style than the filepath.Join result on Windows, but it is the same
+		// directory and the assertion is about which dir gets synced.
+		if filepath.Clean(got) != filepath.Clean(dir) {
 			t.Fatalf("同步了错误的目录 %q want %q", got, dir)
 		}
 	}

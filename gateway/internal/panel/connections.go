@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -23,7 +24,11 @@ type connections struct {
 	service       *authflow.Service
 	vault         *accountvault.Vault
 	providerVault *accountvault.Vault
-	err           error
+	// providerVaultOwned is false when the handle was handed in by the
+	// inference layer. Closing a borrowed vault would break live model calls,
+	// so only a vault this package opened may be closed here.
+	providerVaultOwned bool
+	err                error
 }
 
 // doubaoPassportSave persists the session the passport produced. The profile
@@ -102,9 +107,17 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 		}
 		s.connections.vault = v
 		s.connections.service = service
-		if s.opts.ProviderVaultDir != "" {
+		if s.opts.ProviderVault != nil {
+			// The inference layer already owns this vault's exclusive lock.
+			// Sharing the handle is the only correct option: a second Open on
+			// the same directory returns vault_busy.
+			s.connections.providerVault = s.opts.ProviderVault
+		} else if s.opts.ProviderVaultDir != "" {
 			if pv, err := accountvault.Open(s.opts.ProviderVaultDir); err == nil {
 				s.connections.providerVault = pv
+				s.connections.providerVaultOwned = true
+			} else {
+				log.Printf("WARN: [panel] 打开 provider 账号库失败（登录无法保存账号）：%v", err)
 			}
 		}
 	})
@@ -113,7 +126,7 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 
 // Close releases the optional authentication vault; it does not change account data.
 func (s *Server) Close() error {
-	if s.connections.providerVault != nil {
+	if s.connections.providerVaultOwned && s.connections.providerVault != nil {
 		_ = s.connections.providerVault.Close()
 	}
 	if s.connections.vault != nil {

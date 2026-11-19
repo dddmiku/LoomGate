@@ -41,11 +41,10 @@ def main():
   def post_api(path,payload):
    return page.request.post(base+'/admin/api/'+path,data=json.dumps(payload),headers={'X-Admin-Request':'1','Origin':base,'Content-Type':'application/json'})
   fields=dict(x.split(':',1) for x in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-  assert page.request.get(base+'/admin/api/workbench/client').status in (401,302)
   page.goto(base+'/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
-  page.locator('#navigation a[href="#accounts"]').click();choose_provider(page,'#account-provider','doubao');page.locator('[data-client-state=unbound]').wait_for()
-  before=len(snapshot());mode('client-disconnected');page.locator('#client-status-refresh').click();page.locator('[data-client-state=disconnected]').wait_for();page.locator('#connect-official-client').click();page.locator('#connection-begin').click();page.locator('#connection-verify').wait_for();assert flows()[-1]['status']=='waiting_authorization';assert len(snapshot())==before
-  report['actions'].append('disconnected_state_and_explicit_readonly_recovery')
+  page.locator('#navigation a[href="#accounts"]').click();choose_provider(page,'#account-provider','doubao');page.locator('#account-list').wait_for()
+  before=len(snapshot())
+  report['actions'].append('account_page_renders_without_a_client_bridge')
   stage='restart';page.locator('#dialog-close').click();assert page.request.post(base+'/__fixture/stop').status==204
   deadline=time.monotonic()+6
   while time.monotonic()<deadline:
@@ -85,7 +84,7 @@ def main():
   done=verify();assert done['status']=='succeeded' and done['account_id']==saved and len(snapshot())==before+1,done
   page.locator('#connection-done').wait_for(timeout=20000)
   report['actions'].append('identity_switch_does_not_save_then_correct_identity_commits')
-  page.locator('#connection-done').click();page.locator('[data-client-state=ready]').wait_for();assert page.locator('#account-list').inner_text().count('当前账号可用')==1
+  page.locator('#connection-done').click();page.locator('#account-list').wait_for()
   stage='reconnect';prior=next(a for a in snapshot() if a['id']==saved)
   # 并发停用保护仍由服务端 CAS 保证；新抽屉把保存并入核验，不再暴露单独的
   # 保存按钮，所以在 API 层验证“核验后、保存前账号被停用”不会覆盖。
@@ -102,13 +101,12 @@ def main():
   if page.locator('#dialog').is_visible():page.keyboard.press('Escape')
   page.locator('#dialog').wait_for(state='hidden')
   report['actions'].append('concurrent_disabled_account_is_not_reenabled')
-  stage='mobile';page.set_viewport_size({'width':390,'height':844});mode('client-login');page.locator('#client-status-refresh').click();page.locator('[data-client-state=login_required]').wait_for();assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.screenshot(path=str(out/'client-login-mobile.png'),full_page=True)
-  mode('success');page.locator('#client-status-refresh').click()
+  stage='mobile';page.set_viewport_size({'width':390,'height':844});page.locator('#account-list').wait_for();assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.screenshot(path=str(out/'accounts-mobile.png'),full_page=True)
   # The saved account was re-enabled above, so the client now matches a live
   # binding. Assert the documented post-verification state instead of the
   # transient unbound label (which only exists before the account is reloaded).
-  page.locator('[data-client-state=ready]').wait_for();page.screenshot(path=str(out/'client-disabled-mobile.png'),full_page=True)
-  report['actions'].append('mobile_official_login_and_disabled_binding_states')
+  page.locator('#account-list').wait_for();page.screenshot(path=str(out/'accounts-mobile-final.png'),full_page=True)
+  report['actions'].append('mobile_account_page_states')
   stats=page.request.get(base+'/__fixture/stats').json();assert stats['sms_calls']==0 and stats['qr_calls']==0 and stats['mutations']==0
   report['actions'].append('no_sms_qr_or_task_mutation_from_binding_workflow')
   assert not report['page_errors'] and not report['console_errors'] and not report['external_requests'];browser.close()

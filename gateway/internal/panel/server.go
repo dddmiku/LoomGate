@@ -34,6 +34,8 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/accountvault"
+
 	"workbuddy2api/internal/authflow"
 	panelassets "workbuddy2api/panel"
 )
@@ -49,6 +51,13 @@ type Options struct {
 	// ProviderVaultDir is the encrypted provider-account vault shared with the
 	// inference layer. Login drivers that create accounts write here so the new
 	// credential is immediately usable by the model endpoint.
+	//
+	// ProviderVault is the already-open handle for that same directory. It
+	// takes precedence over ProviderVaultDir when set: the vault holds an
+	// exclusive owner lock, so the process that opened it for inference is the
+	// only one that may write to it. Re-opening the directory here fails with
+	// vault_busy, which used to surface as an unconfirmed login.
+	ProviderVault    *accountvault.Vault
 	ProviderVaultDir string
 	// AdminDir 存 credentials.json / initial-password.txt。
 	AdminDir string

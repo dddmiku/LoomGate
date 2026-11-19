@@ -13,6 +13,9 @@ package autoclaw
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +33,16 @@ const (
 	sendCodePath  = "/userapi/v1/agent-send-code"
 	agentLoginPt  = "/userapi/v1/agent-login"
 	loginDeviceID = "loomgate-autoclaw"
+
+	// The fission (invite) endpoints live on the web host, not the acceleration
+	// host, and need the web header set. Both facts come from the released
+	// gateway; guessing "acceleration host with the client headers" 404s.
+	webBase         = "autoglm-api.zhipuai.cn"
+	fissionBindPt   = "/agent-assetmgr/api/v1/fission-v2/bind"
+	fissionActivity = "autoclaw_fission"
+	// DefaultInviteCode is the referral code a freshly created AutoClaw account
+	// binds to. Binding is best effort: it never blocks or fails a login.
+	DefaultInviteCode = "H2QARJKM"
 )
 
 // LoginDriver starts and completes a phone + SMS login for AutoClaw accounts.
@@ -38,6 +51,9 @@ type LoginDriver struct {
 	Save func(ctx context.Context, profile []byte) (accountID string, err error)
 	// HTTP is optional; tests inject a transport.
 	HTTP *http.Client
+	// InviteCode is bound after a successful login when set. Empty uses
+	// DefaultInviteCode; "-" disables binding.
+	InviteCode string
 }
 
 type loginState struct {
@@ -65,7 +81,11 @@ func (*LoginDriver) Methods() []authflow.Method {
 // input, so the number arrives on the first Step; the SMS side effect happens
 // there, where the intent has already been persisted.
 func (d *LoginDriver) Start(ctx context.Context, r authflow.Request) (authflow.Result, error) {
-	st := loginState{DeviceID: loginDeviceID, Stage: "awaiting_phone"}
+	// A per-flow device id, matching the released gateway's "acg-"+uuid shape.
+	// It must be stable across send-code → login → refresh for one login, and
+	// must differ between accounts: reusing one constant across every login
+	// makes the upstream treat unrelated accounts as the same device.
+	st := loginState{DeviceID: newDeviceID(), Stage: "awaiting_phone"}
 	secret, _ := json.Marshal(st)
 	return authflow.Result{
 		Status: "waiting_phone", InputMode: "phone", Secret: secret,
@@ -142,13 +162,107 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 		if err != nil {
 			return authflow.Result{}, err
 		}
-		return authflow.Result{Status: "verified", AccountID: id,
-			Notice: "登录成功，账号已保存到 AutoClaw 账号池。"}, nil
+		notice := "登录成功，账号已保存到 AutoClaw 账号池。"
+		if code := d.inviteCode(); code != "" {
+			var s stored
+			if json.Unmarshal(profile, &s) == nil {
+				if bindErr := fissionBind(ctx, s.AccessToken, code, s.DeviceID, d.client()); bindErr != nil {
+					// A failed referral bind must not fail the login: the
+					// account already works for inference.
+					notice += "（邀请码 " + code + " 绑定失败：" + bindErr.Error() + "）"
+				} else {
+					notice += "已绑定邀请码 " + code + "。"
+				}
+			}
+		}
+		return authflow.Result{Status: "verified", AccountID: id, Notice: notice}, nil
 	default:
 		return authflow.Result{}, authflow.ErrInvalid
 	}
 }
 
+// inviteCode resolves the referral code to bind after login.
+func (d *LoginDriver) inviteCode() string {
+	code := strings.TrimSpace(d.InviteCode)
+	if code == "-" {
+		return ""
+	}
+	if code == "" {
+		return DefaultInviteCode
+	}
+	return code
+}
+
+// fissionBind binds a referral code to the freshly logged-in account.
+//
+// This uses the web host and the "fission" header set rather than the
+// acceleration host the chat path uses: the referral API belongs to the web
+// product, and the client headers are rejected there.
+func fissionBind(ctx context.Context, accessToken, inviteCode, deviceID string, client *http.Client) error {
+	if accessToken == "" || inviteCode == "" {
+		return errors.New("autoclaw_invite_bind_incomplete")
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"activity_id": fissionActivity,
+		"business":    "autoclaw",
+		"invite_code": inviteCode,
+		"source_id":   "autoclaw",
+		"device_id":   deviceID,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+webBase+fissionBindPt, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	setWebHeaders(req, accessToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if json.Unmarshal(raw, &out) != nil {
+		return errors.New("invite response unreadable")
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("code=%d %s", out.Code, out.Msg)
+	}
+	return nil
+}
+
+// setWebHeaders applies the browser-shaped header set the web/referral API
+// expects, including the same appid signature the client endpoints use.
+func setWebHeaders(req *http.Request, accessToken string) {
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+	req.Header.Set("X-Channel", "fission")
+	req.Header.Set("X-Product", "rumination")
+	req.Header.Set("X-Tm", "web")
+	req.Header.Set("X-Version", "1.47.0")
+	req.Header.Set("X-Lang", "zh")
+	req.Header.Set("X-Agent-OS", "web")
+	req.Header.Set("Origin", "https://autoglm.zhipuai.cn")
+	req.Header.Set("Referer", "https://autoglm.zhipuai.cn/")
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+	setSign(req)
+}
+
+// setSign stamps the appid/sign/timestamp triple shared by both header sets.
+func setSign(req *http.Request) {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sum := md5.Sum([]byte(appID + "&" + ts + "&" + appKey))
+	req.Header.Set("x-auth-appid", appID)
+	req.Header.Set("x-auth-sign", hex.EncodeToString(sum[:]))
+	req.Header.Set("x-auth-timestamp", ts)
+}
+
+// sliderGate 表示上游要求人工滑块验证。
 type sliderGate struct{}
 
 func (*sliderGate) Error() string { return "autoclaw slider verification required" }
@@ -297,6 +411,18 @@ func SaveProfile(vault *accountvault.Vault) func(context.Context, []byte) (strin
 		}
 		return id, nil
 	}
+}
+
+// newDeviceID returns a fresh per-flow device id in the released gateway's
+// "acg-"+uuid shape.
+func newDeviceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "acg-fallback-device"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("acg-%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func isPhone(v string) bool {

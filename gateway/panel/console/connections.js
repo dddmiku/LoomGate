@@ -125,22 +125,12 @@ window.LoomConnections = (() => {
     try{const Audio=window.AudioContext||window.webkitAudioContext;const a=new Audio(),o=a.createOscillator(),g=a.createGain();o.frequency.value=660;g.gain.value=.08;o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.2);o.onended=()=>a.close();}catch{}
   }
   const clientLabels={not_configured:'尚未连接',disconnected:'连接已断开',unbound:'等待绑定当前账号',login_required:'需要官方登录',busy:'连接正忙',unsupported:'客户端版本待适配',ready:'当前账号可用',switch_required:'需切换官方账号',connection_unavailable:'等待连接恢复',disabled:'账号已停用',legacy_session:'原有会话',conflict:'绑定冲突'};
-  async function client(target,onStatus,provider){
-    const read=async()=>{
-      target.innerHTML='<p class="muted small" role="status">正在核验官方客户端连接…</p>';
-      try{
-        const data=await ui.api('workbench/client');if(!target.isConnected)return;
-        target.innerHTML=`<section class="panel section-gap" aria-label="官方客户端连接"><div class="section-heading"><h2>官方客户端连接</h2><button id="client-status-refresh" class="quiet">刷新连接</button></div><p class="badge ${data.state==='ready'?'':'neutral'}" data-client-state="${esc(data.state)}">${esc(clientLabels[data.state]||'待核验')}</p><p class="muted small section-gap">${esc(data.notice||'')}</p>${data.configured?'<div class="actions section-gap"><button id="connect-official-client">连接当前官方账号</button></div>':''}<p class="muted small section-gap">登录与续期由官方客户端管理。切换账号后，只有身份匹配的绑定可用。</p></section>`;
-        document.getElementById('client-status-refresh').onclick=read;
-        const connect=document.getElementById('connect-official-client');if(connect)connect.onclick=()=>open(provider||'','','desktop');
-        onStatus?.(data.accounts||[]);
-      }catch(e){if(e.name==='AbortError'||!target.isConnected)return;target.innerHTML='<p class="notice warn">客户端状态暂时读不到。请稍后重新读取账号页面。</p>';}
-    };
-    await read();
-  }
-  // Providers that expose a desktop-client bridge. Only these render the
-  // client panel; a pure HTTP provider must never show "official client" UI.
-  const clientBridges = new Set(['workbuddy','trae']);
-  const hasClientBridge = id => clientBridges.has(id);
-  return {init,open,list,stop,client,clientLabels,hasClientBridge};
+  // The "official desktop client" panel was never backed by a route: there is
+  // no /workbench/client handler, and neither legacy driver exposes a
+  // "desktop" method, so both the status read and the connect button could
+  // only fail. Everything an account needs is already shown per row (state,
+  // limits, credits), so this panel is gone rather than left to 404.
+  //
+  // clientLabels stays: the per-account status line uses it.
+  return {init,open,list,stop,clientLabels};
 })();

@@ -162,10 +162,17 @@ func panelContainer() string {
 // adminHandler 是网关的管理接口 mux：面板与网关在同一个进程里，直接把它交给面板，
 // 由面板在进程内分发（不经 socket/TCP）。分进程部署的形态下传 nil，面板自己回落到
 // socket 路径。
-func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler, drivers ...map[string]authflow.Driver) (http.Handler, error) {
+func startGoPanel(layout unifiedLayout, cfg *Config, adminHandler http.Handler, workbench *workbenchRuntime, drivers ...map[string]authflow.Driver) (http.Handler, error) {
 	opts := goPanelOptions(layout)
 	if len(drivers) > 0 {
 		opts.ConnectionDrivers = drivers[0]
+	}
+	// The provider-account vault holds an exclusive owner lock. Inference
+	// already opened it, so the panel must write through that same handle;
+	// opening the directory again fails with vault_busy and a successful login
+	// then reports "结果未确认".
+	if workbench != nil {
+		opts.ProviderVault = workbench.vault
 	}
 	opts.AdminHandler = adminHandler
 	opts.UpdateDir = panelUpdateDir(cfg)

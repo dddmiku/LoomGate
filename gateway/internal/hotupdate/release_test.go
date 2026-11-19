@@ -123,7 +123,10 @@ func TestDownloadVerifiesDigest(t *testing.T) {
 	if got != digest {
 		t.Fatalf("sum = %s want %s", got, digest)
 	}
-	if filepath.Dir(path) != dir || !strings.Contains(filepath.Base(path), "v9.9.9") {
+	// filepath.Join normalizes separators, so compare against the cleaned
+	// form: t.TempDir() inherits whatever separator TMP uses, and on Windows
+	// that can differ from the joined path even though it is the same dir.
+	if filepath.Dir(path) != filepath.Clean(dir) || !strings.Contains(filepath.Base(path), "v9.9.9") {
 		t.Fatalf("unexpected target path %s", path)
 	}
 	saved, err := os.ReadFile(path)

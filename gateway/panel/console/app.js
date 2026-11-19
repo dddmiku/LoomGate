@@ -153,7 +153,7 @@
     state.accountProvider=selected;
     const generation=state.version;
     $('#view').innerHTML=heading(button('connect-account','添加账号','','primary'))+
-      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="client-status"></div><div id="account-list" class="loading">正在读取账号…</div>`;
+      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-list" class="loading">正在读取账号…</div>`;
     bindProviderFilter('account-provider',value=>{state.accountProvider=value;state.accountRealm='';});
     const rows=await accountsFor(selected);if(generation!==state.version)return;state.accountRows=rows;const clientStates=new Map();
     // 区域筛选只在 WorkBuddy（有 CN/Global 两个独立站点）显示；Trae 与 AutoClaw 各自
@@ -196,7 +196,6 @@
     };
     drawRealms();draw();
     $('#account-search').addEventListener('input',draw);
-    if(LoomConnections.hasClientBridge(selected))await LoomConnections.client($('#client-status'),list=>{clientStates.clear();list.forEach(x=>clientStates.set(x.id,x));draw();},selected);
   }
   // 模型限流与积分过期必须常显、用高亮色，不能折叠进 details 或只有 hover 才
   // 能看到——用户明确要求「看到了，还在，不要自动隐藏」「还是用高亮色显示」。
