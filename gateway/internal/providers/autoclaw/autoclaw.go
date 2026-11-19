@@ -333,11 +333,12 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 		if err != nil {
 			return result, err
 		}
-		text, usage, err := aggregate(raw)
+		text, usage, toolCalls, err := aggregate(raw)
 		if err != nil {
 			return result, err
 		}
 		result.Text = text
+		result.ToolCalls = toolCalls
 		result.UsageReported = usage.PromptSeen || usage.CompletionSeen
 		result.PromptTokens = usage.Prompt
 		result.CompletionTokens = usage.Completion
@@ -551,40 +552,21 @@ func newTraceID() string {
 }
 
 // aggregate folds an SSE body into plain text, for non-streaming callers.
-func aggregate(raw []byte) (string, streamUsage, error) {
+func aggregate(raw []byte) (string, streamUsage, []inference.ToolCall, error) {
 	var text strings.Builder
-	var usage streamUsage
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	var calls []inference.ToolCall
+	text0, _, usage, toolCalls, err := streamSSEWithTools(bytes.NewReader(raw),
+		func(delta string) error { text.WriteString(delta); return nil }, nil, nil)
+	if err != nil {
+		var empty *emptyAnswerError
+		if errors.As(err, &empty) && len(toolCalls) > 0 {
+			// A tool-only answer is not an empty answer.
+			return "", usage, toolCalls, nil
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-			Usage json.RawMessage `json:"usage"`
-		}
-		if json.Unmarshal([]byte(payload), &chunk) != nil {
-			continue
-		}
-		for _, c := range chunk.Choices {
-			text.WriteString(c.Delta.Content)
-		}
-		if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
-			usage = parseUsage(chunk.Usage, usage)
-		}
+		return text0, usage, toolCalls, err
 	}
-	if text.Len() == 0 {
-		return "", usage, &emptyAnswerError{}
-	}
-	return text.String(), usage, nil
+	calls = toolCalls
+	return text.String(), usage, calls, nil
 }
 
 // streamSSE forwards each text delta as it arrives and returns the joined text.

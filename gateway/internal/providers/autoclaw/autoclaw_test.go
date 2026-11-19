@@ -98,7 +98,7 @@ func TestNonStreamAggregatesSSE(t *testing.T) {
 		`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}`,
 		`data: [DONE]`,
 	}, "\n")
-	text, usage, err := aggregate([]byte(raw))
+	text, usage, _, err := aggregate([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestNonStreamAggregatesSSE(t *testing.T) {
 // TestEmptyAnswerIsAnError keeps "HTTP 200 with no text" from being reported as
 // a successful completion.
 func TestEmptyAnswerIsAnError(t *testing.T) {
-	if _, _, err := aggregate([]byte("data: [DONE]\n")); err == nil {
+	if _, _, _, err := aggregate([]byte("data: [DONE]\n")); err == nil {
 		t.Fatal("empty answer accepted")
 	}
 }
@@ -389,5 +389,31 @@ func TestToolsOnlyModeStillParsesToolCalls(t *testing.T) {
 	}
 	if calls[0].Function.Arguments != `{"city":"北京"}` {
 		t.Fatalf("arguments=%q", calls[0].Function.Arguments)
+	}
+}
+
+// Non-streaming requests (stream:false) aggregate the SSE body. That path also
+// has to read tool_calls: a client running a tool loop usually asks for the
+// final answer non-streamed, and losing the call there returns a 502 for a
+// turn the upstream answered correctly.
+func TestAggregateKeepsToolCalls(t *testing.T) {
+	raw := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	text, usage, calls, err := aggregate([]byte(raw))
+	if err != nil {
+		t.Fatalf("a tool-only body was rejected: %v", err)
+	}
+	if text != "" {
+		t.Fatalf("prose leaked: %q", text)
+	}
+	if len(calls) != 1 || calls[0].ID != "call_7" || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("tool call lost in aggregation: %+v", calls)
+	}
+	if !usage.CompletionSeen || usage.Completion != 5 {
+		t.Fatalf("usage lost: %+v", usage)
 	}
 }
