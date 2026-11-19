@@ -12,7 +12,7 @@ func TestProviderNamespaceBindingsRoundTripExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	models := []string{"doubao:synthetic-mode:" + strings.Repeat("m", 120), "new-provider:synthetic-model"}
+	models := []string{"autoclaw:synthetic-mode:" + strings.Repeat("m", 120), "new-provider:synthetic-model"}
 	_, secret, err := store.Create("synthetic", "", models)
 	if err != nil {
 		t.Fatal(err)

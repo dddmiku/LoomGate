@@ -14,7 +14,7 @@ func TestModelsPayloadKeepsZeroCreditsAndProviderErrors(t *testing.T) {
 			map[string]any{"id": "cn:paid-model", "credits": "x0.11 credits", "name": "Paid"},
 			map[string]any{"id": "cn:unknown-model"},
 		},
-		"provider_errors": []any{map[string]any{"provider": "doubao", "code": "catalog_unavailable"}},
+		"provider_errors": []any{map[string]any{"provider": "autoclaw", "code": "catalog_unavailable"}},
 	}
 	out := modelsPayload(payload)
 	items, _ := out["items"].([]map[string]any)

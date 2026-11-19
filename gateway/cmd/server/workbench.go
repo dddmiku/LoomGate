@@ -82,9 +82,9 @@ func openWorkbench(stateDir string, p *pool.Pool, up *upstream.Client, expiring 
 	return openWorkbenchFor(stateDir, p, up, runtime.GOOS, expiring...)
 }
 
-// openWorkbenchFor keeps an explicit host platform parameter so callers that
-// used to test the Doubao desktop wiring contract still compile; the current
-// provider set is transport-independent and ignores it.
+// openWorkbenchFor keeps an explicit host-platform parameter for callers that
+// still pass one. The current provider set is transport-independent and ignores
+// it; the parameter only preserves the historical call shape.
 func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos string, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
 	_ = goos
 	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(stateDir, "task-engine.json"), AllowTaskTimeout: true})

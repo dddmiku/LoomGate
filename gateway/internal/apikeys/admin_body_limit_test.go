@@ -19,7 +19,7 @@ func TestAdminAcceptsMaximumLegalModelBinding(t *testing.T) {
 	}
 	models := make([]string, 0, MaxBoundModels)
 	for i := 0; i < MaxBoundModels; i++ {
-		models = append(models, "doubao:m"+strings.Repeat("m", 190)+string(rune('a'+i%26))+string(rune('a'+i/26)))
+		models = append(models, "autoclaw:m"+strings.Repeat("m", 190)+string(rune('a'+i%26))+string(rune('a'+i/26)))
 	}
 	payload, err := json.Marshal(map[string]any{"name": "many-models", "models": models})
 	if err != nil {

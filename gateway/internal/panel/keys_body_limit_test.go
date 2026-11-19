@@ -6,13 +6,13 @@ import (
 )
 
 // 面板自己把密钥 body 限在 8192 字节，但密钥库允许 64 项 × 每项 256 字节的模型绑定。
-// 合法配置（例如 64 个 doubao 动态模型名）的 JSON 能到十几 KB，会在面板层被 413
+// 合法配置（例如 64 个自动发现的长模型名）的 JSON 能到十几 KB，会在面板层被 413
 // 拦下，而网关本身完全接受——用户只看到「请求体超过大小限制」，没有任何字段超限。
 func maximumModelBinding() []any {
 	models := make([]any, 0, 64)
 	for i := 0; i < 64; i++ {
 		// 每个名字 200 字节左右，带合法前缀；末尾两字符保证唯一。
-		models = append(models, "doubao:m"+strings.Repeat("m", 190)+string(rune('a'+i%26))+string(rune('a'+i/26)))
+		models = append(models, "autoclaw:m"+strings.Repeat("m", 190)+string(rune('a'+i%26))+string(rune('a'+i/26)))
 	}
 	return models
 }

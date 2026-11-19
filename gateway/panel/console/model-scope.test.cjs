@@ -1,9 +1,9 @@
 'use strict';
-// /api/models 是所有 provider 的聚合目录（cn:/global:/trae:/doubao:…）。
+// /api/models 是所有 provider 的聚合目录（cn:/global:/trae:/autoclaw:…）。
 // 控制台按服务页展示时必须只挑属于该服务的命名空间。原实现只有二选一：
-// "trae 前缀 → Trae，其余 → WorkBuddy"，于是桌面版注册了豆包推理后，
-// doubao:* 模型会混进 WorkBuddy 的模型目录——用户在「WorkBuddy」页看到并选中
-// 一个豆包模型，实际调用会走另一个服务，范围显示与真实归属不一致。
+// "trae 前缀 → Trae，其余 → WorkBuddy"，于是新增推理 provider 后，
+// 它的模型会混进 WorkBuddy 的模型目录——用户在「WorkBuddy」页看到并选中
+// 一个别的服务的模型，实际调用会走另一个服务，范围显示与真实归属不一致。
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
 const fs = require('node:fs');
@@ -18,9 +18,9 @@ function seam() {
 }
 const items = [
   {id: 'cn:deepseek'}, {id: 'global:gpt'}, {id: 'trae:deepseek'},
-  {id: 'doubao:synthetic-mode:synthetic'},
+  {id: 'autoclaw:synthetic-mode:synthetic'},
 ];
-test('WorkBuddy shows only cn:/global: models, never doubao or trae', () => {
+test('WorkBuddy shows only cn:/global: models, never autoclaw or trae', () => {
   const ids = seam()(items, 'workbuddy').map((m) => m.id);
   assert.deepEqual(ids, ['cn:deepseek', 'global:gpt']);
 });
@@ -28,8 +28,8 @@ test('Trae shows only trae: models', () => {
   const ids = seam()(items, 'trae').map((m) => m.id);
   assert.deepEqual(ids, ['trae:deepseek']);
 });
-test('Doubao (account scope) is never fed from the aggregate catalog', () => {
-  assert.deepEqual(seam()(items, 'doubao').map((m) => m.id), ['doubao:synthetic-mode:synthetic']);
+test('an account-scoped provider keeps its own namespace', () => {
+  assert.deepEqual(seam()(items, 'autoclaw').map((m) => m.id), ['autoclaw:synthetic-mode:synthetic']);
 });
 test('an unknown or future provider does not inherit WorkBuddy models', () => {
   // vm 里产出的数组原型属于另一个 realm，deepStrictEqual 会因原型不同判不等；

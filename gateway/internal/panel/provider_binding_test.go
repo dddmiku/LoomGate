@@ -6,7 +6,7 @@ import (
 )
 
 func TestProviderBindingsAcceptDynamicNamespaceAndBoundLength(t *testing.T) {
-	for _, id := range []string{"doubao:synthetic-mode:synthetic-model", "future-provider:some-model", "doubao:" + strings.Repeat("x", 200)} {
+	for _, id := range []string{"autoclaw:synthetic-mode:synthetic-model", "future-provider:some-model", "autoclaw:" + strings.Repeat("x", 200)} {
 		if modelBindingError([]any{id}) != "" {
 			t.Fatal("dynamic model rejected")
 		}

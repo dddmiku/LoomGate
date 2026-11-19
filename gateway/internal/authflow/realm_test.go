@@ -28,7 +28,7 @@ func (d *realmDriver) Step(context.Context, Flow, string, Input) (Result, error)
 }
 
 func TestRealmContractBeforeDriverOrPersistence(t *testing.T) {
-	for _, provider := range []string{"workbuddy", "trae", "doubao"} {
+	for _, provider := range []string{"workbuddy", "trae", "autoclaw"} {
 		for _, realm := range []string{"", "cn", "global", "trae", "other", "CN", " cn"} {
 			for _, httpBoundary := range []bool{false, true} {
 				name := provider + "/" + realm + "/service"
