@@ -33,6 +33,11 @@ func providerErrorCode(err error) string {
 			return code
 		case "provider_idempotency_invalid", "provider_idempotency_required", "provider_idempotency_conflict", "provider_request_already_processed":
 			return code
+		// Provider-specific credential/quota states the console already has
+		// labels for. Passing them through turns an opaque 502 into a message
+		// the operator can act on.
+		case "access_token_expired", "autoclaw_rate_limited", "autoclaw_quota_exhausted":
+			return code
 		}
 	}
 	return "provider_request_failed"

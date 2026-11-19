@@ -348,6 +348,21 @@ type accountError struct {
 
 func (e *accountError) Error() string { return "autoclaw upstream: " + e.code }
 
+// PublicCode lets a dead credential surface as a credential problem instead of
+// the generic 502 the console cannot act on. The console already has a label
+// for access_token_expired; without this it was unreachable.
+func (e *accountError) PublicCode() string {
+	switch {
+	case e.status == 401 || e.status == 403:
+		return "access_token_expired"
+	case e.status == 429:
+		return "autoclaw_rate_limited"
+	case e.status == 402:
+		return "autoclaw_quota_exhausted"
+	}
+	return ""
+}
+
 // RetryClass keeps the same policy the legacy path uses: auth/quota/rate-limit
 // and server faults implicate the account, a client error does not.
 //

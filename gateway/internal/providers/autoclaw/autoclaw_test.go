@@ -572,3 +572,25 @@ func TestOnlyAuthFailuresTriggerRenewal(t *testing.T) {
 		}
 	}
 }
+
+// A dead credential must not surface as a generic 502: the console has a label
+// for access_token_expired and the operator needs to know it is a login
+// problem, not an upstream outage.
+func TestAuthFailuresExposeActionableCodes(t *testing.T) {
+	cases := []struct {
+		status int
+		want   string
+	}{
+		{401, "access_token_expired"},
+		{403, "access_token_expired"},
+		{429, "autoclaw_rate_limited"},
+		{402, "autoclaw_quota_exhausted"},
+		{500, ""},
+		{400, ""},
+	}
+	for _, tc := range cases {
+		if got := (&accountError{status: tc.status}).PublicCode(); got != tc.want {
+			t.Errorf("PublicCode(%d)=%q want %q", tc.status, got, tc.want)
+		}
+	}
+}
