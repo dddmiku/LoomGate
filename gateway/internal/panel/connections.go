@@ -14,6 +14,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/authflow"
 	"workbuddy2api/internal/providers/autoclaw"
+	"workbuddy2api/internal/providers/doubao"
 	"workbuddy2api/internal/upstream/trae"
 )
 
@@ -23,6 +24,43 @@ type connections struct {
 	vault         *accountvault.Vault
 	providerVault *accountvault.Vault
 	err           error
+}
+
+// doubaoPassportSave persists the session the passport produced. The profile
+// already carries the login-issued Query/Headers, so it is written verbatim.
+func doubaoPassportSave(s *Server) func(context.Context, string, doubao.Stored) error {
+	return func(ctx context.Context, id string, profile doubao.Stored) error {
+		if s.connections.providerVault == nil {
+			return errors.New("provider_vault_unavailable")
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b, err := json.Marshal(profile)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for i := range b {
+				b[i] = 0
+			}
+		}()
+		var revision uint64
+		rows, err := s.connections.providerVault.List()
+		if err != nil {
+			return err
+		}
+		for _, a := range rows {
+			if a.ID == id {
+				if a.Provider != "doubao" {
+					return errors.New("account_provider_conflict")
+				}
+				revision = a.Revision
+			}
+		}
+		_, err = s.connections.providerVault.Put(accountvault.Account{ID: id, Provider: "doubao", Enabled: true}, b, revision)
+		return err
+	}
 }
 
 // autoclawSaveProfile returns the callback that persists a verified AutoClaw
@@ -49,6 +87,9 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 			// AutoClaw logs in with a phone number + SMS code against its own
 			// upstream. No token import and no desktop client are required.
 			"autoclaw": &autoclaw.LoginDriver{Save: autoclawSaveProfile(s)},
+			// Doubao logs in through its own passport: QR scan or phone + SMS.
+			// Both produce a real session Cookie; no packet capture is needed.
+			"doubao": &doubao.Passport{Save: doubaoPassportSave(s)},
 		}
 		for id, d := range s.opts.ConnectionDrivers {
 			drivers[id] = d

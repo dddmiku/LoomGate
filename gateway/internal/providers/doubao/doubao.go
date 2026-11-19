@@ -93,16 +93,27 @@ var baseQuery = url.Values{
 	"web_platform":           {"desktop"},
 }
 
-// Stored is the encrypted profile for one Doubao account: nothing but the
-// login cookie and the identity facts needed to build a request.
+// Stored is the encrypted profile for one Doubao account.
+//
+// A profile is produced either by the gateway's own passport login (which fills
+// Query/Headers with the real device identity the service assigned to this
+// session) or by a plain Cookie import (which fills only Cookie). Both are
+// valid: the request builder prefers the login-issued Query/Headers when they
+// are present and falls back to the fixed client defaults otherwise.
 type Stored struct {
-	Cookie  string `json:"cookie"`
-	BotID   string `json:"bot_id,omitempty"`
-	Device  string `json:"device_id,omitempty"`
-	WebID   string `json:"web_id,omitempty"`
-	LocalID string `json:"local_app_id,omitempty"`
+	Cookie  string      `json:"cookie,omitempty"`
+	Query   url.Values  `json:"query,omitempty"`
+	Headers http.Header `json:"headers,omitempty"`
+	BotID   string      `json:"bot_id,omitempty"`
+	Device  string      `json:"device_id,omitempty"`
+	WebID   string      `json:"web_id,omitempty"`
+	LocalID string      `json:"local_app_id,omitempty"`
 	// Conversation is the single server-side conversation this account reuses.
 	Conversation string `json:"conversation_id,omitempty"`
+	BindingFlow  string `json:"binding_flow,omitempty"`
+	VerifiedAt   time.Time `json:"verified_at,omitempty"`
+	Mobile       string    `json:"mobile,omitempty"`
+	DisplayName  string    `json:"display_name,omitempty"`
 }
 
 type Provider struct {
@@ -144,7 +155,10 @@ func (p *Provider) session(id string) (Stored, error) {
 	}
 	defer wipe(plain)
 	var s Stored
-	if json.Unmarshal(plain, &s) != nil || strings.TrimSpace(s.Cookie) == "" {
+	if json.Unmarshal(plain, &s) != nil {
+		return Stored{}, errors.New("doubao_session_invalid")
+	}
+	if strings.TrimSpace(s.Cookie) == "" && len(s.Headers) == 0 {
 		return Stored{}, errors.New("doubao_session_invalid")
 	}
 	return s, nil
@@ -247,7 +261,11 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 	if err != nil {
 		return inference.Result{}, err
 	}
-	u := "https://www.doubao.com/chat/completion?" + baseQuery.Encode()
+	query := baseQuery
+	if len(s.Query) > 0 {
+		query = mergeQuery(baseQuery, s.Query)
+	}
+	u := "https://www.doubao.com/chat/completion?" + query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return inference.Result{}, err
@@ -258,7 +276,18 @@ func (p *Provider) turn(ctx context.Context, row accountvault.Account, model str
 	req.Header.Set("last-event-id", "undefined")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", "https://www.doubao.com/")
-	req.Header.Set("Cookie", s.Cookie)
+	if cookie := sessionCookie(s); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	for key, list := range s.Headers {
+		switch key {
+		case "Cookie", "Content-Length", "Host", "Connection", "Accept-Encoding":
+			continue
+		}
+		for _, v := range list {
+			req.Header.Set(key, v)
+		}
+	}
 
 	resp, err := p.httpClient().Do(req)
 	if err != nil {
@@ -456,6 +485,27 @@ func flatten(messages []inference.Message) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// mergeQuery overlays the login-issued device identity on the fixed defaults.
+func mergeQuery(base, override url.Values) url.Values {
+	out := url.Values{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
+}
+
+// sessionCookie prefers an explicit Cookie field, then a Cookie header captured
+// during login, then the profile's cookie jar serialization.
+func sessionCookie(s Stored) string {
+	if strings.TrimSpace(s.Cookie) != "" {
+		return s.Cookie
+	}
+	return s.Headers.Get("Cookie")
 }
 
 func deviceName(s Stored) string {

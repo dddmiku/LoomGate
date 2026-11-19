@@ -30,7 +30,7 @@
   }
   const routes = {overview:['','工作台','先处理需要关注的事项。'], providers:['CONNECTIONS','服务接入','按服务查看已接入账号与真实可用能力。'], accounts:['IDENTITIES','账号','集中查看服务账号的启用状态、会话有效期和目录入口。'], models:['MODEL LIBRARY','模型目录','从上游获取可选模型。能力与可用范围以当前账号的响应为准。'], tasks:['AUTOMATION','任务','按分区查看任务、定时与运行状态。'], runs:['ACTIVITY','执行记录','查看每次派发、执行与服务端复核的结果。'], usage:['OBSERVABILITY','用量','查看网关累计请求与上游报告的用量。'], logs:['REQUEST HISTORY','请求记录','按请求查看模型、状态和耗时，不展示消息内容。'], keys:['API KEYS','API 密钥','用于调用模型接口的密钥；与面板登录账号无关。'], migration:['MIGRATION','迁移','只读核对迁移标记与工具状态；导入需离线确认。'], settings:['PREFERENCES','工作区设置','管理显示偏好、会话与迁移准备。']};
   const labels = {ready:'目录已同步',stale:'旧缓存',unavailable:'暂不可用',disabled:'已停用',queued:'等待执行',running:'执行中',succeeded:'已核验完成',failed:'失败',canceled:'已取消',uncertain:'待复核',skipped:'已跳过',manual_action:'需要人工',discover:'发现',inspect:'检查',execute:'执行',claim:'领取',verify:'复核'};
-  const errorLabels = {login_required:'登录已失效，请在对应服务重新登录。',access_token_expired:'访问令牌已过期，请重新导入 AutoClaw 凭证。',autoclaw_no_account:'尚未添加 AutoClaw 账号。',autoclaw_session_invalid:'AutoClaw 凭证无效，请重新导入。',autoclaw_empty_answer:'上游返回了空回答，请重试。',accounts_unavailable:'账号存储读取失败，请检查服务状态。',catalog_timeout:'目录读取超时，请稍后重试。',migration_timeout:'迁移预检超时：旧工作区可能过大或磁盘较慢，未写入任何文件；可改为在命令行离线执行预检。',catalog_failed:'目录读取失败，请稍后重试。',catalog_unavailable:'上游目录暂不可用。',account_not_found:'账号已不存在，请刷新账号列表。',schedule_not_saved:'计划未保存，请检查时间、时区和任务范围。',run_rejected:'执行请求未被接受，可能已有任务正在运行。',unauthorized:'管理会话已过期，请重新登录。'};
+  const errorLabels = {login_required:'登录已失效，请在对应服务重新登录。',doubao_no_account:'尚未添加豆包账号，请导入 Cookie。',doubao_session_invalid:'豆包 Cookie 无效或已过期，请重新导入。',doubao_empty_answer:'上游返回了空回答，请重试。',access_token_expired:'访问令牌已过期，请重新导入 AutoClaw 凭证。',autoclaw_no_account:'尚未添加 AutoClaw 账号。',autoclaw_session_invalid:'AutoClaw 凭证无效，请重新导入。',autoclaw_empty_answer:'上游返回了空回答，请重试。',accounts_unavailable:'账号存储读取失败，请检查服务状态。',catalog_timeout:'目录读取超时，请稍后重试。',migration_timeout:'迁移预检超时：旧工作区可能过大或磁盘较慢，未写入任何文件；可改为在命令行离线执行预检。',catalog_failed:'目录读取失败，请稍后重试。',catalog_unavailable:'上游目录暂不可用。',account_not_found:'账号已不存在，请刷新账号列表。',schedule_not_saved:'计划未保存，请检查时间、时区和任务范围。',run_rejected:'执行请求未被接受，可能已有任务正在运行。',unauthorized:'管理会话已过期，请重新登录。'};
   Object.assign(errorLabels,{desktop_cleanup_uncertain:'客户端清理状态未确认，请检查官方客户端后再试。',desktop_ownership_lost:'本次连接的归属已变化，请重新连接官方客户端。',desktop_submission_uncertain:'请求可能已提交，请先核对官方服务状态，避免重复提交。',composer_not_empty:'官方客户端有未发送内容，请先保留或处理草稿。',desktop_model_unavailable:'当前账号的实时目录中没有此模型，请刷新目录。',desktop_native_tools_unsupported:'该请求需要官方任务运行时，但当前选择或任务上下文不匹配，未发送。',provider_output_budget_unsupported:'官方签名请求没有可兑现的输出 token 上限，本次未发送。',provider_system_instructions_unsupported:'官方签名构造器没有可验证的系统指令字段，本次未发送。'});
   const badge = (value, text) => `<span class="badge ${['failed','unavailable','uncertain'].includes(value)?'bad':['stale','manual_action'].includes(value)?'warn':['disabled','skipped','canceled'].includes(value)?'neutral':''}" data-status="${esc(value)}">${esc(text || labels[value] || value)}</span>`;
   const button = (action, text, extra = '', cls = '') => `<button data-action="${action}" class="${cls}" ${extra}>${text}</button>`;
@@ -190,7 +190,7 @@
         const balance=typeof credit?.remain==='number'
           ? `${number(credit.remain)}${credit.expiring>0?`<p class="credit-expiring" data-expiring="${esc(credit.expiring)}">其中 ${number(credit.expiring)} 即将过期${credit.expiry?' · '+esc(date(credit.expiry)):''}</p>`:''}`
           : credit?.ok===false?'<span class="muted">读取失败</span>':'<span class="muted">未读取</span>';
-        const sessionText=connection?esc(LoomConnections.clientLabels[connection.state]||'待核验')+(connection.verified_at?`<p>最近核验 ${esc(date(connection.verified_at))}</p>`:''):selected==='autoclaw'?'<p>纯 HTTP 模型调用，不创建会话，不依赖任何客户端</p>':`${esc(date(a.expires_at))}${a.expires_at&&a.expires_at*1000<Date.now()?'<p>会话已过期</p>':''}`;
+        const sessionText=connection?esc(LoomConnections.clientLabels[connection.state]||'待核验')+(connection.verified_at?`<p>最近核验 ${esc(date(connection.verified_at))}</p>`:''):selected==='autoclaw'?'<p>纯 HTTP 模型调用，不创建会话，不依赖任何客户端</p>':selected==='doubao'?(a.bot_id?'<p>已绑定一个固定会话，不依赖客户端</p>':'<p>首次调用时会创建一个固定会话</p>'):`${esc(date(a.expires_at))}${a.expires_at&&a.expires_at*1000<Date.now()?'<p>会话已过期</p>':''}`;
         return [`<strong class="account-name">${esc(a.nickname||a.mobile||'未提供昵称')}</strong>${a.mobile?`<p class="account-mobile">${esc(a.mobile)}</p>`:''}<p>${esc({cn:'WorkBuddy 国内版',global:'WorkBuddy 国际版',trae:'Trae'}[a.realm]||providerName(selected))}</p><details class="account-id"><summary>账号标识</summary><code>${esc(a.id)}</code>${a.enterpriseId?`<p class="muted small">企业：<code>${esc(a.enterpriseId)}</code></p>`:''}${a.botId?`<p class="muted small">官方 Bot：<code>${esc(a.botId)}</code></p>`:''}${a.verifiedAt?`<p class="muted small">核验于 ${esc(date(a.verifiedAt))}</p>`:''}</details>`,status,balance,sessionText,`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}" data-realm="${esc(a.realm||'')}"`,'quiet compact')}</div>`];
       })):empty(query?'没有匹配的账号':realm?'该区域下没有账号':'尚未接入账号',query?'试试其他昵称或账号标识。':(realm?'可切换区域查看全部账号。':'接入账号后在这里查看状态、限流与积分过期。'));
     };
@@ -256,11 +256,11 @@
     }
     return [...map.values()].sort((a,b)=>a.name.localeCompare(b.name,'zh-Hans-CN'));
   }
-  // /api/models 是全部 provider 的聚合目录（cn:/global:/trae:/autoclaw:…）。
+  // /api/models 是全部 provider 的聚合目录（cn:/global:/trae:/autoclaw:/doubao:…）。
   // 模型页是「按服务」展示的：必须按命名空间挑出属于本服务的行，否则某个
   // 推理 provider 注册后，它的命名空间会混进 WorkBuddy 的目录，用户选中的模型
   // 实际归另一个服务。这里不用「非 trae 即 WorkBuddy」的二选一。
-  const providerModelScopes = {workbuddy:['cn:','global:'],trae:['trae:'],autoclaw:['autoclaw:']};
+  const providerModelScopes = {workbuddy:['cn:','global:'],trae:['trae:'],autoclaw:['autoclaw:'],doubao:['doubao:']};
   function modelsForProvider(items, provider) {
     const prefixes = providerModelScopes[provider];
     if (!prefixes) return [];
@@ -307,7 +307,7 @@
     $('#model-list').innerHTML=`<div class="browser-workspace" id="model-browser"><div class="selection-pane"><p class="selection-caption">${groups.length} 个模型${groups.length!==all.length?'（'+all.length+' 个账号目录条目）':''}${p.inference_available?'':'，当前仅目录'}${pages>1?` · 第 ${state.modelGroupPage+1}/${pages} 页`:''}</p>${channelChips}<div role="listbox" aria-label="模型列表">${pageGroups.map((g,i)=>{const m=g.model;const capability=['官方工作工具','API 工具调用','图像输入','推理'].filter((label,k)=>m[['native_tools','supports_tool_call','supports_images','supports_reasoning'][k]]===true).join(' · ');return `<button class="selection-row" role="option" aria-selected="false" data-action="select-model-group" data-index="${i}" data-model-id="${esc(m.id)}" data-account="${esc(g.accounts[0]||'')}"><span><strong>${esc(g.name)}</strong><small>${esc([g.channels.map(c=>channelName(c)).join('/'),capability,g.accounts.length>1?g.accounts.length+' 个账号可见':''].filter(Boolean).join(' · '))}</small></span><span class="selection-arrow" aria-hidden="true">›</span></button>`;}).join('')}</div></div><section class="detail-pane" id="model-detail" tabindex="-1" aria-label="模型详情"></section></div><div id="model-group-pagination" class="pagination">${pages>1?`<span>第 ${state.modelGroupPage+1} / ${pages} 页</span><div class="actions">${button('model-group-prev','上一页',state.modelGroupPage===0?'disabled':'')}${button('model-group-next','下一页',state.modelGroupPage>=pages-1?'disabled':'')}</div>`:''}</div>`;
     selectModelGroup(selected,false);
   }
-  function channelName(id){return ({cn:'国内版',global:'国际版',trae:'Trae',autoclaw:'AutoClaw'})[id]||id;}
+  function channelName(id){return ({cn:'国内版',global:'国际版',trae:'Trae',autoclaw:'AutoClaw',doubao:'豆包工作'})[id]||id;}
   function selectModelGroup(index,open=true) {
     const g=state.modelGroups?.[index];
     if(!g)return;
@@ -850,7 +850,7 @@
           <div><dt>Anthropic Messages</dt><dd><code>${esc(base)}/messages</code></dd></div>
           <div><dt>Gemini</dt><dd><code>${esc(base)}/beta/models/&lt;模型&gt;:generateContent</code></dd></div>
         </dl>
-        <p class="small muted">鉴权用下面任意一把密钥作为 Bearer token；模型名形如 <code>autoclaw:glm-5.3-flash</code>，可在「模型目录」里查看。</p>
+        <p class="small muted">鉴权用下面任意一把密钥作为 Bearer token；模型名形如 <code>autoclaw:glm-5.3-flash</code> 或 <code>doubao:deepseek-v4-flash</code>，可在「模型目录」里查看。</p>
       </section>`+
       (rows.length?table(['名称','密钥','状态','有效期','限流','累计 Token','操作'],rows):empty('还没有 API 密钥','创建第一把密钥后才能通过 OpenAI / Anthropic / Gemini 兼容接口调用网关。'))+
       notice('密钥明文只在创建或「显示密钥」时返回一次；列表只显示掩码。停用会立即生效，删除不可恢复。','warn');
@@ -926,7 +926,14 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='theme'){toggleTheme();return;}
     if(name==='provider-models' || name==='account-models'){state.modelProvider=element.dataset.provider;state.modelAccount=element.dataset.account || '';state.modelOffset=0;location.hash='models';return;}
     if(name==='provider-accounts'){state.accountProvider=element.dataset.provider;location.hash='accounts';return;}
-    if(name==='connect-account'||name==='reconnect-account'){await LoomConnections.open(element.dataset.provider||state.accountProvider,element.dataset.account||'','',element.dataset.realm||'');return;}
+    if(name==='connect-account'||name==='reconnect-account'){
+      const provider=element.dataset.provider||state.accountProvider;
+      // Cookie-authenticated providers have no login flow: they take a pasted
+      // session cookie instead. AutoClaw takes a phone number in its SMS flow.
+      if(provider==='autoclaw'){await LoomConnections.open('autoclaw',element.dataset.account||'','','');return;}
+      await LoomConnections.open(provider,element.dataset.account||'','',element.dataset.realm||'');
+      return;
+    }
     if(name==='toggle-account'){
       const a=state.accountRows[index],provider=element.dataset.provider;openDialog(a.enabled?'停用账号':'启用账号',`<form id="account-toggle-form" class="form"><p>账号 <code>${esc(a.id)}</code></p><p class="muted">${a.enabled?'停用后不再用于后续目录请求与任务。正在进行的操作应在执行记录中单独核验。':'启用后该账号可再次用于目录读取和任务。'}</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认${a.enabled?'停用':'启用'}</button></div></form>`);
       $('#account-toggle-form').onsubmit=e=>{e.preventDefault();const modern=state.providers.find(p=>p.id===provider)?.catalog_scope==='account';mutate('account-toggle',modern?'workbench/account/toggle':'account/toggle',modern?{id:a.id,enabled:!a.enabled,revision:a.revision}:{uid:a.id,disabled:a.enabled},async()=>{const updated=(await accountsFor(provider)).find(x=>x.id===a.id);if(!updated||updated.enabled===a.enabled)throw new APIError('request_failed',502);closeDialog();toast('账号状态已从服务端核验。');await reload();});};return;
