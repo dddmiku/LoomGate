@@ -22,9 +22,11 @@ import (
 // payload. If a field like conversation_id ever appears here, the provider has
 // drifted back into client emulation.
 func TestBuildBodyHasNoConversationFields(t *testing.T) {
+	// stream is true here because that is what the provider always asks for;
+	// a stream:false upstream answers plain JSON that the SSE parser cannot read.
 	body, err := buildBody("autoclaw:glm-5.3-flash", []inference.Message{
 		{Role: "user", Content: "hello"},
-	}, false)
+	}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,14 +424,16 @@ func TestAggregateKeepsToolCalls(t *testing.T) {
 // the tool path only when a stream sink existed, so stream:false fell back to
 // the plain dialogue call: no tools went upstream and a tool-only answer came
 // back as an empty reply.
+// A buffered (stream:false) tool turn still has to carry the catalog. The
+// upstream request itself is always stream:true — see turnWith — and the caller
+// only decides whether frames are forwarded.
 func TestNonStreamingToolTurnKeepsTheCatalog(t *testing.T) {
 	tools := []inference.ToolDefinition{{
 		"type":     "function",
 		"function": map[string]any{"name": "get_weather"},
 	}}
-	// stream=false is exactly what the handler passes for a non-streaming turn.
 	body, err := buildDialogueBody("autoclaw:glm-5.3-flash",
-		[]inference.Message{{Role: "user", Content: "北京天气"}}, tools, "auto", false)
+		[]inference.Message{{Role: "user", Content: "北京天气"}}, tools, "auto", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,10 +441,30 @@ func TestNonStreamingToolTurnKeepsTheCatalog(t *testing.T) {
 	if json.Unmarshal(body, &decoded) != nil {
 		t.Fatal("invalid body")
 	}
-	if decoded["stream"] != false {
-		t.Fatalf("stream flag changed: %v", decoded["stream"])
+	if decoded["stream"] != true {
+		t.Fatalf("provider must always stream upstream: %v", decoded["stream"])
 	}
 	if decoded["tools"] == nil {
-		t.Fatal("a non-streaming tool turn dropped the tools catalog")
+		t.Fatal("a buffered tool turn dropped the tools catalog")
+	}
+}
+
+// The upstream answers stream:false with one JSON object, not SSE. Buffering it
+// through the SSE parser therefore yields no frames at all, and every
+// non-streaming caller used to see autoclaw_empty_answer after a long wait.
+// turnWith must always send stream:true and aggregate locally; the caller's
+// stream flag only decides whether those frames are forwarded downstream.
+func TestProviderAlwaysRequestsUpstreamStreaming(t *testing.T) {
+	body, err := buildDialogueBody("autoclaw:glm-5.3-flash",
+		[]inference.Message{{Role: "user", Content: "hi"}}, nil, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if json.Unmarshal(body, &decoded) != nil {
+		t.Fatal("invalid body")
+	}
+	if decoded["stream"] != true {
+		t.Fatalf("upstream request is not streaming: %v", decoded["stream"])
 	}
 }

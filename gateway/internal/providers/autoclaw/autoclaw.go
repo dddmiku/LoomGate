@@ -300,7 +300,13 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 	if err != nil {
 		return inference.Result{}, err
 	}
-	body, err := buildDialogueBody(model, messages, q.Tools, q.ToolChoice, emit != nil || emitTool != nil)
+	// Always ask the upstream to stream. With stream:false this endpoint answers
+	// a single JSON body, and every parser here reads SSE frames — a buffered
+	// answer therefore looked like an empty stream and every non-streaming
+	// caller got a 502 ("autoclaw_empty_answer") after a long wait. Streaming
+	// upstream and aggregating locally is also what the vendor's own gateway
+	// does; the caller's stream flag only decides whether we forward frames.
+	body, err := buildDialogueBody(model, messages, q.Tools, q.ToolChoice, true)
 	if err != nil {
 		return inference.Result{}, err
 	}
