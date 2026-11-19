@@ -142,13 +142,6 @@ func TestProviderDynamicModelsRespectCallingKey(t *testing.T) {
 	}
 }
 
-func TestUnconfiguredDoubaoNeverFallsThroughToLegacy(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(), APIKey: "synthetic-key"})
-	w := providerRequest(h, "synthetic-key", `{"model":"doubao:synthetic:model","messages":[{"role":"user","content":"synthetic"}]}`)
-	if w.Code != 400 || !strings.Contains(w.Body.String(), "provider_unavailable") {
-		t.Fatal("unconfigured provider fell through to legacy")
-	}
-}
 
 func TestProviderPanicDoesNotEscapeOrDisableHealthyProvider(t *testing.T) {
 	h, p, key, _ := providerFixture(t, nil)

@@ -49,7 +49,7 @@ def main():
             if not page.locator('#navigation').is_visible():
                 page.locator('#navigation-toggle').click()
             page.locator('#navigation a[href="#'+route+'"]').click()
-            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','schedules':'计划','runs':'执行记录','usage':'用量','logs':'请求记录','keys':'访问密钥','migration':'迁移','settings':'设置'}[route]).wait_for(state='attached')
+            page.locator('#navigation a[aria-current="page"]').filter(has_text={'overview':'工作台','providers':'服务','accounts':'账号','models':'模型目录','tasks':'任务','usage':'用量','logs':'请求记录','keys':'API 密钥','migration':'迁移','settings':'设置'}[route]).wait_for(state='attached')
         def shot(name):
             if page.locator('#toast').count() and page.locator('#toast').is_visible():
                 page.locator('#toast').wait_for(state='hidden',timeout=7000)
@@ -153,26 +153,27 @@ def main():
         select_task(page,'fixture-manual','manual-task')
         assert '选择需要处理的文档' in page.locator('#dialog-body').inner_text()
         page.locator('#dialog-close').click();done('dynamic_tasks_and_specific_manual_action');shot('console-tasks.png')
-        page.locator('[data-action=select-task-group]').first.click()
-        page.locator('#task-detail [data-action=open-runs]').click()
-        page.wait_for_function("document.querySelector('h1')?.textContent==='执行记录'")
-        done('task_detail_links_directly_to_execution_records')
+        # 目录专用任务没有随包定时；状态列必须是「—」而不是可点的开关。
+        row=page.locator('[data-task=fixture-check]')
+        assert row.locator('[data-action=toggle-schedule]').count()==0
+        assert '未定时' in row.inner_text()
+        done('catalog_only_task_has_no_fake_schedule')
         nav('tasks');choose_provider(page,'#task-provider','doubao');page.locator('[data-task]').first.wait_for()
         stage='schedule-create'
-        select_task(page,'fixture-check','task-schedule')
+        # 计划随包发布：只能改时间/时区/开关，不能新建或删除一项随包任务。
+        sid='legacy-checkin'
+        choose_provider(page,'#task-provider','workbuddy');page.locator('[data-task=checkin]').wait_for()
+        select_task(page,'checkin','task-schedule')
         assert page.locator('[data-plan-step="1"]').is_visible() and page.locator('#plan-save').is_visible()
         assert page.locator('#plan-provider').is_hidden() and page.locator('#plan-task').is_hidden()
         plan_times(page,['06:17','18:17'],'Asia/Shanghai')
         page.locator('#plan-enabled-quick').check()
         shot('console-schedule-editor.png')
-        before_ids={x['id'] for x in work()['schedules']}
         page.locator('#plan-save').click()
         page.locator('#dialog').wait_for(state='hidden')
-        page.locator('[data-action=new-schedule]').wait_for()
-        saved=[x for x in work()['schedules'] if x['id'] not in before_ids];assert len(saved)==1
-        saved=saved[0];sid=saved['id']
-        assert saved['hours']==[6,18] and saved['minute']==17 and saved['account_ids']==['a-fixture'] and saved['next_run']
-        done('schedule_create_and_authoritative_readback')
+        saved=next(x for x in work()['schedules'] if x['id']==sid)
+        assert saved['hours']==[6,18] and saved['minute']==17 and saved['next_run']
+        done('shipped_plan_time_edit_and_authoritative_readback')
         stage='restart-persistence'
         assert page.request.post(base+'/__fixture/stop').status==204
         deadline=time.monotonic()+8
@@ -194,18 +195,18 @@ def main():
             time.sleep(.1)
         else: raise AssertionError('fixture_did_not_restart')
         assert next(x for x in work()['schedules'] if x['id']==sid)['hours']==[6,18]
-        page.reload();page.locator('[data-schedule-id="'+sid+'"]').wait_for()
+        page.locator('[data-plan-row="'+sid+'"]').wait_for()
         done('actual_process_restart_preserves_schedule_and_session')
         stage='schedule-edit'
-        row=page.locator('[data-schedule-id="'+sid+'"]')
-        row.locator('[data-action=edit-schedule]').click()
+        row=page.locator('[data-plan-row="'+sid+'"]')
+        row.locator('[data-action=edit-plan-time]').click()
         assert page.locator('[data-plan-step="1"]').is_visible() and page.locator('#plan-save').is_visible()
         plan_times(page,['06:17','06:17']);page.locator('#plan-save').click()
         assert page.locator('#form-message').is_visible()
         plan_times(page,['07:17','19:17'],'UTC')
         page.locator('#plan-save').click();page.locator('#dialog').wait_for(state='hidden')
         assert next(x for x in work()['schedules'] if x['id']==sid)['timezone']=='UTC'
-        row=page.locator('[data-schedule-id="'+sid+'"]')
+        row=page.locator('[data-plan-row="'+sid+'"]')
         row.locator('[data-action=toggle-schedule]').click();page.get_by_text('计划已停用。',exact=True).wait_for()
         assert not next(x for x in work()['schedules'] if x['id']==sid)['enabled']
         done('schedule_validation_edit_and_disable');shot('console-schedules.png')
@@ -242,16 +243,19 @@ def main():
         page.locator('[data-action=logs-prev]').click();page.get_by_text('synthetic-request-30',exact=True).wait_for();done('real_usage_and_request_stores_with_pagination')
         stage='mobile'
         page.set_viewport_size({'width':390,'height':844})
-        for route in ['overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings']:
+        for route in ['overview','providers','accounts','models','tasks','usage','logs','keys','migration','settings']:
+            stage='mobile:'+route
             nav(route)
-            page.locator('#view > .loading').wait_for(state='detached')
+            # data-load-state=ready 是导航完成的服务端渲染信号；比等待骨架
+            # 元素消失更准：路由相同不会触发 hashchange，骨架本来就不存在。
+            page.wait_for_function("document.querySelector('#view')?.dataset.loadState==='ready'")
             if route=='models':models_settled()
             assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1'),route
-            if route in ['models','schedules']:
+            if route in ['models','tasks']:
                 shot('console-'+route+'-mobile.png')
             if route=='models':
                 assert page.locator('#model-account').bounding_box()['width']>=240
-        done('twelve_mobile_routes_and_usable_filter_widths')
+        done('ten_mobile_routes_and_usable_filter_widths')
         stage='key-lifecycle'
         page.set_viewport_size({'width':1440,'height':1000})
         nav('keys')
@@ -323,9 +327,11 @@ def main():
         page.locator('[data-action=password]').click();page.locator('#password-form').wait_for();page.keyboard.press('Escape');assert not page.locator('#dialog').is_visible()
         sidebar_action(page,'#theme');done('theme_persistence_settings_and_keyboard_dialog')
         stage='delete'
-        nav('schedules');row=page.locator('[data-schedule-id="'+sid+'"]');row.locator('[data-action=delete-schedule]').click()
-        page.locator('#delete-form button[type=submit]').click();page.locator('#dialog').wait_for(state='hidden')
-        assert not any(x['id']==sid for x in work()['schedules']);done('schedule_delete_readback')
+        # 随包计划不能从界面删除：删掉一项只会让任务在下个版本前消失，
+        # 运营动作应是停用（开关），而不是删除代码里的计划。
+        nav('tasks');row=page.locator('[data-plan-row="'+sid+'"]');row.wait_for()
+        assert row.locator('[data-action=delete-schedule]').count()==0
+        assert any(x['id']==sid for x in work()['schedules']);done('shipped_plan_cannot_be_deleted_from_ui')
         stage='logout'
         sidebar_action(page,'#logout',close=False);page.locator('#login-submit').wait_for()
         assert page.request.get(base+'/admin/api/workbench').status==401

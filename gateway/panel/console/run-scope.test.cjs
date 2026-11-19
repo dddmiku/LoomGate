@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(__dirname + '/app.js', 'utf8');
 function drive(task) {
-  const code = source.slice(source.indexOf('  function confirmRun('), source.indexOf('  async function schedules('));
+  const code = source.slice(source.indexOf('  function confirmRun('), source.indexOf('  // legacy_enabled 是'));
   const captured = {req: null, opened: false, toast: null, submitted: false};
   const context = {
     state: {taskAccount: 'scope-account-default', taskProvider: 'workbuddy', pending: new Set()},

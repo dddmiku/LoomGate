@@ -219,7 +219,7 @@ func (v *Vault) SetEnabled(id string, enabled bool, expected uint64) (Account, e
 			secret[i] = 0
 		}
 	}()
-	if a.Provider != "doubao" || a.Revision != expected {
+	if a.Revision != expected {
 		return Account{}, ErrConflict
 	}
 	a.Enabled = enabled

@@ -42,22 +42,25 @@ def sidebar_action(page, selector, close=True):
 
 
 def select_task(page, key, action=None, first=False):
-    """Select a task in the grouped task center.
+    """Trigger a row action in the task center.
 
-    The list is grouped by (provider, realm, task key); accounts are listed in
-    the detail pane. Rows carry ``data-task`` with the task key, so the helper
-    keeps working; the per-account action button lives in the detail pane and
-    uses ``data-task-index``.
+    The task page renders one row per shipped plan (data-task = plan task key)
+    plus catalog-only rows for discovered tasks without a plan. Actions live on
+    the row itself: 运行 = run-plan, 定时 = edit-plan-time, 日志 = task-log.
+    Historical action names from the old detail-pane layout are mapped here so
+    existing acceptance scripts keep their intent.
     """
     row = page.locator('[data-task="' + key + '"]')
     if first:
         row = row.first
-    if not row.is_visible() and page.locator('[data-action=task-back]').is_visible():
-        page.locator('[data-action=task-back]').click()
-    row.click()
-    page.locator('#task-detail').wait_for(state='visible')
+    row.wait_for(state='visible')
     if action:
-        page.locator('#task-detail [data-action="' + action + '"]').first.click()
+        mapped = {
+            'task-schedule': 'edit-plan-time',
+            'run-task': 'run-plan',
+            'manual-task': 'manual-plan',
+        }.get(action, action)
+        row.locator('[data-action="' + mapped + '"]').first.click()
 
 
 def plan_timing(page):

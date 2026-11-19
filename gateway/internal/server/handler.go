@@ -1694,16 +1694,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reasoningLoopGuard := h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard
-	if namespace, _, ok := strings.Cut(peek.Model, ":"); ok {
+	if namespace, _, ok := strings.Cut(peek.Model, ":"); ok && namespace != "" {
 		if provider := h.cfg.Inference[namespace]; provider != nil {
 			h.providerChat(w, r, providerBody, peek.Model, peek.Stream, st, provider)
 			return
 		}
-		if namespace == "doubao" {
-			st.status = 400
-			writeOpenAIError(w, 400, "provider_unavailable", "requested provider is not configured")
-			return
-		}
+		// Unknown prefixes are not provider namespaces unless a provider is
+		// registered under that name: `cn:`/`global:`/`trae:` are routing
+		// realms and anything else is a plain model name that may legitimately
+		// contain a colon. The legacy pool resolves those below.
 	}
 	if info, ok := requestKeyInfo(r); ok && info.ReasoningLoopGuard != nil {
 		reasoningLoopGuard = *info.ReasoningLoopGuard

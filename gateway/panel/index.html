@@ -4158,7 +4158,7 @@ async function loadKeyModels(){
     KS.modelItems = (result && Array.isArray(result.items) && result.items.length)
       ? result.items
       : KS.models.map(function(id){ return {id:id}; });
-    // provider_errors 表示某个渠道的目录没读到（如豆包超时）。不显示它，
+    // provider_errors 表示某个渠道的目录没读到。不显示它，
     // 用户会把「这个渠道失败」当成「本来就没有这些模型」，甚至据此删掉已有
     // 绑定。只含 {provider,code}，不展示上游原文。
     KS.providerErrors = (result && Array.isArray(result.provider_errors)) ? result.provider_errors : [];
@@ -4238,7 +4238,7 @@ function renderModelPanel(){
   // 看不出是哪个渠道，也看不出「已有绑定仍然保留」。
   var providerErrors = Array.isArray(KS.providerErrors) ? KS.providerErrors : [];
   // 渠道显示名：只在这一处用，写成局部常量避免依赖 workspace.js 的加载顺序。
-  var providerLabel = {workbuddy:'WorkBuddy',trae:'Trae',doubao:'豆包'};
+  var providerLabel = {workbuddy:'WorkBuddy',trae:'Trae',autoclaw:'AutoClaw'};
   var errorNote = providerErrors.length
     ? '<div class="mempty" role="status">部分渠道目录暂不可用（' +
       esc(providerErrors.map(function(e){ return providerLabel[e.provider] || e.provider; }).join('、')) +
@@ -4653,8 +4653,8 @@ $('#keyForm').addEventListener('submit', async function(event){
   var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value), reasoning_loop_guard:$('#keyGuard').checked, global_fallback_to_cn:$('#keyGlobalFallback').checked};
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
-  // 单项上限与密钥库一致（256 字节）：豆包的完整模型名是
-  // doubao:<mode>:<上游 ID>，很容易超过 64 字符。旧面板在这里按 64 拦，
+  // 单项上限与密钥库一致（256 字节）：完整模型名可能带 provider:mode:id 前缀，
+  // 很容易超过 64 字符。旧面板在这里按 64 拦，
   // 而同一份绑定从新控制台/API 保存是成功的——同一份配置两个入口结论不同。
   if (body.models.some(function(item){return item.length > 256;})){keyFormError('单个模型名不能超过 256 个字符');$('#keyModels').focus();return;}
   // 绑定按完整模型名逐字比对，裸名一条也匹配不上（模型列表里没有裸名）。
@@ -6053,7 +6053,7 @@ document.addEventListener('change', function(e){
 
 "use strict";
 var LW={providers:[],schedules:[],runs:[],tasks:[],models:[],offset:0,epoch:0};
-var LP={workbuddy:'WorkBuddy',trae:'Trae',doubao:'豆包'};
+var LP={workbuddy:'WorkBuddy',trae:'Trae',autoclaw:'AutoClaw'};
 var LSTATUS={queued:'排队中',running:'执行中',succeeded:'已核实完成',failed:'失败',canceled:'已取消',uncertain:'结果待核实',skipped:'已跳过',manual_action:'需要人工操作'};
 function loomEmpty(title,text){return '<div class="loom-state"><strong>'+esc(title)+'</strong>'+esc(text)+'</div>';}
 function loomNotice(id,text){var el=$('#'+id);if(el)el.innerHTML=text?'<div class="loom-notice" role="alert">'+esc(text)+'</div>':'';}
@@ -6132,13 +6132,13 @@ function catalogOptions(){
   var options=LC.accounts.filter(function(a){return !provider.value||a.provider===provider.value;});
   account.innerHTML='<option value="">全部账号</option>'+options.map(function(a){return '<option value="'+esc(a.id)+'">'+esc(a.id)+(a.enabled?'':' · 已停用')+'</option>';}).join('');
   if(options.some(function(a){return a.id===chosen;}))account.value=chosen;
-  account.disabled=provider.value!==''&&provider.value!=='doubao';
+  var chosenProvider=LC.providers.find(function(p){return p.id===provider.value;});
+  account.disabled=!(chosenProvider&&chosenProvider.catalog_scope==='account');
 }
 // 聚合目录 /api/models 里每个 provider 的命名空间是确定的：WorkBuddy 用
-// cn:/global:，Trae 用 trae:。豆包是账号级目录（/api/workbench/models 按账号
-// 返回、带 account_id），聚合目录里的 doubao:* 没有账号归属，不能猜。
-// 原实现是「非 trae 即 WorkBuddy」，于是豆包推理注册后 doubao:* 会混进
-// WorkBuddy 的目录，用户以为选的是 WorkBuddy 模型。未知命名空间同理丢弃。
+// cn:/global:，Trae 用 trae:。账号级目录的 provider（scope=account）走
+// /api/workbench/models，按账号返回并带 account_id；聚合目录里它的命名空间
+// 没有账号归属，不能猜。未知命名空间同理丢弃。
 var LEGACY_PROVIDER_PREFIXES={workbuddy:['cn:','global:'],trae:['trae:']};
 function legacyCatalogGroups(items,provider){
   var groups={};
@@ -6166,7 +6166,7 @@ async function loomProviders(){
       var counts=p.accounts||{},isCatalogOnly=!p.inference_available;
       return '<article class="loom-card" data-provider="'+esc(p.id)+'"><div class="card-head"><span class="provider-icon">'+esc(p.name.slice(0,1))+'</span><div><h3>'+esc(p.name)+'</h3><code>'+esc(p.id)+'</code></div></div><div class="loom-tags"><span class="loom-tag '+(isCatalogOnly?'wait':'good')+'">'+(isCatalogOnly?'目录与任务接入':'API 调用已接入')+'</span><span class="loom-tag">'+esc(counts.enabled||0)+' / '+esc(counts.total||0)+' 个账号启用</span></div><p>'+(isCatalogOnly?'可查看账号模型目录。当前仅提供账号目录与任务接入，还不能通过网关调用这些模型。':'模型来自当前服务目录，可继续使用已有账号登录与网关 API。')+'</p>'+(p.error_code?'<p role="alert">'+esc(CERROR[p.error_code]||'服务状态暂时不可用。')+'</p>':'')+'<div class="card-actions"><button class="btn pri" data-catalog-provider="'+esc(p.id)+'">查看模型目录</button>'+(p.login_available?'<button class="btn" data-loom-add="'+esc(p.id)+'">管理账号</button>':'')+'</div></article>';
     }).join('')||loomEmpty('尚无已注册服务','服务配置就绪后可在此查看。');
-    loomNotice('providersNotice',meta.accountError?'加密账号存储读取失败，豆包账号信息暂不可用。':'');
+    loomNotice('providersNotice',meta.accountError?'加密账号存储读取失败，账号信息暂不可用。':'');
   }catch(e){if(generation!==LC.generation)return;$('#providerGrid').innerHTML=loomEmpty('服务信息读取失败','检查网关连接后，点击刷新目录重试。');loomNotice('providersNotice','无法读取当前服务能力。');}
   finally{clearTimeout(timer);if(generation===LC.generation)LC.controller=null;}
 }
@@ -6181,20 +6181,23 @@ async function loomModels(force,append){
     LC.providers=meta.providers;LC.accounts=meta.accounts;LC.initialized=true;catalogOptions();
     provider=$('#modelProvider').value;account=$('#modelAccount').value;
     var jobs=[];
+    var chosen=LC.providers.find(function(p){return p.id===provider;});
+    var accountScoped=!!chosen&&chosen.catalog_scope==='account';
     // Legacy catalogs remain provider-wide. Do not label a union as an account
-    // specific result. Selecting a Doubao account never queries legacy models.
-    if(!append&&provider!=='doubao'&&!account){
+    // specific result. Selecting an account-scoped provider never queries them.
+    if(!append&&!accountScoped&&!account){
       jobs.push(catalogAPI(force?'api/models/refresh':'api/models',force?{}:undefined,controller.signal).then(function(d){
         var items=Array.isArray(d.items)?d.items:[];return {kind:'legacy',items:items};
       }).catch(function(){return {kind:'legacy',error:true};}));
     }
-    if(!provider||provider==='doubao'){
-      var query='?provider=doubao&limit=20&offset='+(append?LC.offset:0)+(force?'&refresh=1':'')+(account?'&account='+encodeURIComponent(account):'');
-      jobs.push(catalogAPI('api/workbench/models'+query,undefined,controller.signal).then(function(d){return {kind:'doubao',page:d};}).catch(function(){return {kind:'doubao',error:true};}));
+    if(!provider||accountScoped){
+      var query='?limit=20&offset='+(append?LC.offset:0)+(force?'&refresh=1':'')+(provider?'&provider='+encodeURIComponent(provider):'')+(account?'&account='+encodeURIComponent(account):'');
+      var kind=provider||'account';
+      jobs.push(catalogAPI('api/workbench/models'+query,undefined,controller.signal).then(function(d){return {kind:kind,page:d};}).catch(function(){return {kind:kind,error:true};}));
     }
     var results=await Promise.all(jobs);if(generation!==LC.generation)return;
     results.forEach(function(result){
-      if(result.error){LC.rows.push({provider_id:result.kind==='legacy'?(provider||'legacy'):'doubao',status:'unavailable',error_code:'catalog_failed',models:[]});return;}
+      if(result.error){LC.rows.push({provider_id:result.kind==='legacy'?(provider||'legacy'):result.kind,status:'unavailable',error_code:'catalog_failed',models:[]});return;}
       if(result.kind==='legacy'){
         var groups=legacyCatalogGroups(result.items,provider);
         Object.keys(groups).forEach(function(p){LC.rows.push({provider_id:p,status:'ready',routing_status:'available',scope:'provider',models:groups[p]});});
@@ -6223,7 +6226,7 @@ function loomModelCards(){
     });
   });
   $('#catalogStatus').innerHTML=states.join('');$('#modelCount').textContent=models.length+' 个模型条目';
-  $('#modelsMore').classList.toggle('hide',!LC.hasMore);$('#modelsPageInfo').textContent=LC.total?'豆包账号 '+Math.min(LC.offset,LC.total)+' / '+LC.total:'';
+  $('#modelsMore').classList.toggle('hide',!LC.hasMore);$('#modelsPageInfo').textContent=LC.total?'账号级目录 '+Math.min(LC.offset,LC.total)+' / '+LC.total:'';
   var stale=LC.rows.some(function(r){return r.status==='stale';});
   loomNotice('modelsNotice',LC.error||(stale?'部分目录刷新失败，旧缓存仅供查看；缓存过旧时不再展示模型。':''));
   $('#modelGrid').innerHTML=models.map(function(entry){

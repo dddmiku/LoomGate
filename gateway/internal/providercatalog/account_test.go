@@ -15,11 +15,11 @@ func TestAccountToggleRequiresRevisionAndExplicitState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer v.Close()
-	a, err := v.Put(accountvault.Account{ID: "synthetic-account", Provider: "doubao", Enabled: true}, []byte(`{"synthetic":"private-session"}`), 0)
+	a, err := v.Put(accountvault.Account{ID: "synthetic-account", Provider: "fixture", Enabled: true}, []byte(`{"synthetic":"private-session"}`), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(Options{Accounts: v})
+	s := New(Options{Accounts: v, Sources: []ProviderSource{fixtureSource{id: "fixture"}}})
 	for _, tc := range []struct {
 		body string
 		code int

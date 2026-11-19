@@ -72,67 +72,32 @@ def main():
         nav('tasks'); settled()
         assert page.locator('.scope-toolbar select,.scope-toolbar details').count() == 0
         assert page.locator('#task-provider [aria-pressed=true]').inner_text() == 'WorkBuddy'
-        # Grouped by provider+realm+task key: balance = one CN row + one global
-        # row, with the 3 accounts listed in each detail pane.
-        assert page.locator('[data-task=balance]').count() == 2
-        choose_account(page, '#task-account', '1003'); settled()
-        assert requests[-1]['query'] == {'provider': ['workbuddy'], 'accounts': ['1003']}
+        # 任务页现在以随包计划为行：没有账号范围选择器，目录请求也不带 accounts。
+        assert page.locator('#task-account').count() == 0
+        plans = page.locator('[data-plan-row]')
+        plans.first.wait_for()
+        assert plans.count() == 11, plans.count()
         assert page.locator('[data-task=balance]').count() == 1
-        assert page.locator('[data-task=checkin]').count() == 0
-        assert page.locator('#task-account').evaluate('(e)=>e===document.activeElement')
-        choose_account(page, '#task-account', ''); settled()
-        assert requests[-1]['query'] == {'provider': ['workbuddy']}
-        assert page.locator('[data-task=balance]').count() == 2
-        # Rows are ordered by Chinese task name, so realm order is not fixed:
-        # one row is the CN group (2 accounts) and the other is global (1).
-        rows = page.locator('[data-task=balance]'); counts = []
-        for i in range(rows.count()):
-            page.locator('[data-action=task-back]').click() if page.locator('[data-action=task-back]').is_visible() else None
-            rows.nth(i).click(); page.locator('#task-detail').wait_for()
-            counts.append(page.locator('#task-detail .account-task-row').count())
-        assert sorted(counts) == [1, 2], counts
-        report['actions'].append('single_and_all_scope_reach_actual_catalog_and_change_task_rows')
+        assert page.locator('#task-list.loading').count() == 0
+        report['actions'].append('task_page_rows_come_from_shipped_plans_without_account_scope')
         shot('filters-tasks-desktop.png')
-        page.locator('#task-account').click(); shot('filters-account-desktop.png'); page.keyboard.press('Escape')
 
         stage = 'search-cancel'
         choose_provider(page, '#task-provider', 'doubao'); settled()
         assert requests[-1]['query'] == {'provider': ['doubao']}
-        page.locator('#task-account').click()
-        assert page.locator('#scope-search').evaluate('(e)=>e===document.activeElement')
-        assert page.locator('#scope-accounts button').count() == 23
-        assert page.locator('[data-account-choice=c-disabled]').count() == 0
-        count = len(requests)
-        page.locator('#scope-search').fill('Z-PAGE-20')
-        assert page.locator('#scope-accounts button').count() == 1
-        assert page.locator('#scope-accounts button').inner_text().startswith('z-page-20')
-        page.locator('#scope-search').fill('not-an-account')
-        assert page.locator('#scope-accounts button').count() == 0
-        assert '没有匹配' in page.locator('#scope-accounts').inner_text()
-        page.locator('.scope-footer [data-action=close]').click()
-        assert len(requests) == count
-        assert '全部已启用' in page.locator('#task-account').inner_text()
-        page.locator('#task-account').click(); page.locator('#scope-search').fill('a-fixture')
-        page.keyboard.press('Escape')
-        assert page.locator('#task-account').evaluate('(e)=>e===document.activeElement')
-        assert len(requests) == count
-        report['actions'].append('search_empty_state_disabled_exclusion_cancel_escape_no_filter_request')
+        # 任务页已经没有任何账号范围选择器：账号范围由「运行」时目录返回的
+        # 可执行账号决定，页面不维护第二份选中状态。
+        assert page.locator('#task-account').count() == 0
+        assert page.locator('#scope-search').count() == 0
+        report['actions'].append('task_page_has_no_account_scope_picker')
 
         stage = 'keyboard'
-        page.locator('#task-account').press('Enter')
-        page.locator('#scope-search').fill('a-fixture')
-        page.keyboard.press('Tab')  # all accounts
-        page.keyboard.press('Tab')  # matching account
-        assert page.locator('[data-account-choice=a-fixture]').evaluate('(e)=>e===document.activeElement')
-        page.keyboard.press('Enter')
-        page.wait_for_function('document.querySelector("#task-account strong")?.textContent==="a-fixture"')
-        settled()
-        assert requests[-1]['query'] == {'provider': ['doubao'], 'accounts': ['a-fixture']}
+        # 键盘只切服务；切回 WorkBuddy 后加载的仍是随包计划。
         choose_provider(page, '#task-provider', 'workbuddy'); settled()
         assert requests[-1]['query'] == {'provider': ['workbuddy']}
-        assert '全部已启用' in page.locator('#task-account').inner_text()
         assert page.locator('#task-provider [aria-pressed=true]').evaluate('(e)=>e===document.activeElement')
-        report['actions'].append('keyboard_select_and_provider_change_resets_scope')
+        page.locator('[data-plan-row]').first.wait_for()
+        report['actions'].append('keyboard_provider_change_keeps_task_plans')
 
         stage = 'model-and-account-pages'
         nav('models'); choose_provider(page, '#model-provider', 'doubao'); settled()
@@ -157,25 +122,26 @@ def main():
         report['actions'].append('model_scope_disabled_catalog_capabilities_and_connect_default')
 
         stage = 'responsive-and-modal-focus'
-        nav('tasks'); settled()
+        # 账号范围对话框现在只存在于模型页（按账号取目录）；任务页不再有
+        # 「当前选中账号」这种状态。这里锁的是同一个复用组件的焦点约束。
+        nav('models'); choose_provider(page, '#model-provider', 'doubao'); settled()
         for width, height in ((1440, 1000), (1024, 768), (768, 844), (390, 844), (320, 568)):
             page.set_viewport_size({'width': width, 'height': height}); bounds()
-            if width == 390: shot('filters-tasks-mobile.png')
-            page.locator('#task-account').click(); bounds()
+            page.locator('#model-account:not([disabled])').click(); bounds()
             assert page.locator('#dialog').get_attribute('class') == 'account-dialog'
             for _ in range(10):
                 page.keyboard.press('Tab')
                 assert page.locator('#dialog').evaluate('(d)=>d.contains(document.activeElement)')
-            page.locator('#scope-search').fill('100')
+            page.locator('#scope-search').fill('a-fixture')
             page.locator('#scope-search').focus()
-            if width == 390: shot('filters-account-mobile.png')
             page.keyboard.press('Escape')
-            assert page.locator('#task-account').evaluate('(e)=>e===document.activeElement')
+            assert page.locator('#model-account').evaluate('(e)=>e===document.activeElement')
         report['actions'].append('five_widths_no_overflow_modal_focus_containment_and_return')
         page.set_viewport_size({'width': 1440, 'height': 1000})
-        page.locator('#theme').click(); page.locator('#task-account').click(); shot('filters-account-dark.png')
+        page.locator('#theme').click(); page.locator('#model-account:not([disabled])').click(); shot('filters-account-dark.png')
         page.keyboard.press('Escape'); page.locator('#theme').click()
-        page.locator('[data-action=run-all]').click()
+        # 运行确认框仍使用普通 dialog 样式，关闭后样式复原。
+        nav('tasks'); page.locator('[data-plan-row] [data-action=run-plan]').first.click()
         assert page.locator('#dialog').get_attribute('class') == ''
         assert page.locator('#run-form').is_visible()
         page.keyboard.press('Escape')

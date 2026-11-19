@@ -270,68 +270,84 @@ func main() {
 	var workbenchHandler http.Handler
 	var taskController server.TaskController = sch
 	if useLoomGateWorkbench() {
-		workbench, workbenchHandler, err = openWorkbenchWithLegacySchedules(stateDirOf(cfg.StateFile), p, up, cfg.Schedule, cfg.ExpiringSoonDur)
+		workbench, workbenchHandler, err = openWorkbenchWithBuiltinSchedules(stateDirOf(cfg.StateFile), p, up, cfg.ExpiringSoonDur)
 		if err != nil {
 			log.Fatalf("open task engine: %v", err)
 		}
 		// Never run both schedulers against the same account pool.
 		taskController = nil
 	}
-	switch {
-	case !cfg.Schedule.CheckinEnabled:
-		log.Printf("WorkBuddy 签到已禁用（schedule.checkin_enabled=false）")
-	default:
-		log.Printf("WorkBuddy 签到已启用：%v 点（cn/global 签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
-	}
-	// Trae 是另一个站点，独立排程、独立开关（见 scheduler 的 traeCheckAll）。
-	switch {
-	case !cfg.Schedule.TraeCheckEnabled:
-		log.Printf("Trae 签到已禁用（schedule.trae_check_enabled=false）")
-	default:
-		// 文案要与实现一致：9074 是**设备维度**的时段性限流，撞上后会换设备号重试一次，
-		// 仍失败则记有界退避并由后台重试循环（60s 一轮）在退避到期后继续试到当天签上。
-		// 旧的「当天不再重试」是早期误判留下的文案，早已不成立。
-		log.Printf("Trae 签到已启用：%v 点（独立站点，9074 限流时换设备号重试 + 后台自动重试）", cfg.Schedule.TraeCheckHours)
-	}
-	switch {
-	case !cfg.Schedule.TravelEnabled:
-		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
-	default:
-		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
-	}
-	switch {
-	case !cfg.Schedule.ActivityEnabled:
-		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
-	default:
-		log.Printf("活跃上报已启用：%v 点（每号 %d 条，点亮连登 + 补满领猫对话门槛）", cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
-	}
-	if !cfg.Schedule.KeepaliveEnabled {
-		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	// 任务计划属于随包发布的引擎（taskproviders.BuiltinSchedules），旧 config
+	// 的 schedule 段只服务 legacy scheduler。新引擎模式下不再按旧配置打印
+	// 「已启用/已禁用」，避免面板之外的日志与新任务页互相矛盾。
+	if useLoomGateWorkbench() {
+		if count := len(workbench.engine.Schedules()); count > 0 {
+			active := 0
+			for _, plan := range workbench.engine.Schedules() {
+				if plan.Enabled {
+					active++
+				}
+			}
+			log.Printf("[task-engine] 随包任务计划 %d 条，已启用 %d 条；任务与定时在「任务」页管理", count, active)
+		}
 	} else {
-		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
-	}
-	if !cfg.Schedule.SchoolEnabled {
-		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
-	} else {
-		log.Printf("开学季任务已启用：%v 点（school_open_day_2026.py ALL --run --yes）", cfg.Schedule.SchoolHours)
-	}
-	if !cfg.Schedule.CatEnabled {
-		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
-	} else {
-		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
-	}
-	if !cfg.Schedule.GrowthEnabled {
-		log.Printf("成长中心已禁用（schedule.growth_enabled=false）")
-	} else {
-		log.Printf("成长中心已启用：%v 点（原生七段：旅行/任务奖/补登/兑换/抽奖/Buddy盲盒/展示；仅 CN）", cfg.Schedule.GrowthHours)
-	}
-	// 余额刷新：与签到解耦的纯读任务，是「优先消耗快过期积分」的数据来源。
-	// 关掉它会让池里 credits_expiring 停止更新，选号失去快过期偏好。
-	if !cfg.Schedule.BalanceEnabled {
-		log.Printf("余额刷新已禁用（schedule.balance_enabled=false）——池内积分与快过期分桶将不再更新，" +
-			"「优先消耗快过期积分」选号随之失效")
-	} else {
-		log.Printf("余额刷新已启用：%v 点（纯读查余额，驱动快过期积分优先消耗）", cfg.Schedule.BalanceHours)
+		switch {
+		case !cfg.Schedule.CheckinEnabled:
+			log.Printf("WorkBuddy 签到已禁用（schedule.checkin_enabled=false）")
+		default:
+			log.Printf("WorkBuddy 签到已启用：%v 点（cn/global 签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+		}
+		// Trae 是另一个站点，独立排程、独立开关（见 scheduler 的 traeCheckAll）。
+		switch {
+		case !cfg.Schedule.TraeCheckEnabled:
+			log.Printf("Trae 签到已禁用（schedule.trae_check_enabled=false）")
+		default:
+			// 文案要与实现一致：9074 是**设备维度**的时段性限流，撞上后会换设备号重试一次，
+			// 仍失败则记有界退避并由后台重试循环（60s 一轮）在退避到期后继续试到当天签上。
+			// 旧的「当天不再重试」是早期误判留下的文案，早已不成立。
+			log.Printf("Trae 签到已启用：%v 点（独立站点，9074 限流时换设备号重试 + 后台自动重试）", cfg.Schedule.TraeCheckHours)
+		}
+		switch {
+		case !cfg.Schedule.TravelEnabled:
+			log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
+		default:
+			log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+		}
+		switch {
+		case !cfg.Schedule.ActivityEnabled:
+			log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
+		default:
+			log.Printf("活跃上报已启用：%v 点（每号 %d 条，点亮连登 + 补满领猫对话门槛）", cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
+		}
+		if !cfg.Schedule.KeepaliveEnabled {
+			log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+		} else {
+			log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
+		}
+		if !cfg.Schedule.SchoolEnabled {
+			log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
+		} else {
+			log.Printf("开学季任务已启用：%v 点（school_open_day_2026.py ALL --run --yes）", cfg.Schedule.SchoolHours)
+		}
+		if !cfg.Schedule.CatEnabled {
+			log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
+		} else {
+			log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+		}
+		if !cfg.Schedule.GrowthEnabled {
+			log.Printf("成长中心已禁用（schedule.growth_enabled=false）")
+		} else {
+			log.Printf("成长中心已启用：%v 点（原生七段：旅行/任务奖/补登/兑换/抽奖/Buddy盲盒/展示；仅 CN）", cfg.Schedule.GrowthHours)
+		}
+		// 余额刷新：与签到解耦的纯读任务，是「优先消耗快过期积分」的数据来源。
+		// 关掉它会让池里 credits_expiring 停止更新，选号失去快过期偏好。
+		if !cfg.Schedule.BalanceEnabled {
+			log.Printf("余额刷新已禁用（schedule.balance_enabled=false）——池内积分与快过期分桶将不再更新，" +
+				"「优先消耗快过期积分」选号随之失效")
+		} else {
+			log.Printf("余额刷新已启用：%v 点（纯读查余额，驱动快过期积分优先消耗）", cfg.Schedule.BalanceHours)
+		}
+
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

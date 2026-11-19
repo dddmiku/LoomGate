@@ -23,20 +23,20 @@ def main():
    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1'),'page_overflow'
   def shot(name):
    page.locator('h1').first.click();page.screenshot(path=str(out/name),full_page=True,animations='disabled',mask=[page.locator('input[type=password]')]);report['screenshots'].append(name)
-  def nav(route):
+  def nav(target_route):
    if not page.locator('#navigation').is_visible():page.locator('#navigation-toggle').click()
-   page.locator('#navigation a[href="#'+route+'"]').click()
+   page.locator('#navigation a[href="#'+target_route+'"]').click()
    page.locator('#view > .loading').wait_for(state='detached')
-   page.wait_for_function('(route)=>document.querySelector("#navigation a[aria-current=page]")?.hash==="#"+route',arg=route)
-   if route=='models':page.locator('[data-action=model-refresh]:not([disabled])').wait_for()
-   if route=='accounts':page.locator('#account-list.loading').wait_for(state='detached')
-   if route=='tasks':page.locator('#task-list.loading').wait_for(state='detached')
+   page.wait_for_function('(target_route)=>document.querySelector("#navigation a[aria-current=page]")?.hash==="#"+target_route',arg=target_route)
+   if target_route=='models':page.locator('[data-action=model-refresh]:not([disabled])').wait_for()
+   if target_route=='accounts':page.locator('#account-list.loading').wait_for(state='detached')
+   if target_route=='tasks':page.locator('#task-list.loading').wait_for(state='detached')
   fields=dict(line.split(':',1) for line in (root/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in line)
   page.goto(base+'/admin/');page.locator('#login-submit').wait_for();bounds();shot('layout-login-desktop.png')
   page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
   for width in (1440,1024,768,390,320):
    page.set_viewport_size({'width':width,'height':1000 if width>900 else 844})
-   for route in ('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings'):
+   for route in ('overview','providers','accounts','models','tasks','usage','logs','keys','migration','settings'):
     stage=f'{width}:{route}';nav(route);bounds();report['pages']+=1
     if width<=900:assert not page.locator('#navigation').is_visible()
     assert page.locator('.hero,.metrics,.card,.eyebrow').count()==0
@@ -48,7 +48,7 @@ def main():
     if (width,route) in ((1440,'overview'),(1440,'models'),(390,'models'),(390,'overview'),(1024,'providers')):shot(f'layout-{width}-{route}.png')
    if width<=900:
     page.locator('#navigation-toggle').click();links=page.locator('#navigation a')
-    assert links.count()==len(('overview','providers','accounts','models','tasks','schedules','runs','usage','logs','keys','migration','settings'))
+    assert links.count()==len(('overview','providers','accounts','models','tasks','usage','logs','keys','migration','settings'))
     sidebar=page.locator('#sidebar').bounding_box()
     assert sidebar['x']==0 and sidebar['height']>=page.viewport_size['height']-sidebar['y']-1
     for link in links.all():
@@ -62,8 +62,11 @@ def main():
    if width<=700:
     assert page.locator('#model-account').is_visible()
     assert page.locator('#model-account').is_visible() and page.locator('#model-capability').is_visible();bounds()
-   stage=f'{width}:plan-dialog';nav('tasks');choose_provider(page,'#task-provider','doubao');page.locator('[data-task]').first.wait_for()
-   page.locator('[data-action=select-task-group]').first.click();page.locator('#task-detail [data-action=task-schedule-group]').wait_for();page.locator('#task-detail [data-action=task-schedule-group]').click()
+   stage=f'{width}:plan-dialog';nav('tasks')
+   if page.locator('#task-provider [data-provider-choice=workbuddy]').get_attribute('aria-pressed')!='true':
+    choose_provider(page,'#task-provider','workbuddy')
+   page.locator('[data-plan-row] [data-action=edit-plan-time]').first.wait_for()
+   page.locator('[data-plan-row] [data-action=edit-plan-time]').first.click();page.locator('#plan-save').wait_for()
    plan_times(page,['08:20','18:20'])
    bounds();assert page.locator('#dialog').evaluate('(d)=>d.scrollWidth<=d.clientWidth+1')
    assert page.locator('#plan-save').is_visible();page.locator('#plan-save').scroll_into_view_if_needed()
@@ -107,27 +110,30 @@ def main():
   stage='desktop-short-height';page.set_viewport_size({'width':1280,'height':600})
   nav('models');page.locator('#navigation a[href="#settings"]').scroll_into_view_if_needed()
   nav('accounts');page.evaluate('window.scrollTo(0,document.documentElement.scrollHeight)')
-  assert page.locator('#sidebar').bounding_box()['y']==0
+  # 侧栏在短视口下整体可见（sticky 顶部或页面不足一屏时跟随文档顶部），
+  # 且底部控制按钮不能被裁掉。
+  bar=page.locator('#sidebar').bounding_box()
+  assert bar and abs(bar['y'])<=1 and bar['y']+bar['height']<=page.viewport_size['height']+1,bar
   assert page.locator('#theme').bounding_box()['y']>=0
   page.locator('#navigation a[href="#tasks"]').click()
-  page.locator('#task-list.loading').wait_for(state='detached')
+  page.locator('[data-plan-row]').first.wait_for()
   bounds();report['actions'].append('desktop_sidebar_independent_scroll_and_bottom_controls')
-  stage='dark-contrast';page.set_viewport_size({'width':1440,'height':1000});nav('schedules')
+  stage='dark-contrast';page.set_viewport_size({'width':1440,'height':1000});nav('tasks')
   def luminance(color):
    values=[int(x) / 255 for x in color[color.index('(')+1:color.index(')')].split(',')[:3]]
    values=[x/12.92 if x<=.04045 else ((x+.055)/1.055)**2.4 for x in values]
    return sum(x*y for x,y in zip(values,(.2126,.7152,.0722)))
   for theme in ('light','dark'):
    if page.locator('html').get_attribute('data-theme')!=theme:page.locator('#theme').click()
-   button=page.locator('[data-action=new-schedule]');button.hover()
+   button=page.locator('[data-plan-row] [data-action=toggle-schedule]').first;button.hover()
    colors=button.evaluate('(e)=>{const s=getComputedStyle(e);return [s.color,s.backgroundColor]}')
    lo,hi=sorted(luminance(x) for x in colors);assert (hi+.05)/(lo+.05)>=4.5
-   if theme=='dark':shot('layout-plans-dark.png')
+   if theme=='dark':shot('layout-tasks-dark.png')
   page.locator('#theme').click();report['actions'].append('primary_hover_contrast_light_and_dark')
   browser.close()
  assert not report['page_errors'] and not report['console_errors'] and not report['external_requests']
 try:main();report['result']='PASS'
-except Exception as e:report.update(result='FAIL',stage=stage,error_type=type(e).__name__,source_lines=[x.lineno for x in traceback.extract_tb(e.__traceback__) if x.filename.endswith('console_layout.py')])
+except Exception as e:report.update(result='FAIL',stage=stage,error_type=type(e).__name__,error_message=str(e)[:500],source_lines=[x.lineno for x in traceback.extract_tb(e.__traceback__) if x.filename.endswith('console_layout.py')])
 (out/'layout-browser.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps({k:report[k] for k in ('result','pages','stage','error_type','source_lines') if k in report}))
 sys.exit(0 if report['result']=='PASS' else 1)

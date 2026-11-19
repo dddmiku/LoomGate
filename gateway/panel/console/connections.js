@@ -13,11 +13,9 @@ window.LoomConnections = (() => {
   const esc=x=>ui.esc(x);
   function stop(){clearTimeout(timer);generation++;current=null;}
   function init(helpers){ui=helpers;document.getElementById('dialog').addEventListener('close',stop);}
-  async function list(target){
-    const data=await ui.api('connections/flows');
-    target.innerHTML=(data.flows || []).length?`<section class="panel section-gap"><div class="panel-title"><h2>接入进度</h2><span class="muted small">刷新和重启后可继续查看</span></div>${data.flows.slice().reverse().map(f=>`<div class="catalog-row"><div><h3>${esc(ui.providerName(f.provider))} · ${esc(labels[f.status] || f.status)}</h3><p class="muted small">${esc(f.notice || '')}</p></div><button data-connection-resume="${esc(f.id)}">查看流程</button></div>`).join('')}</section>`:'';
-    target.querySelectorAll('[data-connection-resume]').forEach(b=>b.onclick=()=>show(data.flows.find(f=>f.id===b.dataset.connectionResume)));
-  }
+  // 账号页不再渲染「接入进度」历史列表：用户明确要求去掉。未完成的登录流程
+  // 仍可在重新发起时从服务端恢复，不需要一页过期/已取消的历史记录。
+  async function list(){ /* intentionally empty: no 接入进度 section */ }
   async function open(provider,accountID='',preferredMethod='',preferredRealm=''){
     stop();const data=await ui.api('connections/providers');const providers=data.providers||[];
     if(!providers.length){ui.openDialog('添加账号','<p class="notice">暂无可用服务，请稍后刷新。</p>','account-dialog connection-drawer');return;}
@@ -27,11 +25,11 @@ window.LoomConnections = (() => {
     const form=document.getElementById('connection-start'),value=name=>form.querySelector(`[name="${name}"]:checked`)?.value;
     const methodReason=m=>{
       if(m.available)return m.id==='desktop'?'将读取官方客户端当前账号并复核后保存。':'授权状态由服务端确认；成功后自动核验并保存。';
-      if(m.reason==='official_desktop_connection_required')return '当前网关运行环境没有可用的官方客户端连接组件，无法从这里添加豆包账号。';
+      if(m.reason==='official_desktop_connection_required')return '当前网关运行环境没有可用的官方客户端连接组件，无法从这里添加需要客户端的账号。';
       if(m.reason==='official_sdk_context_and_signer_required')return '当前网关运行环境缺少官方客户端连接组件。';
       return '当前环境暂不可用。';
     };
-    const selectMethod=()=>{const p=providers.find(p=>p.id===value('provider')),methods=p?.methods||[],selectedMethod=methods.find(m=>m.id===preferredMethod&&m.available)||methods.find(m=>m.available);form.querySelector('#connection-method').innerHTML=methods.map(m=>radio('method',m.id,m.name,m.id===selectedMethod?.id,!m.available,methodReason(m))).join('')||'<p class="muted">当前环境没有可用登录方式。</p>';form.querySelector('#connection-realm-label').hidden=p?.id!=='workbuddy';const hint=form.querySelector('#connection-hint');if(selectedMethod){hint.textContent=methodReason(selectedMethod);}else if(p?.id==='doubao'){hint.textContent='豆包账号需要官方客户端（豆包账号/飞书个人版）在本机登录后，由网关复用该会话。当前服务端环境未提供该连接组件，无法添加豆包账号；这不是浏览器登录失败，也不会重发短信。';}else{hint.textContent='此运行环境尚未接好官方客户端登录组件，不能开始登录。请在安装了官方客户端的桌面运行并配置连接组件。';}form.querySelector('#connection-begin').disabled=!selectedMethod;const label=methods.find(m=>m.id===value('method'))?.name||'';form.querySelector('#connection-begin').textContent=selectedMethod?'开始'+label:'暂不可用';};
+    const selectMethod=()=>{const p=providers.find(p=>p.id===value('provider')),methods=p?.methods||[],selectedMethod=methods.find(m=>m.id===preferredMethod&&m.available)||methods.find(m=>m.available);form.querySelector('#connection-method').innerHTML=methods.map(m=>radio('method',m.id,m.name,m.id===selectedMethod?.id,!m.available,methodReason(m))).join('')||'<p class="muted">当前环境没有可用登录方式。</p>';form.querySelector('#connection-realm-label').hidden=p?.id!=='workbuddy';const hint=form.querySelector('#connection-hint');if(selectedMethod){hint.textContent=methodReason(selectedMethod);}else if(p?.id==='autoclaw'){hint.textContent='AutoClaw 是纯 HTTP 模型调用：把已有的 accessToken / refreshToken 凭证导入账号池即可，不需要浏览器登录，也不需要运行任何客户端。';}else{hint.textContent='此运行环境尚未接好官方客户端登录组件，不能开始登录。请在安装了官方客户端的桌面运行并配置连接组件。';}form.querySelector('#connection-begin').disabled=!selectedMethod;const label=methods.find(m=>m.id===value('method'))?.name||'';form.querySelector('#connection-begin').textContent=selectedMethod?'开始'+label:'暂不可用';};
     selectMethod();form.querySelector('#connection-provider').onchange=selectMethod;form.querySelector('#connection-realm').onchange=selectMethod;
     form.onsubmit=async e=>{e.preventDefault();const b=form.querySelector('#connection-begin');if(b.disabled)return;const p=value('provider'),method=value('method'),realm=value('realm');form.querySelectorAll('input,button').forEach(x=>x.disabled=true);try{const result=await ui.api('connections/start',{body:{provider:p,method,realm:p==='workbuddy'?realm:'',account_id:p===provider?accountID:''},signal:null});if(form.isConnected)show(result.flow);}catch(error){if(form.isConnected){const box=form.querySelector('#connection-error');box.textContent=error instanceof Error?error.message:'授权流程未建立，请稍后重试。';box.hidden=false;form.querySelectorAll('input,button').forEach(x=>x.disabled=false);selectMethod();}}};
   }
@@ -47,8 +45,8 @@ window.LoomConnections = (() => {
     const form=document.getElementById('connection-sensitive');if(form)form.onsubmit=e=>{e.preventDefault();const input=Object.fromEntries(new FormData(form));step(f.status==='waiting_phone'?'send_code':'submit_code',input);form.reset();};
     const callback=document.getElementById('connection-callback');if(callback)callback.onsubmit=e=>{e.preventDefault();const input=Object.fromEntries(new FormData(callback));step('callback',input);callback.reset();};
     const verify=document.getElementById('connection-verify');if(verify)verify.onclick=()=>step('verify');
-    if(f.input_mode==='official'&&['uncertain','manual_action','waiting_authorization'].includes(f.status)&&f.provider==='doubao'&&f.method!=='desktop'&&f.error_code!=='official_already_authenticated'){const resume=document.createElement('button');resume.id='connection-resume';resume.textContent='继续当前官方窗口';resume.onclick=()=>step('resume');document.querySelector('#dialog-body .actions').prepend(resume);}
-    if(f.input_mode==='official'&&f.provider==='doubao'&&f.status==='expired'){
+    if(f.input_mode==='official'&&['uncertain','manual_action','waiting_authorization'].includes(f.status)&&f.method!=='desktop'&&f.error_code!=='official_already_authenticated'){const resume=document.createElement('button');resume.id='connection-resume';resume.textContent='继续当前官方窗口';resume.onclick=()=>step('resume');document.querySelector('#dialog-body .actions').prepend(resume);}
+    if(f.input_mode==='official'&&f.status==='expired'){
       const note=document.createElement('p');note.className='notice';note.textContent='如果你已在官方窗口完成登录，可核验当前会话并另行保存连接。原过期记录保留，不会重新发送短信或生成二维码。';document.getElementById('connection-progress').before(note);
       const recover=document.createElement('button');recover.id='connection-recover-session';recover.textContent='核验已完成的官方登录';recover.onclick=()=>recoverSession(f);document.querySelector('#dialog-body .actions').prepend(recover);
     }
@@ -103,8 +101,8 @@ window.LoomConnections = (() => {
   async function recoverSession(f){
     if(step.pending||current?.id!==f.id)return;step.pending=true;
     document.querySelectorAll('#dialog-body button').forEach(b=>b.disabled=true);
-    try{const data=await ui.api('connections/start',{body:{provider:'doubao',method:'desktop',account_id:f.account_id||''},signal:null});if(current?.id===f.id)show(data.flow);}
-    catch{if(current?.id===f.id){const box=document.getElementById('connection-error');box.textContent='会话核验结果未确认，请关闭窗口后在接入进度查看现有流程。不会自动重复发起登录。';box.hidden=false;}}
+    try{const data=await ui.api('connections/start',{body:{provider:f.provider||'',method:'desktop',account_id:f.account_id||''},signal:null});if(current?.id===f.id)show(data.flow);}
+    catch{if(current?.id===f.id){const box=document.getElementById('connection-error');box.textContent='会话核验结果未确认，请关闭窗口后重新打开添加账号即可查看现有流程。不会自动重复发起登录。';box.hidden=false;}}
     finally{step.pending=false;if(current?.id===f.id){document.getElementById('dialog-close').disabled=false;document.getElementById('connection-refresh').disabled=false;}}
   }
   async function step(action,input={}){
@@ -127,18 +125,22 @@ window.LoomConnections = (() => {
     try{const Audio=window.AudioContext||window.webkitAudioContext;const a=new Audio(),o=a.createOscillator(),g=a.createGain();o.frequency.value=660;g.gain.value=.08;o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.2);o.onended=()=>a.close();}catch{}
   }
   const clientLabels={not_configured:'尚未连接',disconnected:'连接已断开',unbound:'等待绑定当前账号',login_required:'需要官方登录',busy:'连接正忙',unsupported:'客户端版本待适配',ready:'当前账号可用',switch_required:'需切换官方账号',connection_unavailable:'等待连接恢复',disabled:'账号已停用',legacy_session:'原有会话',conflict:'绑定冲突'};
-  async function client(target,onStatus){
+  async function client(target,onStatus,provider){
     const read=async()=>{
       target.innerHTML='<p class="muted small" role="status">正在核验官方客户端连接…</p>';
       try{
         const data=await ui.api('workbench/client');if(!target.isConnected)return;
         target.innerHTML=`<section class="panel section-gap" aria-label="官方客户端连接"><div class="section-heading"><h2>官方客户端连接</h2><button id="client-status-refresh" class="quiet">刷新连接</button></div><p class="badge ${data.state==='ready'?'':'neutral'}" data-client-state="${esc(data.state)}">${esc(clientLabels[data.state]||'待核验')}</p><p class="muted small section-gap">${esc(data.notice||'')}</p>${data.configured?'<div class="actions section-gap"><button id="connect-official-client">连接当前官方账号</button></div>':''}<p class="muted small section-gap">登录与续期由官方客户端管理。切换账号后，只有身份匹配的绑定可用。</p></section>`;
         document.getElementById('client-status-refresh').onclick=read;
-        const connect=document.getElementById('connect-official-client');if(connect)connect.onclick=()=>open('doubao','','desktop');
+        const connect=document.getElementById('connect-official-client');if(connect)connect.onclick=()=>open(provider||'','','desktop');
         onStatus?.(data.accounts||[]);
       }catch(e){if(e.name==='AbortError'||!target.isConnected)return;target.innerHTML='<p class="notice warn">客户端状态暂时读不到。请稍后重新读取账号页面。</p>';}
     };
     await read();
   }
-  return {init,open,list,stop,client,clientLabels};
+  // Providers that expose a desktop-client bridge. Only these render the
+  // client panel; a pure HTTP provider must never show "official client" UI.
+  const clientBridges = new Set(['workbuddy','trae']);
+  const hasClientBridge = id => clientBridges.has(id);
+  return {init,open,list,stop,client,clientLabels,hasClientBridge};
 })();

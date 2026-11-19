@@ -13,7 +13,6 @@ import (
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/authflow"
-	"workbuddy2api/internal/providers/doubao"
 	"workbuddy2api/internal/upstream/trae"
 )
 
@@ -31,7 +30,7 @@ func (s *Server) connectionsService() (*authflow.Service, error) {
 			s.connections.err = errors.New("authentication_storage_unavailable")
 			return
 		}
-		drivers := map[string]authflow.Driver{"workbuddy": &legacyConnection{s: s, provider: "workbuddy"}, "trae": &legacyConnection{s: s, provider: "trae"}, "doubao": &doubao.Passport{}}
+		drivers := map[string]authflow.Driver{"workbuddy": &legacyConnection{s: s, provider: "workbuddy"}, "trae": &legacyConnection{s: s, provider: "trae"}}
 		for id, d := range s.opts.ConnectionDrivers {
 			drivers[id] = d
 		}

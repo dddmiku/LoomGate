@@ -187,3 +187,47 @@ pre.code{display:block;max-width:100%;overflow-x:auto;white-space:pre;padding:14
 /* 请求日志：13 列宽表 */
 .log-table{min-width:1280px}
 @media (max-width:820px){.usage-grid{grid-template-columns:1fr}}
+/* 任务状态列 = 定时启用/暂停开关（不弹确认框，写后从服务端读回核验） */
+.switch{display:inline-flex;align-items:center;gap:8px;border:0;background:transparent;padding:6px 4px;min-height:36px;border-radius:8px;cursor:pointer}
+.switch:hover:not(:disabled){background:var(--soft)}
+.switch-track{position:relative;width:36px;height:20px;border-radius:10px;background:var(--line);flex-shrink:0;transition:background .15s ease}
+.switch-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--surface);box-shadow:0 1px 2px #25363d33;transition:transform .15s ease}
+.switch.on .switch-track{background:var(--accent)}
+.switch.on .switch-thumb{transform:translateX(16px)}
+.switch-text{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.switch.on .switch-text{color:var(--accent)}
+tr.plan-paused td{color:var(--muted)}
+tr.plan-paused td:nth-child(5),tr.plan-paused td:nth-child(6){color:var(--text)}
+.task-table td .switch{min-height:32px;padding:2px 4px}
+@media (max-width:640px){.switch-text{display:none}}
+.task-table-wrap{overflow-x:auto;overscroll-behavior-x:contain}
+.task-table{min-width:720px}
+@media (max-width:640px){.task-table{min-width:640px}}
+/* 任务页窄屏：按行堆叠，保留字段名；避免横向滚动表 */
+@media (max-width:700px){
+  .task-table-wrap{overflow:visible}
+  .task-table{min-width:0}
+  .task-table thead{display:none}
+  .task-table,.task-table tbody,.task-table tr,.task-table td{display:block;width:100%}
+  .task-table tr{padding:12px 0;border-bottom:1px solid var(--line)}
+  .task-table td{padding:4px 0;border:0;display:grid;grid-template-columns:78px minmax(0,1fr);gap:10px;overflow-wrap:anywhere}
+  .task-table td:before{content:attr(data-label);font-size:11px;color:var(--muted)}
+  .task-table td.log-expander{display:none}
+  .task-table .task-section th{display:block;background:var(--soft);padding:9px 12px;border-radius:7px}
+  .task-table td .actions{flex-wrap:wrap}
+  .switch-text{display:inline}
+}
+/* WorkBuddy 区域筛选（CN / Global） */
+.realm-filter{display:flex;gap:2px;padding:3px;border:1px solid var(--line);border-radius:9px;background:var(--soft)}
+.realm-filter[hidden]{display:none}
+.realm-filter button{min-height:32px;padding:5px 12px;border:0;border-radius:7px;background:transparent;font-size:12px;font-weight:600;color:var(--muted);display:inline-flex;align-items:center;gap:6px}
+.realm-filter button[aria-pressed=true]{background:var(--surface);color:var(--accent);box-shadow:0 1px 2px #25363d1a}
+.realm-filter small{font-size:10px;font-weight:400;color:var(--muted)}
+/* 模型限流与积分过期常显高亮（不折叠、不靠悬停） */
+.limit-list{display:grid;gap:3px;margin-top:5px}
+.model-limit{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:3px 8px;border-radius:6px;background:var(--warn-bg);color:var(--warn);font-size:12px;line-height:1.5}
+.model-limit.unavailable{background:var(--soft);color:var(--muted)}
+.limit-model{font-weight:600}
+.limit-when,.limit-reason{font-variant-numeric:tabular-nums}
+.limit-reason{opacity:.8}
+.credit-expiring{margin-top:3px;padding:2px 7px;border-radius:6px;display:inline-block;background:var(--warn-bg);color:var(--warn);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}

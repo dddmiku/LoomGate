@@ -1,5 +1,11 @@
 // Package providercatalog is the read-only management view of provider accounts
-// and catalogs. It never exports sessions or adds unimplemented inference routes.
+// and their model catalogs.
+//
+// It owns no provider-specific types. Every provider plugs in through
+// ProviderSource: it reports its own display name, its catalog scope, whether
+// it can answer inference, and (optionally) a per-account model catalog. Adding
+// a provider therefore never requires editing another provider's package, and
+// deleting one leaves no dangling references.
 package providercatalog
 
 import (
@@ -16,49 +22,31 @@ import (
 	"time"
 
 	"workbuddy2api/internal/accountvault"
-	"workbuddy2api/internal/providers/doubao"
 )
 
-type Accounts interface {
-	List() ([]accountvault.Account, error)
-}
-type DoubaoCatalog interface {
-	Catalog(context.Context, string, bool) (doubao.Catalog, error)
-}
-type Count struct {
-	Total   int `json:"total"`
-	Enabled int `json:"enabled"`
-}
-type Provider struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	CatalogScope string `json:"catalog_scope"`
-	Inference    bool   `json:"inference_available"`
-	Login        bool   `json:"login_available"`
-	Accounts     Count  `json:"accounts"`
-	ErrorCode    string `json:"error_code,omitempty"`
-}
-type Options struct {
-	Accounts        Accounts
-	Doubao          DoubaoCatalog
-	LegacyCounts    func() map[string]Count
-	Timeout         time.Duration
-	Concurrency     int
-	DoubaoInference bool
-	DoubaoMultiTurn bool
-	// DoubaoBinding returns only the verified, non-secret display facts of a
-	// bound Doubao account (official BotID + verification time). Sessions,
-	// cookies and the encrypted profile never leave the vault. A missing
-	// binding reports ok=false so the UI can say "未提供" instead of inventing
-	// a nickname from the account ID (P1-04).
-	DoubaoBinding func(id string) (botID string, verifiedAt time.Time, ok bool)
-	// DoubaoDisplay returns the account's masked phone number and display name.
-	// Both are non-secret and the phone number is already masked upstream.
-	DoubaoDisplay func(id string) (mobile, nickname string, ok bool)
+// Model is the neutral catalog row. Provider packages translate their own
+// wire types into this, so this package never imports one of them.
+type Model struct {
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	ContextWindow      int64  `json:"context_length,omitempty"`
+	InferenceAvailable bool   `json:"inference_available"`
+	SupportsMultiTurn  bool   `json:"supports_multi_turn"`
 }
 
-// AccountView is the safe account row DTO returned by /workbench/accounts.
-// It carries the vault metadata plus only verified, non-secret display facts.
+// Catalog is one account's model snapshot.
+type Catalog struct {
+	Models    []Model
+	Status    string
+	ErrorCode string
+	FetchedAt time.Time
+	ExpiresAt time.Time
+	RetryAt   time.Time
+	Streaming string
+}
+
+// AccountView is the safe account row DTO. It carries vault metadata plus only
+// non-secret display facts a provider explicitly supplies.
 type AccountView struct {
 	ID         string     `json:"id"`
 	Provider   string     `json:"provider"`
@@ -69,33 +57,97 @@ type AccountView struct {
 	BotID      string     `json:"bot_id,omitempty"`
 	VerifiedAt *time.Time `json:"verified_at,omitempty"`
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	// Mobile is the service-masked phone number (e.g. "138****8000"). The
-	// upstream masks it before returning it, so this never exposes a full
-	// number; it exists so a row can be told apart at a glance.
-	Mobile string `json:"mobile,omitempty"`
+	Mobile     string     `json:"mobile,omitempty"`
 }
-type Service struct {
-	opts  Options
-	slots chan struct{}
+
+// ProviderSource is everything the management view needs from one provider.
+// A provider that only exposes a fixed catalog can leave Catalog nil.
+type ProviderSource interface {
+	// ID is the vault `provider` value this source owns.
+	ID() string
+	// Name is the console label.
+	Name() string
+	// CatalogScope describes how models are addressed ("provider" or "account").
+	CatalogScope() string
+	// Inference reports whether this provider can serve completions at all.
+	Inference() bool
+	// Login reports whether the console can start a login flow for it.
+	Login() bool
+	// Catalog returns one account's models. Providers that only publish a fixed
+	// list implement LiveCatalog instead and leave this out; StaticModels then
+	// backs the answer.
+	StaticModels() []Model
+	// Display returns non-secret display facts for an account.
+	Display(account string) (mobile, nickname, botID string, verifiedAt time.Time, ok bool)
 }
+
+// LiveCatalog is the optional half of ProviderSource for providers that fetch a
+// per-account catalog. A provider with a fixed model list omits it entirely, and
+// the catalog layer answers from StaticModels without any network call.
+type LiveCatalog interface {
+	Catalog(ctx context.Context, account string, force bool) (Catalog, error)
+}
+
+// LegacyCounts reports account counts for providers the pool (not the vault)
+// owns. It stays a callback so this package never imports the pool.
+type LegacyCounts func() map[string]Count
+
+type Count struct {
+	Total   int `json:"total"`
+	Enabled int `json:"enabled"`
+}
+
+type Provider struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	CatalogScope string `json:"catalog_scope"`
+	Inference    bool   `json:"inference_available"`
+	Login        bool   `json:"login_available"`
+	Accounts     Count  `json:"accounts"`
+	ErrorCode    string `json:"error_code,omitempty"`
+}
+
 type Row struct {
-	AccountID     string         `json:"account_id"`
-	ProviderID    string         `json:"provider_id"`
-	Status        string         `json:"status"`
-	RoutingStatus string         `json:"routing_status"`
-	StreamingMode string         `json:"streaming_mode,omitempty"`
-	Models        []doubao.Model `json:"models"`
-	FetchedAt     *time.Time     `json:"fetched_at,omitempty"`
-	ExpiresAt     *time.Time     `json:"expires_at,omitempty"`
-	RetryAt       *time.Time     `json:"retry_at,omitempty"`
-	ErrorCode     string         `json:"error_code,omitempty"`
+	AccountID     string     `json:"account_id"`
+	ProviderID    string     `json:"provider_id"`
+	Status        string     `json:"status"`
+	RoutingStatus string     `json:"routing_status"`
+	StreamingMode string     `json:"streaming_mode,omitempty"`
+	Models        []Model    `json:"models"`
+	FetchedAt     *time.Time `json:"fetched_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	RetryAt       *time.Time `json:"retry_at,omitempty"`
+	ErrorCode     string     `json:"error_code,omitempty"`
 }
+
 type Page struct {
 	Catalogs []Row `json:"catalogs"`
 	Total    int   `json:"total"`
 	Offset   int   `json:"offset"`
 	Limit    int   `json:"limit"`
 	HasMore  bool  `json:"has_more"`
+}
+
+type Options struct {
+	Accounts     Accounts
+	Sources      []ProviderSource
+	LegacyCounts LegacyCounts
+	// LegacyProviders are pool-owned providers that keep their historical
+	// account counts (WorkBuddy, Trae). They never appear in the vault but must
+	// still be listed.
+	LegacyProviders []Provider
+	Timeout         time.Duration
+	Concurrency     int
+}
+
+type Accounts interface {
+	List() ([]accountvault.Account, error)
+}
+
+type Service struct {
+	opts  Options
+	slots chan struct{}
+	byID  map[string]ProviderSource
 }
 
 func New(opts Options) *Service {
@@ -105,14 +157,23 @@ func New(opts Options) *Service {
 	if opts.Concurrency <= 0 || opts.Concurrency > 8 {
 		opts.Concurrency = 4
 	}
-	return &Service{opts: opts, slots: make(chan struct{}, opts.Concurrency)}
+	byID := make(map[string]ProviderSource, len(opts.Sources))
+	for _, s := range opts.Sources {
+		if s != nil {
+			byID[s.ID()] = s
+		}
+	}
+	return &Service{opts: opts, slots: make(chan struct{}, opts.Concurrency), byID: byID}
 }
+
 func write(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// accounts lists only vault-backed provider accounts.
 func (s *Service) accounts() ([]accountvault.Account, error) {
 	if s.opts.Accounts == nil {
 		return nil, errors.New("accounts_unavailable")
@@ -121,9 +182,9 @@ func (s *Service) accounts() ([]accountvault.Account, error) {
 	if err != nil {
 		return nil, errors.New("accounts_unavailable")
 	}
-	out := []accountvault.Account{}
+	out := make([]accountvault.Account, 0, len(rows))
 	for _, a := range rows {
-		if a.Provider == "doubao" {
+		if _, ok := s.byID[a.Provider]; ok {
 			out = append(out, a)
 		}
 	}
@@ -131,27 +192,18 @@ func (s *Service) accounts() ([]accountvault.Account, error) {
 	return out, nil
 }
 
-// accountViews maps vault rows to the safe display DTO. Nickname is left empty
-// when the provider has no verified human-readable name: the UI must fall back
-// to "未提供" rather than showing the raw account ID as a nickname.
 func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
 	out := make([]AccountView, 0, len(rows))
 	for _, a := range rows {
 		view := AccountView{ID: a.ID, Provider: a.Provider, Revision: a.Revision, UpdatedAt: a.UpdatedAt, Enabled: a.Enabled}
-		if s.opts.DoubaoBinding != nil && a.Provider == "doubao" {
-			if botID, verifiedAt, ok := s.opts.DoubaoBinding(a.ID); ok {
+		if src := s.byID[a.Provider]; src != nil {
+			if mobile, nickname, botID, verifiedAt, ok := src.Display(a.ID); ok {
+				view.Mobile = mobile
+				view.Nickname = nickname
 				view.BotID = botID
 				if !verifiedAt.IsZero() {
 					value := verifiedAt
 					view.VerifiedAt = &value
-				}
-			}
-		}
-		if s.opts.DoubaoDisplay != nil && a.Provider == "doubao" {
-			if mobile, nickname, ok := s.opts.DoubaoDisplay(a.ID); ok {
-				view.Mobile = mobile
-				if view.Nickname == "" {
-					view.Nickname = nickname
 				}
 			}
 		}
@@ -160,8 +212,6 @@ func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
 	return out
 }
 
-// Route reports whether it owns the management path; authorization is applied
-// once by the caller's internal management boundary.
 func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path == "/workbench/account/toggle" {
 		s.toggleAccount(w, r)
@@ -181,15 +231,36 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 		if s.opts.LegacyCounts != nil {
 			counts = s.opts.LegacyCounts()
 		}
-		db := Count{Total: len(accounts)}
-		for _, a := range accounts {
-			if a.Enabled {
-				db.Enabled++
+		out := make([]Provider, 0, len(s.opts.LegacyProviders)+len(s.opts.Sources))
+		for _, p := range s.opts.LegacyProviders {
+			if c, ok := counts[p.ID]; ok {
+				p.Accounts = c
 			}
+			out = append(out, p)
 		}
-		out := []Provider{{ID: "workbuddy", Name: "WorkBuddy", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["workbuddy"]}, {ID: "trae", Name: "Trae", CatalogScope: "provider", Inference: true, Login: true, Accounts: counts["trae"]}, {ID: "doubao", Name: "豆包工作", CatalogScope: "account", Accounts: db, Inference: s.opts.DoubaoInference}}
+		for _, src := range s.opts.Sources {
+			count := Count{Total: 0}
+			for _, a := range accounts {
+				if a.Provider == src.ID() {
+					count.Total++
+					if a.Enabled {
+						count.Enabled++
+					}
+				}
+			}
+			out = append(out, Provider{
+				ID: src.ID(), Name: src.Name(), CatalogScope: src.CatalogScope(),
+				Inference: src.Inference(), Login: src.Login(), Accounts: count,
+			})
+		}
 		if err != nil {
-			out[2].ErrorCode = "accounts_unavailable"
+			// Accounts being unavailable must not hide the provider list; mark it
+			// instead so the console can show a real error.
+			for i := range out {
+				if out[i].CatalogScope == "account" {
+					out[i].ErrorCode = "accounts_unavailable"
+				}
+			}
 		}
 		write(w, 200, map[string]any{"providers": out})
 		return true
@@ -249,6 +320,19 @@ func (s *Service) models(w http.ResponseWriter, r *http.Request, accounts []acco
 		write(w, 400, map[string]string{"error": "invalid_catalog_query"})
 		return
 	}
+	if q.provider != "" {
+		if s.byID[q.provider] == nil {
+			write(w, 400, map[string]string{"error": "unsupported_provider"})
+			return
+		}
+		filtered := accounts[:0]
+		for _, a := range accounts {
+			if a.Provider == q.provider {
+				filtered = append(filtered, a)
+			}
+		}
+		accounts = filtered
+	}
 	if q.account != "" {
 		filtered := []accountvault.Account{}
 		for _, a := range accounts {
@@ -286,6 +370,7 @@ func (s *Service) models(w http.ResponseWriter, r *http.Request, accounts []acco
 }
 
 type query struct {
+	provider      string
 	account       string
 	offset, limit int
 	refresh       bool
@@ -307,9 +392,7 @@ func parseQuery(r *http.Request) (query, error) {
 			return out, errors.New("unknown_query")
 		}
 	}
-	if p := values.Get("provider"); p != "" && p != "doubao" {
-		return out, errors.New("unsupported_provider")
-	}
+	out.provider = values.Get("provider")
 	out.account = values.Get("account")
 	if out.account != "" && !accountID.MatchString(out.account) {
 		return out, errors.New("invalid_account")
@@ -335,11 +418,13 @@ func parseQuery(r *http.Request) (query, error) {
 	}
 	return out, nil
 }
+
 func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool) (row Row) {
-	row = Row{AccountID: a.ID, ProviderID: "doubao", Status: "unavailable", RoutingStatus: "catalog_only", Models: []doubao.Model{}}
+	src := s.byID[a.Provider]
+	row = Row{AccountID: a.ID, ProviderID: a.Provider, Status: "unavailable", RoutingStatus: "catalog_only", Models: []Model{}}
 	defer func() {
 		if recover() != nil {
-			row.Models = []doubao.Model{}
+			row.Models = []Model{}
 			row.Status = "unavailable"
 			row.ErrorCode = "catalog_failed"
 		}
@@ -348,8 +433,26 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		row.Status = "disabled"
 		return
 	}
-	if s.opts.Doubao == nil {
+	if src == nil {
 		row.ErrorCode = "catalog_unavailable"
+		return
+	}
+	live, hasCatalog := src.(LiveCatalog)
+	if !hasCatalog {
+		row.Models = cloneModels(src.StaticModels())
+		if len(row.Models) == 0 {
+			row.ErrorCode = "catalog_empty"
+			return
+		}
+		callable := src.Inference()
+		row.Status = "ready"
+		if callable {
+			row.RoutingStatus = "single_turn_text"
+			row.StreamingMode = "incremental"
+		}
+		for i := range row.Models {
+			row.Models[i].InferenceAvailable = callable
+		}
 		return
 	}
 	select {
@@ -359,7 +462,7 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		row.ErrorCode = "catalog_timeout"
 		return
 	}
-	snapshot, err := s.opts.Doubao.Catalog(ctx, a.ID, force)
+	snapshot, err := live.Catalog(ctx, a.ID, force)
 	if !snapshot.FetchedAt.IsZero() {
 		row.FetchedAt = &snapshot.FetchedAt
 	}
@@ -374,25 +477,22 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		return
 	}
 	if len(snapshot.Models) > 0 {
-		row.Models = snapshot.Models
-		if s.opts.DoubaoInference && snapshot.RuntimeBound {
-			row.RoutingStatus = "single_turn_text"
-			if s.opts.DoubaoMultiTurn {
-				row.RoutingStatus = "verified_conversation"
-			}
-		}
+		row.Models = cloneModels(snapshot.Models)
+		row.RoutingStatus = "single_turn_text"
 	}
-	if err != nil || snapshot.Stale || snapshot.ErrorCode != "" {
-		row.ErrorCode = "catalog_failed"
+	if snapshot.Status != "" {
+		row.Status = snapshot.Status
+	}
+	if snapshot.Streaming != "" {
+		row.StreamingMode = snapshot.Streaming
+	}
+	if err != nil || snapshot.ErrorCode != "" {
+		row.ErrorCode = snapshot.ErrorCode
+		if row.ErrorCode == "" {
+			row.ErrorCode = "catalog_failed"
+		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			row.ErrorCode = "catalog_timeout"
-		}
-		var apiErr *doubao.APIError
-		if errors.As(err, &apiErr) {
-			switch apiErr.Kind {
-			case "login_required", "desktop_unavailable", "desktop_identity_mismatch", "desktop_login_required", "desktop_version_unsupported", "desktop_timeout", "desktop_busy", "desktop_upstream_rejected", "desktop_cleanup_uncertain", "desktop_ownership_lost", "desktop_submission_uncertain", "composer_not_empty":
-				row.ErrorCode = apiErr.Kind
-			}
 		}
 		if len(row.Models) > 0 {
 			row.Status = "stale"
@@ -404,12 +504,18 @@ func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool)
 		return
 	}
 	row.Status = "ready"
-	if s.opts.DoubaoInference && snapshot.RuntimeBound {
+	callable := src.Inference()
+	if callable {
 		row.StreamingMode = "incremental"
 	}
 	for i := range row.Models {
-		row.Models[i].InferenceAvailable = s.opts.DoubaoInference && snapshot.RuntimeBound
-		row.Models[i].SupportsMultiTurn = row.Models[i].InferenceAvailable && s.opts.DoubaoMultiTurn
+		row.Models[i].InferenceAvailable = callable
 	}
 	return
+}
+
+func cloneModels(in []Model) []Model {
+	out := make([]Model, len(in))
+	copy(out, in)
+	return out
 }

@@ -543,7 +543,6 @@ func TestAcceptedTravelReceiptPersistsUntilDelayedSettlement(t *testing.T) {
 	}
 }
 
-
 // spendJournalForTest reads the durable spend record through the registered
 // production module, proving the test exercises the real vault path.
 func spendJournalForTest(t *testing.T, a *Accounts, uid, kind string) spendJournal {
@@ -568,7 +567,6 @@ func spendJournalForTest(t *testing.T, a *Accounts, uid, kind string) spendJourn
 	t.Fatalf("spend module %s not registered", kind)
 	return spendJournal{}
 }
-
 
 func TestRewardModuleExplicitRefusalDoesNotBlockLaterChance(t *testing.T) {
 	a, f, _ := lifecycleSetup(t)
