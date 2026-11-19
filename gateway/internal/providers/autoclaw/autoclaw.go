@@ -343,18 +343,50 @@ func (p *Provider) turnWithReasoning(ctx context.Context, row accountvault.Accou
 	return result, nil
 }
 
-// buildBody renders the OpenAI-compatible request. `store:false` is explicit:
-// the upstream is a stateless completion endpoint and nothing may be retained.
+// forbiddenBodyFields never reach the upstream.
+//
+// The service rejects a client-supplied output budget with 406 and an EMPTY
+// body, which is indistinguishable from every other 406 (bad banner, missing
+// model). It cannot be diagnosed from the response, so the field has to be
+// dropped before sending. max_output_tokens is the Responses-protocol twin.
+var forbiddenBodyFields = []string{"max_tokens", "max_completion_tokens", "max_output_tokens"}
+
+// strippedBodyFields are accepted by OpenAI clients but have no meaning on this
+// endpoint; forwarding them risks the same opaque 406.
+var strippedBodyFields = []string{
+	"frequency_penalty", "presence_penalty", "logit_bias", "logprobs",
+	"top_logprobs", "n", "seed", "user", "parallel_tool_calls", "store",
+	"metadata", "service_tier", "response_format", "stop",
+}
+
+// foreignIdentities are phrases that make the CN gateway return 406: it
+// requires the AutoClaw banner to be the assistant's identity and rejects a
+// request that claims to be another agent (notably the Claude Agent SDK).
+// Longest-first so a longer phrase is replaced before a shorter substring of it.
+var foreignIdentities = []string{
+	"you are claude code",
+	"you are claude",
+	"claude agent sdk",
+	"you are anthropic's claude",
+}
+
+// buildBody renders the OpenAI-compatible request.
+//
+// The upstream is OpenAI-shaped but not OpenAI-compatible: it demands the
+// AutoClaw banner in a system message, rejects client-supplied token budgets,
+// and refuses bodies that identify as another agent. Each of those failures
+// comes back as a 406 with no body, so all three are handled here rather than
+// being diagnosed from a response.
 func buildBody(model string, messages []inference.Message, stream bool) ([]byte, error) {
 	msgs := make([]map[string]any, 0, len(messages)+1)
-	hasPrefix := false
+	hasBanner := false
 	for _, m := range messages {
-		if m.Role == "system" && strings.Contains(m.Content, promptPrefix) {
-			hasPrefix = true
+		if m.Role == "system" && strings.Contains(strings.ToLower(m.Content), strings.ToLower(promptPrefix)) {
+			hasBanner = true
 			break
 		}
 	}
-	if !hasPrefix {
+	if !hasBanner {
 		msgs = append(msgs, map[string]any{"role": "system", "content": promptPrefix + "."})
 	}
 	for _, m := range messages {
@@ -362,16 +394,42 @@ func buildBody(model string, messages []inference.Message, stream bool) ([]byte,
 		if role == "" {
 			role = "user"
 		}
-		msgs = append(msgs, map[string]any{"role": role, "content": m.Content})
+		content := m.Content
+		if role == "system" {
+			content = neutraliseIdentity(content)
+		}
+		msgs = append(msgs, map[string]any{"role": role, "content": content})
 	}
 	payload := map[string]any{
-		"model":                 within(model),
-		"messages":              msgs,
-		"stream":                stream,
-		"store":                 false,
-		"max_completion_tokens": 4096,
+		"model":    within(model),
+		"messages": msgs,
+		"stream":   stream,
+	}
+	for _, field := range forbiddenBodyFields {
+		delete(payload, field)
+	}
+	for _, field := range strippedBodyFields {
+		delete(payload, field)
 	}
 	return json.Marshal(payload)
+}
+
+// neutraliseIdentity replaces a foreign agent identity with the AutoClaw one.
+// The CN gateway answers 406 when a request claims to be another agent, and a
+// Claude Code / Agent SDK client always sends such a system prompt.
+func neutraliseIdentity(content string) string {
+	lower := strings.ToLower(content)
+	for _, phrase := range foreignIdentities {
+		if idx := strings.Index(lower, phrase); idx >= 0 {
+			replacement := "You are AutoClaw"
+			if phrase == "claude agent sdk" {
+				replacement = "AutoClaw"
+			}
+			content = content[:idx] + replacement + content[idx+len(phrase):]
+			lower = strings.ToLower(content)
+		}
+	}
+	return content
 }
 
 func setHeaders(req *http.Request, accessToken, model string) {
@@ -380,7 +438,9 @@ func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("Content-Type", "application/json")
 	// "node" is what the desktop client sends; the upstream gate is known to
 	// be picky about it.
-	req.Header.Set("User-Agent", "node")
+	// The Aliyun WAF answers 405 to Go's default UA and to a missing one; the
+	// managed client identifies as AutoClaw/<version>.
+	req.Header.Set("User-Agent", "AutoClaw/"+version)
 	req.Header.Set("X-Agent-Id", "main")
 	// Only attach the bearer pair when there is a token. The login and
 	// refresh endpoints are unauthenticated, and sending "Bearer " with an
@@ -394,6 +454,8 @@ func setHeaders(req *http.Request, accessToken, model string) {
 	req.Header.Set("x-lang", "zh-CN")
 	req.Header.Set("x-product", "autoclaw")
 	req.Header.Set("x-request-model", model)
+	// X-Tm accepts only win / mac / linux-x64; a bare "linux" is refused
+	// outright by the overseas gateway.
 	req.Header.Set("x-tm", "win")
 	req.Header.Set("x-version", version)
 	req.Header.Set("accept-encoding", "identity")

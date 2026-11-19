@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -503,4 +504,66 @@ func digits(v string) string {
 		}
 	}
 	return b.String()
+}
+
+// ExportProfile renders one stored account in the standalone reference
+// gateway's account format. The result holds live credentials: callers must
+// write it with restrictive permissions and never log it.
+func ExportProfile(vault *accountvault.Vault, id string) ([]byte, error) {
+	if vault == nil {
+		return nil, errors.New("autoclaw_vault_unavailable")
+	}
+	_, plain, err := vault.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	defer wipe(plain)
+	var s stored
+	if json.Unmarshal(plain, &s) != nil {
+		return nil, errors.New("autoclaw_profile_invalid")
+	}
+	if s.Phone == "" {
+		return nil, errors.New("autoclaw_profile_incomplete")
+	}
+	// The reference format is camelCase and carries a JWT-derived uid.
+	return json.Marshal(map[string]any{
+		"phone":        s.Phone,
+		"uid":          jwtClaim(s.AccessToken, "uid"),
+		"accessToken":  s.AccessToken,
+		"refreshToken": s.RefreshToken,
+		"deviceId":     s.DeviceID,
+		"expiresAt":    s.ExpiresAt,
+	})
+}
+
+// ExportPhoneDigits returns the digits of the phone number, for filename use.
+func ExportPhoneDigits(profile []byte) string {
+	var v struct {
+		Phone string `json:"phone"`
+	}
+	if json.Unmarshal(profile, &v) != nil {
+		return "unknown"
+	}
+	return digits(v.Phone)
+}
+
+// jwtClaim reads one string claim from an unsigned JWT payload. A token that is
+// not a JWT, or lacks the claim, yields an empty string.
+func jwtClaim(token, claim string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return ""
+	}
+	var claims map[string]any
+	if json.Unmarshal(raw, &claims) != nil {
+		return ""
+	}
+	if value, ok := claims[claim].(string); ok {
+		return value
+	}
+	return ""
 }

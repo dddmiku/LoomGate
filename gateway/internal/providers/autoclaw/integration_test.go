@@ -76,8 +76,8 @@ func TestProviderServesStreamFromRealVaultAccount(t *testing.T) {
 			t.Fatalf("wire body leaked client-protocol field %q", forbidden)
 		}
 	}
-	if gotBody["store"] != false {
-		t.Fatal("store must be false")
+	if _, ok := gotBody["store"]; ok {
+		t.Fatal("store must be stripped; the upstream 406s on generic OpenAI knobs with an empty body")
 	}
 }
 

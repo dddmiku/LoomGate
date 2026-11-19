@@ -37,8 +37,13 @@ func TestBuildBodyHasNoConversationFields(t *testing.T) {
 			t.Fatalf("payload carries client-protocol field %q: %s", forbidden, body)
 		}
 	}
-	if decoded["store"] != false {
-		t.Fatal("store must be false: the upstream call is stateless")
+	// store/max_tokens and friends are stripped before sending: this endpoint
+	// answers 406 with an empty body for any client-supplied output budget or
+	// generic OpenAI knob, and that 406 is indistinguishable from every other.
+	for _, stripped := range []string{"store", "max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p", "n", "seed", "user"} {
+		if _, present := decoded[stripped]; present {
+			t.Errorf("payload forwards %q, which the upstream rejects with an opaque 406", stripped)
+		}
 	}
 	if decoded["model"] != "zai_glm-5.3-flash" {
 		t.Fatalf("model not normalised: %v", decoded["model"])
