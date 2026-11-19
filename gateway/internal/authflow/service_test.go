@@ -233,3 +233,73 @@ func TestBoundedProviderBusinessCodeSurvivesWorkflowProjection(t *testing.T) {
 		t.Fatal("persisted business code lost")
 	}
 }
+
+// A completed-but-unsaved login must not block the next one. The operator
+// adds several accounts in a row; each earlier flow sits at "verified" waiting
+// for its idempotent commit, or at "uncertain" needing a look. Only a live
+// upstream dialog may hold the provider.
+func TestFinishedLoginDoesNotBlockTheNextAccount(t *testing.T) {
+	d := &driverStub{step: func(_ context.Context, _ Flow, _ string, _ Input) (Result, error) {
+		return Result{Status: "verified", Secret: json.RawMessage(`{}`)}, nil
+	}}
+	s, _, _, _ := testService(t, d)
+
+	first, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"})
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	verified, err := s.Step(context.Background(), first.ID, "send_code", Input{Phone: "13800000000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Status != "verified" {
+		t.Fatalf("setup: status=%q", verified.Status)
+	}
+
+	// The first flow is still non-terminal (awaiting commit), yet a second
+	// account must be addable.
+	second, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"})
+	if err != nil {
+		t.Fatalf("a verified flow blocked the next login: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatal("the second start reused the first flow")
+	}
+}
+
+// A flow that needs human attention must not block the provider either.
+func TestUncertainLoginDoesNotBlockTheNextAccount(t *testing.T) {
+	d := &driverStub{step: func(_ context.Context, _ Flow, _ string, _ Input) (Result, error) {
+		return Result{Status: "uncertain"}, nil
+	}}
+	s, _, _, _ := testService(t, d)
+	first, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Step(context.Background(), first.ID, "send_code", Input{Phone: "13800000000"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"}); err != nil {
+		t.Fatalf("an uncertain flow blocked the next login: %v", err)
+	}
+}
+
+// A live dialog still wins: two SMS sends racing the same provider would
+// confuse the account being created.
+func TestLiveDialogStillBlocksAConcurrentStart(t *testing.T) {
+	d := &driverStub{step: func(_ context.Context, _ Flow, _ string, _ Input) (Result, error) {
+		return Result{Status: "waiting_code"}, nil
+	}}
+	s, _, _, _ := testService(t, d)
+	first, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Step(context.Background(), first.ID, "send_code", Input{Phone: "13800000000"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Start(context.Background(), Request{Provider: "synthetic", Method: "sms"}); err != ErrBusy {
+		t.Fatalf("a waiting_code flow did not block a concurrent start: %v", err)
+	}
+}

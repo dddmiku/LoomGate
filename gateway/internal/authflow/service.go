@@ -196,6 +196,23 @@ func (s *Service) save(rows []Flow) error {
 func terminal(status string) bool {
 	return status == "succeeded" || status == "canceled" || status == "expired" || status == "failed"
 }
+
+// inProgress reports whether a flow still owns the driver's login session.
+// Only these may block a second start for the same provider.
+//
+// "verified" deliberately does not count: identity has already been proven and
+// the only remaining work is an idempotent commit. "uncertain" and
+// "manual_action" are likewise finished attempts that need the operator to
+// look, not a live upstream dialog. Treating any of them as "in progress" made
+// the first successful login permanently block every later one, because such a
+// flow only clears when its lifetime expires.
+func inProgress(status string) bool {
+	switch status {
+	case "working", "waiting_phone", "waiting_code", "waiting_scan", "scanned", "verifying", "waiting_authorization":
+		return true
+	}
+	return false
+}
 func (s *Service) Providers() []Provider {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -270,7 +287,10 @@ func (s *Service) Start(ctx context.Context, r Request) (View, error) {
 	}
 	s.mu.Lock()
 	for _, f := range s.flows {
-		if f.Provider == r.Provider && f.Realm == r.Realm && !terminal(f.Status) {
+		// Only a live upstream session blocks a new one. A finished login that
+		// is merely waiting to be saved must not stop the operator from adding
+		// a different account.
+		if f.Provider == r.Provider && f.Realm == r.Realm && inProgress(f.Status) {
 			s.mu.Unlock()
 			return f.View, ErrBusy
 		}
