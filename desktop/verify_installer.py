@@ -57,7 +57,7 @@ def run(installer,root,out):
    page.on('pageerror',lambda e:report['page_errors'].append(type(e).__name__));page.on('console',lambda m:report['console_errors'].append('console_error') if m.type=='error' else None)
    page.on('request',lambda req:report['external_requests'].append('external') if not req.url.startswith('http://127.0.0.1:17864/') else None)
    fields=dict(x.split(':',1) for x in (workspace/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
-   page.goto('http://127.0.0.1:17864/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-agenda]').wait_for()
+   page.goto('http://127.0.0.1:17864/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
    def api(path):return page.request.get('http://127.0.0.1:17864/admin/api/'+path).json()
    assert api('workbench')['schedules']==[] and api('workbench/accounts')['accounts']==[]
    page.locator('#navigation a[href="#tasks"]').click();page.locator('#task-list.loading').wait_for(state='detached');page.screenshot(path=str(out/'installed-desktop.png'),full_page=True);report['screenshots'].append('installed-desktop.png')
