@@ -32,9 +32,11 @@ fun releaseVersionCode(name: String): Int {
     if (parts[0] > 2100 || parts[1] >= 1000 || parts[2] >= 1000) {
         throw GradleException("Android 版本分段超出合法范围。")
     }
-    // Mirror android/build.py: a LoomGate generation offset keeps 1.x above the
-    // legacy 3.x installation line without lowering any existing code.
-    val code = 4_000_000L + parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2]
+    // Mirror android/build.py. The shipped v3.17.0 bridge used 7_017_000; the
+    // previous 5M LoomGate mapping could not update a device after that bridge.
+    // Preserve legacy 3.x/preview 0.x codes and put the new line above all 3.x.
+    val generation = if (parts[0] == 0L || parts[0] == 3L) 4_000_000L else 8_000_000L
+    val code = generation + parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2]
     if (code !in 3_016_002L..2_100_000_000L) {
         throw GradleException("Android versionCode 低于既有 v3.16.1 安装版本或超过平台上限。")
     }

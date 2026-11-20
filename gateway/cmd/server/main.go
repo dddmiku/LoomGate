@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-11-20：工作台升级暂存后重启生效，避免新旧任务引擎争用排他状态锁。
 // 2026-09-26：注入来源闸门开关与轮转上限，并打一行生效策略日志。
 // 2026-09-26：预热模型目录；内嵌面板首次启动失败时网关继续服务，面板后台重试。
 // 2026-09-25：启用共享密钥限流与有界请求明细，热交接/信号退出均在在途结束后关闭。
@@ -41,7 +42,6 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
-	"workbuddy2api/internal/version"
 )
 
 func main() {
@@ -52,7 +52,29 @@ func main() {
 		return
 	}
 	cfgPath := flag.String("config", "config.json", "path to config json")
+	repairStage := flag.Bool("repair-update", false, "verify and stage a transition repair without starting or stopping the gateway")
+	repairStatus := flag.Bool("repair-update-status", false, "read transition repair status")
+	repairRollback := flag.Bool("repair-update-rollback", false, "restore this repair's previous startup pointer if it is still current")
+	repairTarget := flag.String("repair-update-tag", "", "optional latest release tag for transition repair")
+	repairDir := flag.String("repair-update-dir", "", "absolute update directory of the existing deployment")
 	flag.Parse()
+	if *repairStage || *repairStatus || *repairRollback {
+		action, count := "", 0
+		for name, selected := range map[string]bool{"stage": *repairStage, "status": *repairStatus, "rollback": *repairRollback} {
+			if selected {
+				action, count = name, count+1
+			}
+		}
+		if count != 1 {
+			log.Print("repair_action_invalid")
+			os.Exit(1)
+		}
+		if err := runRepairUpdate(*cfgPath, action, *repairTarget, *repairDir, os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// 安卓端：目录与首次运行的配置必须在读配置之前准备好（见 BootstrapAndroidLayout）。
 	if err := BootstrapAndroidLayout(*cfgPath); err != nil {
@@ -71,20 +93,12 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	// v3.17.0 transitional hand-off: a legacy deployment still points its update
-	// source at the old maintenance repository. Without this it would stay on
-	// 3.17.0 forever and never see LoomGate 1.x. Runs once, keeps a rollback copy
-	// and never touches a repo the operator set deliberately.
-	if strings.HasPrefix(strings.TrimSpace(version.Version), "v3.") {
-		changed, migrateErr := migrateUpdateRepo(*cfgPath)
-		if migrateErr != nil {
-			log.Printf("WARN: [transition] 更新源迁移未完成（保留原配置）：%v", migrateErr)
-		} else if changed {
-			log.Printf("INFO: [transition] 更新源已切换到 %s（原配置备份见 config.json%s）", loomGateRepo, transitionBackupSuffix)
-			if reloaded, loadErr := loadConfigOrEnv(*cfgPath); loadErr == nil {
-				cfg = reloaded
-			}
-		}
+	// The bridge resolves the new feed in memory. A candidate must not rewrite
+	// its still-running legacy parent's config before successful startup, and
+	// legacy container configurations may be read-only single-file mounts.
+	if repo := effectiveUpdateRepo(*cfgPath, cfg.Update.Repo); repo != cfg.Update.Repo {
+		cfg.Update.Repo = repo
+		log.Printf("INFO: [transition] 当前进程使用 LoomGate 更新源；原配置文件保持不变")
 	}
 
 	layout, err := prepareUnified(cfg, *cfgPath)
@@ -447,6 +461,10 @@ func main() {
 		Args:          os.Args[1:],
 		Listener:      mainLn,
 		AdminListener: adminLn,
+		// The task engine and provider vaults have lifetime exclusive locks.
+		// A child cannot become ready before this process releases them; stage
+		// the verified runtime for a gateway restart instead of a failed handover.
+		RequireRestart: workbench != nil,
 		// 安卓上更新的是 APK（应用私有目录不能执行），交给系统安装器；
 		// 其他平台返回 nil，走既有的进程交接。
 		StageInstaller: hotupdate.StageInstallerForAndroid(updateDir(cfg)),

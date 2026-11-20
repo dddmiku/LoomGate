@@ -237,7 +237,8 @@ func stillBeyondWindow(body []byte, budget outputBudget, sessionPrompt int64) bo
 // 字节口径：中文约 4–5 字节/token、代码约 3 字节/token 时偏高（只影响边界判定的保守侧）；
 // 重复短词约 2 字节/token 时仍能认出已超窗（线上 104 万请求验收）。
 func estimateInputTokens(body []byte, sessionPrompt int64) int64 {
-	return max(estimatePromptTokens(body), (textBytes(body)*2+4)/5, sessionPrompt)
+	prompt, textBytes := promptMeasures(body)
+	return max(prompt, (textBytes*2+4)/5, sessionPrompt)
 }
 
 // EstimateInputTokens 供包外读取输入量估算（Anthropic 首帧的临时 input_tokens）。
@@ -309,6 +310,14 @@ func textBytes(body []byte) int64 {
 // ceil(中日韩字符/1.8) + ceil(其他字符/4)。base64 图片数据不计入（图片由视觉编码器单独计费）。
 // 只用于判断是否贴近窗口，不参与计量。
 func estimatePromptTokens(body []byte) int64 {
+	prompt, _ := promptMeasures(body)
+	return prompt
+}
+
+// Budget selection and provisional usage need both measures. Derive them in
+// one scan and keep ordinary ASCII out of the Unicode range-table lookups.
+// Model context/output limits and reported token accounting are unchanged.
+func promptMeasures(body []byte) (prompt, textBytes int64) {
 	var cjk, other int64
 	var scan dataURIScan
 	for i := 0; i < len(body); {
@@ -318,15 +327,22 @@ func estimatePromptTokens(body []byte) int64 {
 				continue
 			}
 		}
+		if body[i] < utf8.RuneSelf {
+			other++
+			textBytes++
+			i++
+			continue
+		}
 		r, size := utf8.DecodeRune(body[i:])
 		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
 			cjk++
 		} else {
 			other++
 		}
+		textBytes += int64(size)
 		i += size
 	}
-	return (cjk*10+17)/18 + (other+3)/4
+	return (cjk*10+17)/18 + (other+3)/4, textBytes
 }
 
 // boundaryContextFailure 把窗口边界处的 11133 表述为上下文超限（保留上游原始错误）。

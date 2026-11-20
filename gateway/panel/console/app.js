@@ -109,6 +109,7 @@
     try {
       const response=await fetch('api/'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',signal:controller.signal,headers:body===undefined?{}:{'Content-Type':'application/json','X-Admin-Request':'1'},body:body===undefined?undefined:JSON.stringify(body)});
       const data=await response.json();
+      if(response.status===401)state.usageSnapshot=null;
       if(!response.ok || data.ok===false && !allowNotOK) throw new APIError(data.error || data.error_code || 'request_failed',response.status,typeof data.message==='string'?data.message:'');
       $('#sync-time').textContent='同步于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
       return data;
@@ -212,6 +213,7 @@
   async function navigate() {
     const route=location.hash.slice(1).split('?')[0] || 'overview';
     state.route=Object.hasOwn(routes,route)?route:'overview';
+    state.usageSnapshot=null;
     const generation=begin();closeDialog();closeNavigation();
     document.querySelectorAll('#navigation a').forEach(a=>{if(a.hash==='#'+state.route)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
     document.title=routes[state.route][1]+' · LoomGate';
@@ -902,16 +904,37 @@
     if(!from&&!to)return days;
     return days.filter(d=>(!from||d.day>=from)&&(!to||d.day<=to));
   }
+  // 账本按服务端本地日历日归桶，快捷日期也使用本地日历，避免凌晨仍选到 UTC 的前一天。
+  function usageDayKey(value){
+    const p=n=>String(n).padStart(2,'0');
+    return `${value.getFullYear()}-${p(value.getMonth()+1)}-${p(value.getDate())}`;
+  }
   async function usage() {
-    const data=await api('usage'),totals=data.totals;
-    if(!totals)throw new APIError('request_failed',503);
+    const generation=state.version;
+    state.usageSnapshot=null;
+    const data=await api('usage');
+    if(generation!==state.version||state.route!=='usage'||!navigator.onLine)return;
+    if(!data.totals)throw new APIError('request_failed',503);
+    state.usageSnapshot=data;
+    state.usageReadAt=new Date().toISOString();
+    drawUsage(data);
+  }
+  function filterUsage(){
+    if(state.route!=='usage')return;
+    if(!navigator.onLine)state.usageSnapshot=null;
+    if(!state.usageSnapshot){toast(navigator.onLine?'正在读取或数据已失效，请刷新用量后再筛选。':'当前离线，请恢复连接并刷新用量。');return;}
+    drawUsage(state.usageSnapshot);
+  }
+  function drawUsage(data) {
+    const totals=data.totals;
     const allDays=usageDays(data);
-    const today=new Date().toISOString().slice(0,10);
-    const cutoff=n=>new Date(Date.now()-(n-1)*86400000).toISOString().slice(0,10);
+    const today=usageDayKey(new Date());
+    const cutoff=n=>{const day=new Date();day.setDate(day.getDate()-(n-1));return usageDayKey(day);};
     state.usageRange=state.usageRange||{from:'',to:''};
     const range=state.usageRange;
     const scoped=usageInRange(allDays,range.from,range.to);
-    const scopedTotals=range.from||range.to?usageSum(scoped):totals;
+    const hasRange=!!(range.from||range.to);
+    const scopedTotals=hasRange?usageSum(scoped):totals;
     const rangeLabel=(()=>{
       if(!range.from&&!range.to)return '全部时间';
       if(range.from===today&&range.to===today)return '今天';
@@ -924,7 +947,12 @@
     })();
     // Per-model figures come from the scoped day buckets when a range is active;
     // the all-time totals are used only when no range is selected.
-    const keys=data.keys||[];
+    // 每张卡片使用同一范围。旧账本缺少按日维度时不能拿历史总量替代；
+    // 有日总量但缺模型桶时保留调用方数据，并明确提示模型拆分不完整。
+    const keys=hasRange?(data.keys||[]).map(key=>({...key,
+      totals:usageSum(usageInRange(key.days||[],range.from,range.to)),
+      models:usageInRange(key.day_models||[],range.from,range.to).flatMap(day=>day.models||[]),
+    })).filter(key=>key.totals.requests>0):(data.keys||[]);
     const byModel=new Map();
     for(const key of keys){
       for(const m of (key.models||[])){
@@ -938,6 +966,10 @@
       }
     }
     const models=[...byModel.entries()].sort((a,b)=>(b[1].prompt+b[1].completion)-(a[1].prompt+a[1].completion));
+    const modelRequests=models.reduce((n,entry)=>n+entry[1].requests,0);
+    const callerRequests=keys.reduce((n,key)=>n+(key.totals?.requests||0),0);
+    const modelCoverage=hasRange&&modelRequests<scopedTotals.requests?notice('部分历史记录缺少按日模型明细，模型统计仅包含已有记录。','warn'):'';
+    const callerCoverage=hasRange&&callerRequests<scopedTotals.requests?notice('部分历史记录缺少按日调用方明细，调用方统计仅包含已有记录。','warn'):'';
     const pct=(n,total)=>total>0?Math.round(n/total*1000)/10:0;
     const palette=['#4f7df3','#3bb273','#e8a33d','#c85fd0','#38a4c9','#9b8cf0','#e0644f'];
     const segments=models.slice(0,6).map((e,i)=>({value:e[1].prompt+e[1].completion,color:palette[i%palette.length]}));
@@ -971,18 +1003,21 @@
       `<div class="usage-grid">
         <section class="usage-card">
           <div class="usage-card-head"><h2>模型分布</h2><span class="small muted">按 Token</span></div>
+          ${modelCoverage}
           ${segments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(segments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
         </section>
         <section class="usage-card">
           <div class="usage-card-head"><h2>调用方</h2><span class="small muted">按 Token</span></div>
+          ${callerCoverage}
           ${keys.length?table(['调用方','请求','Token'],[...keys].sort((a,b)=>(b.totals?.total_tokens||0)-(a.totals?.total_tokens||0)).slice(0,10).map(k=>[esc(k.name||k.masked_key||k.key_id||'未命名'),number(k.totals?.requests||0),number(k.totals?.total_tokens||0)])):empty('暂无调用方用量','按 API 密钥统计。')}
         </section>
       </div>`+
       `<section class="usage-card">
         <div class="usage-card-head"><h2>按模型明细</h2><span class="small muted">${esc(rangeLabel)}</span></div>
+        ${modelCoverage}
         ${models.length?table(['模型','请求','输入','输出','缓存','消耗'],[...models].map(e=>[`<code>${esc(e[0])}</code>`,number(e[1].requests),number(e[1].prompt),number(e[1].completion),number(e[1].cached),number(e[1].credit)])):empty('暂无明细','')}
       </section>`+
-      notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。`,'');
+      notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。本页读取于 ${date(state.usageReadAt)}；刷新用量可读取最新记录。`,'');
   }
 
   // The request log follows the shape operators know from other gateways: one
@@ -1093,6 +1128,7 @@
     lines.push('当前版本：' + current + (status.commit && status.commit !== 'unknown' ? ' · ' + String(status.commit).slice(0, 7) : ''));
     if(status.repo) lines.push('发布仓库：' + status.repo + (status.visibility ? ' · ' + ({public:'公开',private:'私有',unknown:'未确认'}[status.visibility] || status.visibility) : ''));
     if(status.latest_tag) lines.push('远端最新：' + status.latest_tag);
+    if(status.restart_required === true && status.staged_version) lines.push('待启用版本：' + status.staged_version);
     if(status.asset_name) lines.push('更新包：' + status.asset_name + (status.asset_size ? ' · ' + Math.round(status.asset_size / 1048576 * 10) / 10 + ' MB' : ''));
     if(validUpdateTime(status.built_at))lines.push('构建时间：'+date(status.built_at));
     if(validUpdateTime(status.deployed_at))lines.push('部署时间：'+date(status.deployed_at));
@@ -1106,6 +1142,7 @@
     lines.push(status.signature_verification === true ? '签名校验：已启用（内置发布公钥）' : '签名校验：未内置发布公钥（构建不验签）');
     if(status.state === 'failed' && status.last_error) lines.push('失败原因：' + status.last_error);
     const base = {unread:false,lines,detail:'',canCheck:true,canApply:false};
+    if(status.restart_required === true) return {...base,badge:'manual_action',badgeText:'等待重启',detail:'更新包已下载、校验并准备好；当前版本继续服务。请重启网关或容器后启用新版本，再刷新核验运行版本。'};
     if(update.ok === false) return {...base,canCheck:false,badge:'disabled',badgeText:'未启用',detail:typeof update.message === 'string' && update.message ? update.message : '当前构建未启用热更新。'};
     if(status.enabled !== true) return {...base,canCheck:false,badge:'disabled',badgeText:'已关闭',detail:status.unavailable_reason || '热更新已在配置中关闭（config update.enabled=false）。'};
     if(status.unavailable_reason) return {...base,canCheck:false,badge:'unavailable',badgeText:'不可用',detail:status.unavailable_reason};
@@ -1154,7 +1191,7 @@
     $('.update-badge',card).innerHTML=badge(info.badge,info.badgeText);
     if(completed)updateActionNotice(card,'运行版本已核验：'+status.current+'。此处是当前进程读回，不是部署时间记录。','');
     else if(intent?.blocked)updateActionNotice(card,'无法安全读取或记录本标签页的更新提交，已阻止应用更新。可继续只读刷新状态。');
-    else if(intent)updateActionNotice(card,status.state==='failed'?'服务端报告更新失败；原提交保护仍保留，请核对后解除。':'有一次更新提交尚未核验运行版本；只刷新状态，不会自动重复应用。');
+    else if(intent)updateActionNotice(card,status.restart_required===true?'更新包已准备好，等待重启网关或容器；重启后刷新核验运行版本，不会自动重复下载。':status.state==='failed'?'服务端报告更新失败；原提交保护仍保留，请核对后解除。':'有一次更新提交尚未核验运行版本；只刷新状态，不会自动重复应用。');
   }
   async function readUpdateStatus(card,generation,polls=0){
     clearTimeout(state.poll);
@@ -1167,7 +1204,7 @@
       if(!current())return;
       paintUpdateCard(card,snapshot);
       const intent=readUpdateIntent(),status=snapshot.status||{};
-      if(polls>0&&intent&&!intent.blocked&&snapshot.ok===true&&status.enabled===true&&!status.unavailable_reason&&status.state!=='failed'){
+      if(polls>0&&intent&&!intent.blocked&&snapshot.ok===true&&status.enabled===true&&!status.unavailable_reason&&status.state!=='failed'&&status.restart_required!==true){
         state.poll=setTimeout(()=>readUpdateStatus(card,generation,polls-1),2000);
       }
     }catch(e){
@@ -1586,9 +1623,9 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='copy-endpoint'){const value=element.dataset.value||'';try{await navigator.clipboard.writeText(value);toast('接入地址已复制。');}catch{const box=document.getElementById('endpoint-base');if(box){const range=document.createRange();range.selectNodeContents(box);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);}toast('已选中地址，请按 Ctrl+C 复制。');}return;}
     if(name==='logs-prev' || name==='logs-next'){state.logOffset=Math.max(0,(state.logOffset || 0)+(name==='logs-next'?30:-30));await reload();return;}
     if(name==='request-expand'){toggleRequestRow(index);return;}
-    if(name==='usage-range'){state.usageRange={from:element.dataset.from||'',to:element.dataset.to||''};await reload();return;}
-    if(name==='usage-apply'){const from=document.getElementById('usage-from')?.value||'',to=document.getElementById('usage-to')?.value||'';if(from&&to&&from>to){toast('起始日期不能晚于结束日期。');return;}state.usageRange={from,to};await reload();return;}
-    if(name==='usage-reset'){state.usageRange={from:'',to:''};await reload();return;}
+    if(name==='usage-range'){state.usageRange={from:element.dataset.from||'',to:element.dataset.to||''};filterUsage();return;}
+    if(name==='usage-apply'){const from=document.getElementById('usage-from')?.value||'',to=document.getElementById('usage-to')?.value||'';if(from&&to&&from>to){toast('起始日期不能晚于结束日期。');return;}state.usageRange={from,to};filterUsage();return;}
+    if(name==='usage-reset'){state.usageRange={from:'',to:''};filterUsage();return;}
     if(name==='lan-settings'){await lanSettingsDialog(element);return;}
     if(name==='loop-toggle'){
       const card=element.closest('#setting-loop');
@@ -1718,8 +1755,8 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
   // 用户能看到「核对后解除」。重复关闭不会重复提交任何东西。
   $('#dialog').addEventListener('close',()=>{if(['tasks','schedules','runs'].includes(state.route))paintTaskGuard();});
   document.addEventListener('click',e=>{const target=e.target.closest('[data-action]');if(target && !target.disabled)action(target).catch(err=>{if(err.name!=='AbortError')toast(err instanceof APIError?err.message:'操作未完成，请刷新状态后重试。');});});
-  $('#logout').onclick=()=>mutate('logout','auth/logout',{},async()=>location.replace('login'));
-  const network=()=>{$('#connection').hidden=navigator.onLine;$('#connection').textContent='当前网络离线。页面中的数据可能已过期，恢复连接后请刷新。';};window.addEventListener('offline',network);window.addEventListener('online',network);network();
+  $('#logout').onclick=()=>{state.usageSnapshot=null;return mutate('logout','auth/logout',{},async()=>location.replace('login'));};
+  const network=()=>{if(!navigator.onLine)state.usageSnapshot=null;$('#connection').hidden=navigator.onLine;$('#connection').textContent='当前网络离线。页面中的数据可能已过期，恢复连接后请刷新。';};window.addEventListener('offline',network);window.addEventListener('online',network);network();
   LoomConnections.init({api,esc,openDialog,toast,reload,providerName,dialogRevision:()=>state.taskLogGeneration,accountConnected:f=>{state.accountProvider=f.provider;state.providersDirty=true;}});
-  window.addEventListener('hashchange',navigate);window.addEventListener('pagehide',()=>{state.controller?.abort();clearTimeout(state.poll);LoomConnections.stop();});navigate();
+  window.addEventListener('hashchange',navigate);window.addEventListener('pagehide',()=>{state.usageSnapshot=null;state.controller?.abort();clearTimeout(state.poll);LoomConnections.stop();});navigate();
 })();

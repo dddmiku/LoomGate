@@ -75,8 +75,11 @@ func (h *Handler) providerModels(ctx context.Context) ([]map[string]any, []map[s
 			issues = append(issues, map[string]string{"provider": id, "code": providerErrorCode(err)})
 			continue
 		}
+		toolProvider, carriesTools := h.cfg.Inference[id].(inference.ToolProvider)
+		supportsTools := carriesTools && toolProvider.SupportsTools()
+		_, supportsReasoning := h.cfg.Inference[id].(inference.ReasoningProvider)
 		for _, m := range models {
-			entry := map[string]any{"id": m.ID, "object": "model", "created": 0, "owned_by": id, "name": m.Name, "supports_tool_call": false, "supports_images": false, "single_turn_text_only": !m.MultiTurn, "supports_multi_turn": m.MultiTurn}
+			entry := map[string]any{"id": m.ID, "object": "model", "created": 0, "owned_by": id, "name": m.Name, "supports_tool_call": supportsTools, "supports_images": false, "supports_reasoning": supportsReasoning, "single_turn_text_only": !m.MultiTurn, "supports_multi_turn": m.MultiTurn}
 			entry["streaming_mode"] = "buffered"
 			if m.Incremental {
 				entry["streaming_mode"] = "incremental"
@@ -221,14 +224,27 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 			text = value
 		}
 	}
-	if len(parsed) == 0 || total > maxDialogueChars || len(parsed) > 101 || (!hasDialogue && !carriesTools && len(parsed) != 1) {
+	// A tool-using client can exceed 101 messages with a small transcript.
+	// Enforce the byte budget, not a message count unrelated to the model's
+	// context window. Keep every turn (including tool call/result pairs).
+	if total > maxDialogueChars {
+		st.status = http.StatusRequestEntityTooLarge
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "conversation text exceeds the provider size limit")
+		return
+	}
+	if len(parsed) == 0 {
 		st.status = 400
-		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
+		writeOpenAIError(w, 400, "provider_input_unsupported", "messages must include readable text or supported tool history")
+		return
+	}
+	if !hasDialogue && !carriesTools && len(parsed) != 1 {
+		st.status = 400
+		writeOpenAIError(w, 400, "provider_context_unsupported", "this provider only supports a single text message")
 		return
 	}
 	if !carriesTools && text == "" {
 		st.status = 400
-		writeOpenAIError(w, 400, "provider_input_unsupported", "the request carried no readable text, or exceeded the size limit")
+		writeOpenAIError(w, 400, "provider_input_unsupported", "messages must include readable text")
 		return
 	}
 	var result inference.Result

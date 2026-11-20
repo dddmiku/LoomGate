@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/version"
 )
 
 // Transitional release support (v3.17.0).
@@ -21,9 +24,9 @@ import (
 // keep the original value in a sidecar, and never rewrite a value the operator
 // set deliberately later.
 const (
-	loomGateRepo          = "dddmiku/LoomGate"
-	legacyRepos           = "dddmiku/workbuddy2api-maintenance,dddmiku/workbuddy2api"
-	transitionMarkerName  = "loomgate-transition.json"
+	loomGateRepo           = "dddmiku/LoomGate"
+	legacyRepos            = "dddmiku/workbuddy2api-maintenance,dddmiku/workbuddy2api"
+	transitionMarkerName   = "loomgate-transition.json"
 	transitionBackupSuffix = ".pre-loomgate"
 )
 
@@ -32,6 +35,50 @@ type transitionRecord struct {
 	To        string `json:"to"`
 	AtUTC     string `json:"at_utc"`
 	ConfigSHA string `json:"config_sha256_before"`
+}
+
+// effectiveUpdateRepo is a runtime hand-off, not a config migration. Older
+// containers commonly mount config.json read-only or as a single-file bind
+// mount. Replacing it can fail with EBUSY, and modifying it before a candidate
+// reports ready also strands the still-running legacy parent on a 1.x feed.
+// Resolve the bridge's feed in memory and leave all source bytes untouched.
+//
+// A valid prior migration marker preserves the existing operator override:
+// changing back to a legacy feed after that migration is deliberate. Third
+// party repositories are always preserved.
+func effectiveUpdateRepo(configPath, configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured != "" && !legacyRepo(configured) {
+		return configured
+	}
+	if configured != "" && strings.TrimSpace(configPath) != "" {
+		marker := filepath.Join(filepath.Dir(configPath), transitionMarkerName)
+		if raw, err := os.ReadFile(marker); err == nil {
+			var record transitionRecord
+			if json.Unmarshal(raw, &record) == nil && record.To == loomGateRepo && legacyRepo(record.From) {
+				return configured
+			}
+		}
+	}
+	current := strings.TrimPrefix(strings.TrimSpace(version.Version), "v")
+	// Only builds from the LoomGate generation perform the legacy hand-off.
+	// An older 3.16.x release must continue seeing its bridge feed.
+	if strings.HasPrefix(current, "1.") || transitionalVersion(current) {
+		return loomGateRepo
+	}
+	return configured
+}
+
+func transitionalVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 || parts[0] != "3" {
+		return false
+	}
+	var minor int
+	if _, err := fmt.Sscanf(parts[1], "%d", &minor); err != nil {
+		return false
+	}
+	return minor >= 17
 }
 
 // migrateUpdateRepo points the update source at LoomGate once.
@@ -100,11 +147,11 @@ func migrateUpdateRepo(configPath string) (bool, error) {
 	}
 	next = append(next, '\n')
 	backup := absolute + transitionBackupSuffix
-	if err := writeExclusive(backup, raw); err != nil {
+	if err := writeTransitionOnce(backup, raw); err != nil {
 		return false, err
 	}
 	temporary := absolute + ".transition-pending"
-	if err := writeExclusive(temporary, next); err != nil {
+	if err := writeTransitionOnce(temporary, next); err != nil {
 		return false, err
 	}
 	if err := os.Rename(temporary, absolute); err != nil {
@@ -118,6 +165,27 @@ func migrateUpdateRepo(configPath string) (bool, error) {
 		return true, fmt.Errorf("repo switched but marker not written: %w", err)
 	}
 	return true, nil
+}
+
+// Retry the same fixed slot after an interrupted write without replacing a
+// different rollback copy or following a symbolic link.
+func writeTransitionOnce(path string, raw []byte) error {
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return errors.New("transition slot is not a regular file")
+		}
+		existing, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if !bytes.Equal(existing, raw) {
+			return errors.New("transition slot already contains different rollback bytes")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeExclusive(path, raw)
 }
 
 func legacyRepo(value string) bool {
@@ -134,7 +202,8 @@ func sha256Hex(raw []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func writeExclusive(path string, raw []byte) error {	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+func writeExclusive(path string, raw []byte) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

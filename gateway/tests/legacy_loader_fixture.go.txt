@@ -1,0 +1,99 @@
+package hotupdate
+
+// This test is copied into the exact v3.16.1 package by legacy_loader_probe.py.
+// It changes neither the frozen loader nor the release assets.
+import (
+    "context"
+    "crypto/sha256"
+    "encoding/hex"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "runtime"
+    "strings"
+    "testing"
+
+    "workbuddy2api/internal/version"
+)
+
+func TestFrozenLegacyLoaderActualSignedBridge(t *testing.T) {
+    assets := os.Getenv("LOOMGATE_BRIDGE_ASSETS")
+    public, err := os.ReadFile(os.Getenv("LOOMGATE_BRIDGE_PUBLIC_KEY"))
+    if err != nil || assets == "" { t.Fatal("bridge assets and public key are required") }
+    version.Version, version.ReleaseKey = "v3.16.1", strings.TrimSpace(string(public))
+    if (Release{Tag: "v1.0.5"}).UpdateAvailable() {
+        t.Fatal("baseline unexpectedly bypassed the required bridge generation")
+    }
+    names := []string{"SHA256SUMS.txt", "SHA256SUMS.txt.sig"}
+    name, err := assetName()
+    if err != nil { t.Fatal("baseline has no matching host asset") }
+    if runtime.GOOS == "linux" { name = runtimeAssetName() }
+    names = append(names, name)
+    payload := map[string][]byte{}
+    for _, member := range names {
+        body, readErr := os.ReadFile(filepath.Join(assets, member))
+        if readErr != nil { t.Fatalf("required signed bridge asset is unavailable: %s", member) }
+        payload[member] = body
+    }
+    var api *httptest.Server
+    api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.URL.Path == "/repos/dddmiku/workbuddy2api-maintenance/releases/latest" {
+            rows := []map[string]any{}
+            for _, member := range names {
+                digest := sha256.Sum256(payload[member])
+                rows = append(rows, map[string]any{"name":member, "size":len(payload[member]),
+                    "url":api.URL+"/assets/"+member, "browser_download_url":api.URL+"/assets/"+member,
+                    "digest":"sha256:"+hex.EncodeToString(digest[:])})
+            }
+            _ = json.NewEncoder(w).Encode(map[string]any{"tag_name":"v3.17.0", "assets":rows})
+            return
+        }
+        if data, ok := payload[strings.TrimPrefix(r.URL.Path, "/assets/")]; ok { _, _ = w.Write(data); return }
+        w.WriteHeader(http.StatusNotFound)
+    }))
+    defer api.Close()
+    client := NewClient("dddmiku/workbuddy2api-maintenance", "")
+    client.Bundle, client.APIBase = true, api.URL
+    release, err := client.Latest(context.Background())
+    if err != nil || release.AssetName != name || !release.UpdateAvailable() {
+        t.Fatal("frozen latest lookup did not select the bridge asset")
+    }
+    digest, verified, err := client.VerifySignedRelease(context.Background(), release)
+    if err != nil || !verified { t.Fatal("real bridge signature was not accepted by the frozen verifier") }
+    directory := t.TempDir()
+    path, downloaded, err := client.Download(context.Background(), release, directory)
+    if err != nil || downloaded != digest { t.Fatal("frozen download did not match the signed digest") }
+    if runtime.GOOS == "linux" {
+        path, err = extractRuntimeBundle(path, release, directory)
+        if err != nil { t.Fatal("frozen loader rejected the real bridge runtime") }
+    }
+    // The existing published transition binary runs only its read-only identity
+    // mode, before configuration, account state and any network startup.
+    raw, err := exec.Command(path, "--loomgate-build-info").Output()
+    if err != nil { t.Fatal("downloaded bridge could not execute its identity check") }
+    var identity struct { Version string `json:"version"`; Verification bool `json:"verification_enabled"` }
+    if json.Unmarshal(raw, &identity) != nil || identity.Version != release.Tag || !identity.Verification {
+        t.Fatal("bridge binary identity does not match its signed release")
+    }
+    // Signature enforcement must remain intact on this actual old code.
+    payload["SHA256SUMS.txt"] = append(payload["SHA256SUMS.txt"], []byte("tampered\n")...)
+    if _, _, err = client.VerifySignedRelease(context.Background(), release); err == nil {
+        t.Fatal("frozen verifier accepted a modified checksum manifest")
+    }
+}
+
+func TestFrozenLegacyExtractorAcceptsActualBridgeFileSet(t *testing.T) {
+    archive := filepath.Join(os.Getenv("LOOMGATE_BRIDGE_ASSETS"), "wb2api-runtime-linux-"+runtime.GOARCH+".tar.gz")
+    if runtime.GOARCH == "arm" { archive = filepath.Join(os.Getenv("LOOMGATE_BRIDGE_ASSETS"), "wb2api-runtime-linux-armv7.tar.gz") }
+    directory := t.TempDir()
+    path, err := extractRuntimeBundle(archive, Release{Tag: "v3.17.0"}, directory)
+    if err != nil { t.Fatal("the exact old extractor rejected the signed bridge's 18-file layout") }
+    for name := range runtimeFiles {
+        if info, err := os.Stat(filepath.Join(filepath.Dir(path), name)); err != nil || !info.Mode().IsRegular() {
+            t.Fatalf("old runtime member was not extracted: %s", name)
+        }
+    }
+}

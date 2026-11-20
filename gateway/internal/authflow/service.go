@@ -93,6 +93,14 @@ type Driver interface {
 	Step(context.Context, Flow, string, Input) (Result, error)
 }
 
+// StepValidator rejects malformed local input before an external operation is
+// recorded or its cooldown starts. Validation must be local and side-effect
+// free. A nil result permits the normal operation; a result is persisted and
+// returned without calling the driver step.
+type StepValidator interface {
+	ValidateStep(Flow, string, Input) *Result
+}
+
 // PreparedStarter persists the provider intent before any external side effect.
 // PrepareStart must only inspect local state, never perform network operations.
 type PreparedStarter interface {
@@ -484,8 +492,17 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 		s.mu.Unlock()
 		return f.View, ErrInvalid
 	}
+	d := s.opts.Drivers[f.Provider]
+	if d == nil {
+		s.mu.Unlock()
+		return View{}, ErrInvalid
+	}
+	var validation *Result
+	if validator, ok := d.(StepValidator); ok {
+		validation = validator.ValidateStep(f, action, input)
+	}
 	now := s.opts.Now()
-	if action == "send_code" {
+	if validation == nil && action == "send_code" {
 		for _, prior := range rows {
 			if prior.Provider == f.Provider && now.Before(prior.RetryAt) {
 				s.mu.Unlock()
@@ -493,18 +510,13 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 			}
 		}
 	}
-	if (action == "poll" || readVerify) && now.Before(f.NextPollAt) || action == "send_code" && now.Before(f.RetryAt) {
+	if validation == nil && ((action == "poll" || readVerify) && now.Before(f.NextPollAt) || action == "send_code" && now.Before(f.RetryAt)) {
 		s.mu.Unlock()
 		return f.View, ErrBusy
 	}
-	d := s.opts.Drivers[f.Provider]
-	if d == nil {
-		s.mu.Unlock()
-		return View{}, ErrInvalid
-	}
 	f.Status = "working"
 	f.Action = action
-	if action == "send_code" {
+	if validation == nil && action == "send_code" {
 		f.RetryAt = now.Add(time.Minute)
 	}
 	f.Revision++
@@ -516,6 +528,9 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 	bounded, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	s.active[id] = cancel
 	s.mu.Unlock()
+	if validation != nil {
+		return s.call(bounded, cancel, f, func() (Result, error) { return *validation, nil })
+	}
 	if readVerify {
 		return s.call(bounded, cancel, f, func() (Result, error) { return verifier.Verify(bounded, f) })
 	}

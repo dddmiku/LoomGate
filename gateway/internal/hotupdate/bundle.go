@@ -30,16 +30,16 @@ var runtimeFiles = map[string]os.FileMode{
 	// 豆包官方桌面目录桥接。Linux 运行包带上它，才能在已运行官方客户端的机器上
 	// 通过回环端口连接现有会话（不启动、不托管客户端）。它们是一整组：
 	// 要么全部带上，要么整组省略——半包会让工作台在运行期才发现缺 helper。
-	"doubao-runtime/bridge.py":        0644,
-	"doubao-runtime/managed.py":       0644,
-	"doubao-runtime/stream_bridge.py": 0644,
-	"doubao-runtime/runtime.js":       0644,
-	"doubao-runtime/tasks_runtime.js": 0644,
-	"doubao-runtime/work_runtime.js":  0644,
+	"doubao-runtime/bridge.py":         0644,
+	"doubao-runtime/managed.py":        0644,
+	"doubao-runtime/stream_bridge.py":  0644,
+	"doubao-runtime/runtime.js":        0644,
+	"doubao-runtime/tasks_runtime.js":  0644,
+	"doubao-runtime/work_runtime.js":   0644,
 	"doubao-runtime/stream_runtime.js": 0644,
-	"doubao-runtime/probe_runtime.js": 0644,
-	"doubao-runtime/probe_cleanup.js": 0644,
-	"doubao-runtime/requirements.txt": 0644,
+	"doubao-runtime/probe_runtime.js":  0644,
+	"doubao-runtime/probe_cleanup.js":  0644,
+	"doubao-runtime/requirements.txt":  0644,
 }
 
 // doubaoRuntimeFiles is the optional group above. Bundles released before the
@@ -211,6 +211,11 @@ func extractRuntimeBundle(archive string, release Release, dir string) (binary s
 		if len(manifest.Files[name]) != 64 || !strings.EqualFold(manifest.Files[name], hashes[name]) {
 			return "", fmt.Errorf("runtime digest mismatch for %s", name)
 		}
+	}
+	// Only a fully checked extraction belongs to the updater. Cleanup never
+	// infers ownership from a directory name or follows a marker symlink.
+	if err := root.WriteFile(managedRuntimeMarker, []byte(managedRuntimeMarkerContent), 0600); err != nil {
+		return "", fmt.Errorf("mark verified runtime: %w", err)
 	}
 	return filepath.Join(stage, "wb2api"), nil
 }

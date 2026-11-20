@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-11-20：工作台独占状态改为验签暂存、重启生效；保留完整运行目录并明确待启用版本。
 // 2026-09-26：下载前验签、下载后与签名摘要对账，不符即拒绝更新。
 // 2026-09-26：交接完成后清理更新目录。
 // 2026-09-24：自动更新不降级；管理员显式指定当前 latest 的旧标签时保留手动回滚能力。
@@ -48,22 +49,22 @@ type Status struct {
 	// 公开仓库匿名可读发布，热更新可用；私有仓库需要令牌，未配令牌时明确不可用。
 	Visibility Visibility `json:"visibility"`
 	// UnavailableReason 不可用时的原因（给面板与运维看的中文说明）；可用时为空。
-	UnavailableReason string    `json:"unavailable_reason,omitempty"`
-	Current           string    `json:"current"`
-	Commit            string    `json:"commit"`
-	BuiltAt           string    `json:"built_at"`
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	Current           string `json:"current"`
+	Commit            string `json:"commit"`
+	BuiltAt           string `json:"built_at"`
 	// DeployedAt 是当前运行文件在本机的落盘时间（RFC3339）。它不是构建时间：
 	// 手动替换、完整运行包解压或热更新提交 current 指针时，文件 mtime 会更新，
 	// 运维据此判断「这个进程是什么时候换上的」。无法读取时为 null，不猜。
-	DeployedAt *time.Time `json:"deployed_at,omitempty"`
-	Repo              string    `json:"repo"`
-	Dir               string    `json:"dir"`
-	State             State     `json:"state"`
-	LatestTag         string    `json:"latest_tag"`
-	LatestAt          time.Time `json:"latest_at"`
-	UpdateReady       bool      `json:"update_ready"`
-	AssetName         string    `json:"asset_name"`
-	AssetSize         int64     `json:"asset_size"`
+	DeployedAt  *time.Time `json:"deployed_at,omitempty"`
+	Repo        string     `json:"repo"`
+	Dir         string     `json:"dir"`
+	State       State      `json:"state"`
+	LatestTag   string     `json:"latest_tag"`
+	LatestAt    time.Time  `json:"latest_at"`
+	UpdateReady bool       `json:"update_ready"`
+	AssetName   string     `json:"asset_name"`
+	AssetSize   int64      `json:"asset_size"`
 	// DownloadedBytes / Progress 是下载进度，供面板与 App 显示进度条。
 	//
 	// 为什么要有它：更新包十几 MB，在网络慢的时候要等几十秒。此前界面上只有一个
@@ -77,6 +78,9 @@ type Status struct {
 	CheckedAt       time.Time `json:"checked_at"`
 	LastError       string    `json:"last_error"`
 	InheritedFD     bool      `json:"inherited_fd"`
+	RestartRequired bool      `json:"restart_required"`
+	RestartOnUpdate bool      `json:"restart_on_update"`
+	StagedVersion   string    `json:"staged_version,omitempty"`
 	// SignatureVerification 报告本二进制是否内置发布验签公钥。
 	// 面板必须按真实值显示「签名校验：已启用 / 未内置公钥」；笼统写「已签名的
 	// 运行包」会让开发构建看起来具备它并不具备的信任根（P1 发布口径）。
@@ -100,6 +104,15 @@ type Options struct {
 	// 必须一并继承；nil = 本次部署没有管理通道。
 	AdminListener net.Listener
 	OnSwitched    func() // 交接成功后的回调（main 用它触发优雅停机）
+	// RequireRestart preserves exclusive workbench state ownership. A staged
+	// update is verified and committed for the next gateway start; it never
+	// launches a second task engine or closes the currently serving runtime.
+	RequireRestart bool
+	// Repair stages a deployment from a separately invoked recovery CLI. Its
+	// own binary version is not the running deployment version, and it cannot
+	// infer ownership of the running runtime for pruning.
+	Repair            bool
+	BeforeStageCommit func(binary string) error
 	// StageInstaller 在**安卓**上替代进程交接：把校验过的更新件交给系统安装器。
 	//
 	// 安卓的应用私有目录不能执行（SELinux 的 untrusted_app 域禁止在 app_data_file
@@ -125,7 +138,8 @@ type Manager struct {
 	visibility Visibility
 	// downloaded 是本次下载已落盘的字节数（供进度条）。由 DownloadWithProgress
 	// 的回调在下载线程上写入，读侧在 statusLocked 里持同一把锁。
-	downloaded int64
+	downloaded    int64
+	stagedVersion string
 }
 
 // NewManager 构造管理器；Dir 为空时回落到系统临时目录下的固定子目录。
@@ -276,9 +290,14 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		m.mu.Unlock()
 		return status, errors.New("已有更新任务在进行中")
 	}
-	if m.opts.Listener == nil {
+	if m.opts.Listener == nil && !(m.opts.Repair && m.opts.RequireRestart) {
 		m.mu.Unlock()
 		return m.Status(), errors.New("没有可交接的监听套接字（热更新需要以正常启动方式运行）")
+	}
+	if m.stagedVersion != "" {
+		status := m.statusLocked()
+		m.mu.Unlock()
+		return status, errors.New("更新包已准备好，请先重启网关后再检查更新")
 	}
 	m.busy = true
 	m.state = StateChecking
@@ -318,7 +337,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 		return m.Status(), err
 	}
 	sameVersion := strings.TrimPrefix(release.Tag, "v") == strings.TrimPrefix(strings.TrimSpace(version.Version), "v")
-	if sameVersion || (strings.TrimSpace(target) == "" && !release.UpdateAvailable()) {
+	if !m.opts.Repair && (sameVersion || (strings.TrimSpace(target) == "" && !release.UpdateAvailable())) {
 		err := fmt.Errorf("没有可自动升级的版本（当前 %s，最新发布 %s）", version.Version, release.Tag)
 		m.fail(err)
 		return m.Status(), err
@@ -416,18 +435,44 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	// 不做这件事的后果很具体：Windows 上更新会一路成功到交接，然后报
 	// 「dup listener: listener inheritance is unsupported on Windows」——用户看到的
 	// 是「更新失败」，而实际上新版本已经下载校验完毕、只差一次重启（2026-10-13 实测）。
-	if !HandoverSupported {
+	if !HandoverSupported || m.opts.RequireRestart {
+		if err := ctx.Err(); err != nil {
+			m.fail(err)
+			return m.Status(), err
+		}
+		if m.opts.BeforeStageCommit != nil {
+			if err := m.opts.BeforeStageCommit(path); err != nil {
+				m.fail(err)
+				return m.Status(), err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			m.fail(err)
+			return m.Status(), err
+		}
 		if err := writeCurrentPointer(m.opts.Dir, path); err != nil {
 			m.fail(fmt.Errorf("写入更新指针失败：%w", err))
 			return m.Status(), err
 		}
-		pruneUpdateDir(m.opts.Dir, path)
+		// The pointer is now committed. In bundle mode its complete directory
+		// must survive Apply's deferred cleanup until the next process starts.
+		committed = true
+		// The pointer now names the staged version; resolve the actual running
+		// binary separately so cleanup cannot remove its helpers or rollback.
+		active := m.opts.Binary
+		if active == "" {
+			active, _ = os.Executable()
+		}
+		if !m.opts.Repair {
+			pruneUpdateDir(m.opts.Dir, path, active)
+		}
 		m.mu.Lock()
 		m.state = StateIdle
 		m.checkedAt = time.Now().UTC()
 		m.lastError = ""
+		m.stagedVersion = release.Tag
 		m.mu.Unlock()
-		log.Printf("[update] %s 已下载并校验；本平台不支持运行中交接，重启后生效", release.Tag)
+		log.Printf("[update] %s 已下载并校验；当前实例继续服务，重启网关后生效", release.Tag)
 		return m.Status(), nil
 	}
 
@@ -517,7 +562,7 @@ func writeCurrentPointer(dir, binaryPath string) error {
 }
 
 // CurrentBinary 返回 current 指针指向的二进制（不存在时返回空串）。
-func CurrentBinary(dir string) string {	// #nosec G304 -- current 指针位于更新目录，非请求输入
+func CurrentBinary(dir string) string { // #nosec G304 -- current 指针位于更新目录，非请求输入
 	raw, err := os.ReadFile(filepath.Join(dir, "current"))
 	if err != nil {
 		return ""
@@ -574,7 +619,7 @@ func (m *Manager) statusLocked() Status {
 		State:             m.state,
 		LatestTag:         m.latest.Tag,
 		LatestAt:          m.latest.PublishedAt,
-		UpdateReady:       available && m.latest.Tag != "" && m.latest.UpdateAvailable(),
+		UpdateReady:       available && m.stagedVersion == "" && m.latest.Tag != "" && m.latest.UpdateAvailable(),
 		AssetName:         m.latest.AssetName,
 		AssetSize:         m.latest.AssetSize,
 		DownloadedBytes:   m.downloaded,
@@ -582,6 +627,9 @@ func (m *Manager) statusLocked() Status {
 		CheckedAt:         m.checkedAt,
 		LastError:         m.lastError,
 		InheritedFD:       Inherited(),
+		RestartRequired:   m.stagedVersion != "",
+		RestartOnUpdate:   m.opts.RequireRestart || !HandoverSupported,
+		StagedVersion:     m.stagedVersion,
 
 		SignatureVerification: version.ReleaseVerificationEnabled(),
 	}

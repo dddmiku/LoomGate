@@ -26,10 +26,11 @@ func (Source) StaticModels() []providercatalog.Model {
 	out := make([]providercatalog.Model, 0, len(Models))
 	for _, m := range Models {
 		out = append(out, providercatalog.Model{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.ContextWindow,
-			Credits:       "1x",
+			ID:                m.ID,
+			Name:              m.Name,
+			ContextWindow:     m.ContextWindow,
+			SupportsMultiTurn: m.MultiTurn,
+			Credits:           "1x",
 		})
 	}
 	return out

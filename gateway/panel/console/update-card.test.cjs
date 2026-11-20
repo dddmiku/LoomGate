@@ -180,3 +180,40 @@ test('signature capability is stated from the real field on every branch', () =>
   }}));
   assert.ok(off.lines.some((line) => line.includes('未内置发布公钥')), off.lines.join('|'));
 });
+
+test('staged update requires a gateway restart and never claims the new version is running', () => {
+  const view = seam()(publicStatus({status: {enabled: true, state: 'idle',
+    current: 'v1.0.5', latest_tag: 'v1.0.6', staged_version: 'v1.0.6',
+    restart_required: true, update_ready: true, signature_verification: true,
+    repo: 'owner/loomgate', asset_name: 'fixture-runtime.tar.gz'}}));
+  assert.equal(view.badgeText, '等待重启');
+  assert.equal(view.canApply, false);
+  assert.match(view.detail, /重启网关或容器/);
+  assert.match(view.detail, /当前版本继续服务/);
+  assert.ok(view.lines.some(line => line === '当前版本：v1.0.5'));
+  assert.ok(view.lines.some(line => line === '待启用版本：v1.0.6'));
+});
+
+test('legacy panel also reports a staged runtime as waiting for a gateway restart', () => {
+  const legacy = fs.readFileSync(__dirname + '/../update.js', 'utf8');
+  const nodes = new Map();
+  function node(id) {
+    if (!nodes.has(id)) nodes.set(id, {style: {}, classList: {remove() {}, add() {}},
+      querySelector() { return node(id + '/fill'); }});
+    return nodes.get(id);
+  }
+  const context = {$: node, esc: String, mrow: (key, value) => key + ':' + value,
+    fmtTime: String, relTime: String};
+  vm.createContext(context);
+  vm.runInContext(legacy.slice(0, legacy.indexOf('async function loadUpdate()')), context);
+  context.UP.data = {ok: true, status: {enabled: true, state: 'idle',
+    current: 'v1.0.5', staged_version: 'v1.0.6', restart_required: true, update_ready: false}};
+  context.UP.modal = true;
+  context.UP.modalBusy = true;
+  context.renderUpdate();
+  assert.equal(node('#btnUpdApply').disabled, true);
+  assert.equal(node('#updState').textContent, '等待重启');
+  assert.match(node('#updHint').textContent, /当前版本继续服务/);
+  assert.equal(node('#updModalTitle').textContent, '等待重启网关');
+  assert.match(node('#updModalNote').textContent, /当前版本仍在运行/);
+});

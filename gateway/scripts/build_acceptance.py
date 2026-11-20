@@ -180,6 +180,11 @@ def build_target(data, ident, work_root, commit, release_version=""):
     # CI artifacts stay development builds; the official release gate passes
     # --version so the runtime manifest matches the Release tag exactly.
     version = release_version or "dev"
+    # The first update is read by the frozen 3.16.x loader. It rejects every
+    # additional archive member, so a bridge tag must use its exact 18-file
+    # contract. Normal LoomGate releases retain the complete optional group.
+    parts = version.lstrip("v").split(".")
+    legacy_transition = len(parts) == 3 and parts[0] == "3" and int(parts[1]) >= 17
     built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flags = ("-s -w -X workbuddy2api/internal/version.Version=%s "
              "-X workbuddy2api/internal/version.Commit=%s -X workbuddy2api/internal/version.BuiltAt=%s "
@@ -204,7 +209,8 @@ def build_target(data, ident, work_root, commit, release_version=""):
     artifacts = [target["update_asset"]]
     shutil.copyfile(stage / "wb2api", out / target["update_asset"])
     if target.get("runtime_asset"):
-        for name in runtime_bundle.FILES:
+        members = runtime_bundle.LEGACY_FILES if legacy_transition else runtime_bundle.FILES
+        for name in members:
             if name in PROGRAMS:
                 continue
             path = stage / name
@@ -214,7 +220,8 @@ def build_target(data, ident, work_root, commit, release_version=""):
             # resolve through source_path instead of assuming gateway/.
             path.write_bytes(runtime_bundle.source_path(GATEWAY, name).read_bytes().replace(b"\r\n", b"\n"))
         arch = "armv" + target["goarm"] if target["goarch"] == "arm" else target["goarch"]
-        runtime_bundle.package(stage, version, arch, out / target["runtime_asset"])
+        runtime_bundle.package(stage, version, arch, out / target["runtime_asset"],
+                               include_doubao=not legacy_transition)
         artifacts.append(target["runtime_asset"])
     sums = {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in artifacts}
     (out / data["checksums_asset"]).write_text("".join("%s  %s\n" % (sums[name], name) for name in sorted(sums)), encoding="ascii")
@@ -222,6 +229,7 @@ def build_target(data, ident, work_root, commit, release_version=""):
               "public_key_sha256": hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
               "artifacts": sums, "release_signature": "NOT GENERATED", "published": False,
               "runtime_identity": identity,
+              "runtime_contract": "legacy-v3" if legacy_transition else "loomgate",
               "apk_builds": "NOT RUN; existing APK signing identity required"}
     (out / "build-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

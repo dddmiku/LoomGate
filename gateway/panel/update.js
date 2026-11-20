@@ -101,10 +101,14 @@ function renderUpdate(){
   //   - 还没检查过（latest_tag 为空且无 checked_at）→ 可点，网关会先查一次远端；
   //   - 检查过但没有可升级版本（已是最新）→ 禁用，否则点下去会把服务白重启一遍。
   var checked = validUpdateTime(s.checked_at);
-  var canApply = !busy && (!checked || !!s.update_ready);
+  var canApply = !busy && !s.restart_required && (!checked || !!s.update_ready);
   $('#btnUpdApply').disabled = !canApply;
   var hint;
-  if (s.state === 'failed') hint = s.last_error || '更新失败';
+  if (s.restart_required){
+    hint = '更新包 ' + (s.staged_version || '') + ' 已准备好；当前版本继续服务，重启网关或容器后生效。';
+    $('#updState').textContent = '等待重启';
+  }
+  else if (s.state === 'failed') hint = s.last_error || '更新失败';
   else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
   else if (checked) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
@@ -154,6 +158,18 @@ function renderUpdateModal(s){
   var state = s.state || 'idle';
   var total = Number(s.asset_size) || 0;
   var done = Number(s.downloaded_bytes) || 0;
+
+  if (s.restart_required){
+    UP.modalDone = true;
+    bar.classList.remove('unknown');
+    fill.style.width = '100%';
+    $('#updModalTitle').textContent = '等待重启网关';
+    $('#updModalIcon').className = 'mic w';
+    text.textContent = '更新包 ' + (s.staged_version || '') + ' 已下载并校验。';
+    note.textContent = '当前版本仍在运行。重启网关或容器后启用，再刷新核验版本。';
+    $('#updModalClose').textContent = '关闭';
+    return;
+  }
 
   if (state === 'failed'){
     // 终态：把原因写清楚，按钮变成「关闭」。不自动收起——用户需要读到失败原因。
@@ -275,6 +291,10 @@ async function actUpdateCheck(){
 
 async function actUpdateApply(){
   var s = (UP.data && UP.data.status) || {};
+  if (s.restart_required){
+    toast('更新包已准备好，重启网关或容器后生效。', 'ok');
+    return;
+  }
   // 兜底：按钮已按 update_ready 禁用，这里再挡一次，避免通过其它入口触发无意义的重启。
   if (validUpdateTime(s.checked_at) && !s.update_ready){
     toast('已是最新版本（' + (s.latest_tag || s.current || '') + '），无需更新', 'ok');

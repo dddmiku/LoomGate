@@ -46,7 +46,17 @@ def main() -> int:
         return code
     command = [sys.executable, "-I", "-B", str(root / "tests" / "console_interactions_browser.py"),
                "--output", str(output), "--assets", str(console.parent)]
-    return subprocess.run(command, cwd=root, check=False).returncode
+    code = subprocess.run(command, cwd=root, check=False).returncode
+    if code:
+        return code
+    for script, directory in [("connection_repeat_browser.py", "connections"),
+                              ("usage_filters_browser.py", "usage")]:
+        command = [sys.executable, "-I", "-B", str(root / "tests" / script),
+                   "--output", str(output / directory)]
+        code = subprocess.run(command, cwd=root, check=False).returncode
+        if code:
+            return code
+    return 0
 
 
 if __name__ == "__main__":

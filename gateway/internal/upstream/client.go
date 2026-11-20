@@ -1409,6 +1409,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // r.Context() 后，客户端断连/请求取消会立即中断在途上游调用、释放连接与账号在途名额，
 // 不再空转到 IdleTimeout。ctx 为 nil 时回落 Background。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	account := a
 	a = a.Snapshot()
 	if ctx == nil {
 		ctx = context.Background()
@@ -1422,14 +1423,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 置位。Trae 在下面提前 return、不走 WorkBuddy 的出站循环，漏掉这一句会让
 		// **所有 trae 请求的用量（token 与积分）都不落账**——面板「积分」列恒为「—」
 		// 的直接原因之一（2026-10-18 实测：请求记录里 upstream_started=false）。
-		observeChatAttempt(ctx, "start", 0)
-		rc, status, respBody, err := trae.ChatStream(ctx, a, body, clientIP, trae.SessionIdentity{
-			CallerID: meta.CallerID, ConversationID: meta.ConversationID,
-		})
-		if err == nil {
-			observeChatAttempt(ctx, "headers", status)
-		}
-		return rc, status, respBody, err
+		return c.traeChatStreamContext(ctx, account, body, clientIP, meta)
 	}
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。

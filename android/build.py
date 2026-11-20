@@ -100,11 +100,13 @@ DEFAULT_ABI = "arm64-v8a"
 ANDROID_API = 24
 # v3.16.1 既有安装链路的最高已发行 code；重构期间不能低于它。
 LEGACY_VERSION_CODE = 3_016_001
-# LoomGate 1.x uses its own generation offset so 1.0.0 outranks the legacy 3.x
-# line without inventing a fake 4.x product version. Same formula is mirrored
-# in Gradle, and both are covered by boundary tests.
-LOOMGATE_GENERATION = 4_000_000
+# 已发行过渡 APK v3.17.0 使用 7_017_000。旧 3.x 与预发布 0.x 保持原编码，
+# 新产品线提高到独立代际，确保安装过桥接版的设备仍能覆盖安装 LoomGate。
+# Gradle 必须镜像同一分段映射，避免直接构建和 Python 构建产出不同安装序号。
+LEGACY_GENERATION = 4_000_000
+LOOMGATE_GENERATION = 8_000_000
 ANDROID_VERSION_CODE_MAX = 2_100_000_000
+APK_PACKAGE = "com.workbuddy2api.app"
 # 来自既有发布 APK 的公开证书，仅用于校验，不包含私钥。
 LEGACY_SIGNER_SHA256 = "44c18e220f1f6e505c2e702ff2a832cedb0e9be89e549d7874c136c0fb6fafef"
 
@@ -312,9 +314,10 @@ def version_code(tag):
     """把 vX.Y.Z 折成一个单调递增的整数，供安卓的 versionCode 用。
 
     安卓只认 versionCode 的大小关系，而本项目的版本号是语义化的 tag。
-    规则：LOOMGATE_GENERATION + major*1_000_000 + minor*1_000 + patch。
-    因此 1.0.0 → 5_000_000，高于旧 3.x 已安装的 3_016_001；旧产品不会把
-    新版本误判为降级，新构建也不会接受更低的安装序号。
+    新产品线：LOOMGATE_GENERATION + major*1_000_000 + minor*1_000 + patch。
+    旧 3.x 和预发布 0.x 保持 LEGACY_GENERATION，不改变已发行桥接版的编码。
+    因此 1.0.0 → 9_000_000，高于已安装桥接版 3.17.0 的 7_017_000；
+    3.x 的合法 minor/patch 全部低于 8_000_000，后续桥接版也不会再次越过 1.x。
 
     拒绝非法版本、低于旧安装链路上限的版本及分段溢出，避免不可覆盖升级。
     """
@@ -322,7 +325,8 @@ def version_code(tag):
     if not match:
         raise SystemExit("Android 发行版本必须为 vX.Y.Z，不能回落 versionCode。")
     major, minor, patch = (int(part) for part in match.groups())
-    code = LOOMGATE_GENERATION + major * 1_000_000 + minor * 1_000 + patch
+    generation = LEGACY_GENERATION if major in (0, 3) else LOOMGATE_GENERATION
+    code = generation + major * 1_000_000 + minor * 1_000 + patch
     if minor >= 1000 or patch >= 1000 or not LEGACY_VERSION_CODE < code <= ANDROID_VERSION_CODE_MAX:
         raise SystemExit("Android versionCode 超出合法范围或并非高于既有 v3.16.1 安装版本。")
     return code
@@ -344,6 +348,32 @@ def verify_apk_signature(apk, sdk):
                               result.stdout, re.MULTILINE)
     if result.returncode != 0 or [v.lower() for v in fingerprints] != [LEGACY_SIGNER_SHA256]:
         raise SystemExit("APK 签名不匹配既有安装链路，拒绝输出分发包。")
+
+
+def read_apk_manifest(apk, sdk):
+    """读取实际 APK 的安装身份，不根据文件名或发布 tag 猜测安装版本。"""
+    tools = Path(sdk) / "build-tools" if sdk is not None else None
+    candidates = [] if tools is None or not tools.is_dir() else sorted(
+        (p for p in tools.iterdir() if p.is_dir() and re.fullmatch(r"\d+(?:\.\d+)*", p.name)),
+        key=lambda p: tuple(int(n) for n in p.name.split(".")), reverse=True)
+    name = "aapt2.exe" if sys.platform == "win32" else "aapt2"
+    aapt = next((p / name for p in candidates if (p / name).is_file()), None)
+    if aapt is None:
+        raise SystemExit("缺少 aapt2，无法验证 APK 安装版本。")
+    result = subprocess.run([str(aapt), "dump", "badging", str(apk)],
+                            capture_output=True, text=True, timeout=60)
+    match = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'",
+                      result.stdout, re.MULTILINE)
+    if result.returncode != 0 or match is None:
+        raise SystemExit("无法读取 APK 的包名与安装版本，拒绝分发。")
+    return {"package": match[1], "version_code": int(match[2]), "version_name": match[3]}
+
+
+def verify_apk_manifest(apk, sdk, tag):
+    expected = {"package": APK_PACKAGE, "version_code": version_code(tag),
+                "version_name": tag.removeprefix("v")}
+    if read_apk_manifest(apk, sdk) != expected:
+        raise SystemExit("APK 实际安装版本与声明不符，拒绝输出分发包。")
 
 
 def build_apk(gradle, variant, abi, tag, go=None, clang=None):
@@ -372,6 +402,7 @@ def build_apk(gradle, variant, abi, tag, go=None, clang=None):
     if len(apks) != 1:
         raise SystemExit("Gradle 输出必须包含且只包含本次构建的一个 APK，请检查构建输出。")
     verify_apk_signature(apks[0], find_sdk())
+    verify_apk_manifest(apks[0], find_sdk(), tag)
     DIST.mkdir(parents=True, exist_ok=True)
     target = DIST / ("workbuddy2api-android-%s.apk" % TARGETS[abi][2])
     shutil.copy2(apks[0], target)

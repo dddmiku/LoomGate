@@ -71,6 +71,7 @@ func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
 		"streaming":          true,
 		"models_path":        "/v1/models",
 		"model_capabilities": "use metadata reported for each model; omitted values are unknown",
+		"model_availability": "catalog visibility does not establish account entitlement; upstream account permissions are checked during generation",
 		"tools": map[string]any{
 			"function":                     "model_dependent",
 			"custom":                       "responses_function_bridge",

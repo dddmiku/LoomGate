@@ -258,8 +258,9 @@ class BuildGuardTests(unittest.TestCase):
             android.verify_jnilibs("go", self.clang, "arm64-v8a", TAG)
 
     def test_version_code_never_falls_back_or_overflows_segments(self):
-        # LoomGate generation offset: 1.0.0 must outrank the legacy 3.16.1 code.
-        self.assertEqual(android.version_code("v1.0.0"), 5_000_000)
+        # The shipped transition APK used 7_017_000; outranking only the old
+        # 3_016_001 baseline strands devices after they install that bridge.
+        self.assertEqual(android.version_code("v1.0.0"), 9_000_000)
         self.assertGreater(android.version_code("v1.0.0"), android.LEGACY_VERSION_CODE)
         self.assertGreater(android.version_code("v1.0.1"), android.version_code("v1.0.0"))
         self.assertGreater(android.version_code("v1.1.0"), android.version_code("v1.0.99"))
@@ -272,6 +273,43 @@ class BuildGuardTests(unittest.TestCase):
         # produces a code above the legacy install line but below 1.0.0.
         self.assertGreater(android.version_code("v0.9.9"), android.LEGACY_VERSION_CODE)
         self.assertLess(android.version_code("v0.9.9"), android.version_code("v1.0.0"))
+
+    def test_android_new_line_outranks_shipped_bridge_and_future_legacy_bridges(self):
+        self.assertEqual(android.version_code("v3.17.0"), 7_017_000)
+        self.assertGreater(android.version_code("v1.0.5"), 7_017_000)
+        self.assertGreater(android.version_code("v1.0.5"), 5_000_005)
+        # Every valid legacy minor/patch remains in its existing 7M range.
+        self.assertEqual(android.version_code("v3.999.999"), 7_999_999)
+        self.assertGreater(android.version_code("v1.0.0"), android.version_code("v3.999.999"))
+        self.assertGreater(android.version_code("v2.0.0"), android.version_code("v1.999.999"))
+
+    def test_android_legacy_and_prerelease_mappings_stay_stable(self):
+        self.assertEqual(android.version_code("v0.9.9"), 4_009_009)
+        self.assertEqual(android.version_code("v3.16.1"), 7_016_001)
+        self.assertEqual(android.version_code("v3.17.1"), 7_017_001)
+
+    def test_android_installer_uses_archive_code_without_matching_the_release_tag(self):
+        # The bridge Release is named 3.17.x but must carry a genuine 1.x APK,
+        # otherwise the next 1.x installation is treated as a downgrade.
+        stage = (REPO / "gateway/internal/hotupdate/installer_android.go").read_text(encoding="utf-8")
+        self.assertIn("func(_ context.Context, assetPath string)", stage.replace("func (_", "func(_"))
+        self.assertNotIn("Release", stage)
+        activity = (REPO / "android/app/src/main/java/com/workbuddy2api/app/MainActivity.java").read_text(encoding="utf-8")
+        start = activity.index("private boolean isNewerThanInstalled(")
+        method = activity[start:activity.index("\n    }", start)]
+        self.assertIn("getPackageArchiveInfo", method)
+        self.assertIn("getLongVersionCode", method)
+        self.assertNotIn("versionName", method)
+
+    def test_android_new_apk_can_follow_bridge_source_but_new_source_cannot_build_legacy_apk(self):
+        (self.gateway / "VERSION").write_text("v3.17.0")
+        with patch.object(android, "verify_jnilibs", side_effect=SystemExit("artifact-check-reached")), \
+                self.assertRaisesRegex(SystemExit, "artifact-check-reached"):
+            android.build_apk("gradle", "release", "arm64-v8a", "v1.0.5", "go", self.clang)
+        (self.gateway / "VERSION").write_text("v1.0.5")
+        with patch.object(android, "verify_jnilibs") as verify, self.assertRaises(SystemExit):
+            android.build_apk("gradle", "release", "arm64-v8a", "v3.17.1", "go", self.clang)
+        verify.assert_not_called()
 
     def test_missing_version_file_does_not_become_dev(self):
         (self.gateway / "VERSION").unlink()
@@ -290,6 +328,28 @@ class BuildGuardTests(unittest.TestCase):
             with self.subTest(code=code, length=len(raw)), \
                     patch.object(android.subprocess, "run", return_value=result(raw, code)), self.assertRaises(SystemExit):
                 android.verify_apk_signature(self.root / "test.apk", self.root / "sdk")
+
+    def test_apk_manifest_reads_actual_identity_and_rejects_unreadable_metadata(self):
+        tools = self.root / "sdk" / "build-tools" / "33.0.2"
+        tools.mkdir(parents=True)
+        (tools / ("aapt2.exe" if sys.platform == "win32" else "aapt2")).write_text("fixture")
+        good = "package: name='com.workbuddy2api.app' versionCode='9000005' versionName='1.0.5'\n"
+        with patch.object(android.subprocess, "run", return_value=result(good)):
+            self.assertEqual(android.read_apk_manifest(self.root / "test.apk", self.root / "sdk"),
+                             {"package": "com.workbuddy2api.app", "version_code": 9_000_005, "version_name": "1.0.5"})
+        for raw, code in ((good, 1), ("", 0), ("package: malformed", 0)):
+            with self.subTest(code=code, raw=raw), patch.object(android.subprocess, "run", return_value=result(raw, code)), \
+                    self.assertRaises(SystemExit):
+                android.read_apk_manifest(self.root / "test.apk", self.root / "sdk")
+
+    def test_apk_manifest_verifier_rejects_stale_codes_wrong_package_and_wrong_version(self):
+        good = {"package": android.APK_PACKAGE, "version_code": 9_000_005, "version_name": "1.0.5"}
+        with patch.object(android, "read_apk_manifest", return_value=good):
+            android.verify_apk_manifest(self.root / "test.apk", None, "v1.0.5")
+        for change in ({"package": "fixture.wrong"}, {"version_code": 5_000_005}, {"version_name": "3.17.0"}):
+            with self.subTest(change=change), patch.object(android, "read_apk_manifest", return_value=dict(good, **change)), \
+                    self.assertRaises(SystemExit):
+                android.verify_apk_manifest(self.root / "test.apk", None, "v1.0.5")
 
     def test_skip_go_packaging_still_validates_artifacts_before_gradle(self):
         with patch.object(android, "verify_jnilibs", side_effect=SystemExit("unverified")) as verify, \
@@ -319,9 +379,11 @@ class BuildGuardTests(unittest.TestCase):
         with patch.object(android, "GRADLE_OUTPUT", gradle_output), patch.object(android, "DIST", dist), \
                 patch.object(android, "verify_jnilibs"), patch.object(android, "run", side_effect=fake_gradle), \
                 patch.object(android, "find_sdk", return_value=None), \
+                patch.object(android, "verify_apk_manifest") as manifest, \
                 patch.object(android, "verify_apk_signature", side_effect=verify_before_copy) as verify:
             output = android.build_apk("gradle", "release", "arm64-v8a", TAG, "go", self.clang)
         verify.assert_called_once()
+        manifest.assert_called_once_with(apk, None, TAG)
         self.assertEqual(output.parent, dist)
         self.assertEqual(output.read_bytes(), apk.read_bytes())
         self.assertIn("-PversionCode=%d" % android.version_code(TAG), commands[0])

@@ -110,6 +110,18 @@ class ReleaseTargetsTests(unittest.TestCase):
         self.assertEqual(set(report["artifacts"]), {"wb2api-windows-amd64"})
         self.assertEqual(checked.call_args.kwargs["env"]["GOOS"], "windows")
 
+    def test_transition_release_uses_exact_legacy_loader_members(self):
+        work = self.root / "transition"
+        with patch.object(build, "checked", side_effect=self.fake_compile), \
+                patch.object(build, "verify_platform"), patch.object(build, "verify_runtime_identity"):
+            report = build.build_target(self.data, "linux-amd64", work, "a" * 40, "v3.17.1")
+        with tarfile.open(work / "artifacts/linux-amd64/wb2api-runtime-linux-amd64.tar.gz") as archive:
+            self.assertEqual(set(archive.getnames()), set(build.runtime_bundle.LEGACY_FILES) | {"manifest.json"})
+            manifest = json.loads(archive.extractfile("manifest.json").read())
+            self.assertEqual(manifest["version"], "v3.17.1")
+            self.assertEqual(set(manifest["files"]), set(build.runtime_bundle.LEGACY_FILES))
+        self.assertEqual(report["runtime_contract"], "legacy-v3")
+
 
     def test_runtime_identity_check_executes_the_artifact_not_metadata_strings(self):
         # A crafted artifact with the right strings in metadata is not enough:

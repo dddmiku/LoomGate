@@ -49,7 +49,17 @@ window.LoomConnections = (() => {
     view=document.querySelector('#dialog-body .connection-flow');
     if(Number.isInteger(f.upstream_code)){const code=document.createElement('p');code.className='muted small';code.textContent='官方业务码：'+f.upstream_code+' · 不代表已定位拒绝原因';document.querySelector('#dialog-body .form').prepend(code);}
     if(qr){const target=document.getElementById('connection-qr');if(typeof window.qrcode==='function'){const code=window.qrcode(0,'M');code.addData(qr);code.make();target.innerHTML=code.createSvgTag(4,4);}else target.textContent='二维码组件不可用，请在官方页面继续。';}
-    const form=document.getElementById('connection-sensitive');if(form)form.onsubmit=e=>{e.preventDefault();const input=Object.fromEntries(new FormData(form));step(f.status==='waiting_phone'?'send_code':'submit_code',input);form.reset();};
+    const form=document.getElementById('connection-sensitive');if(form){
+      if(f.provider==='autoclaw'&&f.status==='waiting_phone'){const phone=form.elements.namedItem('phone');phone.closest('label').firstChild.textContent='手机号';phone.placeholder='11 位大陆手机号';phone.maxLength=11;phone.pattern='1[0-9]{10}';}
+      form.onsubmit=e=>{
+        e.preventDefault();
+        const input=Object.fromEntries(new FormData(form));
+        if('invite_code' in input){input.invite_code=input.invite_code.trim();if(!input.invite_code)delete input.invite_code;}
+        // A response replaces the form on success. Keep its in-memory draft
+        // when the request fails so a rejected send does not erase the phone.
+        step(f.status==='waiting_phone'?'send_code':'submit_code',input);
+      };
+    }
     const callback=document.getElementById('connection-callback');if(callback)callback.onsubmit=e=>{e.preventDefault();const input=Object.fromEntries(new FormData(callback));step('callback',input);callback.reset();};
     const verify=document.getElementById('connection-verify');if(verify)verify.onclick=()=>step('verify');
     if(f.input_mode==='official'&&['uncertain','manual_action','waiting_authorization'].includes(f.status)&&f.method!=='desktop'&&f.error_code!=='official_already_authenticated'){const resume=document.createElement('button');resume.id='connection-resume';resume.textContent='继续当前官方窗口';resume.onclick=()=>step('resume');document.querySelector('#dialog-body .actions').prepend(resume);}
@@ -65,6 +75,18 @@ window.LoomConnections = (() => {
     const cancel=document.getElementById('connection-cancel');if(cancel)cancel.onclick=()=>step('cancel');
     const retry=document.getElementById('connection-retry-save');if(retry)retry.onclick=()=>retryCommit(f);
     const done=document.getElementById('connection-done');if(done)done.onclick=()=>{if(f.status==='succeeded')ui.accountConnected(f);document.getElementById('dialog').close();ui.reload();};
+    if(f.status==='succeeded'){
+      const another=document.createElement('button');another.id='connection-add-another';another.className='primary';another.textContent='再添加一个';done.className='quiet';done.before(another);
+      another.onclick=()=>{
+        ui.accountConnected(f);
+        // Reuse the successful choice, never its account_id or credentials.
+        const pending=open(f.provider,'',f.method||'',f.realm||''),owner=generation;
+        pending.catch(()=>{
+          if(generation!==owner||!document.getElementById('dialog').open)return;
+          render(f);const box=document.getElementById('connection-error');box.textContent='添加入口未读取到，请稍后重试。已保存账号不受影响。';box.hidden=false;
+        });
+      };
+    }
     document.getElementById('connection-refresh').onclick=refresh;
     if(['waiting_code','waiting_scan','waiting_authorization','manual_action'].includes(f.status)&&(f.method!=='desktop'||f.error_code==='desktop_login_required'))notifyOnce(f);
   }
@@ -139,10 +161,15 @@ window.LoomConnections = (() => {
     try{
       const data=await ui.api(path,{body,signal:null});
       if(ownsFlow(id,owner))accept(data);
-    }catch{
+    }catch(error){
       if(ownsFlow(id,owner)){
         const box=document.getElementById('connection-error');
-        if(box){box.textContent=message;box.hidden=false;}
+        if(box){
+          const rejected=error?.status>=400&&error.status<500&&error.status!==408;
+          const rejectedText=body.action==='send_code'&&error.status===409?'验证码请求暂未受理，可能仍在冷却或有登录操作进行中。请稍后刷新状态再试。':({authentication_request_invalid:'登录输入未受理，请检查手机号与可选邀请码后重试。',authentication_not_found:'该登录流程已不存在，请重新发起。',unauthorized:'管理会话已过期，请重新登录。'})[error?.code]||'登录请求未受理，请检查输入或刷新登录状态后重试。';
+          box.textContent=rejected?rejectedText:message;
+          box.hidden=false;
+        }
       }
     }finally{
       if(activeStep===attempt)activeStep=null;

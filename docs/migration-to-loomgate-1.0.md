@@ -1,6 +1,10 @@
 # 从 workbuddy2api 迁移到 LoomGate 1.0.0
 
-LoomGate 1.0.0 沿用原协议、账号文件、API key 格式和更新签名身份，但产品线从 3.x 切换到 1.x，**不是可自动升级的普通小版本**。切换必须按本说明离线执行；旧仓库、旧 Release 和旧生产目录保持不动，直到新副本完成验收和回滚演练。
+LoomGate 沿用原协议、账号文件、API key 格式和更新签名身份。已有 workbuddy2api 3.16.x 安装先通过旧发布源获取 3.17.x 过渡版，再进入 LoomGate 1.x 更新线。Linux 过渡包必须使用旧加载器的 18 文件契约；Android 过渡 Release 直接附同签名、使用新 versionCode 世代的 LoomGate 1.x APK。构建与验收步骤见 [过渡版构建与升级验收](legacy-transition.md)。
+
+已经安装 v3.17.0 或 v1.0.5、遇到 `new instance exited before reporting ready: EOF` 的运行实例，需要按 [工作台版本的更新与重启](updater-restart.md) 完成首次恢复。旧实例持有工作台排他锁时，不能等待新实例同时打开原目录再报告就绪。
+
+以下离线复制流程用于迁移到一个独立工作区、提前验证副本或保留完整回滚环境。它不是每次正常升级都需要执行的步骤。
 
 ## 迁移前
 
@@ -54,9 +58,11 @@ python -I -X utf8 tools/migration/migrate.py rollback \
 ## 平台版本
 
 - Windows 安装包从 LoomGate 仓库的 Release 获取；同签名覆盖安装，修复/卸载保留 `workspace/`。
-- Android 包名 `com.workbuddy2api.app` 和签名不变，versionCode 使用 LoomGate 世代：`4_000_000 + major*1_000_000 + minor*1_000 + patch`，1.0.0 = 5,000,000，高于旧 3.16.1 的 3,016,001。
+- Android 包名 `com.workbuddy2api.app` 和签名不变，LoomGate 1.x 使用 `9_000_000 + minor*1_000 + patch`，高于已经发布的 3.17.0 过渡 APK 的 7,017,000。覆盖安装保留应用数据；不要先卸载。
 - Linux 使用完整运行包，不在运行中导入旧库。
 
 ## 更新源
 
-默认发布仓库为 `dddmiku/LoomGate`。旧维护仓库只保留历史 Release 作为回滚来源；已有配置里写死旧 `update.repo` 的继续按原值使用，迁移时应核对实际目标。
+默认发布仓库为 `dddmiku/LoomGate`。修复后的过渡版与 LoomGate 1.x 进程，对空更新源或已知 workbuddy2api 旧源，在内存中使用 LoomGate 更新源，不要求写入配置文件。只读配置与文件级挂载同样可用；新候选启动失败时，旧实例配置字节不受影响。控制台更新状态的 `repo` 是当前进程的实际更新源。
+
+第三方更新仓库保持原值。若此前已有有效的 `loomgate-transition.json` 迁移标记，随后用户主动把仓库改回旧源，也保留这一选择。修复不会覆盖它。

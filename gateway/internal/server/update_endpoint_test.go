@@ -89,6 +89,16 @@ func TestUpdateApplyWithoutPriorCheckStartsAnUpdate(t *testing.T) {
 	}
 }
 
+func TestWorkbenchUpdateApplyReportsGatewayRestartBeforeDownload(t *testing.T) {
+	manager := hotupdate.NewManager(hotupdate.Options{Enabled: true, RequireRestart: true, Dir: t.TempDir(), Repo: "invalid/repo"})
+	handler := updateTestHandler(t, manager)
+	response := httptest.NewRecorder()
+	handler.InternalHandler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}")))
+	if !strings.Contains(response.Body.String(), "重启本程序") || strings.Contains(response.Body.String(), "新实例接管后") {
+		t.Fatal("workbench update promised a handover despite its exclusive state ownership")
+	}
+}
+
 func TestUpdateApplyRejectsBadTagPayload(t *testing.T) {
 	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir()}))
 	// 载荷一旦带了内容就必须是合法的小 JSON：否则一次手滑的请求会静默升到最新版。

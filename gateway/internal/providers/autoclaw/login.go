@@ -130,6 +130,24 @@ func (d *LoginDriver) sendCodeFlowWith(ctx context.Context, phone, device, invit
 	}, nil
 }
 
+// ValidateStep runs before authflow records an SMS send and starts its
+// cooldown. Rejected local input has not contacted the provider and must be
+// immediately correctable. Keep it shared with direct driver callers.
+func (*LoginDriver) ValidateStep(_ authflow.Flow, action string, input authflow.Input) *authflow.Result {
+	if action != "send_code" && action != "phone" && action != "submit_phone" {
+		return nil
+	}
+	if !isPhone(strings.TrimSpace(input.Phone)) {
+		return &authflow.Result{Status: "waiting_phone", InputMode: "phone",
+			Notice: "手机号格式不正确，请输入 11 位大陆手机号。"}
+	}
+	if code := strings.TrimSpace(input.InviteCode); code != "" && !isInviteCode(code) {
+		return &authflow.Result{Status: "waiting_phone", InputMode: "phone",
+			Notice: "邀请码格式不正确，请检查后重新输入，或留空使用默认邀请码。"}
+	}
+	return nil
+}
+
 func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, input authflow.Input) (authflow.Result, error) {
 	var st loginState
 	if json.Unmarshal(f.Secret, &st) != nil {
@@ -138,21 +156,16 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 	if st.DeviceID == "" {
 		st.DeviceID = loginDeviceID
 	}
+	if validation := d.ValidateStep(f, action, input); validation != nil {
+		return *validation, nil
+	}
 	switch action {
 	case "send_code", "phone", "submit_phone":
 		phone := strings.TrimSpace(input.Phone)
-		if !isPhone(phone) {
-			return authflow.Result{Status: "waiting_phone", InputMode: "phone",
-				Notice: "手机号格式不正确，请输入 11 位大陆手机号。"}, nil
-		}
 		// Optional referral code typed by the operator. Blank keeps the
 		// provider default; it is remembered in the encrypted secret so the
 		// commit step can bind it without asking again.
 		if code := strings.TrimSpace(input.InviteCode); code != "" {
-			if !isInviteCode(code) {
-				return authflow.Result{Status: "waiting_phone", InputMode: "phone",
-					Notice: "邀请码格式不正确，请检查后重新输入，或留空使用默认邀请码。"}, nil
-			}
 			st.InviteCode = code
 		}
 		return d.sendCodeFlowWith(ctx, phone, st.DeviceID, st.InviteCode)

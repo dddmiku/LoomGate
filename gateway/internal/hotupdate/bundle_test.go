@@ -74,6 +74,9 @@ func TestRuntimeBundleContract(t *testing.T) {
 	if filepath.Base(binary) != "wb2api" {
 		t.Fatalf("unexpected executable: %s", binary)
 	}
+	if !managedRuntime(filepath.Dir(binary)) {
+		t.Fatal("fully verified extraction lacks its cleanup ownership marker")
+	}
 	for name := range runtimeFiles {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(binary), filepath.FromSlash(name))); err != nil {
 			t.Fatal(err)

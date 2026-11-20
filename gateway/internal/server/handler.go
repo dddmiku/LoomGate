@@ -825,6 +825,10 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "已有更新任务在进行中", "status": status})
 		return
 	}
+	if status.RestartRequired {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "更新包已准备好，请先重启网关或容器后核验运行版本", "status": status})
+		return
+	}
 	target := strings.TrimSpace(body.Tag)
 	// 只有「已经查过远端、且确认没有新版本」才直接拒绝。没查过就交给 Apply 自己去查，
 	// 否则管理台必须先点一次「检查更新」才能升级，用户看到的是莫名其妙的"已经是最新"。
@@ -848,7 +852,7 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 	// 用同一句话会让 Windows 用户以为「更新完了」，然后重启发现还是旧版
 	// （2026-10-13 实测：那里的 apply 曾直接报 dup listener 失败）。
 	message := "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出"
-	if !hotupdate.HandoverSupported {
+	if status.RestartOnUpdate {
 		message = "已开始下载更新：完成后**重启本程序**即生效（本平台不支持运行中替换）"
 	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{
@@ -1445,7 +1449,14 @@ func rejectUnsupportedChoiceCount(body []byte) error {
 	if json.Unmarshal(body, &request) != nil || request.N == nil {
 		return nil
 	}
-	count, err := request.N.Int64()
+	return rejectChoiceCount(request.N)
+}
+
+func rejectChoiceCount(value *json.Number) error {
+	if value == nil {
+		return nil
+	}
+	count, err := value.Int64()
 	if err != nil {
 		return nil
 	}
@@ -1453,7 +1464,21 @@ func rejectUnsupportedChoiceCount(body []byte) error {
 		return fmt.Errorf("n must be at least 1")
 	}
 	if count > 1 {
-		return fmt.Errorf("n=%s is not supported: this upstream returns a single choice", request.N.String())
+		return fmt.Errorf("n=%s is not supported: this upstream returns a single choice", value.String())
+	}
+	return nil
+}
+
+// Struct decoding historically accepted case-insensitive routing fields.
+// Preserve that behavior while avoiding another full transcript scan.
+func chatRoutingField(object map[string]json.RawMessage, name string) json.RawMessage {
+	if raw, present := object[name]; present {
+		return raw
+	}
+	for key, raw := range object {
+		if strings.EqualFold(key, name) {
+			return raw
+		}
 	}
 	return nil
 }
@@ -1527,13 +1552,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
 		return
 	}
-	if err := json.Unmarshal(body, &peek); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request fields: "+err.Error())
-		return
+	// The envelope is already parsed. Reading small routing fields from it
+	// avoids rescanning a potentially multi-megabyte transcript twice merely
+	// to skip messages while decoding model/stream/n. Structural validation
+	// below still examines the complete request and every tool declaration.
+	for _, field := range []struct {
+		name  string
+		value any
+	}{{"model", &peek.Model}, {"stream", &peek.Stream}} {
+		if raw := chatRoutingField(requestObject, field.name); len(raw) > 0 {
+			if err := json.Unmarshal(raw, field.value); err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request fields: "+err.Error())
+				return
+			}
+		}
 	}
 	// n>1 需要上游返回多个选择，当前上游不提供：静默只回一个 choice 会让按 n 取值
 	// 的客户端越界，明确拒绝。
-	if err := rejectUnsupportedChoiceCount(body); err != nil {
+	var choiceCount *json.Number
+	_ = json.Unmarshal(chatRoutingField(requestObject, "n"), &choiceCount)
+	if err := rejectChoiceCount(choiceCount); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -1565,7 +1603,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// Preserve the caller's exact capability request. Legacy normalizers may
 	// remove tool declarations; external providers must reject those explicitly.
-	providerBody:=append([]byte(nil),body...)
+	providerBody := append([]byte(nil), body...)
 	if r.URL.Path == "/v1/chat/completions" && peek.Stream && hideChatStreamUsage(requestObject) {
 		w = &chatUsageVisibilityWriter{inner: w}
 	}
@@ -2080,6 +2118,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.absorbJSONUsage(respBody)
 			st.status = status
+			if acct.Realm() == auth.RealmTrae && upstream.IsTraeAuthenticationRequired(status, respBody) {
+				releaseHeld()
+				st.status = http.StatusUnauthorized
+				writeOpenAIError(w, http.StatusUnauthorized, "trae_authentication_required", "Trae rejected its stored session after one refresh attempt; sign in to Trae again.")
+				return
+			}
 			kind := upstream.Classify(status, string(respBody))
 			// 以下几类终态由请求本身决定、与账号无关：只释放在途名额，保留会话绑定，
 			// 下一轮仍落在同一账号，上游提示缓存不失效（换号会让整段前缀重新计费）。
@@ -2191,6 +2235,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			if upstream.IsModelAccessDenied(string(respBody)) {
+				// The provider explicitly denied this account's model entitlement.
+				// Retrying parameters or selecting a different model cannot grant it.
+				// Preserve its diagnostic identity without penalizing healthy accounts.
+				releaseHeld()
+				detail := string(respBody)
+				acct.Lock()
+				secretValues := []string{acct.AccessToken, acct.RefreshToken, acct.DeviceToken}
+				acct.Unlock()
+				secretValues = append(secretValues, h.cfg.APIKey, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+				for _, secret := range secretValues {
+					if len(secret) > 4 {
+						detail = strings.ReplaceAll(detail, secret, "[redacted]")
+					}
+				}
+				if len(detail) > 2000 {
+					detail = logfmt.Truncate(detail, 2000)
+				}
+				writeOpenAIError(w, http.StatusForbidden, "upstream_model_access_denied", "upstream account does not have access to the requested model: "+detail)
+				st.status = http.StatusForbidden
+				return
+			}
 			if kind == upstream.ErrBadParams || kind == upstream.ErrClient {
 				// 未知 4xx 也可能是该账号的权限/状态问题：同样先换号再试；
 				// 请求体本身有问题（ErrBadParams）换号无意义，维持原行为。

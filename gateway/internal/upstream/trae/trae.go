@@ -17,11 +17,13 @@
 package trae
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/jsonutil"
@@ -593,6 +595,14 @@ func stableDeviceID(uid, purpose string) string {
 // 响应 Result.Token 为新 JWT、Result.RefreshToken 为新 refresh token（可能轮换）。
 // TokenExpireAt 是秒或毫秒时间戳字符串，统一归一成 Unix 秒。
 func Refresh(a *auth.Auth) (accessToken, refreshToken string, expiresAt int64, err error) {
+	return RefreshContext(context.Background(), a)
+}
+
+// RefreshContext bounds the credential exchange and honors a canceled chat.
+// Redirects are refused because a 307 must not forward refresh credentials.
+func RefreshContext(ctx context.Context, a *auth.Auth) (accessToken, refreshToken string, expiresAt int64, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	rt := strings.TrimSpace(a.RefreshToken)
 	if rt == "" {
 		return "", "", 0, fmt.Errorf("trae refresh: no refresh token")
@@ -603,7 +613,14 @@ func Refresh(a *auth.Auth) (accessToken, refreshToken string, expiresAt int64, e
 		ClientSecret: "-",
 		UserID:       a.UID,
 	})
-	resp, err := http.Post(exchangeHost+exchangePath, "application/json", strings.NewReader(string(payload)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, exchangeHost+exchangePath, strings.NewReader(string(payload)))
+	if err != nil {
+		return "", "", 0, fmt.Errorf("trae refresh request invalid")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := *http.DefaultClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("trae refresh: %w", err)
 	}
@@ -613,14 +630,14 @@ func Refresh(a *auth.Auth) (accessToken, refreshToken string, expiresAt int64, e
 		return "", "", 0, fmt.Errorf("trae refresh read: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", 0, fmt.Errorf("trae refresh: HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
+		return "", "", 0, fmt.Errorf("trae refresh: HTTP %d", resp.StatusCode)
 	}
 	var out exchangeResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		return "", "", 0, fmt.Errorf("trae refresh parse: %w", err)
 	}
 	if out.Result.Token == "" {
-		return "", "", 0, fmt.Errorf("trae refresh: no Token in response (re-login required): %s", truncate(string(data), 300))
+		return "", "", 0, fmt.Errorf("trae refresh: no Token in response (re-login required)")
 	}
 	newRefresh := out.Result.RefreshToken
 	if newRefresh == "" {
