@@ -871,7 +871,7 @@
     const base = [esc(labels[step.stage] || step.stage), `<code>${esc(step.account_id)}</code>`, `${badge(step.status)}${reason}${note}`];
     return withTask ? [`<code>${esc(step.task_key || '—')}</code>`, ...base] : base;
   }
-  const discoveryIssueLabels = {module_discovery_failed:'模块状态读取失败',desktop_activity_unavailable:'官方客户端任务目录不可用',desktop_identity_mismatch:'官方客户端账号身份不匹配',desktop_login_required:'官方客户端需要登录'};
+  const discoveryIssueLabels = {module_discovery_failed:'模块状态读取失败（原因未归类）',upstream_unavailable:'上游服务暂时不可用，稍后会自动重试',upstream_rate_limited:'上游正在限流，稍后会自动重试',authentication_required:'账号登录已失效，需要重新登录',account_unavailable:'账号当前不可用（额度或授权受限）',module_not_offered:'该账号没有这项能力',state_unrecognized:'官方返回的状态无法识别，未做任何操作',desktop_activity_unavailable:'官方客户端任务目录不可用',desktop_identity_mismatch:'官方客户端账号身份不匹配',desktop_login_required:'官方客户端需要登录'};
   function runDiscoveryIssues(issues) {
     if (!issues?.length) return '';
     return `<section class="section-gap"><h4>任务发现问题</h4>${table(['账号','模块','原因'],issues.map(issue=>[`<code>${esc(issue.account_id)}</code>`,`<code>${esc(issue.module_id)}</code>`,esc(discoveryIssueLabels[issue.error_code] || '任务目录读取失败')]))}</section>`;

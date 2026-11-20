@@ -160,6 +160,25 @@ func (e *Engine) Catalog(ctx context.Context, provider string, scope Scope) ([]T
 	}
 	return catalog.Tasks, err
 }
+// discoveryCodes are the only failure reasons a provider may surface. They are
+// stable panel codes, never upstream text: the console renders one sentence per
+// code so an operator can tell an upstream outage from a missing capability.
+var discoveryCodes = map[string]bool{
+	"module_discovery_failed": true,
+	"upstream_unavailable":    true,
+	"upstream_rate_limited":   true,
+	"authentication_required": true,
+	"account_unavailable":     true,
+	"module_not_offered":      true,
+	"state_unrecognized":      true,
+	// Provider-specific codes already exposed by the workbench connection flow.
+	"desktop_activity_unavailable": true,
+	"desktop_identity_mismatch":    true,
+	"desktop_login_required":       true,
+}
+
+func validDiscoveryCode(code string) bool { return discoveryCodes[code] }
+
 func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scope, key string) (Catalog, error) {
 	e.mu.Lock()
 	a := e.adapters[provider]
@@ -179,7 +198,7 @@ func (e *Engine) CatalogDetails(ctx context.Context, provider string, scope Scop
 		return Catalog{}, errors.New("catalog_limit_exceeded")
 	}
 	for _, issue := range catalog.Issues {
-		if issue.ProviderID != provider || !IDPattern.MatchString(issue.AccountID) || !IDPattern.MatchString(issue.ModuleID) || issue.ErrorCode != "module_discovery_failed" || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, issue.AccountID) {
+		if issue.ProviderID != provider || !IDPattern.MatchString(issue.AccountID) || !IDPattern.MatchString(issue.ModuleID) || !validDiscoveryCode(issue.ErrorCode) || len(scope.AccountIDs) > 0 && !contains(scope.AccountIDs, issue.AccountID) {
 			return Catalog{}, errors.New("invalid_discovery_issue")
 		}
 	}

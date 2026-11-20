@@ -77,17 +77,20 @@ func TestPartialDiscoveryHTTPExecutionAndRestart(t *testing.T) {
 	}
 }
 func TestDiscoveryIssueCannotEscapeAccountScopeOrExposeRawError(t *testing.T) {
-	for _, code := range []string{"module_discovery_failed", "synthetic-private-raw-error"} {
+	for _, code := range []string{"module_discovery_failed", "upstream_unavailable", "synthetic-private-raw-error"} {
 		e := openBehaviorEngine(t, taskengine.Options{})
 		a := &discoveryAdapter{catalog: taskengine.Catalog{Issues: []taskengine.DiscoveryIssue{{ProviderID: "synthetic", AccountID: "foreign", ModuleID: "module", ErrorCode: code}}}}
 		e.Register("synthetic", a)
 		if _, err := e.CatalogDetails(context.Background(), "synthetic", taskengine.Scope{AccountIDs: []string{"allowed"}}, ""); err == nil {
 			t.Fatal("foreign account issue admitted")
 		}
-		if code != "module_discovery_failed" {
-			if _, err := e.CatalogDetails(context.Background(), "synthetic", taskengine.Scope{}, ""); err == nil {
-				t.Fatal("raw error admitted")
-			}
+		allowed := code == "module_discovery_failed" || code == "upstream_unavailable"
+		_, err := e.CatalogDetails(context.Background(), "synthetic", taskengine.Scope{}, "")
+		if allowed && err != nil {
+			t.Fatalf("allowlisted discovery code %q was rejected: %v", code, err)
+		}
+		if !allowed && err == nil {
+			t.Fatal("raw error admitted")
 		}
 	}
 }
