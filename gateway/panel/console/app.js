@@ -56,6 +56,78 @@
   const notice = (text, kind='') => `<div class="notice ${kind}" role="status">${esc(text)}</div>`;
   const options = (rows, value) => rows.map(([id,name]) => `<option value="${esc(id)}" ${id===value?'selected':''}>${esc(name)}</option>`).join('');
   const providerName = id => state.providers?.find(p=>p.id===id)?.name || id;
+  const creditIsPending=c=>Boolean(c?.pending||c?.error_code==='credit_pending');
+  const creditAmount=(amount,complete)=>typeof amount==='number'?`${complete?'':'≥ '}${number(amount)}`:'未知';
+  function providerCreditRows(st){
+    const rows=[];
+    const legacy=[['workbuddy','WorkBuddy'],['trae','Trae']];
+    for(const [id,label] of legacy){
+      const accounts=(st?.accounts||[]).filter(a=>{const provider=String(a.provider||'').toLowerCase();if((provider&&provider!==id)||/doubao/i.test(a.domain||''))return false;return id==='trae'?(a.realm==='trae'||/trae/i.test(a.domain||'')):(a.realm==='cn'||a.realm==='global'||(!a.realm&&!/trae/i.test(a.domain||'')));});
+      if(!accounts.length) continue;
+      let remain=0,expiring=0,ok=0,expiringOK=0,failed=0;
+      for(const a of accounts){const c=a.credits||{};if(typeof c.remain==='number'){remain+=c.remain;ok++;}else if(c.error||c.ok===false)failed++;if(typeof c.remain==='number'&&typeof c.expiring==='number'){expiring+=c.expiring;expiringOK++;}}
+      rows.push({id,label,remain:ok?remain:null,expiring:expiringOK?expiring:null,accounts:accounts.length,ok,failed,unknown:accounts.length-ok-failed,complete:ok===accounts.length,expiringComplete:expiringOK===accounts.length});
+    }
+    for(const p of (state.providers||[])){
+      if(p.id!=='autoclaw') continue;
+      const c=p.credit_totals||{};
+      const accounts=c.accounts??p.accounts?.total??0,ok=c.ok??0,failed=c.failed??0;
+      rows.push({id:p.id,label:p.name||'AutoClaw',remain:c.remain??null,expiring:c.expiring??null,accounts,ok,unknown:Math.max(0,accounts-ok-failed),failed,complete:ok===accounts,expiringComplete:c.complete===true&&typeof c.expiring==='number'});
+    }
+    return rows;
+  }
+  function providerCreditPanel(rows,pendingLegacy=false,pendingAuto=false){
+    if(!rows.length)return `<div class="ov-empty">${pendingLegacy||pendingAuto?'查询中':'暂无积分数据'}</div>`;
+    return `<div class="provider-credit-list">${rows.map(c=>{
+      const pending=c.id==='autoclaw'?pendingAuto:pendingLegacy;
+      return `<div class="ov-realm provider-credit" data-credit-provider="${esc(c.id)}"><span>${esc(c.label)}<small>${c.ok}/${c.accounts} 个账号已读取${c.failed?` · ${c.failed} 失败`:''}${c.unknown?` · ${c.unknown} ${pending?'查询中':'未知'}`:''}</small></span><b>余额 ${creditAmount(c.remain,c.complete)} <em>· 临期 ${creditAmount(c.expiring,c.expiringComplete)}</em></b></div>`;
+    }).join('')}</div>`;
+  }
+  function scheduleCreditReadback(isCurrent,read,paint){
+    // 普通快照读回，指数退避；只回读明确在途的余额，最多 7 次，不走 refresh=1。
+    const delays=[1000,2000,4000,8000,15000,30000,60000];
+    const next=i=>{
+      state.creditTimer=setTimeout(async()=>{
+        if(!isCurrent())return;
+        let result;
+        try{result=await read();}catch{if(isCurrent())paint(null,false);return;}
+        if(!isCurrent())return;
+        const more=paint(result,i+1<delays.length);
+        if(more&&i+1<delays.length)next(i+1);
+      },delays[i]);
+    };
+    next(0);
+  }
+  function accountCreditSummary(rows,querying=true){
+    if(!rows.length) return '';
+    let remain=0,expiring=0,ok=0,expiringKnown=0,pending=0,failed=0,unknown=0;
+    for(const a of rows){
+      const c=a.credits;
+      if(typeof c?.remain==='number'){ok++;remain+=c.remain;if(typeof c.expiring==='number'){expiringKnown++;expiring+=c.expiring;}}
+      else if(creditIsPending(c)&&querying) pending++;
+      else if(creditIsPending(c)) unknown++;
+      else if(c?.error_code||c?.error||c?.ok===false) failed++;
+      else unknown++;
+    }
+    const partial=ok<rows.length;
+    const balance=ok?`${partial?'≥ ':''}${number(remain)}`:'—';
+    const expiringText=expiringKnown?`${expiringKnown<rows.length?'≥ ':''}${number(expiring)}`:'—';
+    const expiringUnknown=ok-expiringKnown;
+    const status=failed||pending||unknown||expiringUnknown?`${ok}/${rows.length} 个账号已读取${failed?` · ${failed} 失败`:''}${pending?` · ${pending} 查询中`:''}${unknown?` · ${unknown} 未知`:''}${expiringUnknown?` · ${expiringUnknown} 个临期额未返回`:''}`:'全部账号已读取';
+    return `<section class="ov-panel account-credit-summary"><div class="ov-ph"><h2>当前服务积分</h2><span>${esc(status)}</span></div><div class="ov-cells"><div><span>总余额${partial?'（已知下限）':''}</span><b>${balance}</b></div><div><span>即将过期${expiringKnown<rows.length?'（已知下限）':''}</span><b class="${expiring?'warn':''}">${expiringText}</b></div><div><span>已读取账号</span><b>${ok} / ${rows.length}</b></div><div><span>未知 / 失败</span><b>${unknown+pending+failed+expiringUnknown}</b></div></div></section>`;
+  }
+  function accountCreditCell(credit,querying){
+    const hasBalance=typeof credit?.remain==='number';
+    let amount='未读取';
+    if(hasBalance)amount=number(credit.remain);
+    else if(creditIsPending(credit)){if(querying)amount='查询中';}
+    else if(credit?.error_code==='upstream_not_reported')amount='上游未返回';
+    else if(credit?.error_code||credit?.error||credit?.ok===false)amount='读取失败';
+    const expiryText=credit?.expiring_text||(typeof credit?.expiry==='string'&&credit.expiry?(credit.fetched_at?credit.expiry:date(credit.expiry)):null);
+    const expiry=typeof credit?.expiring==='number'?credit.expiring>0?`<p class="credit-expiring" data-expiring="${esc(credit.expiring)}">其中 ${number(credit.expiring)} 即将过期${expiryText?' · '+esc(expiryText):''}</p>`:'':typeof credit?.remain==='number'?'<p class="muted">临期积分未知</p>':'';
+    const stale=hasBalance&&credit.error_code&&credit.error_code!=='autoclaw_expiring_unavailable'&&!creditIsPending(credit);
+    return `<span class="${hasBalance?'':'muted'}">${amount}</span>${stale?'<p class="muted">刷新失败，显示上次余额</p>':''}${expiry}`;
+  }
   function providerFilter(id, value) {
     return `<div class="provider-filter"><span id="${id}-label" class="filter-label">服务</span><div id="${id}" class="provider-choices" role="group" aria-labelledby="${id}-label">${(state.providers||[]).map(p=>`<button type="button" data-provider-choice="${esc(p.id)}" aria-pressed="${p.id===value}">${esc(p.name)}</button>`).join('')}</div></div>`;
   }
@@ -117,12 +189,13 @@
     finally { clearTimeout(timer); signal?.removeEventListener('abort',abort); }
   }
   async function providers(refresh=false) {
-    if(refresh||!state.providers||state.providersDirty){
+    const walletSnapshotDue=(state.route==='overview'||state.route==='providers')&&Date.now()-(state.providerCreditReadAt||0)>=60_000;
+    if(refresh||!state.providers||state.providersDirty||walletSnapshotDue){
       const generation=state.version;
       const data=await api('workbench/providers');
       if(generation!==state.version)return;
       if(!Array.isArray(data.providers))throw new APIError('request_failed',502);
-      state.providers=data.providers;state.providersDirty=false;
+      state.providers=data.providers;state.providersDirty=false;state.providerCreditReadAt=Date.now();
     }
     return state.providers;
   }
@@ -140,11 +213,16 @@
     if(a.parsable!==false) return '';
     return '账号文件存在但无法解析，网关不会加载它；请重新登录，或核对旧版凭证格式后再启用。';
   }
-  async function accountsFor(provider,options) {
+  async function accountsFor(provider,options,onSnapshot) {
     const p=state.providers.find(p=>p.id===provider);
-    if(p?.catalog_scope==='account') return (await api('workbench/accounts',options)).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,nickname:a.nickname||'',mobile:a.mobile||'',botId:a.bot_id||'',verifiedAt:a.verified_at||null,enabled:a.enabled,expires_at:a.expires_at,revision:a.revision}));
+    if(p?.catalog_scope==='account') return (await api('workbench/accounts',options)).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,nickname:a.nickname||'',mobile:a.mobile||'',botId:a.bot_id||'',verifiedAt:a.verified_at||null,enabled:a.enabled,expires_at:a.expires_at,revision:a.revision,credits:a.credits||null}));
     const data=await api('state',options);
-    return (data.accounts || []).map(a=>({...a,realm:a.realm||(/trae/i.test(a.domain||'')?'trae':/workbuddy\.ai/i.test(a.domain||'')?'global':'cn')})).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(authSummaryRow);
+    onSnapshot?.(data);
+    return (data.accounts || []).map(a=>({...a,realm:a.realm||(/trae/i.test(a.domain||'')?'trae':/workbuddy\.ai/i.test(a.domain||'')?'global':'cn')})).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(a=>{
+      const row=authSummaryRow(a),c=row.credits;
+      if(data.creditPending&&typeof c?.remain!=='number'&&!c?.error&&c?.ok!==false)row.credits={...c,pending:true};
+      return row;
+    });
   }
   function fail(e) {
     if(e.name==='AbortError')return;
@@ -196,7 +274,7 @@
       sourceControl?.removeAttribute('aria-busy');
     }
   }
-  function begin() { state.controller?.abort(); clearTimeout(state.poll); state.controller=new AbortController(); state.version++; return state.version; }
+  function begin() { state.controller?.abort(); clearTimeout(state.poll); clearTimeout(state.creditTimer); state.controller=new AbortController(); state.version++; return state.version; }
   function showRouteLoading() {
     const view=$('#view'),old=view.querySelector('[data-view-content]');
     if(old){old.inert=true;old.setAttribute('aria-hidden','true');}
@@ -246,7 +324,7 @@
     const schedules = work.status === 'fulfilled' ? (work.value.schedules || []) : [];
     const rows = work.status === 'fulfilled' ? (work.value.runs || []) : [];
     state.runs = rows;
-    const st = snap.status === 'fulfilled' ? snap.value : null;
+    let st = snap.status === 'fulfilled' ? snap.value : null;
     // 池数据缺失时不能显示成 0/0「全部可用」——那读起来像一切正常，实际是还不知道。
     const pool = st && st.pool ? st.pool : {};
     const totalActive = state.providers.reduce((n, p) => n + (p.accounts.total || 0), 0);
@@ -262,27 +340,14 @@
     const running = rows.filter(r => r.status === 'running' || r.status === 'queued').length;
     const unconfirmed = rows.filter(r => r.status === 'uncertain').length;
     const enabledPlans = schedules.filter(s => s.enabled).length;
-    // 积分合计：直接读后端已经汇总好的 creditTotals，不在前端重算。
-    const credit = st && st.creditTotals ? st.creditTotals : null;
-    const remain = credit ? num(credit.remain) : null;
-    const size = credit ? num(credit.size) : null;
-    const expiring = credit ? num(credit.expiring) : null;
-    const creditAccounts = credit ? num(credit.accounts) : null;
-    const creditOk = credit ? num(credit.ok) : null;
-    // 过期窗口是后端配置的（pool.expiring_soon，默认 7 天），文案跟着它走，
-    // 否则会出现「面板说 3 天、网关其实按 7 天加权」的错位。
-    const expiryHours = credit ? num(credit.expiring_window_hours) : null;
-    const expiryLabel = expiryHours && expiryHours % 24 === 0 ? `${expiryHours / 24} 天内过期` : '快过期积分';
-    const creditSub = !st ? '未读取'
-      : st.creditPending && remain === null ? '查询中'
-      : st.creditError && remain === null ? '查询失败'
-      : remain === null ? '暂无数据'
-      : (size && size > 0 ? `已用 ${Math.round((size - remain) / size * 100)}%` : '');
-    const pct = size && size > 0 && remain !== null ? Math.max(0, Math.min(100, Math.round(remain / size * 100))) : null;
+    const pendingAutoClaw=()=>state.providers.some(p=>p.id==='autoclaw'&&p.accounts?.total>0&&!p.error_code&&p.credit_totals?.unknown>0);
+    let pendingLegacy=Boolean(st?.creditPending),pendingAuto=pendingAutoClaw();
+    const creditRows=()=>providerCreditRows(st);
+    const creditMetric=()=>metricCard('积分服务',String(creditRows().filter(r=>r.accounts>0).length),'','按供应商列示');
     const metrics = [
       metricCard('已启用账号', String(enabledActive), `/ ${totalActive}`, state.providers.length ? `${state.providers.length} 个服务` : ''),
       metricCard('账号池', total === null ? '—' : String(healthy === null ? 0 : healthy), total === null ? '' : `/ ${total}`, poolSub, poolTone),
-      metricCard('剩余积分', remain === null ? '—' : remain.toLocaleString('zh-CN'), size ? `/ ${size.toLocaleString('zh-CN')}` : '', creditSub),
+      `<div id="overview-credit-metric">${creditMetric()}</div>`,
       metricCard('启用计划', String(enabledPlans), `/ ${schedules.length}`, running ? `${running} 个正在执行` : (unconfirmed ? `${unconfirmed} 个待复核` : ''), unconfirmed ? 'warn' : ''),
     ].join('');
     const poolPanel = total === null
@@ -299,30 +364,34 @@
            const t = num(v.total), h = num(v.healthy);
            return `<div class="ov-realm"><span>${esc(name)}</span><b>${h === null ? '—' : h}${t === null ? '' : ` / ${t}`}</b></div>`;
          })}`;
-    const creditPanel = remain === null
-      ? `<div class="ov-empty">${esc(creditSub || '暂无积分数据')}</div>`
-      : `<div class="ov-big"><span>${remain.toLocaleString('zh-CN')}</span><small>剩余</small></div>
-         ${pct === null ? '' : `<div class="ov-bar"><i class="a" style="width:${pct}%"></i></div>`}
-         <div class="ov-cells">
-           <div><span>总量</span><b>${size === null ? '—' : size.toLocaleString('zh-CN')}</b></div>
-           <div><span>已用</span><b>${size === null ? '—' : (size - remain).toLocaleString('zh-CN')}</b></div>
-           <div><span>${expiryLabel}</span><b class="${expiring ? 'warn' : ''}">${expiring === null ? '—' : expiring.toLocaleString('zh-CN')}</b></div>
-           <div><span>取到积分</span><b>${creditOk === null ? '—' : `${creditOk} / ${creditAccounts === null ? '—' : creditAccounts}`}</b></div>
-         </div>`;
     const notes = [];
     if (unconfirmed) notes.push(notice(`有 ${unconfirmed} 次执行结果未确认。请先核验官方状态，不要直接重复提交。`, 'warn'));
-    if (st && st.creditError && remain === null) notes.push(notice('积分数据读取失败：' + String(st.creditError), 'warn'));
     if (st && st.pendingRestart) notes.push(notice('有账号变更尚未生效，重启网关后生效。', 'warn'));
     $('#view').innerHTML = heading(button('reload', '刷新状态', '', 'quiet')) +
       notes.join('') + `<div data-workspace-overview><div class="ov-metrics">${metrics}</div>` +
       `<div class="ov-pairs">
          <section class="ov-panel"><div class="ov-ph"><h2>账号池</h2><span>按区域</span></div>${poolPanel}</section>
-         <section class="ov-panel"><div class="ov-ph"><h2>积分</h2><span>全部账号合计</span></div>${creditPanel}</section>
+         <section class="ov-panel"><div class="ov-ph"><h2>积分</h2><span>按供应商</span></div><div id="overview-provider-credits">${providerCreditPanel(creditRows(),pendingLegacy,pendingAuto)}</div></section>
        </div>` +
       `<div class="ov-links"><a href="#tasks">任务与定时 →</a><a href="#accounts">账号管理 →</a><a href="#logs">请求记录 →</a></div></div>`;
+    if(pendingLegacy||pendingAuto)scheduleCreditReadback(()=>generation===state.version&&state.route==='overview',
+      ()=>Promise.allSettled([pendingLegacy?api('state'):null,pendingAuto?providers(true):null]),(result,canRetry)=>{
+        const [legacy,auto]=result||[];
+        if(legacy?.status==='fulfilled'&&legacy.value)st=legacy.value;
+        pendingLegacy=canRetry&&legacy?.status==='fulfilled'&&Boolean(legacy.value?.creditPending);
+        pendingAuto=canRetry&&auto?.status==='fulfilled'&&pendingAutoClaw();
+        $('#overview-credit-metric').innerHTML=creditMetric();
+        $('#overview-provider-credits').innerHTML=providerCreditPanel(creditRows(),pendingLegacy,pendingAuto);
+        return pendingLegacy||pendingAuto;
+      });
   }
   async function services() {
-    $('#view').innerHTML=heading(button('reload','同步服务','','quiet'))+`<div class="service-list">${state.providers.map(p=>`<article class="service-entry" data-provider="${esc(p.id)}"><div><h2>${esc(p.name)}</h2><p>${p.catalog_scope==='account'?'目录随账号变化':'服务级模型目录'}</p></div><div><dl><div><dt>已连接账号</dt><dd>${p.accounts.total}</dd></div><div><dt>已启用</dt><dd>${p.accounts.enabled}</dd></div></dl><p>${p.inference_available?'消息推理已接入。请求仍受账号余额和上游可用性限制。':'模型目录可读取；此服务的消息转发尚未接通。'}</p>${p.error_code?notice(errorLabels[p.error_code]||'服务状态读取失败','error'):''}</div><div class="actions">${button('provider-models','查看模型',`data-provider="${esc(p.id)}"`,'quiet')}${button('provider-accounts','查看账号',`data-provider="${esc(p.id)}"`,'quiet')}</div></article>`).join('')}</div>`;
+    const credits=new Map(providerCreditRows(null).map(row=>[row.id,row]));
+    $('#view').innerHTML=heading(button('reload','同步服务','','quiet'))+`<div class="service-list">${state.providers.map(p=>{
+      const c=credits.get(p.id);
+      const credit=c?.accounts?`<div class="provider-credit-inline"><b>${creditAmount(c.remain,c.complete)}</b><span>余额 · 临期 ${creditAmount(c.expiring,c.expiringComplete)}</span><small>${c.ok}/${c.accounts} 个账号已读取${c.unknown?` · ${c.unknown} 未知`:''}${c.failed?` · ${c.failed} 失败`:''}</small></div>`:'';
+      return `<article class="service-entry" data-provider="${esc(p.id)}"><div><h2>${esc(p.name)}</h2><p>${p.catalog_scope==='account'?'目录随账号变化':'服务级模型目录'}</p></div><div><dl><div><dt>已连接账号</dt><dd>${p.accounts.total}</dd></div><div><dt>已启用</dt><dd>${p.accounts.enabled}</dd></div></dl>${credit}<p>${p.inference_available?'消息推理已接入。请求仍受账号余额和上游可用性限制。':'模型目录可读取；此服务的消息转发尚未接通。'}</p>${p.error_code?notice(errorLabels[p.error_code]||'服务状态读取失败','error'):''}</div><div class="actions">${button('provider-models','查看模型',`data-provider="${esc(p.id)}"`,'quiet')}${button('provider-accounts','查看账号',`data-provider="${esc(p.id)}"`,'quiet')}</div></article>`;
+    }).join('')}</div>`;
   }
 
   function installViewContent(markup){
@@ -348,10 +417,17 @@
     const selected=state.accountProvider || state.providers[0]?.id || '';
     state.accountProvider=selected;
     const generation=state.version;
-    installViewContent(heading(button('connect-account','添加账号','','primary'))+
-      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-list" class="loading">正在读取账号…</div>`);
+    const showsCredits=['workbuddy','trae','autoclaw'].includes(selected);
+    installViewContent(heading((showsCredits?button('reload','刷新积分','','quiet'):'')+button('connect-account','添加账号','','primary'))+
+      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-credit-summary"></div><div id="account-list" class="loading">正在读取账号…</div>`);
     bindProviderFilter('account-provider',value=>{state.accountProvider=value;state.accountRealm='';});
-    const rows=await accountsFor(selected);if(generation!==state.version)return;state.accountRows=rows;const clientStates=new Map();
+    let snapshot;
+    const rows=await accountsFor(selected,undefined,data=>{snapshot=data;});if(generation!==state.version)return;
+    const pending=()=>selected==='autoclaw'?rows.some(a=>creditIsPending(a.credits)):Boolean(snapshot?.creditPending);
+    let querying=showsCredits&&pending();
+    const summary=$('#account-credit-summary');
+    const drawCreditSummary=()=>{summary.innerHTML=accountCreditSummary(rows,querying);};
+    state.accountRows=rows;if(showsCredits)drawCreditSummary();const clientStates=new Map();
     // 区域筛选只在 WorkBuddy（有 CN/Global 两个独立站点）显示；Trae 与 AutoClaw 各自
     // 只有一个域，出现 CN/Global 只会误导。
     const realmBar=$('#account-realm');
@@ -375,15 +451,26 @@
       $('#account-list').innerHTML=list.length?table(['账号','状态与限流','积分与过期','会话与连接','操作'],list.map(a=>{
         const credit=a.credits,connection=clientStates.get(a.id);
         const status=`<div data-account-status>${accountStatus(a)}</div>`;
-        const balance=typeof credit?.remain==='number'
-          ? `${number(credit.remain)}${credit.expiring>0?`<p class="credit-expiring" data-expiring="${esc(credit.expiring)}">其中 ${number(credit.expiring)} 即将过期${credit.expiry?' · '+esc(date(credit.expiry)):''}</p>`:''}`
-          : credit?.ok===false?'<span class="muted">读取失败</span>':'<span class="muted">未读取</span>';
+        const balance=showsCredits?`<div data-credit-account="${esc(a.id)}">${accountCreditCell(credit,querying)}</div>`:'<span class="muted">—</span>';
         const sessionText=connection?esc(LoomConnections.clientLabels[connection.state]||'待核验')+(connection.verified_at?`<p>最近核验 ${esc(date(connection.verified_at))}</p>`:''):selected==='autoclaw'?'<p>纯 HTTP 模型调用，不创建会话，不依赖任何客户端</p>':selected==='doubao'?(a.bot_id?'<p>已绑定一个固定会话，不依赖客户端</p>':'<p>首次调用时会创建一个固定会话</p>'):`${esc(date(a.expires_at))}${a.expires_at&&a.expires_at*1000<Date.now()?'<p>会话已过期</p>':''}`;
         return [`<strong class="account-name">${esc(a.nickname||a.mobile||'未提供昵称')}</strong>${a.nickname&&a.mobile?`<p class="account-mobile">${esc(a.mobile)}</p>`:''}<p>${esc({cn:'WorkBuddy 国内版',global:'WorkBuddy 国际版',trae:'Trae'}[a.realm]||providerName(selected))}</p><details class="account-id"><summary>账号标识</summary><code>${esc(a.id)}</code>${a.enterpriseId?`<p class="muted small">企业：<code>${esc(a.enterpriseId)}</code></p>`:''}${a.botId?`<p class="muted small">官方 Bot：<code>${esc(a.botId)}</code></p>`:''}${a.verifiedAt?`<p class="muted small">核验于 ${esc(date(a.verifiedAt))}</p>`:''}</details>`,status,balance,sessionText,`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}" data-realm="${esc(a.realm||'')}"`,'quiet compact')}</div>`];
       })):empty(query?'没有匹配的账号':realm?'该区域下没有账号':'尚未接入账号',query?'试试其他昵称或账号标识。':(realm?'可切换区域查看全部账号。':'接入账号后在这里查看状态、限流与积分过期。'));
     };
     drawRealms();draw();
     $('#account-search').addEventListener('input',draw);
+    if(querying)scheduleCreditReadback(()=>generation===state.version&&state.route==='accounts'&&state.accountProvider===selected,
+      async()=>{let nextSnapshot;const nextRows=await accountsFor(selected,undefined,data=>{nextSnapshot=data;});return {nextRows,nextSnapshot};},(result,canRetry)=>{
+        if(result){
+          snapshot=result.nextSnapshot;
+          const credits=new Map(result.nextRows.map(a=>[a.id,a.credits]));
+          for(const a of rows)if(credits.has(a.id))a.credits=credits.get(a.id);
+        }
+        querying=Boolean(result)&&canRetry&&pending();
+        drawCreditSummary();
+        const byID=new Map(rows.map(a=>[a.id,a.credits]));
+        $('#account-list').querySelectorAll('[data-credit-account]').forEach(cell=>{cell.innerHTML=accountCreditCell(byID.get(cell.dataset.creditAccount),querying);});
+        return querying;
+      });
   }
   // 模型限流与积分过期必须常显、用高亮色，不能折叠进 details 或只有 hover 才
   // 能看到——用户明确要求「看到了，还在，不要自动隐藏」「还是用高亮色显示」。
@@ -1051,12 +1138,34 @@
       <td>${r.output_tokens==null?'—':number(r.output_tokens)}</td>
       <td>${tps==null?'—':tps+' tok/s'}</td>
       <td>${badge(tone,r.status||'未知')}${r.error_code?`<p class="small muted">${esc(r.error_code)}</p>`:''}</td>
-      <td>${r.credit==null?'—':String(r.credit)}</td>
+      <td>${requestCredit(r)}</td>
       <td><code class="small">${esc(r.request_id||'—')}</code></td>
     </tr>`+(open?`<tr class="log-detail-row"><td colspan="13">${requestDetailHtml(r)}</td></tr>`:'');
   }
-  // Detail is rendered from the list row itself, which already carries attempts
-  // and timing. The expanded panel only ever shows metadata — never message text.
+  function requestCredit(r, detail=false){
+    const missing=r.missing_credit_attempts||0;
+    if(r.credit==null){
+      if(r.upstream_started===false)return '<span class="muted">未调用上游</span>';
+      return '<span class="muted" title="上游未上报扣费；这不是零，也未按 token 估算">'+(detail?'上游未上报扣费（不是零，未估算）':'上游未上报')+'</span>';
+    }
+    const value=esc(r.credit);
+    if(!missing)return value;
+    return `${value} <span class="small muted" title="仅累计有报告的尝试，不是本次请求的总花费">${detail?`已知小计 · ${number(missing)} 次未上报`:'部分上报'}</span>`;
+  }
+  function requestAttemptCredits(record){
+    const attempts=Array.isArray(record?.attempts)?record.attempts:[];
+    if(!attempts.length)return '逐次花费未保留';
+    const rows=attempts.map(a=>`<li>第 ${esc(a.number)} 次：${a.credit==null?'上游未上报':esc(a.credit)}</li>`).join('');
+    return `<ul class="request-credit-attempts">${rows}</ul>${record.attempts_truncated?'<p class="small muted">部分尝试没有留存明细</p>':''}`;
+  }
+  async function loadRequestAttemptCredits(node,requestID,generation){
+    const isCurrent=()=>generation===state.version&&state.route==='logs'&&node.isConnected;
+    try{
+      const {record}=await api('requests/'+encodeURIComponent(requestID));
+      if(isCurrent())node.innerHTML=requestAttemptCredits(record?.request_id===requestID?record:null);
+    }catch{if(isCurrent())node.textContent='逐次花费暂不可读';}
+  }
+  // The list and expanded panel use the same summary; partial charges remain partial.
   function requestDetailHtml(r){
     const k=(name,value)=>`<div><dt>${esc(name)}</dt><dd>${value??'—'}</dd></div>`;
     return `<div class="log-detail">
@@ -1077,6 +1186,8 @@
         ${k('上游已启动',r.upstream_started?'是':'否')}
         ${k('尝试次数',number(r.attempt_count))}
         ${k('决策次数',number(r.decision_count))}
+        ${k('花费观测',requestCredit(r,true))}
+        ${r.upstream_started&&r.attempt_count>0&&r.request_id?k('逐次花费','<div data-request-attempt-credit class="muted">正在读取…</div>'):''}
       </dl>
       <p class="small muted">展开只显示请求元数据；消息内容与凭据不在留存量中。</p>
     </div>`;
@@ -1109,6 +1220,8 @@
     if(detailRow?.classList.contains('log-detail-row'))detailRow.remove();
     if(open)nodes[1]&&current.after(nodes[1]);
     current.replaceWith(nodes[0]);
+    const attemptCredit=open&&nodes[1]?.querySelector('[data-request-attempt-credit]');
+    if(attemptCredit)void loadRequestAttemptCredits(attemptCredit,r.request_id,state.version);
   }
 
   // /api/update 的信封有五种真实形态，控制台必须逐一说实话：

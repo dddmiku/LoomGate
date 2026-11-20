@@ -196,6 +196,28 @@ func TestSSEInvalidUsageCannotErasePriorObservation(t *testing.T) {
 	}
 }
 
+func TestSSEPreservesReportedCreditWithoutChangingCompletion(t *testing.T) {
+	creditFrame := func(value string) string { return streamFrame(`{"usage":{"credit":` + value + `}}`) }
+	zero, fraction := 0.0, 0.125
+	for _, c := range []struct {
+		name, frames string
+		want         *float64
+	}{
+		{"missing", "", nil},
+		{"explicit_zero", creditFrame("0"), &zero},
+		{"latest_valid", creditFrame("2") + creditFrame("0.125") + creditFrame("null") + creditFrame(`"invalid"`) + creditFrame("-1") + creditFrame("1e9999"), &fraction},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			frames := streamFrame(`{"choices":[{"delta":{"content":"fixture"},"finish_reason":"stop"}]}`) + c.frames + streamFrame("[DONE]")
+			text, _, usage, err := streamSSE(strings.NewReader(frames), nil, nil)
+			got := usage.observed().Credit
+			if err != nil || text != "fixture" || (got == nil) != (c.want == nil) || got != nil && *got != *c.want {
+				t.Fatalf("credit observation lost or changed completion: credit=%v error=%v", got, err)
+			}
+		})
+	}
+}
+
 func TestSSECallbackErrorStopsConsumptionAndSurvivesWrapping(t *testing.T) {
 	failure := errors.New("fixture_sink_closed")
 	reader := &terminalThenFailure{first: streamFrame(`{"choices":[{"delta":{"content":"first"}}]}`) + streamFrame(`{"choices":[{"delta":{"content":"second"}}]}`) + streamFrame("[DONE]")}

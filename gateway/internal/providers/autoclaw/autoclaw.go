@@ -30,6 +30,7 @@ import (
 	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/providerretry"
+	"workbuddy2api/internal/upstream"
 )
 
 // Upstream facts. These are protocol constants of the AutoClaw desktop client,
@@ -786,6 +787,7 @@ type streamUsage struct {
 	Prompt, Completion, Cached int
 	PromptSeen, CompletionSeen bool
 	CachedSeen                 bool
+	Credit                     *float64
 	// FinishReason is the upstream's termination cause for this turn. Empty
 	// means the upstream did not report one.
 	FinishReason string
@@ -796,9 +798,10 @@ type streamUsage struct {
 // split usage harmless.
 func parseUsage(raw json.RawMessage, acc streamUsage) streamUsage {
 	var u struct {
-		PromptTokens         *int `json:"prompt_tokens"`
-		CompletionTokens     *int `json:"completion_tokens"`
-		PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
+		PromptTokens         *int            `json:"prompt_tokens"`
+		CompletionTokens     *int            `json:"completion_tokens"`
+		PromptCacheHitTokens *int            `json:"prompt_cache_hit_tokens"`
+		Credit               json.RawMessage `json:"credit"`
 		PromptTokensDetails  *struct {
 			CachedTokens *int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
@@ -817,6 +820,12 @@ func parseUsage(raw json.RawMessage, acc streamUsage) streamUsage {
 	}
 	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil {
 		acc.Cached, acc.CachedSeen = *u.PromptTokensDetails.CachedTokens, true
+	}
+	// Invalid optional billing metadata must not break a valid model response.
+	if len(u.Credit) > 0 && u.Credit[0] != '"' {
+		if value, ok := upstream.UsageCredit(json.Number(u.Credit)); ok && value <= 1e12 {
+			acc.Credit = &value
+		}
 	}
 	return acc
 }

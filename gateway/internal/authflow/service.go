@@ -66,9 +66,10 @@ type View struct {
 // Flow is private storage. Only View may be serialized into management responses.
 type Flow struct {
 	View
-	Secret json.RawMessage `json:"secret,omitempty"`
-	Action string          `json:"action,omitempty"`
-	Polls  int             `json:"polls,omitempty"`
+	Secret      json.RawMessage `json:"secret,omitempty"`
+	Action      string          `json:"action,omitempty"`
+	Polls       int             `json:"polls,omitempty"`
+	CooldownKey string          `json:"cooldown_key,omitempty"`
 }
 
 func (Flow) String() string   { return "authflow.Flow[redacted]" }
@@ -99,6 +100,13 @@ type Driver interface {
 // returned without calling the driver step.
 type StepValidator interface {
 	ValidateStep(Flow, string, Input) *Result
+}
+
+// CooldownScoped lets a provider scope a send cooldown to the identity that
+// received the side effect. The key is private and must not contain raw user
+// input when it is persisted in Flow.
+type CooldownScoped interface {
+	CooldownKey(Flow, string, Input) string
 }
 
 // PreparedStarter persists the provider intent before any external side effect.
@@ -502,9 +510,19 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 		validation = validator.ValidateStep(f, action, input)
 	}
 	now := s.opts.Now()
+	cooldownKey := ""
 	if validation == nil && action == "send_code" {
+		if scoped, ok := d.(CooldownScoped); ok {
+			cooldownKey = scoped.CooldownKey(f, action, input)
+		}
 		for _, prior := range rows {
-			if prior.Provider == f.Provider && now.Before(prior.RetryAt) {
+			if prior.Provider != f.Provider || !now.Before(prior.RetryAt) {
+				continue
+			}
+			// Drivers that expose a scope (AutoClaw uses a phone hash) only
+			// block the same identity. A missing key is treated conservatively
+			// as provider-wide, which preserves legacy persisted flows.
+			if cooldownKey == "" || prior.CooldownKey == "" || prior.CooldownKey == cooldownKey {
 				s.mu.Unlock()
 				return f.View, ErrBusy
 			}
@@ -518,6 +536,7 @@ func (s *Service) Step(ctx context.Context, id, action string, input Input) (Vie
 	f.Action = action
 	if validation == nil && action == "send_code" {
 		f.RetryAt = now.Add(time.Minute)
+		f.CooldownKey = cooldownKey
 	}
 	f.Revision++
 	rows[idx] = f

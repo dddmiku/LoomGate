@@ -137,10 +137,11 @@ type ToolCapableProvider interface {
 // TokenUsage preserves the difference between an omitted metric and a reported zero.
 type TokenUsage struct {
 	Prompt, Completion, Cached *int
+	Credit                     *float64
 }
 
 func (u TokenUsage) Reported() bool {
-	return u.Prompt != nil || u.Completion != nil || u.Cached != nil
+	return u.Prompt != nil || u.Completion != nil || u.Cached != nil || u.Credit != nil
 }
 
 func (u TokenUsage) Complete() bool { return u.Prompt != nil && u.Completion != nil }

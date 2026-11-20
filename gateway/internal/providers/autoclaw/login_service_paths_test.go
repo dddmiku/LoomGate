@@ -174,6 +174,35 @@ func TestRealLoginServiceValidationCanBeCorrectedWithoutCooldown(t *testing.T) {
 	}
 }
 
+func TestRealLoginServiceCooldownIsScopedPerPhone(t *testing.T) {
+	transport := &sendCodeFixture{body: `{"code":42001,"msg":"synthetic rejection"}`}
+	svc, _ := realLoginService(t, transport)
+	phoneA := "1" + strings.Repeat("0", 10)
+	phoneB := "1" + strings.Repeat("1", 10)
+	first := loginRoute(t, svc, "start", authflow.Request{Provider: "autoclaw", Method: "sms"})
+	first = loginRoute(t, svc, "step", map[string]any{"id": first.ID, "action": "send_code",
+		"input": map[string]any{"phone": phoneA, "invite_code": ""}})
+	if first.Status != "failed" || transport.calls != 1 {
+		t.Fatalf("first send did not record its cooldown: status=%s calls=%d", first.Status, transport.calls)
+	}
+	second := loginRoute(t, svc, "start", authflow.Request{Provider: "autoclaw", Method: "sms"})
+	second = loginRoute(t, svc, "step", map[string]any{"id": second.ID, "action": "send_code",
+		"input": map[string]any{"phone": phoneB, "invite_code": ""}})
+	if second.Status != "failed" || transport.calls != 2 {
+		t.Fatalf("different phone was incorrectly blocked by first cooldown: status=%s calls=%d", second.Status, transport.calls)
+	}
+	if _, err := svc.Step(t.Context(), second.ID, "cancel", authflow.Input{}); err != nil {
+		t.Fatalf("cancel second flow: %v", err)
+	}
+	third, err := svc.Start(t.Context(), authflow.Request{Provider: "autoclaw", Method: "sms"})
+	if err != nil {
+		t.Fatalf("start same-phone retry flow: %v", err)
+	}
+	if _, err = svc.Step(t.Context(), third.ID, "send_code", authflow.Input{Phone: phoneA}); err != authflow.ErrBusy {
+		t.Fatalf("same phone bypassed its cooldown: %v", err)
+	}
+}
+
 func TestRealLoginServiceTimedOutSendIsUnconfirmed(t *testing.T) {
 	transport := &sendCodeFixture{wait: true}
 	svc, _ := realLoginService(t, transport, 20*time.Millisecond)

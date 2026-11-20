@@ -5,6 +5,7 @@ import (
 
 	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/requestlog"
+	"workbuddy2api/internal/upstream"
 )
 
 func providerUsage(result inference.Result) inference.TokenUsage {
@@ -64,12 +65,6 @@ func recordProviderAttempts(st *chatStat, result inference.Result, model string,
 	u := providerUsage(result)
 	st.unreported = !u.Complete()
 	st.prompt, st.toks, st.cached = providerTokenValue(u.Prompt), providerTokenValue(u.Completion), providerTokenValue(u.Cached)
-	if st.trace == nil {
-		return
-	}
-	trace := st.trace
-	trace.account, trace.model = result.AccountRef, model
-	trace.record.UpstreamStarted = result.Attempted
 	records := result.AttemptRecords
 	summarized := len(records) == 0 && result.Attempted
 	if summarized {
@@ -79,7 +74,12 @@ func recordProviderAttempts(st *chatStat, result inference.Result, model string,
 			records[0].ErrorCode = providerErrorCode(err)
 		}
 	}
-	trace.record.AttemptCount = len(records)
+	trace := st.trace
+	if trace != nil {
+		trace.account, trace.model = result.AccountRef, model
+		trace.record.UpstreamStarted = result.Attempted
+		trace.record.AttemptCount = len(records)
+	}
 	for i, a := range records {
 		status := requestlog.StatusError
 		switch {
@@ -96,6 +96,14 @@ func recordProviderAttempts(st *chatStat, result inference.Result, model string,
 				a.Usage = u
 			}
 		}
+		charge := providerCredit(a.Usage.Credit)
+		if charge != nil {
+			st.credit += *charge
+			st.hasCred = true
+		}
+		if trace == nil {
+			continue
+		}
 		attempt := requestlog.Attempt{
 			Number: i + 1, AccountID: a.AccountRef, Model: model,
 			StartedAt: a.StartedAt, FinishedAt: a.FinishedAt,
@@ -103,12 +111,12 @@ func recordProviderAttempts(st *chatStat, result inference.Result, model string,
 			HTTPStatus: a.HTTPStatus, Status: status,
 			ErrorCode: traceCode(a.ErrorCode), FinishReason: traceCode(a.FinishReason),
 			InputTokens: providerCount(a.Usage.Prompt), OutputTokens: providerCount(a.Usage.Completion),
-			CachedTokens: providerCount(a.Usage.Cached),
+			CachedTokens: providerCount(a.Usage.Cached), Credit: charge,
 		}
 		switch {
 		case attempt.InputTokens != nil && attempt.OutputTokens != nil:
 			attempt.UsageState = requestlog.UsageComplete
-		case attempt.InputTokens != nil || attempt.OutputTokens != nil || attempt.CachedTokens != nil:
+		case attempt.InputTokens != nil || attempt.OutputTokens != nil || attempt.CachedTokens != nil || attempt.Credit != nil:
 			attempt.UsageState, attempt.UsageReason = requestlog.UsagePartial, "partial_usage"
 		default:
 			attempt.UsageState, attempt.UsageReason = requestlog.UsageMissing, "usage_not_reported"
@@ -121,6 +129,15 @@ func recordProviderAttempts(st *chatStat, result inference.Result, model string,
 			trace.last = &attempt
 		}
 	}
+}
+
+func providerCredit(credit *float64) *float64 {
+	if credit != nil {
+		if amount, ok := upstream.UsageCredit(*credit); ok && amount <= 1e12 {
+			return &amount
+		}
+	}
+	return nil
 }
 
 func providerFinishReason(reason string, toolCalls bool) string {

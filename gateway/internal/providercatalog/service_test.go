@@ -31,15 +31,16 @@ type fixtureSource struct {
 	inf     bool
 }
 
-func (f fixtureSource) ID() string                          { return f.id }
-func (f fixtureSource) Name() string                        { return f.id }
-func (f fixtureSource) CatalogScope() string                { return "account" }
-func (f fixtureSource) Inference() bool                     { return f.inf }
-func (f fixtureSource) Login() bool                         { return false }
-func (f fixtureSource) StaticModels() []Model               { return f.static }
+func (f fixtureSource) ID() string            { return f.id }
+func (f fixtureSource) Name() string          { return f.id }
+func (f fixtureSource) CatalogScope() string  { return "account" }
+func (f fixtureSource) Inference() bool       { return f.inf }
+func (f fixtureSource) Login() bool           { return false }
+func (f fixtureSource) StaticModels() []Model { return f.static }
 func (f fixtureSource) Display(string) (string, string, string, time.Time, bool) {
 	return "", "", "", time.Time{}, false
 }
+
 // liveFixture adds the optional live-catalog half.
 type liveFixture struct{ fixtureSource }
 
@@ -70,6 +71,36 @@ func decodePage(t *testing.T, w *httptest.ResponseRecorder) Page {
 		t.Fatal("invalid catalog page")
 	}
 	return p
+}
+
+type fixtureCreditSource struct {
+	fixtureSource
+	views map[string]CreditView
+}
+
+func (f fixtureCreditSource) Credits(_ context.Context, account string, _ bool) (CreditView, error) {
+	return f.views[account], nil
+}
+
+func TestProviderCreditTotalsCountWalletsWhenExpiryIsPartial(t *testing.T) {
+	var zero, balance, expiring int64 = 0, 42, 5
+	rows := []accountvault.Account{acct("complete", true), acct("wallet-only", true), acct("pending", true), acct("failed", true)}
+	s := New(Options{Accounts: accountList{rows: rows}, Sources: []ProviderSource{fixtureCreditSource{
+		fixtureSource: fixtureSource{id: "fixture"},
+		views: map[string]CreditView{
+			"complete":    {Supported: true, Remain: &balance, Expiring: &expiring},
+			"wallet-only": {Supported: true, Remain: &zero, ErrorCode: "autoclaw_expiring_unavailable"},
+			"pending":     {Supported: true, Pending: true, ErrorCode: "credit_pending"},
+			"failed":      {Supported: true, ErrorCode: "autoclaw_credit_unavailable"},
+		},
+	}}})
+	got := s.creditTotals(t.Context(), rows, "fixture", false)
+	if got == nil || got.Remain == nil || *got.Remain != balance || got.Expiring == nil || *got.Expiring != expiring {
+		t.Fatalf("wallet or known expiring points lost: %+v", got)
+	}
+	if got.Accounts != 4 || got.OK != 2 || got.Failed != 1 || got.Unknown != 1 || got.ExpiringUnknown != 3 || got.Complete {
+		t.Fatalf("partial coverage reported incorrectly: %+v", got)
+	}
 }
 
 // A provider error code must survive to the row so the console can render an

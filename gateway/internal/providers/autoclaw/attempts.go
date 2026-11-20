@@ -36,7 +36,7 @@ func attemptErrorCode(err error) string {
 }
 
 func (u streamUsage) observed() inference.TokenUsage {
-	var out inference.TokenUsage
+	out := inference.TokenUsage{Credit: u.Credit}
 	if u.PromptSeen {
 		value := u.Prompt
 		out.Prompt = &value

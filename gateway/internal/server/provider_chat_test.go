@@ -142,7 +142,6 @@ func TestProviderDynamicModelsRespectCallingKey(t *testing.T) {
 	}
 }
 
-
 func TestProviderPanicDoesNotEscapeOrDisableHealthyProvider(t *testing.T) {
 	h, p, key, _ := providerFixture(t, nil)
 	p.panic = true
@@ -234,5 +233,24 @@ func TestProviderUsageReachesTheRequestLogWithoutAttemptRecords(t *testing.T) {
 	}
 	if page.Items[0].InputTokens == nil || *page.Items[0].InputTokens != 1234 || page.Items[0].UsageState != requestlog.UsageComplete {
 		t.Fatalf("summary lost the usage: %+v", page.Items[0])
+	}
+}
+
+func TestProviderAttemptsPreserveExplicitChargesAndMissingCharges(t *testing.T) {
+	charge, free := 0.125, 0.0
+	st := &chatStat{trace: &requestTrace{}}
+	result := inference.Result{Attempted: true, AttemptRecords: []inference.Attempt{
+		{HTTPStatus: 429, Usage: inference.TokenUsage{Credit: &charge}},
+		{HTTPStatus: 500},
+		{HTTPStatus: 200, Usage: inference.TokenUsage{Credit: &free}},
+	}}
+	recordProviderAttempts(st, result, "fixture:dynamic", nil)
+	attempts := st.trace.record.Attempts
+	if !st.hasCred || st.credit != charge || len(attempts) != 3 {
+		t.Fatal("reported provider charges did not reach both accounting paths")
+	}
+	if attempts[0].Credit == nil || *attempts[0].Credit != charge || attempts[0].UsageState != requestlog.UsagePartial ||
+		attempts[1].Credit != nil || attempts[2].Credit == nil || *attempts[2].Credit != 0 {
+		t.Fatal("request log conflated absent charges with free or dropped an observed charge")
 	}
 }

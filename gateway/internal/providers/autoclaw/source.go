@@ -2,6 +2,7 @@ package autoclaw
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
 
@@ -14,6 +15,10 @@ import (
 // answers from StaticModels without touching the network or the vault.
 type Source struct {
 	Vault *accountvault.Vault
+	// Client and BaseURL are optional seams for isolated provider tests. Empty
+	// values preserve the production transport and AutoClaw endpoint.
+	Client  *http.Client
+	BaseURL string
 }
 
 func (Source) ID() string           { return "autoclaw" }

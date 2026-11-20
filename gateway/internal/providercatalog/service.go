@@ -52,16 +52,35 @@ type Catalog struct {
 // AccountView is the safe account row DTO. It carries vault metadata plus only
 // non-secret display facts a provider explicitly supplies.
 type AccountView struct {
-	ID         string     `json:"id"`
-	Provider   string     `json:"provider"`
-	Revision   uint64     `json:"revision"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	Enabled    bool       `json:"enabled"`
-	Nickname   string     `json:"nickname,omitempty"`
-	BotID      string     `json:"bot_id,omitempty"`
-	VerifiedAt *time.Time `json:"verified_at,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	Mobile     string     `json:"mobile,omitempty"`
+	ID         string      `json:"id"`
+	Provider   string      `json:"provider"`
+	Revision   uint64      `json:"revision"`
+	UpdatedAt  time.Time   `json:"updated_at"`
+	Enabled    bool        `json:"enabled"`
+	Nickname   string      `json:"nickname,omitempty"`
+	BotID      string      `json:"bot_id,omitempty"`
+	VerifiedAt *time.Time  `json:"verified_at,omitempty"`
+	ExpiresAt  *time.Time  `json:"expires_at,omitempty"`
+	Mobile     string      `json:"mobile,omitempty"`
+	Credits    *CreditView `json:"credits,omitempty"`
+}
+
+// CreditView carries only safe wallet facts; nil amounts mean the upstream did
+// not report them and are never estimated locally.
+type CreditView struct {
+	Supported    bool       `json:"supported"`
+	Pending      bool       `json:"pending,omitempty"`
+	Remain       *int64     `json:"remain"`
+	Expiring     *int64     `json:"expiring"`
+	Expiry       any        `json:"expiry,omitempty"`
+	ExpiringText string     `json:"expiring_text,omitempty"`
+	FetchedAt    *time.Time `json:"fetched_at,omitempty"`
+	ErrorCode    string     `json:"error_code,omitempty"`
+}
+
+// CreditSource is implemented by providers that expose a read-only wallet.
+type CreditSource interface {
+	Credits(ctx context.Context, account string, force bool) (CreditView, error)
 }
 
 // ProviderSource is everything the management view needs from one provider.
@@ -102,13 +121,26 @@ type Count struct {
 }
 
 type Provider struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	CatalogScope string `json:"catalog_scope"`
-	Inference    bool   `json:"inference_available"`
-	Login        bool   `json:"login_available"`
-	Accounts     Count  `json:"accounts"`
-	ErrorCode    string `json:"error_code,omitempty"`
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	CatalogScope string        `json:"catalog_scope"`
+	Inference    bool          `json:"inference_available"`
+	Login        bool          `json:"login_available"`
+	Accounts     Count         `json:"accounts"`
+	CreditTotals *CreditTotals `json:"credit_totals,omitempty"`
+	ErrorCode    string        `json:"error_code,omitempty"`
+}
+
+type CreditTotals struct {
+	Supported       bool   `json:"supported"`
+	Remain          *int64 `json:"remain"`
+	Expiring        *int64 `json:"expiring"`
+	Accounts        int    `json:"accounts"`
+	OK              int    `json:"ok"`
+	Failed          int    `json:"failed"`
+	Unknown         int    `json:"unknown"`
+	ExpiringUnknown int    `json:"expiring_unknown"`
+	Complete        bool   `json:"complete"`
 }
 
 type Row struct {
@@ -210,6 +242,11 @@ func (s *Service) publicID(a accountvault.Account) string {
 }
 
 func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
+	return s.accountViewsContext(context.Background(), rows, false)
+}
+
+func (s *Service) accountViewsContext(ctx context.Context, rows []accountvault.Account, force bool) []AccountView {
+	credits := s.creditViews(ctx, rows, "", force)
 	out := make([]AccountView, 0, len(rows))
 	for _, a := range rows {
 		view := AccountView{ID: s.publicID(a), Provider: a.Provider, Revision: a.Revision, UpdatedAt: a.UpdatedAt, Enabled: a.Enabled}
@@ -223,10 +260,117 @@ func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
 					view.VerifiedAt = &value
 				}
 			}
+			if credit, ok := credits[a.ID]; ok {
+				view.Credits = &credit
+			}
 		}
 		out = append(out, view)
 	}
 	return out
+}
+
+func (s *Service) creditViews(ctx context.Context, rows []accountvault.Account, provider string, force bool) map[string]CreditView {
+	type job struct {
+		id     string
+		source CreditSource
+	}
+	type result struct {
+		id     string
+		credit CreditView
+	}
+	jobs := make([]job, 0, len(rows))
+	for _, account := range rows {
+		if provider != "" && account.Provider != provider {
+			continue
+		}
+		if source, ok := s.byID[account.Provider].(CreditSource); ok {
+			jobs = append(jobs, job{id: account.ID, source: source})
+		}
+	}
+	results := make(map[string]CreditView, len(jobs))
+	if len(jobs) == 0 {
+		return results
+	}
+	workers := 4
+	if len(jobs) < workers {
+		workers = len(jobs)
+	}
+	queue := make(chan job)
+	out := make(chan result, len(jobs))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range queue {
+				credit, err := item.source.Credits(ctx, item.id, force)
+				if err != nil && credit.ErrorCode == "" {
+					credit.ErrorCode = "credit_unavailable"
+				}
+				if credit.ErrorCode == "credit_pending" {
+					credit.Pending = true
+				}
+				out <- result{id: item.id, credit: credit}
+			}
+		}()
+	}
+	go func() {
+		for _, item := range jobs {
+			queue <- item
+		}
+		close(queue)
+		wg.Wait()
+		close(out)
+	}()
+	for item := range out {
+		results[item.id] = item.credit
+	}
+	return results
+}
+
+func (s *Service) creditTotals(ctx context.Context, rows []accountvault.Account, provider string, force bool) *CreditTotals {
+	// Reuse the bounded credit worker pool used for account rows. Calling
+	// CreditSource directly here made every cache miss spawn its own refresh
+	// goroutine, so a large account pool could fan out unbounded upstream work
+	// while the totals were being assembled.
+	credits := s.creditViews(ctx, rows, provider, force)
+	var remain, expiring int64
+	var seen, okCount, failed, unknown, expiringCount int
+	for _, a := range rows {
+		if a.Provider != provider {
+			continue
+		}
+		if _, ok := s.byID[a.Provider].(CreditSource); !ok {
+			continue
+		}
+		seen++
+		c := credits[a.ID]
+		if c.Remain == nil {
+			if c.ErrorCode != "" && !c.Pending && c.ErrorCode != "credit_pending" {
+				failed++
+			} else {
+				unknown++
+			}
+			continue
+		}
+		okCount++
+		remain += *c.Remain
+		if c.Expiring != nil {
+			expiringCount++
+			expiring += *c.Expiring
+		}
+	}
+	if seen == 0 {
+		return nil
+	}
+	var remainValue, expiringValue *int64
+	if okCount > 0 {
+		remainValue = &remain
+	}
+	if expiringCount > 0 {
+		expiringValue = &expiring
+	}
+	return &CreditTotals{Supported: true, Remain: remainValue, Expiring: expiringValue, Accounts: seen, OK: okCount, Failed: failed, Unknown: unknown, ExpiringUnknown: seen - expiringCount, Complete: expiringCount == seen}
 }
 
 func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
@@ -265,10 +409,12 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 					}
 				}
 			}
-			out = append(out, Provider{
+			provider := Provider{
 				ID: src.ID(), Name: src.Name(), CatalogScope: src.CatalogScope(),
 				Inference: src.Inference(), Login: src.Login(), Accounts: count,
-			})
+			}
+			provider.CreditTotals = s.creditTotals(r.Context(), accounts, src.ID(), r.URL.Query().Get("refresh") == "1")
+			out = append(out, provider)
 		}
 		if err != nil {
 			// Accounts being unavailable must not hide the provider list; mark it
@@ -287,7 +433,8 @@ func (s *Service) Route(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if r.URL.Path == "/workbench/accounts" {
-		write(w, 200, map[string]any{"accounts": s.accountViews(accounts)})
+		force := r.URL.Query().Get("refresh") == "1"
+		write(w, 200, map[string]any{"accounts": s.accountViewsContext(r.Context(), accounts, force)})
 		return true
 	}
 	s.models(w, r, accounts)

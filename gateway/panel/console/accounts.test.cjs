@@ -38,3 +38,17 @@ test('doubao account mapping uses verified binding facts and never invents a nic
   assert.equal(rows[1].botId,'');               // 未绑定不编造
   assert.equal(rows[1].verifiedAt,null);
 });
+
+test('account mapping preserves AutoClaw credit pending and upstream failure facts', async () => {
+  const context = {state: {providers: [{id:'autoclaw',catalog_scope:'account'}]},
+    api: async () => ({accounts: [
+      {id:'auto-pending',provider:'autoclaw',enabled:true,credits:{supported:true,pending:true,error_code:'credit_pending'}},
+      {id:'auto-failed',provider:'autoclaw',enabled:true,credits:{supported:true,error_code:'autoclaw_credit_unavailable'}},
+    ]})};
+  const code = source.slice(source.indexOf('  function authSummaryRow('), source.indexOf('  function fail('));
+  vm.createContext(context); vm.runInContext(code + '\nthis.readAccounts = accountsFor;', context);
+  const rows = await context.readAccounts('autoclaw');
+  assert.equal(rows[0].credits.pending, true);
+  assert.equal(rows[0].credits.error_code, 'credit_pending');
+  assert.equal(rows[1].credits.error_code, 'autoclaw_credit_unavailable');
+});

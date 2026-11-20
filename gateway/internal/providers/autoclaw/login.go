@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -55,6 +56,21 @@ type LoginDriver struct {
 	// InviteCode is bound after a successful login when set. Empty uses
 	// DefaultInviteCode; "-" disables binding.
 	InviteCode string
+}
+
+// CooldownKey scopes the SMS send guard to a phone number. AutoClaw's one
+// minute resend protection must not block a different account from starting
+// its own login flow. Only a hash is persisted in the encrypted flow record.
+func (*LoginDriver) CooldownKey(_ authflow.Flow, action string, input authflow.Input) string {
+	if action != "send_code" {
+		return ""
+	}
+	phone := strings.TrimSpace(input.Phone)
+	if !isPhone(phone) {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(phone))
+	return "phone:" + hex.EncodeToString(digest[:])
 }
 
 type loginState struct {

@@ -19,7 +19,7 @@ import (
 	"workbuddy2api/internal/authflow"
 )
 
-func TestRealAuthflowReachesSucceeded(t *testing.T) {
+func TestRealAuthflowReachesSucceededForTwoPhonesDuringCooldown(t *testing.T) {
 	vault, err := accountvault.Open(filepath.Join(t.TempDir(), "flows"))
 	if err != nil {
 		t.Fatal(err)
@@ -27,10 +27,10 @@ func TestRealAuthflowReachesSucceeded(t *testing.T) {
 	defer vault.Close()
 
 	tr := &inviteTransport{}
-	save := SaveProfile(mustProviderVault(t))
+	accounts := mustProviderVault(t)
 	driver := &LoginDriver{
 		HTTP:       &http.Client{Transport: tr},
-		Save:       save,
+		Save:       SaveProfile(accounts),
 		InviteCode: "-",
 	}
 	svc, err := authflow.Open(authflow.Options{
@@ -42,39 +42,35 @@ func TestRealAuthflowReachesSucceeded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	flow, err := svc.Start(t.Context(), authflow.Request{Provider: "autoclaw", Method: "sms"})
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	if flow.Status != "waiting_phone" {
-		t.Fatalf("status=%q", flow.Status)
-	}
-	flow, err = svc.Step(t.Context(), flow.ID, "send_code", authflow.Input{Phone: "13800000000"})
-	if err != nil || flow.Status != "waiting_code" {
-		t.Fatalf("send_code: status=%q err=%v", flow.Status, err)
-	}
-	flow, err = svc.Step(t.Context(), flow.ID, "submit_code", authflow.Input{Code: "123456"})
-	if err != nil {
-		t.Fatalf("submit_code: %v", err)
-	}
-	if flow.Status != "verified" {
-		t.Fatalf("after submit_code status=%q want verified (a provider must not claim success before commit)", flow.Status)
-	}
+	ids := make(map[string]bool)
+	for i, phone := range []string{"10000000000", "11111111111"} {
+		flow, err := svc.Start(t.Context(), authflow.Request{Provider: "autoclaw", Method: "sms"})
+		if err != nil || flow.Status != "waiting_phone" {
+			t.Fatalf("account %d: start status=%q err=%v", i, flow.Status, err)
+		}
+		flow, err = svc.Step(t.Context(), flow.ID, "send_code", authflow.Input{Phone: phone})
+		if err != nil || flow.Status != "waiting_code" {
+			t.Fatalf("account %d: send_code status=%q err=%v", i, flow.Status, err)
+		}
+		flow, err = svc.Step(t.Context(), flow.ID, "submit_code", authflow.Input{Code: "123456"})
+		if err != nil || flow.Status != "verified" {
+			t.Fatalf("account %d: submit_code status=%q err=%v (must not claim success before commit)", i, flow.Status, err)
+		}
 
-	// The service's own guard is what turned the old flow into "uncertain".
-	flow, err = svc.Step(t.Context(), flow.ID, "commit", authflow.Input{})
-	if err != nil {
-		t.Fatalf("commit: %v", err)
+		flow, err = svc.Step(t.Context(), flow.ID, "commit", authflow.Input{})
+		if err != nil || flow.Status != "succeeded" {
+			t.Fatalf("account %d: commit status=%q err=%v (code=%q)", i, flow.Status, err, flow.ErrorCode)
+		}
+		if flow.AccountID == "" || ids[flow.AccountID] {
+			t.Fatalf("account %d: succeeded flow did not carry a distinct account ID", i)
+		}
+		ids[flow.AccountID] = true
+		if raw := string(mustJSON(t, flow)); strings.Contains(raw, "synthetic.access.token") || strings.Contains(raw, phone) {
+			t.Fatal("private login data leaked into the public flow view")
+		}
 	}
-	if flow.Status != "succeeded" {
-		t.Fatalf("final status=%q want succeeded (notice=%q error=%q)",
-			flow.Status, flow.Notice, flow.ErrorCode)
-	}
-	if flow.AccountID == "" {
-		t.Fatal("succeeded flow carries no account id")
-	}
-	if strings.Contains(string(mustJSON(t, flow)), "synthetic.access.token") {
-		t.Fatal("the access token leaked into the public flow view")
+	if rows, err := accounts.List(); err != nil || len(rows) != len(ids) {
+		t.Fatalf("persisted %d accounts, want %d (err=%v)", len(rows), len(ids), err)
 	}
 }
 
