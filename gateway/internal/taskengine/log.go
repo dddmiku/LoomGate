@@ -100,13 +100,16 @@ var logStageText = map[Stage]string{
 var logStatusText = map[Status]string{
 	StatusQueued:    "排队中",
 	StatusRunning:   "执行中",
-	StatusSucceeded: "成功",
+	StatusSucceeded: "本次操作已核验",
 	StatusFailed:    "失败",
 	StatusCanceled:  "已取消",
 	StatusUncertain: "结果未确认",
 	StatusSkipped:   "已跳过",
 	StatusManual:    "需要人工",
 }
+
+// LogStatusText 是日志结尾状态文案的只读入口（供跨包回归固定口径）。
+func LogStatusText(status Status) string { return logStatus(status) }
 
 func logStatus(status Status) string {
 	if text, ok := logStatusText[status]; ok {
@@ -239,6 +242,9 @@ func taskLogLines(r Run) []string {
 	}
 	lines := []string{
 		fmt.Sprintf("%s 开始执行（%s）", stamp(r.StartedAt), logTrigger(r.Trigger)),
+	}
+	if n := len(r.AccountIDs); n > 0 {
+		lines = append(lines, fmt.Sprintf("账号范围：%d 个账号；每行一个账号，按完成顺序排列。", n))
 	}
 	if r.Status == StatusQueued {
 		lines = append(lines, "等待执行槽位；开始后会继续追加输出。")

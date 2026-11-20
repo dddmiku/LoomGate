@@ -118,14 +118,12 @@ func (m *growthModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.T
 		if x.TaskID() != code {
 			continue
 		}
+		// The step line already carries the authoritative summary; repeating it as
+		// progress output printed the same sentence twice in the operator log.
 		if accept {
-			state := growthAcceptState(x)
-			taskProgress(ctx, state.Summary)
-			return state, nil
+			return growthAcceptState(x), nil
 		}
-		state := growthClaimState(x)
-		taskProgress(ctx, state.Summary)
-		return state, nil
+		return growthClaimState(x), nil
 	}
 	taskProgress(ctx, "该任务本轮不在官方动态目录中。")
 	return taskengine.Observation{Phase: "blocked", Summary: "该任务已不在官方目录。"}, nil
@@ -140,9 +138,11 @@ func growthAcceptState(x upstream.GrowthTask) taskengine.Observation {
 	case "not_accepted":
 		return taskengine.Observation{Phase: "ready", Summary: "官方任务可接单；接单后仍需在官方客户端完成真实工作。", Current: current, Total: total}
 	case "accepted", "in_progress":
-		return taskengine.Observation{Phase: "done", Summary: "官方确认任务已接单并开始追踪进度。", Current: current, Total: total}
+		// 接单是终态，但任务本身还没完成：把它写成「已接单」再补一句未完成，
+		// 避免运行结尾的「已核验完成」被读成「桌面端对话1次已完成」。
+		return taskengine.Observation{Phase: "done", Summary: "官方已接单并在追踪进度；此任务本身仍未完成，请在官方客户端完成真实工作。", Current: current, Total: total}
 	case "completed", "claimed":
-		return taskengine.Observation{Phase: "done", Summary: "官方确认任务已接单。", Current: current, Total: total}
+		return taskengine.Observation{Phase: "done", Summary: "官方确认该任务本身已完成。", Current: current, Total: total}
 	}
 	return taskengine.Observation{Phase: "blocked", Summary: "官方任务状态无法识别。", Current: current, Total: total}
 }
