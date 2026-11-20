@@ -419,10 +419,20 @@ func discoveryReason(err error) string {
 		}
 	}
 	switch strings.TrimSpace(err.Error()) {
-	case "buddy_state_missing", "buddy_state_invalid", "travel_state_invalid",
-		"travel_config_invalid", "makeup_state_missing", "redemption_directory_missing",
-		"redemption_directory_invalid", "redemption_directory_duplicate", "redemption_state_unknown":
-		return "state_unrecognized"
+	case "travel_state_invalid":
+		return "travel_state_unrecognized"
+	case "travel_config_invalid":
+		return "travel_directory_unrecognized"
+	case "buddy_state_missing", "buddy_state_invalid":
+		return "buddy_unrecognized"
+	case "makeup_state_missing":
+		return "makeup_state_unrecognized"
+	case "redemption_directory_missing", "redemption_directory_invalid", "redemption_directory_duplicate":
+		return "redemption_directory_unrecognized"
+	case "redemption_state_unknown":
+		return "redemption_state_unrecognized"
+	case "streak_state_invalid":
+		return "streak_unrecognized"
 	}
 	return "module_discovery_failed"
 }

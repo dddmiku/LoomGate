@@ -20,7 +20,8 @@ func TestDiscoveryFailureKeepsAClassifiableReason(t *testing.T) {
 		{&upstream.Error{Kind: upstream.ErrNotFound, Status: 404}, "module_not_offered"},
 		{&upstream.Error{Kind: upstream.ErrAccountFault, Status: 403}, "account_unavailable"},
 		{&upstream.Error{Kind: upstream.ErrSoftRate, Status: 429}, "upstream_rate_limited"},
-		{errors.New("buddy_state_missing"), "state_unrecognized"},
+		{errors.New("buddy_state_missing"), "buddy_unrecognized"},
+		{errors.New("travel_state_invalid"), "travel_state_unrecognized"},
 		{errors.New("totally-unknown"), "module_discovery_failed"},
 	} {
 		if got := discoveryReason(test.err); got != test.want {
