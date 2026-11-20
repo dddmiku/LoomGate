@@ -65,6 +65,10 @@ def version() -> str:
     return (GATEWAY / "VERSION").read_text(encoding="utf-8").strip()
 
 
+def source_commit() -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=BASE, text=True).strip()
+
+
 def release_public_key() -> str:
     """只读仓库内既有公钥；缺失或损坏时不能产出跳过更新验签的发行包。"""
     try:
@@ -216,8 +220,8 @@ def stage_common(target: Path, goos: str, goarch: str, tag: str) -> None:
 
     # 网关本体（带版本元数据，面板「关于」页会显示）
     ldflags = ("-s -w -X workbuddy2api/internal/version.Version=%s "
-               "-X workbuddy2api/internal/version.Commit=desktop "
-               "-X workbuddy2api/internal/version.BuiltAt=desktop" % tag)
+               "-X workbuddy2api/internal/version.Commit=%s "
+               "-X workbuddy2api/internal/version.BuiltAt=desktop" % (tag, source_commit()))
     go_build("server", target / ("wb2api" + exe), goos, goarch, ldflags)
 
     # 辅助程序
