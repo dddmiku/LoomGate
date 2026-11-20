@@ -1469,18 +1469,22 @@ func rejectChoiceCount(value *json.Number) error {
 	return nil
 }
 
-// Struct decoding historically accepted case-insensitive routing fields.
-// Preserve that behavior while avoiding another full transcript scan.
-func chatRoutingField(object map[string]json.RawMessage, name string) json.RawMessage {
-	if raw, present := object[name]; present {
-		return raw
-	}
+// Struct decoding historically accepted case-insensitive routing fields. Keep
+// that compatibility for a single spelling, but reject ambiguous aliases
+// instead of choosing one nondeterministically from a map.
+func chatRoutingField(object map[string]json.RawMessage, name string) (json.RawMessage, error) {
+	var found json.RawMessage
+	matches := 0
 	for key, raw := range object {
 		if strings.EqualFold(key, name) {
-			return raw
+			found = raw
+			matches++
 		}
 	}
-	return nil
+	if matches > 1 {
+		return nil, fmt.Errorf("duplicate case-insensitive %s field", name)
+	}
+	return found, nil
 }
 
 // stripContextMarker 去掉 Anthropic 的上下文窗口别名后缀（`[1m]`／`[1M]`）。
@@ -1560,7 +1564,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		name  string
 		value any
 	}{{"model", &peek.Model}, {"stream", &peek.Stream}} {
-		if raw := chatRoutingField(requestObject, field.name); len(raw) > 0 {
+		raw, fieldErr := chatRoutingField(requestObject, field.name)
+		if fieldErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", fieldErr.Error())
+			return
+		}
+		if len(raw) > 0 {
 			if err := json.Unmarshal(raw, field.value); err != nil {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request fields: "+err.Error())
 				return
@@ -1569,8 +1578,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// n>1 需要上游返回多个选择，当前上游不提供：静默只回一个 choice 会让按 n 取值
 	// 的客户端越界，明确拒绝。
+	choiceRaw, fieldErr := chatRoutingField(requestObject, "n")
+	if fieldErr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", fieldErr.Error())
+		return
+	}
 	var choiceCount *json.Number
-	_ = json.Unmarshal(chatRoutingField(requestObject, "n"), &choiceCount)
+	_ = json.Unmarshal(choiceRaw, &choiceCount)
 	if err := rejectChoiceCount(choiceCount); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
