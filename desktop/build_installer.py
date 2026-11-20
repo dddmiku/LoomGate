@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a local Windows acceptance installer; never signs or publishes releases."""
+"""Build the Windows installer payload for acceptance or a tagged release."""
 import argparse,hashlib,importlib.util,json,os,re,subprocess,shutil
 from pathlib import Path
 
@@ -21,7 +21,7 @@ def verify_payload(path):
 def build(output,compiler,label):
     output=output.resolve()
     if output==ROOT or ROOT in output.parents or output==output.parent or not output.is_absolute():raise ValueError('output_must_be_separate_workspace')
-    if not re.fullmatch(r'dev-[a-zA-Z0-9._-]{1,64}',label):raise ValueError('development_label_required')
+    if not re.fullmatch(r'(?:dev-[a-zA-Z0-9._-]{1,64}|v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))',label):raise ValueError('invalid_build_label')
     payload=output/'payload';artifacts=output/'artifacts'
     for path in [output,payload,artifacts]:
         if path.is_symlink():raise ValueError('output_link_rejected')
@@ -54,7 +54,10 @@ def build(output,compiler,label):
     (payload/'LICENSE').write_bytes((ROOT/'LICENSE').read_bytes())
     (payload/'doubao-runtime').mkdir()
     for name in RUNTIME_FILES:shutil.copyfile(ROOT/'tools/doubao-runtime'/name,payload/'doubao-runtime'/name)
-    (payload/'README.txt').write_text('LoomGate '+label+'\n\nDevelopment acceptance build. No production release or automatic migration.\nStart program/LoomGate.exe. The new task engine is enabled; no legacy scheduler is started.\nData lives in workspace/ next to program/, or WB2A_DESKTOP_ROOT when explicitly set.\nRepair, upgrade and uninstall preserve workspace. Do not share workspace; it contains credentials.\nUpdates retain the existing release verification public key and are disabled by default.\nBefore production migration, use the offline migration dry-run and obtain independent acceptance.\n',encoding='utf-8')
+    release = label.startswith('v')
+    description = ('Formal LoomGate release build. Follow the release notes and preserve the workspace during upgrades.'
+                   if release else 'Development acceptance build. No production migration is implied.')
+    (payload/'README.txt').write_text('LoomGate '+label+'\n\n'+description+'\nStart program/LoomGate.exe. The new task engine is enabled; no legacy scheduler is started.\nData lives in workspace/ next to program/, or WB2A_DESKTOP_ROOT when explicitly set.\nRepair, upgrade and uninstall preserve workspace. Do not share workspace; it contains credentials.\nUpdates retain the existing release verification public key.\n',encoding='utf-8')
     manifest={'brand':'LoomGate','label':label,'base_commit':commit,'source_dirty':report['source_dirty'],'files':{name:digest(payload/name) for name in PAYLOAD if name!='manifest.json'}}
     (payload/'manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8');verify_payload(payload)
     cmd=[str(compiler),'/Qp','/DPayloadDir='+str(payload),'/DOutputRoot='+str(artifacts),'/DBuildLabel='+label,str(ROOT/'desktop/loomgate.iss')]

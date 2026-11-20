@@ -24,5 +24,7 @@ class InstallerGuards(unittest.TestCase):
   (self.path/'keep.txt').write_text('preserve')
   with self.assertRaises(ValueError):build.build(self.path,Path('unused'),'dev-test')
   self.assertEqual((self.path/'keep.txt').read_text(),'preserve')
+ def test_builder_accepts_formal_semver_release_labels(self):
+  self.assertRegex('v1.0.6', r'^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$')
 
 if __name__=='__main__':unittest.main()

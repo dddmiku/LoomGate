@@ -75,5 +75,5 @@ procedure InitializeWizard;
 begin
   if not DirExists('D:\') then
     WizardForm.DirEdit.Text := ExpandConstant('{localappdata}\Programs\LoomGate');
-  WizardForm.FinishedLabel.Caption := 'LoomGate 已安装。账号与配置数据保存在 program 旁边的 workspace 目录，卸载会保留 workspace。这是开发验收构建，不是正式发行版。';
+  WizardForm.FinishedLabel.Caption := 'LoomGate 已安装。账号与配置数据保存在 program 旁边的 workspace 目录，卸载会保留 workspace。';
 end;
