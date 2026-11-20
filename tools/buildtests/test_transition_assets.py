@@ -18,8 +18,9 @@ class TransitionAssetTests(unittest.TestCase):
                 bridge.bridge_tag(tag)
 
     def test_bridge_reuses_a_new_loomgate_apk_with_its_own_version_name(self):
-        identity = dict(package=bridge.android.APK_PACKAGE, version_name="1.0.6",
-                        version_code=bridge.android.version_code("v1.0.6"))
+        current = bridge.android.read_version()
+        identity = dict(package=bridge.android.APK_PACKAGE, version_name=current.removeprefix("v"),
+                        version_code=bridge.android.version_code(current))
         with patch.object(bridge.android, "verify_apk_signature") as signature, \
                 patch.object(bridge.android, "read_apk_manifest", return_value=identity):
             self.assertEqual(bridge.android_bridge_asset(Path("candidate.apk"), Path("sdk")), identity)
