@@ -31,7 +31,8 @@ func newTravelModule(a *Accounts) (Module, error) {
 				Stages:      []taskengine.Stage{taskengine.StageInspect, taskengine.StageExecute, taskengine.StageClaim, taskengine.StageVerify},
 			},
 		},
-		up: a.Upstream,
+		up:    a.Upstream,
+		owner: a,
 	}, nil
 }
 
@@ -39,7 +40,15 @@ var travelPlan = &DefaultPlan{ID: "legacy-travel", TaskKey: "travel/", Hours: []
 
 type travelModule struct {
 	moduleBase
-	up *upstream.Client
+	up    *upstream.Client
+	owner *Accounts
+}
+
+func (m *travelModule) AcquireTask(ctx context.Context, a *auth.Auth, t taskengine.Task) (func(), error) {
+	if m.owner == nil {
+		return func() {}, nil
+	}
+	return m.owner.acquireLegacyAccountPacing(ctx, t.AccountID)
 }
 
 type travelSnapshot struct {
@@ -50,6 +59,7 @@ type travelSnapshot struct {
 }
 
 func (m *travelModule) read(ctx context.Context, a *auth.Auth) (s travelSnapshot, err error) {
+	taskProgress(ctx, "正在读取 Buddy 档案与旅行状态。")
 	s.buddy, err = m.up.TaskBuddy(ctx, a)
 	if err != nil || s.buddy == nil {
 		return
@@ -73,6 +83,7 @@ func (m *travelModule) read(ctx context.Context, a *auth.Auth) (s travelSnapshot
 		}
 		s.locations = cfg.Locations
 	}
+	taskProgress(ctx, fmt.Sprintf("官方旅行状态：%s；当前记录 %d，业务日 %s。", s.travel.State, s.travel.RecordID, s.day))
 	return
 }
 
@@ -171,7 +182,11 @@ func (m *travelModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.T
 	if t.Key != "travel/depart" || state.Phase != "ready" {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, state), nil
 	}
+	taskProgress(ctx, fmt.Sprintf("正在派往官方动态目录地点：%s。", s.locations[0].Name))
 	e = m.up.TaskTravelDepart(ctx, a, s.locations[0].ID)
+	if e != nil {
+		taskProgress(ctx, "派出结果未确认；等待读取原记录状态，不更换记录重试。")
+	}
 	return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "派出已提交，等待状态复核。")), e
 }
 
@@ -184,12 +199,16 @@ func (m *travelModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Tas
 	if t.Key != "travel/claim" || state.Phase != "claimable" {
 		return taskengine.NotSubmitted(t, taskengine.StageClaim, state), nil
 	}
-	e = m.up.TaskTravelClaim(ctx, a, s.travel.RecordID)
-	result := observation("pending", "领取已提交，等待原记录结算。")
-	if e == nil {
+	taskProgress(ctx, "正在领取原旅行记录奖励。")
+	reward, err := m.up.TaskTravelClaim(ctx, a, s.travel.RecordID)
+	result := observation("pending", "领取已提交，回执尚未确认；保留原记录待核验。")
+	if err == nil {
+		result.Summary = fmt.Sprintf("官方回执奖励：+%d 积分，等待原旅行记录结算复核。", reward)
+		taskProgress(ctx, result.Summary)
 		return taskengine.Accepted(t, taskengine.StageClaim, result), nil
 	}
-	return taskengine.UnknownAction(t, taskengine.StageClaim, result), e
+	taskProgress(ctx, "旅行奖励回执未确认，保留原记录待核验。")
+	return taskengine.UnknownAction(t, taskengine.StageClaim, result), err
 }
 
 func (m *travelModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {

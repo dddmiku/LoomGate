@@ -1,12 +1,11 @@
 // Package autoclaw reverse-proxies the AutoClaw (AutoGLM / 智谱) desktop model
 // channel as an OpenAI-compatible provider inside LoomGate.
 //
-// Unlike the Doubao path there is no client conversation protocol here: the
-// upstream endpoint is itself OpenAI-compatible (`/autoclaw-proxy/proxy/
-// autoclaw/chat/completions`), it stores nothing (`store:false`), and it needs
-// no per-conversation identifier. A request is a plain POST with the account's
-// access token, so "only the model, nothing of the client" is the normal mode
-// rather than an aspiration.
+// Unlike the Doubao path there is no client conversation protocol here. The
+// upstream uses a chat/completions-shaped POST without a conversation identifier.
+// Generic store/output-budget knobs are not sent because the service rejects
+// them; omitting those fields is not a claim about the upstream retention policy.
+// A request carries the account access token and the dialogue messages.
 //
 // Credentials live in the same encrypted accountvault as every other provider.
 // The stored blob is the AutoClaw account record (accessToken / refreshToken /
@@ -104,11 +103,14 @@ func isPublished(name string) bool {
 
 // stored is the encrypted profile for one AutoClaw account.
 type stored struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	DeviceID     string `json:"deviceId,omitempty"`
-	Phone        string `json:"phone,omitempty"`
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"refreshToken"`
+	DeviceID         string `json:"deviceId,omitempty"`
+	Phone            string `json:"phone,omitempty"`
+	ExpiresAt        int64  `json:"expiresAt,omitempty"`
+	RefreshPending   bool   `json:"refresh_pending,omitempty"`
+	RefreshAttempt   string `json:"refresh_attempt,omitempty"`
+	RefreshStartedAt int64  `json:"refresh_started_at,omitempty"`
 }
 
 // Provider implements inference.Provider for AutoClaw accounts.
@@ -119,6 +121,10 @@ type Provider struct {
 	mu     sync.Mutex
 	cursor int
 	cool   *providerretry.Cooldown
+}
+
+func (p *Provider) PublicAccountID(id string) string {
+	return publicAccountID(p.Vault, id)
 }
 
 func (p *Provider) httpClient() *http.Client {
@@ -157,91 +163,106 @@ func (p *Provider) accounts() ([]accountvault.Account, error) {
 }
 
 func (p *Provider) session(id string) (stored, error) {
-	_, plain, err := p.Vault.Get(id)
-	if err != nil {
-		return stored{}, err
-	}
-	defer wipe(plain)
-	var s stored
-	if json.Unmarshal(plain, &s) != nil || s.AccessToken == "" {
-		return stored{}, errors.New("autoclaw_session_invalid")
-	}
-	return s, nil
+	_, s, err := p.loadSession(id)
+	return s, err
 }
 
-// refreshAccessToken is the renewal call itself. It is a variable so the
-// renewal path (retry decision + vault write-back) can be tested without
-// reaching the real upstream; production always uses RefreshToken.
-var refreshAccessToken = RefreshToken
+func (p *Provider) loadSession(id string) (accountvault.Account, stored, error) {
+	if p.Vault == nil {
+		return accountvault.Account{}, stored{}, errors.New("autoclaw_vault_unavailable")
+	}
+	a, plain, err := p.Vault.Get(id)
+	if err != nil {
+		return accountvault.Account{}, stored{}, errors.New("autoclaw_session_unavailable")
+	}
+	defer wipe(plain)
+	if a.Provider != "autoclaw" || !a.Enabled {
+		return accountvault.Account{}, stored{}, errors.New("autoclaw_account_disabled")
+	}
+	var s stored
+	if json.Unmarshal(plain, &s) != nil || s.AccessToken == "" {
+		return accountvault.Account{}, stored{}, errors.New("autoclaw_session_invalid")
+	}
+	if s.RefreshPending {
+		return accountvault.Account{}, stored{}, &refreshError{code: "autoclaw_refresh_pending"}
+	}
+	return a, s, nil
+}
 
-// refreshAccount renews one account's access token and persists the new pair.
-//
-// Without this the provider used the access token until the upstream rejected
-// it and then cooled the account for 30s, so an expired account re-entered
-// rotation forever and never worked again. The refresh token is single-use:
-// the response may carry a new one, and it must be written back before the
-// next request or the chain breaks.
+type refreshError struct{ code string }
+
+func (e *refreshError) Error() string                   { return e.code }
+func (e *refreshError) PublicCode() string              { return e.code }
+func (e *refreshError) RetryClass() providerretry.Class { return providerretry.RetryAccount }
+
+// A refresh token is single-use. The durable intent blocks every provider
+// instance after an ambiguous exchange; only a newly committed login clears it.
 func (p *Provider) refreshAccount(ctx context.Context, id, refreshToken string) (stored, error) {
 	if strings.TrimSpace(refreshToken) == "" {
-		return stored{}, errors.New("autoclaw_refresh_unavailable")
+		return stored{}, &refreshError{code: "autoclaw_refresh_unavailable"}
 	}
-	access, refresh, err := refreshAccessToken(ctx, refreshToken)
+	if err := ctx.Err(); err != nil {
+		return stored{}, err
+	}
+	a, next, err := p.loadSession(id)
 	if err != nil {
 		return stored{}, err
 	}
-	_, plain, err := p.Vault.Get(id)
+	if next.RefreshToken != refreshToken {
+		return next, nil
+	}
+	var attempt [16]byte
+	if _, err := rand.Read(attempt[:]); err != nil {
+		return stored{}, &refreshError{code: "autoclaw_refresh_unavailable"}
+	}
+	next.RefreshPending = true
+	next.RefreshAttempt = base64.RawURLEncoding.EncodeToString(attempt[:])
+	next.RefreshStartedAt = time.Now().UTC().Unix()
+	intent, err := json.Marshal(next)
 	if err != nil {
-		return stored{}, err
+		return stored{}, &refreshError{code: "autoclaw_refresh_unavailable"}
 	}
-	var next stored
-	marshalErr := json.Unmarshal(plain, &next)
-	wipe(plain)
-	if marshalErr != nil {
-		return stored{}, errors.New("autoclaw_session_invalid")
+	pending, err := p.Vault.Put(a, intent, a.Revision)
+	wipe(intent)
+	if err != nil {
+		return stored{}, &refreshError{code: "autoclaw_refresh_conflict"}
 	}
-	next.AccessToken = access
-	if refresh != "" {
-		next.RefreshToken = refresh
+	access, refresh, err := exchangeRefresh(ctx, p.httpClient(), refreshToken, next.DeviceID)
+	if err != nil {
+		return stored{}, &refreshError{code: "autoclaw_refresh_pending"}
 	}
-	if exp := tokenExpiry(access); exp > 0 {
-		next.ExpiresAt = exp
-	}
+	next.AccessToken, next.RefreshToken = access, refresh
+	next.ExpiresAt = tokenExpiry(access)
+	next.RefreshPending, next.RefreshAttempt, next.RefreshStartedAt = false, "", 0
 	profile, err := json.Marshal(next)
 	if err != nil {
-		return stored{}, err
+		return stored{}, &refreshError{code: "autoclaw_refresh_pending"}
 	}
 	defer wipe(profile)
-	rows, err := p.Vault.List()
-	if err != nil {
-		return stored{}, err
-	}
-	var revision uint64
-	for _, row := range rows {
-		if row.ID == id {
-			revision = row.Revision
-			break
-		}
-	}
-	if revision == 0 {
-		return stored{}, errors.New("autoclaw_account_not_found")
-	}
-	if _, err := p.Vault.Put(accountvault.Account{ID: id, Provider: "autoclaw", Enabled: true}, profile, revision); err != nil {
-		return stored{}, err
+	if _, err := p.Vault.Put(pending, profile, pending.Revision); err != nil {
+		return stored{}, &refreshError{code: "autoclaw_refresh_conflict"}
 	}
 	return next, nil
 }
 
-// needsTokenRefresh reports whether a failed call should be retried after renewing the
-// access token rather than cooling the account down. Authentication failures
-// and expired-token rejections are both renewal candidates; anything else is a
-// genuine account fault.
+func refreshHint(status int, body []byte) string {
+	if !needsTokenRefresh(status, string(body)) {
+		return ""
+	}
+	return "token expired"
+}
+
+// Permission and quota failures must not consume a single-use refresh token.
 func needsTokenRefresh(status int, body string) bool {
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+	if status == http.StatusUnauthorized {
 		return true
 	}
+	if status != http.StatusForbidden && status != http.StatusBadRequest {
+		return false
+	}
 	lower := strings.ToLower(body)
-	return strings.Contains(lower, "token expired") || strings.Contains(lower, "invalid token") ||
-		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "access_token")
+	return strings.Contains(lower, "token expired") || strings.Contains(lower, "token has expired") ||
+		strings.Contains(lower, "invalid token") || strings.Contains(lower, "access_token expired")
 }
 
 // Models reports the fixed catalog. It never needs an account to answer, so the
@@ -312,7 +333,7 @@ func (p *Provider) completeTurn(ctx context.Context, q inference.Dialogue, emit,
 	if expectedAccount != "" {
 		filtered := rows[:0]
 		for _, a := range rows {
-			if a.ID == expectedAccount {
+			if a.ID == expectedAccount || publicAccountID(p.Vault, a.ID) == expectedAccount {
 				filtered = append(filtered, a)
 			}
 		}
@@ -336,33 +357,46 @@ func (p *Provider) completeTurn(ctx context.Context, q inference.Dialogue, emit,
 		ids[i] = row.ID
 		byID[row.ID] = row
 	}
-	// Collect one AttemptRecord per real upstream try. The request log is built
-	// from these, so without them every AutoClaw row reported attempts=0 and
-	// the retry history was invisible: a 502 could not be traced to "the first
-	// account 401'd, the second timed out".
-	var records []inference.Attempt
-	result, err := providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
-		started := time.Now()
-		value, turnErr := p.turnWith(ctx, byID[id], q, emit, emitReasoning, emitTool)
-		record := inference.Attempt{StartedAt: started, FinishedAt: time.Now()}
-		if turnErr != nil {
-			record.ErrorCode = "upstream_failed"
-			if public, ok := turnErr.(interface{ PublicCode() string }); ok && public.PublicCode() != "" {
-				record.ErrorCode = public.PublicCode()
-			}
-			if ae, ok := turnErr.(*accountError); ok {
-				record.HTTPStatus = ae.status
-			}
-		} else {
-			record.HTTPStatus = http.StatusOK
+	// Once a downstream callback has seen part of a generation, even a failure
+	// classified as retryable cannot be spliced into that same stream.
+	deliveryStarted := false
+	trackText := func(fn func(string) error) func(string) error {
+		if fn == nil {
+			return nil
 		}
-		records = append(records, record)
+		return func(delta string) error {
+			deliveryStarted = deliveryStarted || delta != ""
+			return fn(delta)
+		}
+	}
+	textSink, reasoningSink := trackText(emit), trackText(emitReasoning)
+	toolSink := emitTool
+	if emitTool != nil {
+		toolSink = func(delta inference.ToolCallDelta) error {
+			deliveryStarted = true
+			return emitTool(delta)
+		}
+	}
+	var records []inference.Attempt
+	var lastSubmitted inference.Result
+	result, err := providerretry.Run(ctx, ids, 3, p.cooldown(), func(ctx context.Context, id string) (inference.Result, error) {
+		value, turnErr := p.turnWith(ctx, byID[id], q, textSink, reasoningSink, toolSink)
+		if value.Attempted {
+			records = append(records, value.AttemptRecords...)
+			lastSubmitted = value
+		}
+		if turnErr != nil && deliveryStarted {
+			return value, &deliveredError{turnErr}
+		}
 		return value, turnErr
 	})
-	if len(records) > 0 {
-		result.AttemptRecords = records
-		result.Attempts = len(records)
+	if err != nil {
+		// Run returns a zero result on failure, but sent requests and observed
+		// usage remain facts even when no account completed the turn.
+		result = lastSubmitted
 	}
+	result.AttemptRecords = records
+	result.Attempts = len(records)
 	return result, err
 }
 
@@ -371,15 +405,17 @@ type accountError struct {
 	code   string
 }
 
-func (e *accountError) Error() string { return "autoclaw upstream: " + e.code }
+func (e *accountError) Error() string { return "autoclaw upstream http=" + strconv.Itoa(e.status) }
 
 // PublicCode lets a dead credential surface as a credential problem instead of
 // the generic 502 the console cannot act on. The console already has a label
 // for access_token_expired; without this it was unreachable.
 func (e *accountError) PublicCode() string {
 	switch {
-	case e.status == 401 || e.status == 403:
+	case e.status == 401 || needsTokenRefresh(e.status, e.code):
 		return "access_token_expired"
+	case e.status == 403:
+		return "autoclaw_forbidden"
 	case e.status == 429:
 		return "autoclaw_rate_limited"
 	case e.status == 402:
@@ -421,120 +457,106 @@ type emptyAnswerError struct{}
 
 func (e *emptyAnswerError) Error() string { return "autoclaw_empty_answer" }
 
-
-
-func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (inference.Result, error) {
-	model, messages := q.Model, q.Messages
+func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inference.Dialogue, emit, emitReasoning func(string) error, emitTool func(inference.ToolCallDelta) error) (result inference.Result, retErr error) {
 	s, err := p.session(row.ID)
 	if err != nil {
-		return inference.Result{}, err
+		return result, err
 	}
-	// Always ask the upstream to stream. With stream:false this endpoint answers
-	// a single JSON body, and every parser here reads SSE frames — a buffered
-	// answer therefore looked like an empty stream and every non-streaming
-	// caller got a 502 ("autoclaw_empty_answer") after a long wait. Streaming
-	// upstream and aggregating locally is also what the vendor's own gateway
-	// does; the caller's stream flag only decides whether we forward frames.
-	body, err := buildDialogueBody(model, messages, q.Tools, q.ToolChoice, true)
+	body, err := buildDialogueBody(q.Model, q.Messages, q.Tools, q.ToolChoice, true)
 	if err != nil {
-		return inference.Result{}, err
+		return result, err
 	}
-	// send performs one upstream call with the given token. The body is rebuilt
-	// for every attempt because a bytes.Reader cannot be replayed.
+	defer wipe(body)
+	defer func() {
+		result.Attempts = len(result.AttemptRecords)
+		if n := len(result.AttemptRecords); n > 0 {
+			last := &result.AttemptRecords[n-1]
+			if last.FinishedAt.IsZero() {
+				last.FinishedAt = time.Now()
+				last.Usage, last.FinishReason = result.Usage, result.FinishReason
+				last.ErrorCode = attemptErrorCode(retErr)
+			}
+		}
+	}()
 	send := func(token string) (*http.Response, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+chatPath, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
-		setHeaders(req, token, within(model))
-		return p.httpClient().Do(req)
+		setHeaders(req, token, within(q.Model))
+		result.Attempted = true
+		result.AccountRef = publicAccountID(p.Vault, row.ID)
+		result.AttemptRecords = append(result.AttemptRecords, inference.Attempt{AccountRef: result.AccountRef, StartedAt: time.Now()})
+		index := len(result.AttemptRecords) - 1
+		client := *p.httpClient()
+		// 307/308 redirects can replay a billable POST outside attempt accounting.
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		resp, err := client.Do(req)
+		last := &result.AttemptRecords[index]
+		if resp != nil {
+			last.HTTPStatus = resp.StatusCode
+		}
+		if err != nil {
+			last.ErrorCode = attemptErrorCode(err)
+			last.FinishedAt = time.Now()
+		}
+		return resp, err
+	}
+	rejection := func(resp *http.Response) *accountError {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		code := refreshHint(resp.StatusCode, raw)
+		wipe(raw)
+		failure := &accountError{status: resp.StatusCode, code: code}
+		last := &result.AttemptRecords[len(result.AttemptRecords)-1]
+		last.ErrorCode, last.FinishedAt = attemptErrorCode(failure), time.Now()
+		return failure
 	}
 	resp, err := send(s.AccessToken)
 	if err != nil {
-		return inference.Result{}, err
+		return result, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		status := resp.StatusCode
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		code := strings.TrimSpace(string(raw))
-		if len(code) > 300 {
-			code = code[:300]
-		}
-		// An authentication rejection is not an account fault: renew the token
-		// once and retry. Without this an expired account cooled down for 30s,
-		// came back with the same dead token, and never worked again.
-		if needsTokenRefresh(status, code) && s.RefreshToken != "" {
-			if renewed, refreshErr := p.refreshAccount(ctx, row.ID, s.RefreshToken); refreshErr == nil {
-				s = renewed
-				resp, err = send(s.AccessToken)
-				if err != nil {
-					return inference.Result{}, err
-				}
-				if resp.StatusCode != http.StatusOK {
-					status = resp.StatusCode
-					raw, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
-					resp.Body.Close()
-					code = strings.TrimSpace(string(raw))
-					if len(code) > 300 {
-						code = code[:300]
-					}
-				}
+		failed := rejection(resp)
+		if needsTokenRefresh(failed.status, failed.code) && s.RefreshToken != "" {
+			renewed, err := p.refreshAccount(ctx, row.ID, s.RefreshToken)
+			if err != nil {
+				return result, err
 			}
-		}
-		if resp.StatusCode != http.StatusOK {
-			return inference.Result{}, &accountError{status: status, code: "http=" + strconv.Itoa(status) + " " + code}
+			resp, err = send(renewed.AccessToken)
+			if err != nil {
+				return result, err
+			}
+			if resp.StatusCode != http.StatusOK {
+				return result, rejection(resp)
+			}
+		} else {
+			return result, failed
 		}
 	}
 	defer resp.Body.Close()
-
-	// AccountRef is what the request log attributes the attempt to; without it
-	// every AutoClaw row showed uid=- and the provider could not be audited.
-	result := inference.Result{Attempted: true, Attempts: 1, AccountRef: row.ID}
-	// A tool turn has no text emitter but still needs the streaming parser:
-	// tool_calls arrive as deltas, so buffering the body and aggregating text
-	// would drop the call and report an empty answer.
-	if emit == nil && emitTool == nil {
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-		if err != nil {
-			return result, err
-		}
-		text, usage, toolCalls, err := aggregate(raw)
-		if err != nil {
-			return result, err
-		}
-		result.Text = text
-		result.ToolCalls = toolCalls
-		result.UsageReported = usage.PromptSeen || usage.CompletionSeen
-		result.PromptTokens = usage.Prompt
-		result.CompletionTokens = usage.Completion
-		result.CachedTokens = usage.Cached
-		result.FinishReason = usage.FinishReason
-		result.Complete = true
-		result.Acknowledged = true
-		result.Events = 1
-		return result, nil
-	}
-
+	buffered := emit == nil && emitTool == nil && emitReasoning == nil
 	if emit == nil {
-		// parseToolCallsOnly consumes the stream without forwarding prose.
 		emit = func(string) error { return nil }
 	}
-	text, events, usage, toolCalls, err := streamSSEWithTools(resp.Body, emit, emitReasoning, emitTool)
-	result.Text = text
-	result.Events = events
-	result.Attempted = true
-	result.UsageReported = usage.PromptSeen || usage.CompletionSeen
-	result.PromptTokens = usage.Prompt
-	result.CompletionTokens = usage.Completion
-	result.CachedTokens = usage.Cached
+	if buffered {
+		var reasoning strings.Builder
+		emitReasoning = func(delta string) error { reasoning.WriteString(delta); return nil }
+		defer func() { result.Reasoning = reasoning.String() }()
+	}
+	text, events, usage, calls, err := streamSSEWithTools(resp.Body, emit, emitReasoning, emitTool)
+	result.Text, result.Events, result.ToolCalls = text, events, calls
+	result.Usage = usage.observed()
+	result.UsageReported = result.Usage.Reported()
+	result.PromptTokens, result.CompletionTokens, result.CachedTokens = usage.Prompt, usage.Completion, usage.Cached
 	result.FinishReason = usage.FinishReason
 	if err != nil {
 		return result, err
 	}
-	result.ToolCalls = toolCalls
-	result.Complete = true
-	result.Acknowledged = true
+	result.Complete, result.Acknowledged = true, true
 	return result, nil
 }
 
@@ -754,133 +776,7 @@ func streamSSE(body io.Reader, emit func(string) error, onReasoning func(string)
 // carry no answer text, so an empty text buffer is legal when the upstream
 // reported any tool call — and so is a turn that only reasoned.
 func streamSSEWithTools(body io.Reader, emit func(string) error, onReasoning func(string) error, onTool func(inference.ToolCallDelta) error) (string, int, streamUsage, []inference.ToolCall, error) {
-	var text strings.Builder
-	var usage streamUsage
-	var toolCalls []inference.ToolCall
-	reasoningSeen := false
-	// finishReason carries the upstream's own termination cause (stop, length,
-	// content_filter, tool_calls). It used to be dropped, so a truncated answer
-	// was reported to the caller as a clean "stop".
-	finishReason := ""
-	events := 0
-	// Read line by line: SSE frames are newline delimited and deltas must be
-	// forwarded immediately, not buffered until the stream ends.
-	tmp := make([]byte, 8192)
-	pending := ""
-	for {
-		n, err := body.Read(tmp)
-		if n > 0 {
-			pending += string(tmp[:n])
-			for {
-				idx := strings.IndexByte(pending, '\n')
-				if idx < 0 {
-					break
-				}
-				line := strings.TrimSpace(pending[:idx])
-				pending = pending[idx+1:]
-				if !strings.HasPrefix(line, "data:") {
-					continue
-				}
-				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if payload == "" || payload == "[DONE]" {
-					continue
-				}
-				var chunk struct {
-					Choices []struct {
-						Delta struct {
-							Content          string `json:"content"`
-							ReasoningContent string `json:"reasoning_content"`
-							ToolCalls []struct {
-								Index    *int   `json:"index"`
-								ID       string `json:"id"`
-								Type     string `json:"type"`
-								Function struct {
-									Name      string `json:"name"`
-									Arguments string `json:"arguments"`
-								} `json:"function"`
-							} `json:"tool_calls"`
-						} `json:"delta"`
-						FinishReason string `json:"finish_reason"`
-					} `json:"choices"`
-					Usage json.RawMessage `json:"usage"`
-				}
-				if json.Unmarshal([]byte(payload), &chunk) != nil {
-					continue
-				}
-				if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
-					usage = parseUsage(chunk.Usage, usage)
-				}
-				for _, c := range chunk.Choices {
-					for _, tc := range c.Delta.ToolCalls {
-						index := 0
-						if tc.Index != nil {
-							index = *tc.Index
-						}
-						for len(toolCalls) <= index {
-							toolCalls = append(toolCalls, inference.ToolCall{Type: "function"})
-						}
-						if tc.ID != "" {
-							toolCalls[index].ID = tc.ID
-						}
-						if tc.Function.Name != "" {
-							toolCalls[index].Function.Name += tc.Function.Name
-						}
-						toolCalls[index].Function.Arguments += tc.Function.Arguments
-						if onTool != nil {
-							if err := onTool(inference.ToolCallDelta{
-								Index:     index,
-								ID:        tc.ID,
-								Name:      tc.Function.Name,
-								Arguments: tc.Function.Arguments,
-							}); err != nil {
-								return text.String(), events, usage, toolCalls, err
-							}
-						}
-						events++
-					}
-					if c.Delta.ReasoningContent != "" {
-						if onReasoning != nil {
-							if err := onReasoning(c.Delta.ReasoningContent); err != nil {
-								return text.String(), events, usage, toolCalls, err
-							}
-						}
-						// Tracked even when nobody consumes the reasoning: a turn
-						// that only thought is not an empty answer.
-						reasoningSeen = true
-						events++
-					}
-					if c.FinishReason != "" {
-						finishReason = c.FinishReason
-					}
-					if c.Delta.Content == "" {
-						continue
-					}
-					if err := emit(c.Delta.Content); err != nil {
-						return text.String(), events, usage, toolCalls, err
-					}
-					text.WriteString(c.Delta.Content)
-					events++
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return text.String(), events, usage, toolCalls, err
-		}
-	}
-	// A turn that asked for tools has no prose by design. Treating that as an
-	// empty answer made every agent loop die after its first tool request.
-	// The same is true of a turn that only reasoned: the model produced output
-	// and the client already received it as reasoning_content. Calling that an
-	// empty answer made the request retry, rotate accounts and finally emit an
-	// in-stream error that told the client to discard a perfectly good think.
-	if text.Len() == 0 && len(toolCalls) == 0 && !reasoningSeen {
-		return "", events, usage, toolCalls, &emptyAnswerError{}
-	}
-	usage.FinishReason = finishReason
-	return text.String(), events, usage, toolCalls, nil
+	return decodeSSE(body, emit, onReasoning, onTool)
 }
 
 // streamUsage carries the upstream-reported token counts. A field is unknown
@@ -900,10 +796,10 @@ type streamUsage struct {
 // split usage harmless.
 func parseUsage(raw json.RawMessage, acc streamUsage) streamUsage {
 	var u struct {
-		PromptTokens        *int `json:"prompt_tokens"`
-		CompletionTokens    *int `json:"completion_tokens"`
+		PromptTokens         *int `json:"prompt_tokens"`
+		CompletionTokens     *int `json:"completion_tokens"`
 		PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
-		PromptTokensDetails *struct {
+		PromptTokensDetails  *struct {
 			CachedTokens *int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 	}
@@ -951,33 +847,61 @@ func wipe(b []byte) {
 	}
 }
 
-// RefreshToken exchanges a refresh token for a fresh access token. It mirrors
-// the desktop gateway's renewal; the provider calls it on an authentication
-// rejection (see refreshAccount) so an expired account recovers by itself.
+// RefreshToken performs a single bounded exchange. Account-backed callers must
+// use refreshAccount so the single-use token has a durable intent first.
 func RefreshToken(ctx context.Context, refreshToken string) (access, refresh string, err error) {
-	body, _ := json.Marshal(map[string]any{"refresh_token": refreshToken, "source_id": "autoclaw"})
+	return exchangeRefresh(ctx, nil, refreshToken, "")
+}
+
+func exchangeRefresh(ctx context.Context, client *http.Client, refreshToken, device string) (access, refresh string, err error) {
+	if strings.TrimSpace(refreshToken) == "" {
+		return "", "", errors.New("autoclaw_refresh_unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	payload := map[string]any{"refresh_token": refreshToken, "source_id": "autoclaw"}
+	if device != "" {
+		payload["device_id"] = device
+	}
+	body, _ := json.Marshal(payload)
+	defer wipe(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+refreshPt, bytes.NewReader(body))
 	if err != nil {
-		return "", "", err
+		return "", "", errors.New("autoclaw_refresh_unavailable")
 	}
 	setHeaders(req, "", "")
 	req.Header.Del("X-Authorization")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	bounded := http.Client{Timeout: 30 * time.Second}
+	if client != nil {
+		bounded = *client
+		if bounded.Timeout <= 0 || bounded.Timeout > 30*time.Second {
+			bounded.Timeout = 30 * time.Second
+		}
+	}
+	bounded.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := bounded.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", errors.New("autoclaw_refresh_exchange_failed")
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", "", errors.New("autoclaw_refresh_rejected")
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	defer wipe(raw)
+	if err != nil || len(raw) > 1<<20 {
+		return "", "", errors.New("autoclaw_refresh_response_invalid")
+	}
 	var out struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
+		Code *int `json:"code"`
 		Data struct {
 			AccessToken  string `json:"access_token"`
 			RefreshToken string `json:"refresh_token"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(raw, &out) != nil || out.Code != 0 || out.Data.AccessToken == "" {
-		return "", "", fmt.Errorf("autoclaw refresh failed: %d %s", out.Code, out.Msg)
+	if json.Unmarshal(raw, &out) != nil || out.Code == nil || *out.Code != 0 ||
+		strings.TrimSpace(out.Data.AccessToken) == "" || strings.TrimSpace(out.Data.RefreshToken) == "" {
+		return "", "", errors.New("autoclaw_refresh_response_invalid")
 	}
 	return out.Data.AccessToken, out.Data.RefreshToken, nil
 }

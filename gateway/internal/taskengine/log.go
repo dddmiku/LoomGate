@@ -9,10 +9,9 @@ import (
 
 // TaskLogResult 是一次「任务输出日志」查询的结果。
 //
-// 与旧调度器的同名结构保持同一语义：任务正在跑就给当前这一轮（日志还在长），
-// 空闲时给最近一次跑完的那一轮。区别只在于行的来源——新引擎没有脚本 stdout，
-// 日志由这次 run 的持久化执行记录（每个阶段的账号、状态、安全摘要）渲染成文本，
-// 面板因此能像旧版一样看到「这一次到底做了什么」。
+// 与旧调度器保持同一语义：执行中返回当前输出，空闲时返回最近一轮。
+// 当前运行的模块输出按行持久化；历史只有 Steps 的运行仍可读，但不伪造实时输出。
+// 日志与动作回执独立，任何输出文本都不构成任务成功证明。
 type TaskLogResult struct {
 	Lines   []string
 	Running bool
@@ -23,15 +22,21 @@ type TaskLogResult struct {
 
 // TaskLog 返回某个任务最近一次（或正在进行的）执行输出。
 func (e *Engine) TaskLog(key string) (TaskLogResult, error) {
+	return e.TaskLogFor("", key)
+}
+
+// TaskLogFor isolates identically named task families across providers. The old
+// unscoped API remains readable for legacy callers; the console always scopes it.
+func (e *Engine) TaskLogFor(provider, key string) (TaskLogResult, error) {
 	key = strings.TrimSpace(key)
-	if key == "" || len(key) > 128 {
+	if key == "" || len(key) > 128 || provider != "" && !IDPattern.MatchString(provider) {
 		return TaskLogResult{}, ErrInvalid
 	}
 	runs := e.Runs()
 	running := -1
 	latest := -1
 	for i := range runs {
-		if !taskLogMatches(key, runs[i].TaskKey) {
+		if !runIncludesLogKey(runs[i], key) || provider != "" && runs[i].ProviderID != provider {
 			continue
 		}
 		if latest < 0 {
@@ -50,6 +55,22 @@ func (e *Engine) TaskLog(key string) (TaskLogResult, error) {
 		return TaskLogResult{Message: "这个任务还没有运行记录。点「运行」后，输出会出现在这里。"}, nil
 	}
 	r := runs[chosen]
+	// A broad run may contain this task, but its sibling task output is not this
+	// task's log. Filter only the presentation copy, never the durable run/work.
+	steps := []Step{}
+	for _, step := range r.Steps {
+		if key == r.TaskKey || step.TaskKey == "" || TaskKeyMatches(key, step.TaskKey) {
+			steps = append(steps, step)
+		}
+	}
+	r.Steps = steps
+	output := []OutputLine{}
+	for _, line := range r.Output {
+		if key == r.TaskKey || TaskKeyMatches(key, line.TaskKey) {
+			output = append(output, line)
+		}
+	}
+	r.Output = output
 	out := TaskLogResult{Running: r.Status == StatusRunning || r.Status == StatusQueued}
 	if r.FinishedAt != nil {
 		out.EndedAt = *r.FinishedAt
@@ -122,6 +143,22 @@ func shortAccount(id string) string {
 		}
 		return "autoclaw"
 	}
+	if len(id) >= 7 && len(id) <= 15 {
+		numeric := true
+		for _, r := range id {
+			if r < '0' || r > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			left, right := 3, 4
+			if len(id) < 11 {
+				left, right = 1, 1
+			}
+			return id[:left] + strings.Repeat("*", len(id)-left-right) + id[len(id)-right:]
+		}
+	}
 	if len(id) <= 8 {
 		return id
 	}
@@ -142,6 +179,11 @@ func stepLine(stamp func(time.Time) string, s Step) string {
 		b.WriteString("[")
 		b.WriteString(tag)
 		b.WriteString("] ")
+	}
+	if name := safeOutputText(s.TaskName, 256); name != "" {
+		b.WriteString("「" + name + "」 ")
+	} else if key := safeOutputText(s.TaskKey, 256); key != "" {
+		b.WriteString("「" + key + "」 ")
 	}
 	text := strings.TrimSpace(s.Summary)
 	switch s.Status {
@@ -202,10 +244,34 @@ func taskLogLines(r Run) []string {
 		lines = append(lines, "等待执行槽位；开始后会继续追加输出。")
 		return lines
 	}
-	steps := append([]Step{}, r.Steps...)
-	sort.SliceStable(steps, func(i, j int) bool { return steps[i].StartedAt.Before(steps[j].StartedAt) })
-	for _, s := range steps {
-		lines = append(lines, stepLine(stamp, s))
+	type entry struct {
+		at   time.Time
+		line string
+	}
+	entries := []entry{}
+	for _, s := range r.Steps {
+		at := s.StartedAt
+		if s.FinishedAt != nil {
+			at = *s.FinishedAt
+		}
+		s.StartedAt = at
+		entries = append(entries, entry{at, stepLine(stamp, s)})
+	}
+	for _, o := range r.Output {
+		prefix := stamp(o.At) + "  [" + shortAccount(o.AccountID) + "] "
+		if name := safeOutputText(o.TaskName, 256); name != "" {
+			prefix += "「" + name + "」 "
+		} else {
+			prefix += "「" + safeOutputText(o.TaskKey, 256) + "」 "
+		}
+		entries = append(entries, entry{o.At, prefix + safeOutputText(o.Text, maxOutputLine)})
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	if r.OutputDropped > 0 {
+		lines = append(lines, fmt.Sprintf("较早的 %d 行进度已超出保留上限；操作回执和待核验状态保留。", r.OutputDropped))
+	}
+	for _, row := range entries {
+		lines = append(lines, row.line)
 	}
 	if r.FinishedAt != nil {
 		lines = append(lines, fmt.Sprintf("%s 结束，耗时 %s，%s",

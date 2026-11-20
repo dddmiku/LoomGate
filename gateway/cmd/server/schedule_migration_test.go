@@ -82,6 +82,8 @@ func TestBuiltinSchedulesAreTheLegacyFixedList(t *testing.T) {
 		{"legacy-buddy-box", "workbuddy", "buddy_box", []int{12}, 20, false, true},
 		{"legacy-resources", "workbuddy", "resources", []int{12}, 25, false, true},
 		{"legacy-compensation", "workbuddy", "compensation", []int{12}, 30, false, false},
+		{"legacy-growth-sequence", "workbuddy", "growth-sequence", []int{12}, 0, false, true},
+		{"legacy-checkin-sequence", "workbuddy", "checkin-balance-sequence", []int{9, 21}, 0, false, true},
 	} {
 		p, ok := byID[tc.id]
 		if !ok || p.ProviderID != tc.provider || p.TaskKey != tc.key || !reflect.DeepEqual(p.Hours, tc.hours) || p.Minute != tc.minute || p.Enabled != tc.enabled {
@@ -101,6 +103,15 @@ func TestBuiltinSchedulesAreTheLegacyFixedList(t *testing.T) {
 		}
 		if p.LegacyEnabled == nil || *p.LegacyEnabled != tc.legacy {
 			t.Errorf("builtin %s lost the recorded legacy switch: %+v", tc.id, p)
+		}
+	}
+	for id, want := range map[string][]string{
+		"legacy-growth-sequence":  {"travel/", "growth/", "makeup", "redeem/", "lottery", "buddy_box", "resources"},
+		"legacy-checkin-sequence": {"credential-preflight", "checkin", "balance"},
+	} {
+		plan, ok := byID[id]
+		if !ok || plan.Enabled || !reflect.DeepEqual(plan.TaskSequence, want) {
+			t.Errorf("sequence default %s missing, enabled or changed: %+v", id, plan)
 		}
 	}
 	// 旧版里没有独立可执行入口的伪造上报类任务不得复活。

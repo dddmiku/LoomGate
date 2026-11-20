@@ -196,10 +196,23 @@ func (s *Service) accounts() ([]accountvault.Account, error) {
 	return out, nil
 }
 
+// PublicIdentity optionally projects private legacy storage IDs to opaque public
+// IDs. Resolution only considers authenticated rows from Accounts.List.
+type PublicIdentity interface {
+	PublicAccountID(string) string
+}
+
+func (s *Service) publicID(a accountvault.Account) string {
+	if source, ok := s.byID[a.Provider].(PublicIdentity); ok {
+		return source.PublicAccountID(a.ID)
+	}
+	return a.ID
+}
+
 func (s *Service) accountViews(rows []accountvault.Account) []AccountView {
 	out := make([]AccountView, 0, len(rows))
 	for _, a := range rows {
-		view := AccountView{ID: a.ID, Provider: a.Provider, Revision: a.Revision, UpdatedAt: a.UpdatedAt, Enabled: a.Enabled}
+		view := AccountView{ID: s.publicID(a), Provider: a.Provider, Revision: a.Revision, UpdatedAt: a.UpdatedAt, Enabled: a.Enabled}
 		if src := s.byID[a.Provider]; src != nil {
 			if mobile, nickname, botID, verifiedAt, ok := src.Display(a.ID); ok {
 				view.Mobile = mobile
@@ -304,7 +317,23 @@ func (s *Service) toggleAccount(w http.ResponseWriter, r *http.Request) {
 		write(w, 503, map[string]string{"error": "accounts_read_only"})
 		return
 	}
-	a, err := store.SetEnabled(req.ID, *req.Enabled, req.Revision)
+	rows, err := s.accounts()
+	if err != nil {
+		write(w, 503, map[string]string{"error": "accounts_unavailable"})
+		return
+	}
+	physicalID := ""
+	for _, row := range rows {
+		if row.ID == req.ID || s.publicID(row) == req.ID {
+			physicalID = row.ID
+			break
+		}
+	}
+	if physicalID == "" {
+		write(w, 404, map[string]string{"error": "account_not_found"})
+		return
+	}
+	a, err := store.SetEnabled(physicalID, *req.Enabled, req.Revision)
 	if err != nil {
 		if errors.Is(err, accountvault.ErrConflict) {
 			write(w, 409, map[string]string{"error": "account_revision_conflict"})
@@ -313,6 +342,7 @@ func (s *Service) toggleAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	a.ID = s.publicID(a)
 	write(w, 200, map[string]any{"ok": true, "account": a})
 }
 
@@ -340,7 +370,7 @@ func (s *Service) models(w http.ResponseWriter, r *http.Request, accounts []acco
 	if q.account != "" {
 		filtered := []accountvault.Account{}
 		for _, a := range accounts {
-			if a.ID == q.account {
+			if a.ID == q.account || s.publicID(a) == q.account {
 				filtered = append(filtered, a)
 			}
 		}
@@ -425,7 +455,7 @@ func parseQuery(r *http.Request) (query, error) {
 
 func (s *Service) fetch(ctx context.Context, a accountvault.Account, force bool) (row Row) {
 	src := s.byID[a.Provider]
-	row = Row{AccountID: a.ID, ProviderID: a.Provider, Status: "unavailable", RoutingStatus: "catalog_only", Models: []Model{}}
+	row = Row{AccountID: s.publicID(a), ProviderID: a.Provider, Status: "unavailable", RoutingStatus: "catalog_only", Models: []Model{}}
 	defer func() {
 		if recover() != nil {
 			row.Models = []Model{}

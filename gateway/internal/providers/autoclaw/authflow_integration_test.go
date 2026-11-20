@@ -6,6 +6,7 @@ package autoclaw
 // "操作结果未确认" on a login that had actually worked.
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -123,4 +124,65 @@ type stubbedOK struct{}
 func (stubbedOK) RoundTrip(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
 		Body: io.NopCloser(strings.NewReader(`{"code":0}`)), Request: r}, nil
+}
+
+// The account id is public: it shows up in the console, the request log and any
+// support transcript. Deriving it from the phone number published the number,
+// so new accounts get opaque IDs. Re-login adopts the physical legacy row,
+// but returns only its opaque public alias.
+func TestSaveProfileUsesAnOpaqueAccountID(t *testing.T) {
+	vault, err := accountvault.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vault.Close()
+	save := SaveProfile(vault)
+	blob, _ := json.Marshal(stored{AccessToken: "a", RefreshToken: "r", Phone: "13800001111"})
+	id, err := save(context.Background(), blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(id, "13800001111") {
+		t.Fatalf("account id published the phone number: %s", id)
+	}
+	if !strings.HasPrefix(id, "autoclaw-") {
+		t.Fatalf("account id lost its provider prefix: %s", id)
+	}
+	// Same phone logs in again: it must reuse the row, not create a second one.
+	again, err := save(context.Background(), blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != id {
+		t.Fatalf("re-login produced a different id: %s vs %s", again, id)
+	}
+	rows, err := vault.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("re-login duplicated the row: %d", len(rows))
+	}
+
+	// An account created by the older build carries the phone in its id; it must
+	// be adopted rather than duplicated.
+	legacyID := "autoclaw-13900002222"
+	legacyBlob, _ := json.Marshal(stored{AccessToken: "old", RefreshToken: "r", Phone: "13900002222"})
+	if _, err := vault.Put(accountvault.Account{ID: legacyID, Provider: "autoclaw", Enabled: true}, legacyBlob, 0); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := save(context.Background(), legacyBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted == "" || adopted == legacyID || strings.Contains(adopted, "13900002222") {
+		t.Fatal("legacy storage identity was returned instead of its public alias")
+	}
+	rows, err = vault.List()
+	if err != nil || len(rows) != 2 {
+		t.Fatal("re-login must update the legacy row without duplicating it")
+	}
+	if _, _, err := vault.Get(legacyID); err != nil {
+		t.Fatal("legacy storage row was not preserved")
+	}
 }

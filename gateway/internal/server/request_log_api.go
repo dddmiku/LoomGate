@@ -44,6 +44,11 @@ func (h *Handler) requestHistory(w http.ResponseWriter, r *http.Request) {
 		h.requestHistoryError(w, err)
 		return
 	}
+	for i := range page.Items {
+		if page.Items[i].LastDecision != nil {
+			page.Items[i].LastDecision.AccountID = h.publicAccountID(page.Items[i].LastDecision.AccountID)
+		}
+	}
 	_ = writeJSON(w, 200, map[string]any{"ok": true, "items": page.Items, "total": page.Total, "offset": page.Offset, "limit": page.Limit, "recovery": page.Recovery, "recording_errors": h.requestLogErrors.Load(), "retention": map[string]any{"max_records": requestlog.DefaultMaxRecords, "max_age_seconds": int64(requestlog.DefaultMaxAge.Seconds()), "max_bytes": requestlog.DefaultMaxBytes}})
 }
 
@@ -61,7 +66,29 @@ func (h *Handler) requestDetail(w http.ResponseWriter, r *http.Request) {
 		h.requestHistoryError(w, err)
 		return
 	}
+	for i := range record.Attempts {
+		record.Attempts[i].AccountID = h.publicAccountID(record.Attempts[i].AccountID)
+	}
+	for i := range record.Decisions {
+		record.Decisions[i].AccountID = h.publicAccountID(record.Decisions[i].AccountID)
+		record.Decisions[i].BoundAccountID = h.publicAccountID(record.Decisions[i].BoundAccountID)
+	}
 	_ = writeJSON(w, 200, map[string]any{"ok": true, "record": record})
+}
+
+func (h *Handler) publicAccountID(id string) string {
+	if id == "" {
+		return id
+	}
+	for _, provider := range h.cfg.Inference {
+		if projector, ok := provider.(interface{ PublicAccountID(string) string }); ok {
+			projected := projector.PublicAccountID(id)
+			if projected != id {
+				return projected
+			}
+		}
+	}
+	return id
 }
 
 func (h *Handler) requestHistoryError(w http.ResponseWriter, err error) {

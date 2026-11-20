@@ -138,21 +138,21 @@ func (c *Client) TaskTravelDepart(ctx context.Context, a *auth.Auth, location in
 	_, err := c.taskGrowthWrite(ctx, a, travelDepartPath, map[string]any{"location_id": location})
 	return err
 }
-func (c *Client) TaskTravelClaim(ctx context.Context, a *auth.Auth, record int64) error {
+func (c *Client) TaskTravelClaim(ctx context.Context, a *auth.Auth, record int64) (int64, error) {
 	if record <= 0 {
-		return errors.New("travel_record_invalid")
+		return 0, errors.New("travel_record_invalid")
 	}
 	raw, err := c.taskGrowthWrite(ctx, a, travelClaimPath, map[string]any{"record_id": record})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var value struct {
 		Reward int64 `json:"reward_credit"`
 	}
 	if taskDecode(raw, &value, "reward_credit") != nil || value.Reward < 0 {
-		return errors.New("travel_reward_unconfirmed")
+		return 0, errors.New("travel_reward_unconfirmed")
 	}
-	return nil
+	return value.Reward, nil
 }
 
 type TaskStreak struct {
@@ -222,24 +222,56 @@ type TaskResources struct {
 	Quota           GrowthBuddyQuota
 }
 
-func (c *Client) TaskResources(ctx context.Context, a *auth.Auth) (TaskResources, error) {
-	var result TaskResources
-	var energy, chances struct {
+func (c *Client) TaskEnergy(ctx context.Context, a *auth.Auth) (int, error) {
+	var result struct {
 		Balance int `json:"balance"`
 	}
-	if err := c.taskGrowthRead(ctx, a, growthEnergyPath, &energy, "balance"); err != nil {
+	if err := c.taskGrowthRead(ctx, a, growthEnergyPath, &result, "balance"); err != nil {
+		return 0, err
+	}
+	if result.Balance < 0 {
+		return 0, errors.New("resource_state_invalid")
+	}
+	return result.Balance, nil
+}
+func (c *Client) TaskLotteryChances(ctx context.Context, a *auth.Auth) (int, error) {
+	var result struct {
+		Balance int `json:"balance"`
+	}
+	if err := c.taskGrowthRead(ctx, a, lotteryChancesPath, &result, "balance"); err != nil {
+		return 0, err
+	}
+	if result.Balance < 0 {
+		return 0, errors.New("resource_state_invalid")
+	}
+	return result.Balance, nil
+}
+func (c *Client) TaskBuddyQuota(ctx context.Context, a *auth.Auth) (GrowthBuddyQuota, error) {
+	var result GrowthBuddyQuota
+	if err := c.taskGrowthRead(ctx, a, growthBuddyQuotaPath, &result, "affordable", "max_open_count"); err != nil {
 		return result, err
 	}
-	if err := c.taskGrowthRead(ctx, a, lotteryChancesPath, &chances, "balance"); err != nil {
-		return result, err
-	}
-	if err := c.taskGrowthRead(ctx, a, growthBuddyQuotaPath, &result.Quota, "affordable", "max_open_count"); err != nil {
-		return result, err
-	}
-	if energy.Balance < 0 || chances.Balance < 0 || result.Quota.Affordable < 0 || result.Quota.MaxOpenCount < 0 {
+	if result.Affordable < 0 || result.MaxOpenCount < 0 {
 		return result, errors.New("resource_state_invalid")
 	}
-	result.Energy, result.Chances = energy.Balance, chances.Balance
+	return result, nil
+}
+
+func (c *Client) TaskResources(ctx context.Context, a *auth.Auth) (TaskResources, error) {
+	var result TaskResources
+	energy, err := c.TaskEnergy(ctx, a)
+	if err != nil {
+		return result, err
+	}
+	chances, err := c.TaskLotteryChances(ctx, a)
+	if err != nil {
+		return result, err
+	}
+	quota, err := c.TaskBuddyQuota(ctx, a)
+	if err != nil {
+		return result, err
+	}
+	result.Energy, result.Chances, result.Quota = energy, chances, quota
 	return result, nil
 }
 

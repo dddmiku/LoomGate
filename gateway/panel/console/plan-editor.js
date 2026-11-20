@@ -92,7 +92,12 @@ window.LoomPlanEditor = (() => {
       saving=true;
       const controls=[...form.querySelectorAll('button,input,select')].map(e=>[e,e.disabled]);
       controls.forEach(([e])=>e.disabled=true);
-      try {await ui.mutate('schedule','workbench/schedule',payload,async()=>{await ui.verifySchedule(payload);ui.closeDialog();ui.toast('计划已保存，并已从服务端核验。');await ui.after();});}
+      try {await ui.mutate('schedule','workbench/schedule',payload,async()=>{
+        const saved=await ui.verifySchedule(payload);
+        if(alive())ui.closeDialog();
+        ui.toast('计划已保存，并已从服务端核验。');
+        ui.after(saved);
+      });}
       finally {saving=false;if(alive())controls.forEach(([e,disabled])=>e.disabled=disabled);}
     };
     paintTimes();paintStep();await load();

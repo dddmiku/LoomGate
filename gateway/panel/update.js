@@ -37,6 +37,13 @@ function upDownBytes(n){
   return n === 0 ? '0 B' : upBytes(n);
 }
 
+// Go 的 time.Time 零值会序列化成 0001-01-01；只有可解析的时间才可作为
+// 构建、发布或检查证据，不能把零值当成「已是最新」。
+function validUpdateTime(value){
+  if (typeof value !== 'string' || !value.trim() || value.indexOf('0001-') === 0) return false;
+  return Number.isFinite(Date.parse(value));
+}
+
 function renderUpdate(){
   var r = UP.data, box = $('#updRows');
   if (!box) return;
@@ -74,15 +81,17 @@ function renderUpdate(){
   var busy = !!UP_BUSY[s.state];
   var current = s.current || '—';
   var commit = (s.commit && s.commit !== 'unknown') ? ' · ' + s.commit.slice(0, 7) : '';
-  var latest = s.latest_tag || (s.checked_at ? '已是最新' : '未检查');
+  var latest = s.latest_tag || (validUpdateTime(s.checked_at) ? '已是最新' : '未检查');
   var rows =
     mrow('当前版本', current + commit) +
-    mrow('构建时间', s.built_at && s.built_at !== 'unknown' ? fmtTime(s.built_at) : '—') +
+    mrow('构建时间', validUpdateTime(s.built_at) ? fmtTime(s.built_at) : '未记录') +
+    mrow('部署时间', validUpdateTime(s.deployed_at) ? fmtTime(s.deployed_at) : '未记录') +
+    mrow('远端发布时间', validUpdateTime(s.latest_at) ? fmtTime(s.latest_at) : '未记录') +
     mrow('远端最新', latest, s.update_ready ? 'w' : 'ok') +
     mrow('更新状态', UP_STATE[s.state] ? UP_STATE[s.state].t : (s.state || '—'),
       (UP_STATE[s.state] || {}).cls || '') +
     mrow('下载包', s.asset_name ? (s.asset_name + ' · ' + upBytes(s.asset_size)) : '—') +
-    mrow('上次检查', s.checked_at ? relTime(s.checked_at) : '—') +
+    mrow('上次成功检查', validUpdateTime(s.checked_at) ? relTime(s.checked_at) : '未记录') +
     mrow('仓库', s.repo || '—');
   box.innerHTML = rows;
   $('#updState').innerHTML = upState(s.state);
@@ -91,14 +100,14 @@ function renderUpdate(){
   //   - 检查过且 update_ready=true → 可点；
   //   - 还没检查过（latest_tag 为空且无 checked_at）→ 可点，网关会先查一次远端；
   //   - 检查过但没有可升级版本（已是最新）→ 禁用，否则点下去会把服务白重启一遍。
-  var checked = !!s.checked_at;
+  var checked = validUpdateTime(s.checked_at);
   var canApply = !busy && (!checked || !!s.update_ready);
   $('#btnUpdApply').disabled = !canApply;
   var hint;
   if (s.state === 'failed') hint = s.last_error || '更新失败';
   else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
-  else if (s.checked_at) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
+  else if (checked) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
   else hint = '点「立即更新」会先检查远端版本';
   $('#updHint').textContent = hint;
   renderUpdateModal(s);
@@ -267,7 +276,7 @@ async function actUpdateCheck(){
 async function actUpdateApply(){
   var s = (UP.data && UP.data.status) || {};
   // 兜底：按钮已按 update_ready 禁用，这里再挡一次，避免通过其它入口触发无意义的重启。
-  if (s.checked_at && !s.update_ready){
+  if (validUpdateTime(s.checked_at) && !s.update_ready){
     toast('已是最新版本（' + (s.latest_tag || s.current || '') + '），无需更新', 'ok');
     return;
   }

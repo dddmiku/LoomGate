@@ -3,6 +3,13 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const date = value => value && !String(value).startsWith('0001-') ? new Date(typeof value === 'number' ? value * 1000 : value).toLocaleString('zh-CN', {hour12:false}) : '—';
+  // Go 的 time.Time 零值会序列化成 0001-01-01；只有可解析的时间才是
+  // 真实构建、发布或检查时间，不能把零值/Invalid Date展示给运维。
+  const validUpdateTime = value => {
+    if(typeof value !== 'string' || !value.trim() || value.startsWith('0001-')) return false;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed);
+  };
   // 旧版任务日志的顶栏口径：「最近一次 11-09 22:26」，不带年份与秒。
   const shortTime = value => {
     if(!value||String(value).startsWith('0001-')) return '—';
@@ -12,7 +19,7 @@
     return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const number = value => typeof value === 'number' ? value.toLocaleString('zh-CN') : '—';
-  const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], usageRange:null, taskCache:null, schedules:[], runs:[], pending:new Set(), poll:null};
+  const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], usageRange:null, taskCache:null, schedules:[], runs:[], keys:[], pending:new Set(), poll:null, taskLogGeneration:0};
   // Task names are a display convenience, not state: remember the last names the
   // server actually returned so a page refresh on 执行计划/执行记录 still shows
   // "每日签到" instead of a raw task key or "已保存的任务". Bounded and best-effort.
@@ -30,6 +37,9 @@
       return (byModule||moduleNames[module]||module)+'（全部任务）';
     }
     if(key==='*')return '全部任务';
+    const sequenceLabels={'growth-sequence':'成长中心有序流水线','checkin-balance-sequence':'签到与余额刷新'};
+    const sequenceName=sequenceLabels[key];
+    if(sequenceName)return sequenceName;
     const names=state.taskNames,rk=realm||'';
     const known=names?.get(provider+'\u0000'+rk+'\u0000'+key)||names?.get(provider+'\u0000\u0000'+key)||state.tasks.find(t=>t.provider_id===provider&&t.key===key)?.name;
     if(known)return known;
@@ -52,9 +62,11 @@
   function bindProviderFilter(id, change) {
     $('#'+id).onclick=async e=>{
       const target=e.target.closest('[data-provider-choice]');if(!target||target.getAttribute('aria-pressed')==='true')return;
-      const route=state.route,value=target.dataset.providerChoice;
-      change(value);await reload();
-      if(state.route===route)[...document.querySelectorAll('#'+id+' button')].find(b=>b.dataset.providerChoice===value)?.focus({preventScroll:true});
+      const value=target.dataset.providerChoice;
+      change(value);
+      const refresh=reload(),generation=state.version;
+      await refresh;
+      if(generation===state.version)[...document.querySelectorAll('#'+id+' button')].find(b=>b.dataset.providerChoice===value)?.focus({preventScroll:true});
     };
   }
   const accountIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg>';
@@ -103,7 +115,16 @@
     } catch(e) { if(e.name==='AbortError' && !signal?.aborted) throw new APIError(timeoutErrorCode(path),408); throw e; }
     finally { clearTimeout(timer); signal?.removeEventListener('abort',abort); }
   }
-  async function providers() { if(!state.providers) { const data=await api('workbench/providers'); if(!Array.isArray(data.providers)) throw new APIError('request_failed',502); state.providers=data.providers; } return state.providers; }
+  async function providers(refresh=false) {
+    if(refresh||!state.providers||state.providersDirty){
+      const generation=state.version;
+      const data=await api('workbench/providers');
+      if(generation!==state.version)return;
+      if(!Array.isArray(data.providers))throw new APIError('request_failed',502);
+      state.providers=data.providers;state.providersDirty=false;
+    }
+    return state.providers;
+  }
   // 服务端 /api/state 的 AuthSummary 带了三项旧版账号信息，控制台曾把它们整体
   // 丢掉：parsable（凭证文件能否解析）、mobile（Trae 掩码手机号）、
   // enterpriseId（WorkBuddy 企业租户）。丢掉 parsable 的后果最重——损坏或旧格式
@@ -118,32 +139,86 @@
     if(a.parsable!==false) return '';
     return '账号文件存在但无法解析，网关不会加载它；请重新登录，或核对旧版凭证格式后再启用。';
   }
-  async function accountsFor(provider) {
+  async function accountsFor(provider,options) {
     const p=state.providers.find(p=>p.id===provider);
-    if(p?.catalog_scope==='account') return (await api('workbench/accounts')).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,nickname:a.nickname||'',mobile:a.mobile||'',botId:a.bot_id||'',verifiedAt:a.verified_at||null,enabled:a.enabled,expires_at:a.expires_at,revision:a.revision}));
-    const data=await api('state');
+    if(p?.catalog_scope==='account') return (await api('workbench/accounts',options)).accounts.filter(a=>a.provider===provider).map(a=>({id:a.id,nickname:a.nickname||'',mobile:a.mobile||'',botId:a.bot_id||'',verifiedAt:a.verified_at||null,enabled:a.enabled,expires_at:a.expires_at,revision:a.revision}));
+    const data=await api('state',options);
     return (data.accounts || []).map(a=>({...a,realm:a.realm||(/trae/i.test(a.domain||'')?'trae':/workbuddy\.ai/i.test(a.domain||'')?'global':'cn')})).filter(a=>provider==='trae'?a.realm==='trae':a.realm==='cn'||a.realm==='global').map(authSummaryRow);
   }
-  function fail(e) { if(e.name==='AbortError') return; $('#view').innerHTML=heading()+notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取')+(e.status===401?' <a href="login">重新登录 →</a>':''); $('#view').dataset.loadState='failed'; }
-  function openDialog(title, html, style='') { $('#dialog').className=style; delete $('#dialog').dataset.taskLog; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
-  function closeDialog() { $('#dialog').close();$('#dialog').className='';delete $('#dialog').dataset.taskLog;$('#dialog-body').replaceChildren(); }
-  async function mutate(key, path, body, after) {
-    if(state.pending.has(key)) return;
-    state.pending.add(key);
-    const controls=[...document.querySelectorAll('dialog button[type=submit],button[data-lock]')];controls.forEach(b=>b.disabled=true);
-    try { const data=await api(path,{body,signal:null}); await after(data); }
-    catch(e) { const rejected=e instanceof APIError && e.status<500 && e.status!==408;if(key==='run' && rejected)sessionStorage.removeItem('loomgate.unconfirmedRun');const message=rejected?e.message:'请求结果尚未确认。请先刷新服务端状态，避免重复提交。'; if($('#dialog').open) { const box=$('#form-message'); if(box){box.textContent=message;box.hidden=false;}else toast(message); } else toast(message); }
-    finally { state.pending.delete(key); controls.forEach(b=>b.disabled=false); }
+  function fail(e) {
+    if(e.name==='AbortError')return;
+    const view=$('#view'),loading=view.querySelector('[data-route-loading]');if(loading)loading.remove();
+    const content=view.querySelector('[data-view-content]');if(content){content.inert=false;content.removeAttribute('aria-hidden');}
+    const root=content||view,headingNode=root.querySelector('.page-heading');
+    const message=notice(e instanceof APIError?e.message:'无法连接工作区，请检查网络或服务状态。','error')+button('reload','重新读取');
+    if(headingNode){let box=root.querySelector('[data-route-error]');if(!box){box=document.createElement('div');box.dataset.routeError='1';headingNode.after(box);}box.innerHTML=message;}
+    else root.insertAdjacentHTML('afterbegin',heading()+message);
+    view.dataset.loadState='failed';
   }
-  function begin() { state.controller?.abort();clearTimeout(state.poll);state.controller=new AbortController();state.version++;return state.version; }
+  function openDialog(title, html, style='') { state.taskLogGeneration++; $('#dialog').className=style; delete $('#dialog').dataset.taskLog; $('#dialog-title').textContent=title; $('#dialog-body').innerHTML=html; if(!$('#dialog').open) $('#dialog').showModal(); }
+  function closeDialog() { state.taskLogGeneration++; $('#dialog').close();$('#dialog').className='';delete $('#dialog').dataset.taskLog;$('#dialog-body').replaceChildren(); }
+  function ownsDialog(node) {return Boolean(node?.isConnected&&$('#dialog').open&&$('#dialog-body').contains(node));}
+  async function readDialog(title,load,render){
+    openDialog(title,`<div data-dialog-read><p role="status">正在读取…</p><div class="actions">${button('close','取消')}</div></div>`);
+    const marker=$('[data-dialog-read]'),generation=state.version,owner=state.taskLogGeneration;
+    const current=()=>generation===state.version&&owner===state.taskLogGeneration&&ownsDialog(marker);
+    try{
+      const data=await load();
+      if(current())render(data);
+    }catch(e){
+      if(!current()||e.name==='AbortError')return;
+      marker.innerHTML=notice(e instanceof APIError?e.message:'读取失败，请关闭后重新打开。','error')+button('close','关闭');
+    }
+  }
+  async function mutate(key,path,body,after,sourceControl,{allowNotOK=false,isCurrent=()=>true}={}) {
+    if(state.pending.has(key))return;
+    state.pending.add(key);
+    const dialog=$('#dialog'), owner=state.taskLogGeneration;
+    const formMessage=dialog.open&&!sourceControl?$('#form-message',dialog):null;
+    const controls=dialog.open?[...dialog.querySelectorAll('button[type=submit]:not(:disabled)')]:[];
+    controls.forEach(control=>control.disabled=true);
+    sourceControl?.setAttribute('aria-busy','true');
+    try{
+      const data=await api(path,{body,signal:null,allowNotOK});
+      await after(data);
+    }catch(e){
+      if(!isCurrent())return;
+      const rejected=e instanceof APIError&&e.status<500&&e.status!==408;
+      if(key==='run'&&rejected)sessionStorage.removeItem('loomgate.unconfirmedRun');
+      if(key==='run')paintTaskGuard();
+      const message=rejected?e.message:'请求结果尚未确认，请先核对服务端状态，避免重复提交。';
+      if(formMessage?.isConnected&&dialog.open&&owner===state.taskLogGeneration){formMessage.textContent=message;formMessage.hidden=false;}
+      else toast(message);
+    }finally{
+      state.pending.delete(key);
+      controls.forEach(control=>control.disabled=false);
+      sourceControl?.removeAttribute('aria-busy');
+    }
+  }
+  function begin() { state.controller?.abort(); clearTimeout(state.poll); state.controller=new AbortController(); state.version++; return state.version; }
+  function showRouteLoading() {
+    const view=$('#view'),old=view.querySelector('[data-view-content]');
+    if(old){old.inert=true;old.setAttribute('aria-hidden','true');}
+    let loading=view.querySelector('[data-route-loading]');
+    if(!loading){loading=document.createElement('div');loading.dataset.routeLoading='1';loading.className='loading';loading.innerHTML='<p>正在读取工作区…</p><div class="progress"></div>';view.append(loading);}
+    loading.hidden=false;
+  }
+  function finishRouteRender(generation){
+    if(generation!==state.version)return;
+    const view=$('#view'),loading=view.querySelector('[data-route-loading]');if(loading)loading.remove();
+    const content=view.querySelector('[data-view-content]');if(content){content.inert=false;content.removeAttribute('aria-hidden');}
+    view.dataset.loadState='ready';
+  }
   async function navigate() {
     const route=location.hash.slice(1).split('?')[0] || 'overview';
-    state.route=Object.hasOwn(routes,route)?route:'overview';begin();closeDialog();closeNavigation();
+    state.route=Object.hasOwn(routes,route)?route:'overview';
+    const generation=begin();closeDialog();closeNavigation();
     document.querySelectorAll('#navigation a').forEach(a=>{if(a.hash==='#'+state.route)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
     document.title=routes[state.route][1]+' · LoomGate';
     $('#current-page').textContent=routes[state.route][1];
-    $('#view').innerHTML=heading()+`<div class="loading"><p>正在读取工作区…</p><div class="progress"></div></div>`;
-    try { await providers(); await renderers[state.route](); $('#view').dataset.loadState='ready'; } catch(e) {fail(e);}
+    $('#view').innerHTML=`<div data-view-content></div>`;
+    showRouteLoading();
+    await renderCurrent(generation);
   }
 
   // 首页按旧版结构：一排指标卡 + 「账号池 / 积分」两块面板。
@@ -163,7 +238,9 @@
     return rows.length ? `<div class="ov-realms">${rows.join('')}</div>` : '';
   }
   async function overview() {
+    const generation=state.version;
     const [work, snap] = await Promise.allSettled([api('workbench'), api('state')]);
+    if(generation!==state.version)return;
     const schedules = work.status === 'fulfilled' ? (work.value.schedules || []) : [];
     const rows = work.status === 'fulfilled' ? (work.value.runs || []) : [];
     state.runs = rows;
@@ -246,12 +323,31 @@
     $('#view').innerHTML=heading(button('reload','同步服务','','quiet'))+`<div class="service-list">${state.providers.map(p=>`<article class="service-entry" data-provider="${esc(p.id)}"><div><h2>${esc(p.name)}</h2><p>${p.catalog_scope==='account'?'目录随账号变化':'服务级模型目录'}</p></div><div><dl><div><dt>已连接账号</dt><dd>${p.accounts.total}</dd></div><div><dt>已启用</dt><dd>${p.accounts.enabled}</dd></div></dl><p>${p.inference_available?'消息推理已接入。请求仍受账号余额和上游可用性限制。':'模型目录可读取；此服务的消息转发尚未接通。'}</p>${p.error_code?notice(errorLabels[p.error_code]||'服务状态读取失败','error'):''}</div><div class="actions">${button('provider-models','查看模型',`data-provider="${esc(p.id)}"`,'quiet')}${button('provider-accounts','查看账号',`data-provider="${esc(p.id)}"`,'quiet')}</div></article>`).join('')}</div>`;
   }
 
+  function installViewContent(markup){
+    const content=document.createElement('div');
+    content.dataset.viewContent='1';content.innerHTML=markup;
+    $('#view').replaceChildren(content);
+    return content;
+  }
+
+  function accountStatus(a){
+    const pool=a.pool;
+    let status=badge(a.enabled?'ready':'disabled',a.enabled?'已启用':'已停用');
+    if(a.parsable===false)status=badge('failed','凭证无法解析')+`<p>${esc(credentialWarning(a))}</p>`;
+    else if(a.enabled&&pool){
+      if(pool.disabled)status=badge('failed','池内不可用')+`<p>${esc(pool.disabledReason||'需核对账号状态')}</p>`;
+      else if(pool.cooling)status=badge('stale','账号级限流')+`<p>${esc(pool.reason||'等待恢复')}${pool.until?' · '+esc(date(pool.until)):''}</p>`;
+      else if(pool.inPool)status=badge('ready','可用');
+      else status=badge('manual_action','未加载');
+    }
+    return status+limitNotices(pool);
+  }
   async function accounts() {
     const selected=state.accountProvider || state.providers[0]?.id || '';
     state.accountProvider=selected;
     const generation=state.version;
-    $('#view').innerHTML=heading(button('connect-account','添加账号','','primary'))+
-      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-list" class="loading">正在读取账号…</div>`;
+    installViewContent(heading(button('connect-account','添加账号','','primary'))+
+      `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-list" class="loading">正在读取账号…</div>`);
     bindProviderFilter('account-provider',value=>{state.accountProvider=value;state.accountRealm='';});
     const rows=await accountsFor(selected);if(generation!==state.version)return;state.accountRows=rows;const clientStates=new Map();
     // 区域筛选只在 WorkBuddy（有 CN/Global 两个独立站点）显示；Trae 与 AutoClaw 各自
@@ -275,16 +371,8 @@
       const list=rows.filter(a=>(!realm||a.realm===realm)&&(a.id+' '+(a.nickname||'')+' '+(a.mobile||'')+' '+(a.enterpriseId||'')).toLowerCase().includes(query));
       $('#account-list').className='account-directory';
       $('#account-list').innerHTML=list.length?table(['账号','状态与限流','积分与过期','会话与连接','操作'],list.map(a=>{
-        const pool=a.pool,credit=a.credits,connection=clientStates.get(a.id);
-        let status=badge(a.enabled?'ready':'disabled',a.enabled?'已启用':'已停用');
-        if(a.parsable===false)status=badge('failed','凭证无法解析')+`<p>${esc(credentialWarning(a))}</p>`;
-        else if(a.enabled&&pool){
-          if(pool.disabled)status=badge('failed','池内不可用')+`<p>${esc(pool.disabledReason||'需核对账号状态')}</p>`;
-          else if(pool.cooling)status=badge('stale','账号级限流')+`<p>${esc(pool.reason||'等待恢复')}${pool.until?' · '+esc(date(pool.until)):''}</p>`;
-          else if(pool.inPool)status=badge('ready','可用');
-          else status=badge('manual_action','未加载');
-        }
-        status+=limitNotices(pool);
+        const credit=a.credits,connection=clientStates.get(a.id);
+        const status=`<div data-account-status>${accountStatus(a)}</div>`;
         const balance=typeof credit?.remain==='number'
           ? `${number(credit.remain)}${credit.expiring>0?`<p class="credit-expiring" data-expiring="${esc(credit.expiring)}">其中 ${number(credit.expiring)} 即将过期${credit.expiry?' · '+esc(date(credit.expiry)):''}</p>`:''}`
           : credit?.ok===false?'<span class="muted">读取失败</span>':'<span class="muted">未读取</span>';
@@ -449,8 +537,8 @@
     // 否则会默认落在一个永远空表的服务上。
     state.taskProvider=state.taskProvider||state.providers[0]?.id||'';
     const generation=state.version;
-    $('#view').innerHTML=heading(button('reload','刷新','','quiet'))+
-      `<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}</div><div id="task-list" class="loading">正在读取任务…</div><div id="task-guard"></div>`;
+    installViewContent(heading(button('reload','刷新','','quiet'))+
+      `<div class="context-bar scope-toolbar">${providerFilter('task-provider',state.taskProvider)}</div><div id="task-discovery-notice"></div><div id="task-list" class="loading">正在读取任务…</div><div id="task-guard"></div>`);
     bindProviderFilter('task-provider',value=>{state.taskProviderPicked=true;state.taskProvider=value;});
     // 三个读取各自独立：账号列表读不到不该让任务表消失；计划读取失败则没有
     // 东西可画，必须如实说明，而不是永远停在「正在读取任务…」。
@@ -497,7 +585,8 @@
     return pattern.endsWith('/')&&String(key||'').startsWith(pattern);
   }
   function groupsForPlan(plan){
-    return state.taskGroups.filter(g=>g.provider_id===plan.provider_id&&planKeyMatches(plan.task_key,g.key));
+    const selectors=Array.isArray(plan.task_sequence)&&plan.task_sequence.length?plan.task_sequence:[plan.task_key];
+    return state.taskGroups.filter(g=>g.provider_id===plan.provider_id&&selectors.some(selector=>planKeyMatches(selector,g.key)));
   }
   function scheduleText(s){
     if(!s)return '';
@@ -512,10 +601,15 @@
     for(const g of groups)for(const t of g.accounts){const p=t.state?.phase;counts[p&&counts[p]!==undefined?p:'unknown']++;}
     return [counts.claimable?counts.claimable+' 可领取':counts.ready?counts.ready+' 待执行':counts.done?counts.done+' 已完成':counts.manual?counts.manual+' 需人工':'',counts.blocked?counts.blocked+' 暂不可用':''].filter(Boolean).join(' · ')||'等待核验';
   }
+  function paintTaskGuard(){
+    const guard=$('#task-guard');if(!guard)return;
+    guard.innerHTML=sessionStorage.getItem('loomgate.unconfirmedRun')?notice('上次执行请求结果未确认。请核对执行时间、服务和账号；不要直接重复提交。','warn')+button('review-submission','核对后解除提交保护'):'';
+  }
   function paintTaskList(issues,catalogState,accounts=[],workFailed=false){
     const box=$('#task-discovery-notice');if(box)box.remove();
-    const unconfirmed=sessionStorage.getItem('loomgate.unconfirmedRun')?notice('上次执行请求结果未确认。请核对执行时间、服务和账号；不要直接重复提交。','warn')+button('review-submission','核对后解除提交保护'):'';
-    const guard=$('#task-guard');if(guard)guard.innerHTML=unconfirmed;
+    const list=$('#task-list');
+    if(!list)return;
+    paintTaskGuard();
     if(issues.length){
       const byModule=new Map();for(const x of issues){byModule.set(x.module_id,(byModule.get(x.module_id)||0)+1);}
       const summary=[...byModule.entries()].map(([name,n])=>n>1?`${name} × ${n}`:name).join('、');
@@ -523,13 +617,12 @@
       notice.innerHTML=`<summary>${issues.length} 项任务目录未能读取（${esc(summary)}）· 定时与开关仍可管理</summary><p class="small">这些分区的对应模块本轮没有返回目录，通常是上游暂时不可用或该账号没有此项任务。账号状态会显示「目录不可用」，但计划与开关不受影响。</p><ul class="issue-list">${issues.map(x=>`<li><code>${esc(x.module_id)}</code> · ${esc(x.account_id)} · ${esc(errorLabels[x.error_code]||x.error_code||'目录不可用')}</li>`).join('')}</ul>`;
       $('#task-list').before(notice);
     }
-    $('#task-list').classList.remove('loading');
-    if(workFailed){
-      $('#task-list').innerHTML=notice('任务计划本次未能从服务读取。任务表与开关都来自服务端保存的计划，不会凭空生成，也不会在读取失败时显示成「没有任务」。','warn')+button('reload','重新读取');
+    list.classList.remove('loading');
+    if(workFailed){list.innerHTML=notice('任务计划本次未能从服务读取。任务表与开关都来自服务端保存的计划，不会凭空生成，也不会在读取失败时显示成「没有任务」。','warn')+button('reload','重新读取');
       return;
     }
     if(!state.schedules.length && !state.taskGroups.length){
-      $('#task-list').innerHTML=empty('当前没有可管理的任务','任务与定时随版本发布；账号目录本轮也没有返回任务。');
+      list.innerHTML=empty('当前没有可管理的任务','任务与定时随版本发布；账号目录本轮也没有返回任务。');
       return;
     }
     const sections=new Map();
@@ -553,9 +646,9 @@
         const disabled=!plan.enabled;
         rows.push(`<tr data-plan-row="${esc(plan.id)}" data-task="${esc(plan.task_key)}" class="${disabled?'plan-paused':''}">
           <td class="log-expander" data-label=""><button type="button" data-action="task-log" data-plan-index="${idx}" aria-expanded="false" aria-label="展开最近执行日志">▸</button></td>
-          <td data-label="任务"><strong>${esc(name)}</strong><p class="small muted">${plan.once_per_day?'每日':'按计划'}${pending?' · 上次结果未确认':''}${groups.some(g=>g.manual_only)?' · 含需人工任务':''}</p></td>
+          <td data-label="任务"><strong>${esc(name)}</strong><p class="small muted"><span data-plan-frequency>${plan.once_per_day?'每日':'按计划'}</span>${pending?' · 上次结果未确认':''}${groups.some(g=>g.manual_only)?' · 含需人工任务':''}</p></td>
           <td data-label="账号状态"><span class="small">${esc(summary)}</span></td>
-          <td data-label="定时"><strong>${esc(scheduleText(plan))}</strong><p class="small muted">${esc(plan.timezone||'')}</p></td>
+          <td data-label="定时" data-plan-timing><strong>${esc(scheduleText(plan))}</strong><p class="small muted">${esc(plan.timezone||'')}</p></td>
           <td data-label="状态"><button type="button" class="switch ${plan.enabled?'on':''}" role="switch" aria-checked="${plan.enabled?'true':'false'}" aria-label="${esc(name)}定时${plan.enabled?'已启用':'已暂停'}" data-action="toggle-schedule" data-index="${state.schedules.indexOf(plan)}" data-lock><span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span><span class="switch-text">${plan.enabled?'已启用':'已暂停'}</span></button></td>
           <td data-label="操作"><div class="actions">${button('run-plan','运行',`data-plan-index="${idx}"`,'compact')}${button('edit-plan-time','定时',`data-plan-index="${idx}"`,'quiet compact')}${button('task-log','日志',`data-plan-index="${idx}"`,'quiet compact')}</div></td>
         </tr>`);
@@ -582,7 +675,7 @@
       }
     }
     // 任务页只列任务与计划。执行历史在「执行记录」页；任务输出日志在每行的「日志」里。
-    $('#task-list').innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogState==='failed'?'<p class="small muted">账号状态本轮未读取；任务、定时与开关仍来自本地，照常可用。</p>':'');
+    list.innerHTML=`<div class="task-table-wrap"><table class="task-table"><thead><tr><th></th><th>任务</th><th>账号状态</th><th>定时</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`+(catalogState==='failed'?'<p class="small muted">账号状态本轮未读取；任务、定时与开关仍来自本地，照常可用。</p>':'');
   }
   const taskErrors={provider_rejected:'官方服务拒绝了此操作',operation_unconfirmed:'操作结果未确认',account_identity_changed:'账号或绑定发生变化',authentication_required:'需要重新登录',task_expired:'任务标识已过期',operation_not_eligible:'当前尚不满足操作条件',provider_busy:'官方客户端正忙',upstream_failed:'上游操作未成功'};
   // 「日志」显示任务自己的输出（旧版行为）：最近一次运行的文本行，而不是
@@ -598,37 +691,40 @@
     openDialog(`任务日志 · ${taskLabel(provider,'',key)}`,
       `<div class="task-log-dialog"><div class="task-log-head"><span class="task-log-status" role="status" aria-live="polite"></span><button type="button" data-action="task-log-refresh" class="quiet compact" aria-label="刷新日志">刷新</button></div><pre class="task-log-output" id="task-log-body" role="log" tabindex="0">加载中…</pre></div>`);
     $('#dialog').dataset.taskLog='1';
-    let timer=null,lastSig='',running=false;
-    const currentDialogOpen=()=>document.getElementById('dialog')?.open===true;
+    const generation=state.taskLogGeneration;
+    let timer=null,lastSig='',running=false,requestSequence=0;
+    const currentDialogOpen=()=>state.taskLogGeneration===generation&&document.getElementById('dialog')?.open===true&&document.getElementById('dialog')?.dataset.taskLog==='1';
     const statusText=data=>data.running?'运行中…':(data.endedAt?'最近一次 '+shortTime(data.endedAt):'');
     const load=async()=>{
+      if(!currentDialogOpen())return;
+      const request=++requestSequence,isLatest=()=>currentDialogOpen()&&request===requestSequence;
       clearTimeout(timer);
       try{
-        const data=await api('task/log?key='+encodeURIComponent(key),{signal:null});
-        if(!currentDialogOpen())return;
+        const data=await api('task/log?key='+encodeURIComponent(key)+'&provider='+encodeURIComponent(provider),{signal:null});
+        if(!isLatest())return;
         running=!!data.running;
         const lines=Array.isArray(data.lines)?data.lines:[];
         const status=$('#dialog-body .task-log-status');
         if(status)status.textContent=statusText(data);
-        // 内容没变就不重写 DOM：自动刷新有间隔，重写会打断选取与滚动位置。
-        const sig=lines.length+'|'+(lines[lines.length-1]||'')+'|'+running;
+        // 比较完整输出，保留未变文本的选区和滚动；不能仅比较行数和末行。
+        const sig=lines.length?lines.join("\n"):(data.message||'这个任务还没有运行记录。点「运行」后，输出会出现在这里。');
         if(sig!==lastSig){
           lastSig=sig;
           const body=$('#task-log-body');
           if(body){
             const atBottom=body.scrollTop+body.clientHeight>=body.scrollHeight-24;
-            body.textContent=lines.length?lines.join("\n"):(data.message||'这个任务还没有运行记录。点「运行」后，输出会出现在这里。');
+            body.textContent=sig;
             if(atBottom)body.scrollTop=body.scrollHeight;
           }
         }
       }catch(e){
-        if(!currentDialogOpen())return;
-        running=false;
+        if(!isLatest())return;
+        running=false;lastSig='';
         const body=$('#task-log-body');
         if(body)body.textContent='拉取失败：'+(e instanceof APIError?e.message:'任务日志读取失败。');
       }
-      // 运行中 2 秒一刷（日志还在长），结束后 5 秒一刷（等下一次触发）。
-      if(currentDialogOpen())timer=setTimeout(()=>load(),running?2000:5000);
+      // 只有最新读取拥有刷新定时器，旧请求不能重新启动旧状态的轮询。
+      if(isLatest())timer=setTimeout(()=>load(),running?2000:5000);
     };
     $('#dialog-body [data-action=task-log-refresh]').onclick=()=>load();
     await load();
@@ -648,8 +744,9 @@
     const planScope=Array.isArray(plan?.account_ids)?plan.account_ids.filter(Boolean):[];
     const groups=planRow.groups||[];
     const catalogScope=[...new Set(groups.flatMap(g=>(g.accounts||[]).filter(t=>!t.manual_only).map(t=>t.account_id)))];
+    const sequence=Array.isArray(plan?.task_sequence)?plan.task_sequence:[];
     const accountIDs=planScope.length?planScope:catalogScope;
-    return {provider_id:provider,key,name:taskLabel(provider,'',key),account_ids:accountIDs};
+    return {provider_id:provider,key,name:taskLabel(provider,'',key),account_ids:accountIDs,...(sequence.length?{task_sequence:[...sequence]}:{})};
   }
   // Renders one run exactly like the old detail dialog: a run picker at the top
   // when there is more than one, then the full step table.
@@ -679,32 +776,86 @@
     if(select)select.onchange=e=>showTaskRunDetail(runs,Number(e.target.value));
   }
 
-  function confirmRun(task) {
+  function confirmRun(task,sourceControl) {
     // 组级执行传 account_ids（数组），单条任务传 account_id。必须优先用数组，
     // 否则组级执行会退化成「全部已启用账号」——执行范围被放大（本轮实测缺陷）。
     const explicit=Array.isArray(task?.account_ids)?task.account_ids.filter(Boolean):task?.account_id?[task.account_id]:[];
     const scope=explicit;
     const req={provider_id:task?.provider_id || state.taskProvider,task_key:task?.key || '*',account_ids:scope};
-    // 空范围不发起请求：看不到账号时按「全部」跑就是放大范围。目录暂时读不到
-    // 时应先刷新目录，而不是拿一次不可见执行去赌。
+    if(Array.isArray(task?.task_sequence)&&task.task_sequence.length)req.task_sequence=[...task.task_sequence];
+    // 空范围不发起请求：看不到账号就不知道会动谁，宁可拒绝并说明原因，也不扩大范围。
     if(!scope.length){toast('没有可执行的账号范围：账号状态尚未读取，请先刷新任务目录再运行。');return;}
     if(sessionStorage.getItem('loomgate.unconfirmedRun')) {toast('上次执行请求结果未确认。请到任务列表核对后继续，避免重复操作。');location.hash='tasks';return;}
-    openDialog('确认执行范围',`<form id="run-form" class="form"><p>${esc(task?.name || '当前范围内的全部任务')}</p><div class="notice">服务：${esc(providerName(req.provider_id))}<br>账号：${esc(scope.join('、') || '全部已启用账号')}<br>执行可能产生上游操作。需要人工的任务会保留待处理状态，奖励以服务端复核为准。</div><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认执行</button></div></form>`);
-    $('#run-form').onsubmit=e=>{e.preventDefault();if(state.pending.has('run'))return;sessionStorage.setItem('loomgate.unconfirmedRun','1');mutate('run','workbench/run',req,async data=>{if(!data.run?.id)throw new APIError('request_failed',502);sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();toast('已进入执行队列，结果可在执行记录里查看。');await reload();});};
+    openDialog('确认执行范围',`<form id="run-form" class="form"><p>${esc(task?.name || '当前范围内的全部任务')}</p><div class="notice">服务：${esc(providerName(req.provider_id))}<br>账号：${esc(scope.join('、'))}<br>执行可能产生上游操作。需要人工的任务会保留待处理状态，奖励以服务端复核为准。</div><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认执行</button></div></form>`);
+    const form=$('#run-form');
+    form.onsubmit=e=>{
+      e.preventDefault();if(state.pending.has('run'))return;
+      sessionStorage.setItem('loomgate.unconfirmedRun','1');
+      mutate('run','workbench/run',req,async data=>{
+        if(!data.run?.id)throw new APIError('request_failed',502);
+        sessionStorage.removeItem('loomgate.unconfirmedRun');
+        state.runs=[data.run,...(state.runs||[]).filter(run=>run.id!==data.run.id)];
+        if(sourceControl){sourceControl.dataset.accepted='true';sourceControl.setAttribute('aria-label','已进入执行队列');sourceControl.textContent='已排队';}
+        if(form.isConnected&&$('#dialog').open)closeDialog();
+        paintTaskGuard();
+        toast('已进入执行队列，进度可在对应任务的「日志」中查看。');
+      },sourceControl);
+    };
   }
 
   async function openPlanEditor(plan){
     await LoomPlanEditor.open({
       existing: plan, providers: state.providers, esc, options, cleanSchedule,
       openDialog, closeDialog, toast, api, accountsFor, mutate, verifySchedule,
-      after: reload,
+      after: updatePlanRow,
     });
   }
 
   // legacy_enabled 是「旧配置原本是否启用」的审计事实。编辑/停启用计划时
   // 必须原样带回，否则一次改时间就会把迁移来源抹掉（rename/badge 也随之消失）。
-  function cleanSchedule(s) {return {id:s.id,provider_id:s.provider_id,task_key:s.task_key,account_ids:s.account_ids || [],hours:s.hours,minute:s.minute,timezone:s.timezone,enabled:s.enabled,once_per_day:s.once_per_day,legacy_enabled:s.legacy_enabled};}
-  async function verifySchedule(s) {const result=await api('workbench');const saved=(result.schedules || []).find(x=>x.id===s.id);if(!saved || JSON.stringify(cleanSchedule(saved))!==JSON.stringify(cleanSchedule(s)))throw new APIError('request_failed',502);}
+  function cleanSchedule(s) {return {id:s.id,provider_id:s.provider_id,task_key:s.task_key,...(Array.isArray(s.task_sequence)&&s.task_sequence.length?{task_sequence:s.task_sequence}:{}),account_ids:s.account_ids || [],hours:s.hours,minute:s.minute,timezone:s.timezone,enabled:s.enabled,once_per_day:s.once_per_day,legacy_enabled:s.legacy_enabled};}
+  async function verifySchedule(schedule){
+    const data=await api('workbench',{signal:null});
+    const saved=(data.schedules||[]).find(item=>item.id===schedule.id);
+    if(!saved||JSON.stringify(cleanSchedule(saved))!==JSON.stringify(cleanSchedule(schedule)))throw new APIError('request_failed',502);
+    return saved;
+  }
+
+  function updateScheduleRow(schedule){
+    const row=document.querySelector(`tr[data-plan-row="${CSS.escape(String(schedule.id))}"]`);
+    if(!row)return;
+    row.classList.toggle('plan-paused',!schedule.enabled);
+    const timing=row.querySelector('[data-plan-timing]');
+    if(timing){$('strong',timing).textContent=scheduleText(schedule);$('p',timing).textContent=schedule.timezone||'';}
+    const frequency=row.querySelector('[data-plan-frequency]');
+    if(frequency)frequency.textContent=schedule.once_per_day?'每日':'按计划';
+    const toggle=row.querySelector('[data-action="toggle-schedule"]');
+    if(toggle){
+      toggle.classList.toggle('on',!!schedule.enabled);
+      toggle.setAttribute('aria-checked',schedule.enabled?'true':'false');
+      toggle.setAttribute('aria-label',`${taskLabel(schedule.provider_id,'',schedule.task_key)}定时${schedule.enabled?'已启用':'已暂停'}`);
+      const text=toggle.querySelector('.switch-text');if(text)text.textContent=schedule.enabled?'已启用':'已暂停';
+    }
+  }
+
+  // A schedule toggle is a row mutation, not a route reload. Keep the catalog,
+  // account states, scroll position and keyboard focus owned by the current page.
+  async function toggleSchedule(index,control){
+    const current=state.schedules[index];if(!current)return;
+    const next={...cleanSchedule(current),enabled:!current.enabled};
+    await mutate('schedule','workbench/schedule',next,async()=>{
+      const saved=await verifySchedule(next);
+      updatePlanRow(saved);
+      toast(next.enabled?'计划已启用。':'计划已停用。');
+    },control);
+  }
+
+  // A plan editor saves its single plan and the caller can update only that row.
+  function updatePlanRow(plan){
+    state.schedules=state.schedules.map(s=>s.id===plan.id?plan:s);
+    for(const row of state.planRows||[])if(row.plan?.id===plan.id)row.plan=plan;
+    updateScheduleRow(plan);
+  }
 
   // 一条计划可以用模块前缀覆盖多个真实任务（迁移来的 growth/ 会展开成
   // growth/accept/<码> 与 growth/<码>）。这时执行详情的步骤表必须带上「任务」列，
@@ -934,7 +1085,7 @@
   // 曾经除「enabled」外一律显示「待独立验收」，把失败与不可用都说成可交接。
   const updateStateLabels = {idle:'空闲',checking:'检查中',downloading:'下载中',handover:'切换中',failed:'失败'};
   function updateView(update) {
-    const empty = {unread:true,canCheck:false,badge:'manual_action',badgeText:'状态未读取',detail:'',lines:[]};
+    const empty = {unread:true,canCheck:false,canApply:false,badge:'manual_action',badgeText:'状态未读取',detail:'',lines:[]};
     if(!update) return empty;
     const status = update.status || {};
     const lines = [];
@@ -943,36 +1094,207 @@
     if(status.repo) lines.push('发布仓库：' + status.repo + (status.visibility ? ' · ' + ({public:'公开',private:'私有',unknown:'未确认'}[status.visibility] || status.visibility) : ''));
     if(status.latest_tag) lines.push('远端最新：' + status.latest_tag);
     if(status.asset_name) lines.push('更新包：' + status.asset_name + (status.asset_size ? ' · ' + Math.round(status.asset_size / 1048576 * 10) / 10 + ' MB' : ''));
-    if(status.checked_at) lines.push('上次检查：' + status.checked_at);
+    if(validUpdateTime(status.built_at))lines.push('构建时间：'+date(status.built_at));
+    if(validUpdateTime(status.deployed_at))lines.push('部署时间：'+date(status.deployed_at));
+    if(validUpdateTime(status.latest_at))lines.push('远端发布时间：'+date(status.latest_at));
+    const checked=validUpdateTime(status.checked_at);
+    if(checked)lines.push('上次成功检查：'+date(status.checked_at));
+    if(Number.isFinite(status.downloaded_bytes)&&status.downloaded_bytes>=0&&status.state==='downloading'){
+      const mb=value=>Math.round(value/1048576*100)/100;
+      lines.push('已下载：'+mb(status.downloaded_bytes)+(Number.isFinite(status.asset_size)&&status.asset_size>0?' / '+mb(status.asset_size):'')+' MB');
+    }
     lines.push(status.signature_verification === true ? '签名校验：已启用（内置发布公钥）' : '签名校验：未内置发布公钥（构建不验签）');
     if(status.state === 'failed' && status.last_error) lines.push('失败原因：' + status.last_error);
-    const base = {unread:false,lines,detail:'',canCheck:true};
+    const base = {unread:false,lines,detail:'',canCheck:true,canApply:false};
     if(update.ok === false) return {...base,canCheck:false,badge:'disabled',badgeText:'未启用',detail:typeof update.message === 'string' && update.message ? update.message : '当前构建未启用热更新。'};
     if(status.enabled !== true) return {...base,canCheck:false,badge:'disabled',badgeText:'已关闭',detail:status.unavailable_reason || '热更新已在配置中关闭（config update.enabled=false）。'};
     if(status.unavailable_reason) return {...base,canCheck:false,badge:'unavailable',badgeText:'不可用',detail:status.unavailable_reason};
     if(status.state === 'failed') return {...base,badge:'failed',badgeText:'失败',detail:status.last_error || '上次更新失败，可重新检查。'};
-    if(['checking','downloading','handover'].includes(status.state)) return {...base,badge:'ready',badgeText:updateStateLabels[status.state],detail:'更新任务正在进行，完成后会再次核对签名与摘要。'};
-    if(status.update_ready === true) return {...base,badge:'ready',badgeText:'可升级',detail:'检测到比当前构建更新的发布；下载前会校验发布签名与 sha256 摘要。'};
-    if(status.checked_at) return {...base,badge:'ready',badgeText:'已是最新',detail:'已读取远端发布，没有比当前构建更新的版本。'};
+    if(['checking','downloading','handover'].includes(status.state)) return {...base,canCheck:false,badge:'ready',badgeText:updateStateLabels[status.state],detail:'更新任务正在进行，完成后以运行版本读回核验；下载完成不等于已切换。'};
+    if(status.update_ready === true){
+      const canApply=status.state==='idle'&&status.signature_verification===true&&typeof status.repo==='string'&&status.repo.trim()!==''&&
+        typeof status.asset_name==='string'&&status.asset_name!==''&&typeof status.latest_tag==='string'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(status.latest_tag);
+      return {...base,canApply,badge:'ready',badgeText:'可升级',detail:canApply?'检测到更新；需确认目标后才下载，保留服务端更新代理及签名校验。':'检测到更新，但本构建缺少验签能力或完整目标信息；此界面不会应用未核验的更新。'};
+    }
+    if(checked) return {...base,badge:'ready',badgeText:'已是最新',detail:'已读取远端发布，没有比当前构建更新的版本。'};
     return {...base,badge:'manual_action',badgeText:'未检查',detail:'尚未读取远端发布；点击「检查更新」后再确认是否有新版本。'};
   }
+  const updateIntentKey='loomgate.unconfirmedUpdate';
+  function readUpdateIntent(){
+    try{
+      const raw=sessionStorage.getItem(updateIntentKey);if(!raw)return null;
+      const intent=JSON.parse(raw);
+      return typeof intent?.tag==='string'&&typeof intent?.repo==='string'?intent:{blocked:true};
+    }catch{return {blocked:true};}
+  }
+  function clearUpdateIntent(intent){
+    try{
+      const current=readUpdateIntent();
+      if(current?.tag!==intent.tag||current?.repo!==intent.repo)return false;
+      sessionStorage.removeItem(updateIntentKey);return sessionStorage.getItem(updateIntentKey)===null;
+    }catch{return false;}
+  }
+  function updateActionNotice(card,text,kind='warn'){
+    const node=$('[data-update-action-status]',card);if(!node)return;
+    node.textContent=text;node.hidden=!text;node.className='notice '+kind;
+  }
+  function paintUpdateCard(card,update,error='') {
+    if(!card?.isConnected)return;
+    const info=updateView(update),status=update?.status||{};
+    let intent=readUpdateIntent(),completed=false;
+    if(intent&&!intent.blocked&&update?.ok===true&&status.repo===intent.repo&&status.current===intent.tag){
+      completed=clearUpdateIntent(intent);if(completed)intent=null;
+    }
+    $('.update-notice',card).innerHTML=info.unread?notice('更新状态读取失败：'+(error||'服务未返回状态')+'。','error'):notice(info.detail,info.badge==='ready'?'':'warn');
+    $('.update-facts',card).innerHTML=info.lines.map(line=>{const p=line.indexOf('：');return `<div><dt>${esc(p>0?line.slice(0,p):'状态')}</dt><dd>${esc(p>0?line.slice(p+1):line)}</dd></div>`;}).join('');
+    $('.update-facts',card).hidden=!info.lines.length;
+    $('[data-action="update-check"]',card).hidden=!info.canCheck||Boolean(intent);
+    $('[data-action="update-apply"]',card).hidden=!info.canApply||Boolean(intent);
+    $('[data-action="update-review"]',card).hidden=!intent||intent.blocked||info.unread||['checking','downloading','handover'].includes(status.state);
+    $('.update-badge',card).innerHTML=badge(info.badge,info.badgeText);
+    if(completed)updateActionNotice(card,'运行版本已核验：'+status.current+'。此处是当前进程读回，不是部署时间记录。','');
+    else if(intent?.blocked)updateActionNotice(card,'无法安全读取或记录本标签页的更新提交，已阻止应用更新。可继续只读刷新状态。');
+    else if(intent)updateActionNotice(card,status.state==='failed'?'服务端报告更新失败；原提交保护仍保留，请核对后解除。':'有一次更新提交尚未核验运行版本；只刷新状态，不会自动重复应用。');
+  }
+  async function readUpdateStatus(card,generation,polls=0){
+    clearTimeout(state.poll);
+    card._updateReadSequence=(card._updateReadSequence||0)+1;
+    const request=card._updateReadSequence;
+    const current=()=>generation===state.version&&request===card._updateReadSequence&&card?.isConnected&&$('#setting-update')===card;
+    if(!current())return;
+    try{
+      const snapshot=await api('update',{signal:null,allowNotOK:true});
+      if(!current())return;
+      paintUpdateCard(card,snapshot);
+      const intent=readUpdateIntent(),status=snapshot.status||{};
+      if(polls>0&&intent&&!intent.blocked&&snapshot.ok===true&&status.enabled===true&&!status.unavailable_reason&&status.state!=='failed'){
+        state.poll=setTimeout(()=>readUpdateStatus(card,generation,polls-1),2000);
+      }
+    }catch(e){
+      if(current())paintUpdateCard(card,undefined,e instanceof APIError?e.message:'状态读取失败；未重复提交更新。');
+    }
+  }
+  function updateTarget(status){return JSON.stringify([status.repo,status.current,status.commit,status.latest_tag,status.asset_name]);}
+  async function updateApplyDialog(){
+    return readDialog('核对更新目标',()=>api('update',{allowNotOK:true}),snapshot=>{
+      if(readUpdateIntent())throw new APIError('request_failed',409,'存在未核验的更新提交，请先刷新状态并核对。');
+      if(!updateView(snapshot).canApply)throw new APIError('request_failed',409,'当前没有可应用的已签名更新，请重新检查状态。');
+      const target=snapshot.status,card=$('#setting-update'),generation=state.version;
+      openDialog('确认应用更新',`<form id="update-form" class="form"><p>当前：<code>${esc(target.current)}</code> → 目标：<code>${esc(target.latest_tag)}</code></p><p>仓库：${esc(target.repo)}<br>更新包：${esc(target.asset_name)}</p><p class="notice warn">确认后才提交下载与切换。保留服务端原加速代理、签名和摘要校验；下载或请求受理不等于新版本已运行。不会在此执行系统重启。</p><label class="check"><input name="acknowledge" type="checkbox" required>我确认上述目标，并同意应用更新</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">确认应用</button></div></form>`);
+      const form=$('#update-form'),submit=$('button[type=submit]',form),message=$('#form-message',form);
+      form.onsubmit=async e=>{
+        e.preventDefault();
+        if(form.dataset.submitting==='1'||form.dataset.submitted==='1'||state.pending.has('runtime-update'))return;
+        if(!form.reportValidity())return;
+        form.dataset.submitting='1';submit.disabled=true;state.pending.add('runtime-update');
+        let attempted=false,rejected=false,intent=null;
+        try{
+          if(readUpdateIntent())throw new APIError('request_failed',409,'已有未核验的更新提交，请先核对。');
+          const fresh=await api('update',{signal:null,allowNotOK:true});
+          if(generation!==state.version||!ownsDialog(form))return;
+          if(!updateView(fresh).canApply||updateTarget(fresh.status)!==updateTarget(target))throw new APIError('request_failed',409,'更新目标或运行构建已变化；请关闭并重新确认，未提交更新。');
+          intent={tag:target.latest_tag,repo:target.repo};
+          const encoded=JSON.stringify(intent);
+          try{sessionStorage.setItem(updateIntentKey,encoded);if(sessionStorage.getItem(updateIntentKey)!==encoded)throw new Error();}
+          catch{throw new APIError('request_failed',409,'无法保存提交保护，未提交更新。');}
+          attempted=true;form.dataset.submitted='1';
+          const data=await api('update/apply',{body:{tag:intent.tag},signal:null,allowNotOK:true});
+          if(data.ok===false){rejected=true;clearUpdateIntent(intent);throw new APIError('request_failed',409,typeof data.message==='string'?data.message:'服务端拒绝了更新请求。');}
+          if(data.ok!==true)throw new APIError('request_failed',502);
+          if(ownsDialog(form))closeDialog();
+          toast('更新请求已接受；将只读核验运行版本，不会重复提交。');
+          await readUpdateStatus(card,generation,30);
+        }catch(e){
+          rejected=rejected||e instanceof APIError&&e.status>=400&&e.status<500&&e.status!==408;
+          if(attempted&&rejected)clearUpdateIntent(intent);
+          const text=!attempted||rejected?(e instanceof APIError?e.message:'更新预检失败，未提交。'):'更新提交结果未确认。请刷新状态核对，不要重复应用。';
+          if(ownsDialog(form)){message.textContent=text;message.hidden=false;}
+          if(generation===state.version&&card?.isConnected){
+            if(attempted)paintUpdateCard(card,undefined,text);
+            updateActionNotice(card,text);
+          }
+        }finally{
+          state.pending.delete('runtime-update');form.dataset.submitting='0';
+          if(!attempted||rejected){form.dataset.submitted='0';if(ownsDialog(form))submit.disabled=false;}
+        }
+      };
+    });
+  }
+  async function reviewUpdateIntent(){
+    return readDialog('核对更新提交保护',()=>api('update',{allowNotOK:true}),snapshot=>{
+      const intent=readUpdateIntent(),status=snapshot.status||{};
+      if(!intent||intent.blocked||snapshot.ok!==true||['checking','downloading','handover'].includes(status.state))throw new APIError('request_failed',409,'更新状态未确认或仍在进行，暂不能解除提交保护。');
+      openDialog('解除更新提交保护',`<form id="update-review-form" class="form"><p>原目标：${esc(intent.tag)}<br>当前运行：${esc(status.current||'未读取')}<br>当前状态：${esc(updateStateLabels[status.state]||'未读取')}</p><p class="notice warn">此操作只解除浏览器防重保护，不会下载、安装或重发更新。尚未确认时请取消。</p><label class="check"><input type="checkbox" required>我已核对运行程序及更新状态，确认可以解除保护</label><div class="actions">${button('close','取消')}<button type="submit">解除保护</button></div></form>`);
+      const form=$('#update-review-form'),card=$('#setting-update');
+      form.onsubmit=e=>{e.preventDefault();if(!form.reportValidity())return;if(clearUpdateIntent(intent)){if(ownsDialog(form))closeDialog();paintUpdateCard(card,snapshot);updateActionNotice(card,'已按人工确认解除提交保护；未执行任何更新。','');}};
+    });
+  }
+  function paintLoopSetting(card,stopOnly,error='') {
+    const known=typeof stopOnly==='boolean', control=$('[data-action="loop-toggle"]',card);
+    $('h3',card).textContent=!known?'状态未读取':stopOnly?'命中即停止':'命中后自动重发';
+    $('.setting-detail',card).textContent=known?'作用于后续请求；已开始的请求沿用原设置。':('重复推理保护读取失败：'+(error||'服务未返回状态')+'。');
+    control.hidden=!known;
+    control.dataset.stopOnly=String(stopOnly);
+    control.textContent=stopOnly?'改为自动重发':'改为命中即停';
+  }
+  function validLANConfig(lan){return Boolean(lan&&typeof lan.enabled==='boolean'&&typeof lan.listen==='string'&&typeof lan.allow_cidrs==='string');}
+  function lanConfigDetail(lan){return `已保存监听配置：${esc(lan.listen||'未声明')}${lan.allow_cidrs?'，允许 '+esc(lan.allow_cidrs):''}${lan.has_key?'':'；尚未创建调用密钥'}<br>此处不核验当前进程的实际监听；修改监听地址需要重启服务后生效。`;}
+  function updateLANCard(card,lan){
+    if(!card?.isConnected)return;
+    $('[data-lan-title]',card).textContent=lan.enabled?'配置已启用':'配置为仅本机';
+    $('[data-lan-config]',card).innerHTML=lanConfigDetail(lan);
+    const control=$('[data-action=lan-settings]',card);if(control)control.textContent=lan.enabled?'调整':'启用';
+  }
+  async function lanSettingsDialog(control){
+    return readDialog('读取局域网配置',()=>api('state'),snapshot=>{
+      const lan=snapshot?.lan;
+      if(!validLANConfig(lan))throw new APIError('request_failed',502,'局域网配置尚未读回，未打开保存表单。');
+      openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">这里修改的是配置文件中的监听地址与允许网段；实际监听与进程重启状态不由此表单推断。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>已保存监听地址<input name="listen" value="${esc(lan.listen||'')}" readonly aria-readonly="true"></label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.0.2.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);
+      const form=$('#lan-form'),card=$('#setting-lan'),generation=state.version;
+      form.onsubmit=e=>{
+        e.preventDefault();
+        const fields=new FormData(form),enabled=fields.get('enabled')==='on';
+        const want={enabled,allow_cidrs:enabled?String(fields.get('allow_cidrs')||'').trim():''};
+        mutate('lan','lan',want,async data=>{
+          const saved=(await api('state',{signal:null}))?.lan;
+          if(!validLANConfig(saved)||saved.enabled!==want.enabled||saved.allow_cidrs!==want.allow_cidrs)throw new APIError('request_failed',502,'配置保存后的读回不匹配。');
+          if(generation===state.version)updateLANCard(card,saved);
+          if(ownsDialog(form)){closeDialog();if(control?.isConnected)control.focus({preventScroll:true});}
+          toast((data.message||'局域网配置已保存。')+' 已核验保存值；不据此推断实际监听。');
+        });
+      };
+    });
+  }
   async function settings() {
-    const session=await api('session');
-    let state=null,loop=null,update=null,stateError='',loopError='',updateError='';
-    try{state=await api('state');}catch(e){if(e.name!=='AbortError')stateError=e.message||'未能读取';}
-    try{loop=await api('features/reasoning-loop');}catch(e){if(e.name!=='AbortError')loopError=e.message||'未能读取';}
-    try{update=await api('update',{allowNotOK:true});}catch(e){if(e.name!=='AbortError')updateError=e.message||'未能读取';}
-    const lan=state?.lan;
-    const loopOn=loop?.stop_only===true;
-    const updateInfo=updateView(update);
-    const updateEnabled=updateInfo.canCheck;
+    const generation=state.version;
+    const [session,snapshot,loop,update]=await Promise.allSettled([
+      api('session'), api('state'), api('features/reasoning-loop'), api('update',{allowNotOK:true}),
+    ]);
+    if(generation!==state.version)return;
+    if(session.status==='rejected')throw session.reason;
+    state.sessionUsername=session.value.username||'';
+    const lan=validLANConfig(snapshot.value?.lan)?snapshot.value.lan:null;
     const lanTitle=!lan?'状态未读取':lan.enabled?'配置已启用':'配置为仅本机';
-    const lanDetail=!lan?notice('局域网状态读取失败：'+esc(stateError||'服务未返回状态')+'。界面不会把它当作已关闭。','error'):`监听 ${esc(lan.listen||'未声明')}${lan.allow_cidrs?'，允许 '+esc(lan.allow_cidrs):''}${lan.has_key?'':'；尚未创建调用密钥'}${lan.enabled?'<br>保存后需要重启服务才会改变实际监听。':''}`;
-    const loopTitle=!loop?'状态未读取':loopOn?'命中即停止':'命中后自动重发';
-    const loopDetail=!loop?notice('重复推理开关读取失败：'+esc(loopError||'服务未返回状态')+'。','error'):'作用于后续请求；已开始的请求沿用原语义。';
-    const updateNotice=updateInfo.unread?notice('更新状态读取失败：'+esc(updateError||'服务未返回状态')+'。','error'):notice(updateInfo.detail,updateInfo.badge==='ready'?'':'warn');
-    const updateUnread=updateInfo.unread;
-    $('#view').innerHTML=heading()+`<div class="split"><section class="panel"><div class="panel-title"><div><h2>显示与会话</h2></div></div><div class="settings-line"><div><h3>界面主题</h3><p>在此浏览器保存偏好。</p></div>${button('theme','切换主题')}</div><div class="settings-line"><div><h3>当前会话</h3><p>有效期至 ${esc(date(session.expiresAt))}</p></div>${badge('ready','已登录')}</div><div class="settings-line"><div><h3>管理账号安全</h3><p>修改密码后其他设备需重新登录。</p></div>${button('password','修改密码')}</div></section><section class="panel"><div class="panel-title"><div><h2>局域网访问</h2></div></div><div class="settings-line"><div><h3>${lanTitle}</h3><p>${lanDetail}</p></div>${state?button('lan-settings',lan?.enabled?'调整':'启用','','quiet'):''}</div></section><section class="panel"><div class="panel-title"><div><h2>重复推理保护</h2></div></div><div class="settings-line"><div><h3>${loopTitle}</h3><p>${loopDetail}</p></div>${loop?button('loop-toggle',loopOn?'改为自动重发':'改为命中即停','','quiet'):''}</div></section><section class="panel"><div class="panel-title"><div><h2>迁移与更新</h2></div></div>${updateNotice}<p class="muted">${update?'检查与下载不会自动切换生产；正式发布前仍需在目标平台完成独立验收。':'更新读取失败时不会显示已启用或已下载。'}</p>${update?'<dl class="detail-specs update-facts">'+updateInfo.lines.map(line=>{const p=line.indexOf('：');return `<div><dt>${esc(p>0?line.slice(0,p):'状态')}</dt><dd>${esc(p>0?line.slice(p+1):line)}</dd></div>`;}).join('')+'</dl>':''}<div class="section-gap">${updateEnabled?button('update-check','检查更新','','quiet'):''}${badge(updateInfo.badge,updateInfo.badgeText)}</div></section></div>`;
+    const lanDetail=!lan?notice('局域网状态读取失败：'+(snapshot.reason?.message||'服务未返回状态')+'。','error'):lanConfigDetail(lan);
+    installViewContent(heading()+`<div class="split">
+      <section class="panel"><div class="panel-title"><h2>显示与会话</h2></div>
+        <div class="settings-line"><div><h3>界面主题</h3><p>在此浏览器保存偏好。</p></div>${button('theme','切换主题')}</div>
+        <div class="settings-line" data-session-status><div><h3>当前会话</h3><p>有效期至 <span data-session-expiry>${esc(date(session.value.expiresAt))}</span></p></div>${badge('ready','已登录')}</div>
+        <div class="settings-line" data-account-security><div><h3>管理账号安全</h3><p>修改密码后其他设备需重新登录。</p></div>${button('password','修改密码')}</div>
+      </section>
+      <section class="panel" id="setting-lan"><div class="panel-title"><h2>局域网访问</h2></div>
+        <div class="settings-line"><div><h3 data-lan-title>${lanTitle}</h3><div data-lan-config>${lanDetail}</div></div>${lan?button('lan-settings',lan.enabled?'调整':'启用','','quiet'):''}</div>
+      </section>
+      <section class="panel" id="setting-loop"><div class="panel-title"><h2>重复推理保护</h2></div>
+        <div class="settings-line"><div><h3></h3><p class="setting-detail"></p></div>${button('loop-toggle','改为命中即停','hidden','quiet')}</div>
+      </section>
+      <section class="panel" id="setting-update"><div class="panel-title"><h2>迁移与更新</h2></div>
+        <div class="update-notice"></div><dl class="detail-specs update-facts" hidden></dl><p data-update-action-status class="notice warn" role="status" hidden></p>
+        <div class="section-gap actions">${button('update-check','检查更新','hidden','quiet')}${button('update-apply','应用更新','hidden','primary')}${button('update-status','刷新状态','','quiet')}${button('update-review','核对后解除提交保护','hidden','quiet')}<span class="update-badge"></span></div>
+      </section>
+    </div>`);
+    paintLoopSetting($('#setting-loop'),loop.value?.stop_only,loop.reason?.message);
+    paintUpdateCard($('#setting-update'),update.value,update.reason?.message);
   }
   // 0 在服务端是「不限」的显式语义（keylimit：>0 才生效）。直接打印
   // "0/分 · 并发 0" 会被读成「一个请求都不放行」，与真实行为相反。
@@ -984,22 +1306,67 @@
     if(Number(limits.queue_timeout_seconds)>0)parts.push('排队 '+limits.queue_timeout_seconds+'s');
     return parts.length?parts.join(' · '):'不限流（每次都可立即执行）';
   }
+  function keyModelsText(models){return (models||[]).length?(models.slice(0,3).join(', '))+(models.length>3?' 等 '+models.length+' 个':''):'不限模型';}
+  function keyList(data){
+    if(!Array.isArray(data?.keys))throw new APIError('request_failed',502,'密钥列表读回无效。');
+    return data.keys;
+  }
+  function keyLimitsValue(limits){return ['requests_per_minute','max_concurrent','queue_timeout_seconds'].map(name=>limits?.[name]??0);}
+  function keyEditMatches(saved,want){
+    const models=saved?.models??[];
+    return Boolean(saved&&saved.id===want.id&&saved.name===want.name&&(saved.note||'')===want.note&&Array.isArray(models)&&
+      JSON.stringify([...models].sort())===JSON.stringify([...want.models].sort())&&
+      JSON.stringify(keyLimitsValue(saved.limits))===JSON.stringify(keyLimitsValue(want.limits)));
+  }
+  async function mutateKey(id,path,body,after,control){
+    const key='key-write:'+id;
+    if(state.pending.has(key)){toast('这把密钥还有一项操作尚未核验，请先等待其结果。');return;}
+    await mutate(key,path,body,after,control);
+  }
+  function keyRow(id){return [...document.querySelectorAll('[data-key-row]')].find(node=>node.dataset.keyRow===id)?.closest('tr');}
+  function updateKeyRow(saved){
+    const row=keyRow(saved.id);
+    if(!row)return;
+    const text=(node,value)=>{if(node&&node.textContent!==value)node.textContent=value;};
+    text(row.querySelector('[data-key-row] strong'),saved.name||'未命名');
+    text(row.querySelector('[data-key-row] p'),saved.note||'');
+    text(row.cells[1]?.querySelector('code'),saved.masked_key||'');
+    text(row.cells[1]?.querySelector('p'),keyModelsText(saved.models));
+    text(row.querySelector('[data-key-limits]'),limitSummary(saved.limits));
+    const status=row.querySelector('[data-key-enabled]'),toggle=row.querySelector('[data-action=key-toggle]');
+    if(toggle?.dataset.enabled!==(saved.enabled?'1':'0')){
+      if(status)status.innerHTML=badge(saved.enabled?'ready':'disabled',saved.enabled?'启用':'停用');
+      if(toggle){toggle.dataset.enabled=saved.enabled?'1':'0';toggle.textContent=saved.enabled?'停用':'启用';}
+    }
+  }
+  const keyColumns=['名称','密钥','状态','有效期','限流','累计 Token','操作'];
+  function keyCells(k,live=null){
+    const liveText=live?`${number(live.requests)} 次/分窗口 · 进行 ${number(live.active)} · 排队 ${number(live.queued)}`:'实时快照未读取';
+    const tokens=k.total_tokens===undefined?'—':number(k.total_tokens);
+    return [`<span data-key-row="${esc(k.id)}"><strong>${esc(k.name||'未命名')}</strong><p class="small muted">${esc(k.note||'')}</p></span>`,`<code>${esc(k.masked_key||'')}</code><p class="small muted">${esc(keyModelsText(k.models))}</p>`, `<span data-key-enabled>${badge(k.enabled?'ready':'disabled',k.enabled?'启用':'停用')}</span>`,esc(k.expires_at?date(k.expires_at):'无限制'),`<span data-key-limits>${esc(limitSummary(k.limits))}</span><p class="small muted">${esc(liveText)}</p>`,tokens,button('key-edit','编辑',`data-id="${esc(k.id)}"`,'quiet')+button('key-toggle',k.enabled?'停用':'启用',`data-id="${esc(k.id)}" data-enabled="${k.enabled?'1':'0'}"`,'quiet')+button('key-copy','显示密钥',`data-id="${esc(k.id)}"`,'quiet')+button('key-delete','删除',`data-id="${esc(k.id)}"`,'quiet danger')];
+  }
+  function insertKeyRow(saved){
+    const list=$('#key-list');if(!list)return;
+    if(keyRow(saved.id)){updateKeyRow(saved);return;}
+    const html=table(keyColumns,[keyCells(saved)]),body=$('tbody',list);
+    if(!body){list.innerHTML=html;return;}
+    const template=document.createElement('template');template.innerHTML=html;
+    body.append($('tbody tr',template.content));
+  }
   async function keyPage() {
+    const generation=state.version;
     const data=await api('keys');
     if(!Array.isArray(data.keys))throw new APIError('request_failed',502);
+    if(generation!==state.version)return;
+    state.keys=data.keys.slice();
     let limits={};
-    try{const live=await api('key-limits');if(live?.ok===true&&live.keys&&typeof live.keys==='object')limits=live.keys;}catch(e){if(e.name!=='AbortError')limits={};}
-    const rows=data.keys.map(k=>{
-      const live=limits[k.id]||null;
-      const limitText=limitSummary(k.limits);
-      const liveText=live?`${number(live.requests)} 次/分窗口 · 进行 ${number(live.active)} · 排队 ${number(live.queued)}`:'实时快照未读取';
-      const tokens=k.total_tokens===undefined?'—':number(k.total_tokens);
-      return [`<strong>${esc(k.name||'未命名')}</strong><p class="small muted">${esc(k.note||'')}</p>`,`<code>${esc(k.masked_key||'')}</code><p class="small muted">${esc((k.models||[]).length?((k.models||[]).slice(0,3).join(', '))+((k.models||[]).length>3?' 等 '+(k.models||[]).length+' 个':''):'不限模型')}</p>`,badge(k.enabled?'ready':'disabled',k.enabled?'启用':'停用'),esc(k.expires_at?date(k.expires_at):'无限制'),esc(limitText)+`<p class="small muted">${esc(liveText)}</p>`,tokens,button('key-edit','编辑',`data-id="${esc(k.id)}"`,'quiet')+button('key-toggle',k.enabled?'停用':'启用',`data-id="${esc(k.id)}" data-enabled="${k.enabled?'1':'0'}"`,'quiet')+button('key-copy','显示密钥',`data-id="${esc(k.id)}"`,'quiet')+button('key-delete','删除',`data-id="${esc(k.id)}"`,'quiet danger')];
-    });
+    try{const live=await api('key-limits');if(generation!==state.version)return;if(live?.ok===true&&live.keys&&typeof live.keys==='object')limits=live.keys;}catch(e){if(e.name!=='AbortError')limits={};}
+    if(generation!==state.version)return;
+    const rows=data.keys.map(k=>keyCells(k,limits[k.id]||null));
     // The endpoint is the single thing every caller has to copy correctly, so it
     // is shown once at the top of the page instead of being buried in docs.
     const base=location.origin+'/v1';
-    $('#view').innerHTML=heading(button('key-new','创建密钥','','primary')+button('reload','刷新','','quiet'))+
+    installViewContent(heading(button('key-new','创建密钥','','primary')+button('reload','刷新','','quiet'))+
       `<section class="endpoint-card">
         <h2>接入地址</h2>
         <p>把客户端的基础地址设为下面这一项；协议路径由客户端自己追加。支持 OpenAI、Anthropic Messages、OpenAI Responses 与 Gemini 四种协议。</p>
@@ -1012,26 +1379,71 @@
         </dl>
         <p class="small muted">鉴权用下面任意一把密钥作为 Bearer token；模型名形如 <code>autoclaw:glm-5.3-flash</code> 或 <code>doubao:deepseek-v4-flash</code>，可在「模型目录」里查看。</p>
       </section>`+
-      (rows.length?table(['名称','密钥','状态','有效期','限流','累计 Token','操作'],rows):empty('还没有 API 密钥','创建第一把密钥后才能通过 OpenAI / Anthropic / Gemini 兼容接口调用网关。'))+
-      notice('密钥明文只在创建或「显示密钥」时返回一次；列表只显示掩码。停用会立即生效，删除不可恢复。','warn');
+      `<div id="key-list">${rows.length?table(keyColumns,rows):empty('还没有 API 密钥','创建第一把密钥后才能通过 OpenAI / Anthropic / Gemini 兼容接口调用网关。')}</div>`+
+      notice('密钥明文只在创建或「显示密钥」时返回一次；列表只显示掩码。停用会立即生效，删除不可恢复。','warn'));
   }
   async function keyEditDialog(id) {
-    const data=await api('keys');
-    const key=(data.keys||[]).find(k=>k.id===id);
+    return readDialog('读取密钥配置',()=>api('keys'),data=>{
+    const key=keyList(data).find(k=>k.id===id);
     if(!key)throw new APIError('request_failed',404,'密钥已不存在，请刷新列表。');
     const limits=key.limits||{};
     openDialog('编辑密钥',`<form id="key-form" class="form"><p class="muted">密钥 <code>${esc(key.masked_key||'')}</code> 的明文不会再显示。留空模型表示不限；模型目录和倍率按服务端当前可见目录读取。</p><label>名称<input name="name" value="${esc(key.name||'')}" required maxlength="80"></label><label>备注<input name="note" value="${esc(key.note||'')}" maxlength="200"></label><input type="hidden" name="models"><section class="key-model-picker-section"><h3>绑定模型</h3><div data-model-picker></div></section><fieldset><legend>限流</legend><label>每分钟请求数（0 不限）<input name="requests_per_minute" type="number" min="0" max="60000" value="${esc(limits.requests_per_minute??0)}"></label><label>并发上限（0 不限）<input name="max_concurrent" type="number" min="0" max="256" value="${esc(limits.max_concurrent??0)}"></label><label>排队秒数（0 不排队）<input name="queue_timeout_seconds" type="number" min="0" max="30" value="${esc(limits.queue_timeout_seconds??0)}"></label></fieldset><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存并核对</button></div></form>`);
     const form=$('#key-form'),picker=LoomModelPicker.mount(form,{api,esc,selected:key.models||[],providers:state.providers||[]});
-    form.onsubmit=e=>{e.preventDefault();const f=new FormData(form);const body={id:key.id,name:String(f.get('name')||'').trim(),note:String(f.get('note')||'').trim(),models:picker.values()};const rpm=Number(f.get('requests_per_minute')||0),conc=Number(f.get('max_concurrent')||0),queue=Number(f.get('queue_timeout_seconds')||0);body.limits=(rpm||conc||queue)?{requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue}:null;mutate('key-edit','keys/update',body,async()=>{const saved=(await api('keys')).keys.find(k=>k.id===key.id);if(!saved||saved.name!==body.name||JSON.stringify(saved.models||[])!==JSON.stringify(body.models))throw new APIError('request_failed',502,'保存后读回与提交不一致。');closeDialog();toast('密钥已更新，并从服务端读回。');await reload();});};
+    form.onsubmit=e=>{
+      e.preventDefault();
+      const fields=new FormData(form),body={id:key.id,name:String(fields.get('name')||'').trim(),note:String(fields.get('note')||'').trim(),models:picker.values()};
+      const rpm=Number(fields.get('requests_per_minute')||0),conc=Number(fields.get('max_concurrent')||0),queue=Number(fields.get('queue_timeout_seconds')||0);
+      body.limits=(rpm||conc||queue)?{requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue}:null;
+      const generation=state.version;
+      mutateKey(key.id,'keys/update',body,async()=>{
+        const saved=keyList(await api('keys',{signal:null})).find(k=>k.id===key.id);
+        if(!keyEditMatches(saved,body))throw new APIError('request_failed',502,'保存后读回与提交不一致。');
+        if(generation===state.version){state.keys=state.keys.map(k=>k.id===key.id?saved:k);updateKeyRow(saved);}
+        if(ownsDialog(form))closeDialog();
+        toast('密钥已更新，并逐项核验备注、模型和限流。');
+      });
+    };
+    });
   }
   async function keyNewDialog() {
     openDialog('创建 API 密钥',`<form id="key-form" class="form"><p class="muted">模型绑定使用服务端当前客户端目录及其真实倍率。留空表示不限模型。</p><label>名称<input name="name" required maxlength="80" autofocus></label><label>备注<input name="note" maxlength="200"></label><input type="hidden" name="models"><section class="key-model-picker-section"><h3>绑定模型</h3><div data-model-picker></div></section><fieldset><legend>限流</legend><label>每分钟请求数（0 不限）<input name="requests_per_minute" type="number" min="0" max="60000" value="0"></label><label>并发上限（0 不限）<input name="max_concurrent" type="number" min="0" max="256" value="0"></label><label>排队秒数（0 不排队）<input name="queue_timeout_seconds" type="number" min="0" max="30" value="0"></label></fieldset><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">创建</button></div></form>`);
-    const form=$('#key-form'),picker=LoomModelPicker.mount(form,{api,esc,selected:[],providers:state.providers||[]});
-    form.onsubmit=e=>{e.preventDefault();const f=new FormData(form);const body={name:String(f.get('name')||'').trim(),note:String(f.get('note')||'').trim(),models:picker.values()};const rpm=Number(f.get('requests_per_minute')||0),conc=Number(f.get('max_concurrent')||0),queue=Number(f.get('queue_timeout_seconds')||0);if(rpm||conc||queue)body.limits={requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue};mutate('key-new','keys',body,async data=>{if(!data.key)throw new APIError('request_failed',502,'服务端没有返回完整密钥。');const secret=String(data.key);$('#dialog-body').innerHTML=`<p>密钥已创建。请立即复制，关闭后无法再次查看。</p><label>密钥<textarea readonly rows="3">${esc(secret)}</textarea></label><div class="actions">${button('close','我已保存')}</div>`;const closeButton=$('#dialog [data-action=close]');if(closeButton)closeButton.onclick=()=>{closeDialog();reload().catch(()=>{});};toast('密钥已创建，请立即保存。');});};
+    const form=$('#key-form'),picker=LoomModelPicker.mount(form,{api,esc,selected:[],providers:state.providers||[]}),generation=state.version;
+    form.onsubmit=e=>{e.preventDefault();const f=new FormData(form);const body={name:String(f.get('name')||'').trim(),note:String(f.get('note')||'').trim(),models:picker.values()};const rpm=Number(f.get('requests_per_minute')||0),conc=Number(f.get('max_concurrent')||0),queue=Number(f.get('queue_timeout_seconds')||0);if(rpm||conc||queue)body.limits={requests_per_minute:rpm,max_concurrent:conc,queue_timeout_seconds:queue};mutate('key-new','keys',body,async data=>{
+        if(typeof data.key!=='string'||!data.key)throw new APIError('request_failed',502,'服务端没有返回完整密钥。');
+        // Deliver the one-time result before any readback that could fail or outlive its form.
+        const result=document.createElement('section');result.className='panel';result.dataset.keyCreatedResult='1';
+        result.innerHTML=`<p>密钥「${esc(body.name)}」已返回创建回执。请立即复制保存；此结果不会存入浏览器存储。</p><label>密钥<textarea readonly rows="3"></textarea></label><p data-key-sync data-state="reading" class="small muted" role="status">正在核对新密钥的列表记录…</p><div class="actions"><button type="button" class="quiet">我已保存</button></div>`;
+        result.querySelector('textarea').value=data.key;
+        const inDialog=ownsDialog(form),sync=$('[data-key-sync]',result);
+        if(inDialog){
+          $('#dialog-body').replaceChildren(result);
+          result.querySelector('button').onclick=()=>{if(ownsDialog(result))closeDialog();};
+        }else{
+          // A late success still belongs to its submitter, never to a newer draft.
+          $('#view').append(result);
+          result.querySelector('button').onclick=()=>result.remove();
+        }
+        toast(inDialog?'密钥已返回，请立即保存；列表正在核验。':'上一笔密钥已返回，结果保留在页面下方；当前表单未改变。');
+        try{
+          const id=data.entry?.id;
+          if(typeof id!=='string'||!id||!keyEditMatches(data.entry,{...body,id}))throw new APIError('request_failed',502);
+          const saved=keyList(await api('keys',{signal:null})).find(k=>k.id===id);
+          if(!keyEditMatches(saved,{...body,id}))throw new APIError('request_failed',502);
+          if(generation===state.version&&state.route==='keys'){
+            state.keys=[...state.keys.filter(k=>k.id!==id),saved];
+            insertKeyRow(saved);
+          }
+          if(result.isConnected){sync.dataset.state='verified';sync.textContent='新密钥已按返回标识核对名称、备注、模型和限流。';}
+        }catch{
+          if(result.isConnected){sync.dataset.state='unconfirmed';sync.className='notice warn';sync.textContent='创建已返回密钥，但列表记录尚未核对匹配。请先保存此结果，再刷新列表核对；不要重复创建。';}
+        }
+      });};
   }
   async function migration() {
+    const generation=state.version;
     let data={},unavailable='';
     try{data=await api('migration',{allowNotOK:true});}catch(e){if(e.name!=='AbortError')unavailable=e.message||'迁移状态未读取';}
+    if(generation!==state.version)return;
     const marker=data.marker||null;
     const toolAvailable=data.tool?.available===true;
     $('#view').innerHTML=heading(button('migration-check','重新读取','','quiet'))+
@@ -1069,17 +1481,44 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     }
   }
   function passwordDialog() {
-    openDialog('修改管理账号',`<form id="password-form" class="form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>用户名<input name="username" autocomplete="username" required pattern="[A-Za-z0-9_.-]{3,32}"></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>再次输入新密码<input name="confirm" type="password" autocomplete="new-password" required></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);
-    $('#password-form').onsubmit=e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.password!==body.confirm){$('#form-message').textContent='两次新密码不一致。';$('#form-message').hidden=false;return;}mutate('password','auth/password',body,async()=>{closeDialog();toast('管理账号已更新。');await reload();});};
+    openDialog('修改管理账号',`<form id="password-form" class="form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>用户名<input name="username" value="${esc(state.sessionUsername||'')}" autocomplete="username" required pattern="[A-Za-z0-9_.-]{3,32}"></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label><label>再次输入新密码<input name="confirm" type="password" autocomplete="new-password" required></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);
+    const form=$('#password-form');
+    form.onsubmit=e=>{
+      e.preventDefault();
+      const body=Object.fromEntries(new FormData(form));
+      if(body.password!==body.confirm){const message=$('#form-message',form);message.textContent='两次新密码不一致。';message.hidden=false;return;}
+      const generation=state.version;
+      mutate('password','auth/password',body,async data=>{
+        if(data.username!==body.username||!Number.isFinite(data.expiresAt)||data.expiresAt<=0)throw new APIError('request_failed',502);
+        const session=await api('session',{signal:null});
+        if(session.username!==body.username||!Number.isFinite(session.expiresAt)||session.expiresAt<=0)throw new APIError('request_failed',502,'管理账号已返回保存回执，但新会话读回未匹配。');
+        for(const name of ['current','password','confirm'])form.elements[name].value='';
+        if(generation===state.version){
+          state.sessionUsername=session.username;
+          const expiry=$('[data-session-expiry]');if(expiry)expiry.textContent=date(session.expiresAt);
+          const info=$('[data-account-security] p');if(info)info.textContent='管理账号已更新，新会话已核验；其他设备需重新登录。';
+        }
+        if(ownsDialog(form))closeDialog();
+        toast('管理账号已更新，新会话已从服务端核验。');
+      });
+    };
   }
   document.addEventListener('keydown',e=>{const row=e.target.closest('.selection-row');if(!row||!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;const rows=[...row.closest('[role=listbox]').querySelectorAll('.selection-row')],i=rows.indexOf(row),next=e.key==='Home'?0:e.key==='End'?rows.length-1:Math.max(0,Math.min(rows.length-1,i+(e.key==='ArrowDown'?1:-1)));e.preventDefault();if(row.dataset.action==='select-model-group')selectModelGroup(next,false);else return;rows[next].focus();});
   const renderers={overview,providers:services,accounts,models:modelPage,tasks,schedules:tasks,runs:tasks,usage,logs,keys:keyPage,migration,settings};
-  // 原地刷新当前页：重跑本页渲染器，不进入 navigate 的整页加载态。
-  //
-  // 之前这里清空 providers 再走 navigate()，于是点一次「运行」或「检查更新」
-  // 都会把整页换成「正在读取工作区…」再重画——视觉上就是页面被刷新了一遍。
-  // 数据本来就要重取，但页面骨架不该消失。
-  async function reload() {state.pollStarted=0;try{await providers();await renderers[state.route]();$('#view').dataset.loadState='ready';}catch(e){fail(e);}}
+  async function renderCurrent(generation,refreshProviders=false,showLoading=true){
+    const render=renderers[state.route];
+    if(showLoading)showRouteLoading();
+    try{
+      await providers(refreshProviders);
+      if(generation!==state.version)return;
+      await render();
+      finishRouteRender(generation);
+    }catch(e){if(generation===state.version)fail(e);}
+  }
+  async function reload(refreshProviders=false) {
+    state.pollStarted=0;
+    await renderCurrent(begin(),refreshProviders,false);
+  }
   async function action(element) {
     const name=element.dataset.action;
     // 组详情里的行内动作用 data-task-index 指回扁平任务数组；
@@ -1087,7 +1526,7 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='select-model-group'){selectModelGroup(index);return;}
     if(name==='model-back'||name==='task-back'){const kind=name.split('-')[0];$('#'+kind+'-browser').classList.remove('detail-open');$('#'+kind+'-browser [aria-selected=true]')?.focus();return;}
     if(name==='close'){closeDialog();return;}
-    if(name==='reload'){await reload();return;}
+    if(name==='reload'){await reload(['providers','overview'].includes(state.route));return;}
     if(name==='theme'){toggleTheme();return;}
     if(name==='provider-models' || name==='account-models'){state.modelProvider=element.dataset.provider;state.modelAccount=element.dataset.account || '';state.modelOffset=0;location.hash='models';return;}
     if(name==='provider-accounts'){state.accountProvider=element.dataset.provider;location.hash='accounts';return;}
@@ -1100,8 +1539,29 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
       return;
     }
     if(name==='toggle-account'){
-      const a=state.accountRows[index],provider=element.dataset.provider;openDialog(a.enabled?'停用账号':'启用账号',`<form id="account-toggle-form" class="form"><p>账号 <code>${esc(a.id)}</code></p><p class="muted">${a.enabled?'停用后不再用于后续目录请求与任务。正在进行的操作应在执行记录中单独核验。':'启用后该账号可再次用于目录读取和任务。'}</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认${a.enabled?'停用':'启用'}</button></div></form>`);
-      $('#account-toggle-form').onsubmit=e=>{e.preventDefault();const modern=state.providers.find(p=>p.id===provider)?.catalog_scope==='account';mutate('account-toggle',modern?'workbench/account/toggle':'account/toggle',modern?{id:a.id,enabled:!a.enabled,revision:a.revision}:{uid:a.id,disabled:a.enabled},async()=>{const updated=(await accountsFor(provider)).find(x=>x.id===a.id);if(!updated||updated.enabled===a.enabled)throw new APIError('request_failed',502);closeDialog();toast('账号状态已从服务端核验。');await reload();});};return;
+      const a=state.accountRows[index],provider=element.dataset.provider,generation=state.version;
+      if(!a)return;
+      const row=element.closest('tr'),accountID=a.id,targetEnabled=!a.enabled,revision=a.revision;
+      const modern=state.providers.find(p=>p.id===provider)?.catalog_scope==='account';
+      openDialog(targetEnabled?'启用账号':'停用账号',`<form id="account-toggle-form" class="form"><p>账号 <code>${esc(accountID)}</code></p><p class="muted">${targetEnabled?'启用后该账号可再次用于目录读取和任务。':'停用后不再用于后续目录请求与任务。正在进行的操作仍需单独核验。'}</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','返回')}<button type="submit" class="primary">确认${targetEnabled?'启用':'停用'}</button></div></form>`);
+      const form=$('#account-toggle-form');
+      form.onsubmit=e=>{
+        e.preventDefault();
+        mutate('account-toggle',modern?'workbench/account/toggle':'account/toggle',modern?{id:accountID,enabled:targetEnabled,revision}:{uid:accountID,disabled:!targetEnabled},async()=>{
+          const updated=(await accountsFor(provider,{signal:null})).find(x=>x.id===accountID);
+          if(!updated||updated.enabled!==targetEnabled)throw new APIError('request_failed',502);
+          state.providersDirty=true;
+          if(generation===state.version){
+            Object.assign(a,updated);
+            const control=$(`#account-list [data-action="toggle-account"][data-index="${index}"]`);
+            const status=control?.closest('tr').querySelector('[data-account-status]');
+            if(status)status.innerHTML=accountStatus(a);
+            if(control)control.textContent=a.enabled?'停用':'启用';
+          }
+          if(form.isConnected&&$('#dialog').open){closeDialog();if(row?.isConnected)element.focus({preventScroll:true});}
+          toast('账号状态已从服务端核验。');
+        });
+      };return;
     }
     if(name==='model-refresh'){await loadModels(true);return;}
     if(name==='model-capability'){return;}
@@ -1113,10 +1573,14 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='open-runs'){location.hash='tasks';return;}
     if(name==='task-log'){await openPlanLog(state.planRows?.[Number(element.dataset.planIndex)]);return;}
     if(name==='manual-plan'){const row=state.planRows?.[Number(element.dataset.planIndex)];const g=row?.groups?.[0];if(g)openDialog('所需人工操作',`<h3>${esc(g.name)}</h3><p class="section-gap">${esc(g.description||'')}</p>${notice('请在对应官方服务完成要求的内容或操作。完成与奖励以服务端核验为准。','warn')}`);return;}
-    if(name==='run-plan'){const t=planRunTask(state.planRows?.[Number(element.dataset.planIndex)]);if(!t){toast('任务目录本轮不可用，无法确定执行账号；可先刷新。');return;}confirmRun(t);return;}
+    if(name==='run-plan'){
+      const row=state.planRows?.[Number(element.dataset.planIndex)],task=planRunTask(row);
+      if(!task){toast('任务目录本轮不可用，无法确定执行账号；可先刷新。');return;}
+      confirmRun(task,element);return;
+    }
     if(name==='edit-plan-time'){const row=state.planRows?.[Number(element.dataset.planIndex)];if(row)await openPlanEditor(row.plan);return;}
-    if(name==='review-submission'){openDialog('核对未确认的提交',`<form id="review-form" class="form"><p>请先检查执行记录和官方服务状态。解除保护不会重试或取消原请求。</p><label class="check"><input type="checkbox" required>我已核对上次提交，确认不会重复执行已有操作</label><div class="actions">${button('close','返回')}<button type="submit">解除提交保护</button></div></form>`);$('#review-form').onsubmit=e=>{e.preventDefault();sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();reload();};return;}
-    if(name==='toggle-schedule'){const s={...cleanSchedule(state.schedules[index]),enabled:!state.schedules[index].enabled};await mutate('schedule','workbench/schedule',s,async()=>{await verifySchedule(s);toast(s.enabled?'计划已启用。':'计划已停用。');await reload();});return;}
+    if(name==='review-submission'){openDialog('核对未确认的提交',`<form id="review-form" class="form"><p>请先检查任务日志和官方服务状态。解除保护不会重试或取消原请求。</p><label class="check"><input type="checkbox" required>我已核对上次提交，确认不会重复执行已有操作</label><div class="actions">${button('close','返回')}<button type="submit">解除提交保护</button></div></form>`);$('#review-form').onsubmit=e=>{e.preventDefault();sessionStorage.removeItem('loomgate.unconfirmedRun');closeDialog();paintTaskGuard();};return;}
+    if(name==='toggle-schedule'){await toggleSchedule(index,element);return;}
     if(name==='cancel-run'){const r=state.runs[index];await mutate('cancel-'+r.id,'workbench/cancel',{id:r.id},async data=>{toast(data.cancel_requested?'已发送取消请求，等待服务端确认。':'任务已结束或无法取消，请查看最新状态。');await reload();});return;}
     if(name==='run-detail'){const r=state.runs[index];openDialog('执行详情',`<h3>${esc(taskLabel(r.provider_id,'',r.task_key))}</h3><p class="muted">${esc(providerName(r.provider_id))} · ${esc(r.account_ids?.join('、')||'全部已启用账号')}</p><p class="small muted"><code>${esc(r.id)}</code></p><div class="section-gap">${badge(r.status)}</div>${r.status==='uncertain'?notice('上游操作结果尚未确认，请先核验服务端状态，不要重复执行。','warn'):''}${runDiscoveryIssues(r.discovery_issues)}<div class="section-gap">${r.steps?.length?(()=>{const columns=runStepColumns(r.steps),withTask=columns.length===4;return table(columns,r.steps.map(s=>runStepCells(s,withTask)));})():empty('尚无执行步骤','任务可能仍在等待派发。')}</div>`);return;}
     if(name==='copy-endpoint'){const value=element.dataset.value||'';try{await navigator.clipboard.writeText(value);toast('接入地址已复制。');}catch{const box=document.getElementById('endpoint-base');if(box){const range=document.createRange();range.selectNodeContents(box);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);}toast('已选中地址，请按 Ctrl+C 复制。');}return;}
@@ -1125,14 +1589,78 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='usage-range'){state.usageRange={from:element.dataset.from||'',to:element.dataset.to||''};await reload();return;}
     if(name==='usage-apply'){const from=document.getElementById('usage-from')?.value||'',to=document.getElementById('usage-to')?.value||'';if(from&&to&&from>to){toast('起始日期不能晚于结束日期。');return;}state.usageRange={from,to};await reload();return;}
     if(name==='usage-reset'){state.usageRange={from:'',to:''};await reload();return;}
-    if(name==='lan-settings'){const st=await api('state');if(!st?.lan)throw new APIError('request_failed',502);const lan=st.lan;openDialog('局域网访问',`<form id="lan-form" class="form"><p class="muted">这里修改的是配置文件中的监听地址与允许网段；保存成功后仍需重启服务，实际监听不会立即改变。</p><label class="check"><input type="checkbox" name="enabled" ${lan.enabled?'checked':''}>启用局域网访问</label><label>监听地址<input name="listen" value="${esc(lan.listen||'')}" readonly aria-readonly="true"></label><label>允许网段<input name="allow_cidrs" value="${esc(lan.allow_cidrs||'')}" placeholder="例如 192.168.1.0/24"></label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">保存</button></div></form>`);$('#lan-form').onsubmit=e=>{e.preventDefault();const form=new FormData(e.target);const want={enabled:form.get('enabled')==='on',allow_cidrs:String(form.get('allow_cidrs')||'').trim()};mutate('lan','lan',want,async data=>{if(data.ok===false)throw new APIError('request_failed',502);const saved=(await api('state'))?.lan;if(!saved||saved.enabled!==want.enabled||String(saved.allow_cidrs||'')!==want.allow_cidrs)throw new APIError('request_failed',502);closeDialog();toast((data.message||'设置已保存。')+' 已从服务端读回配置。');await reload();});};return;}
-    if(name==='loop-toggle'){const current=await api('features/reasoning-loop');if(current?.stop_only===undefined)throw new APIError('request_failed',502);const want=!current.stop_only;await mutate('loop','features/reasoning-loop',{stop_only:want},async()=>{const saved=await api('features/reasoning-loop');if(saved?.stop_only!==want)throw new APIError('request_failed',502);toast('重复推理保护已切换，并已从服务端读回。');await reload();});return;}
-    if(name==='update-check'){await mutate('update-check','update/check',{},async data=>{if(data.ok===false)throw new APIError('request_failed',502,typeof data.message==='string'?data.message:'');const status=data.status||{};toast('已检查更新：'+(status.message||status.state||'状态未变化')+'。');await reload();});return;}
+    if(name==='lan-settings'){await lanSettingsDialog(element);return;}
+    if(name==='loop-toggle'){
+      const card=element.closest('#setting-loop');
+      const want=element.dataset.stopOnly!=='true';
+      await mutate('loop','features/reasoning-loop',{stop_only:want},async()=>{
+        const saved=await api('features/reasoning-loop',{signal:null});
+        if(saved?.stop_only!==want)throw new APIError('request_failed',502);
+        if(card?.isConnected)paintLoopSetting(card,saved.stop_only);
+        toast('重复推理保护已从服务端核验。');
+      },element);return;
+    }
+    if(name==='update-status'){await readUpdateStatus($('#setting-update'),state.version);return;}
+    if(name==='update-apply'){await updateApplyDialog();return;}
+    if(name==='update-review'){await reviewUpdateIntent();return;}
+    if(name==='update-check'){
+      if(state.pending.has('runtime-update')||readUpdateIntent()){toast('有未核验的更新提交，请使用刷新状态。');return;}
+      const card=element.closest('#setting-update'),generation=state.version;
+      await mutate('update-check','update/check',{},async data=>{
+        if(!data.status&&data.ok!==false)throw new APIError('request_failed',502);
+        if(card?.isConnected)paintUpdateCard(card,data);
+        if(data.ok===false)throw new APIError('request_failed',400,typeof data.message==='string'?data.message:'更新检查失败。');
+        toast('已检查更新。');
+      },element,{allowNotOK:true,isCurrent:()=>card?.isConnected&&generation===state.version});return;
+    }
     if(name==='key-new'){await keyNewDialog();return;}
     if(name==='key-edit'){await keyEditDialog(element.dataset.id);return;}
-    if(name==='key-copy'){const id=element.dataset.id;await mutate('key-copy','keys/copy',{id},async data=>{if(!data.key)throw new APIError('request_failed',502,'服务端没有返回密钥。');openDialog('显示密钥',`<p>此密钥只在此刻显示。关闭后可再次点击「显示密钥」。</p><label>密钥<textarea readonly rows="3">${esc(String(data.key))}</textarea></label><div class="actions">${button('close','关闭')}</div>`);});return;}
-    if(name==='key-toggle'){const id=element.dataset.id,want=element.dataset.enabled!=='1';await mutate('key-toggle','keys/update',{id,enabled:want},async()=>{const saved=(await api('keys')).keys.find(k=>k.id===id);if(!saved||saved.enabled!==want)throw new APIError('request_failed',502);toast(want?'密钥已启用。':'密钥已停用。');await reload();});return;}
-    if(name==='key-delete'){const id=element.dataset.id;openDialog('删除 API 密钥',`<form id="key-delete-form" class="form"><p>删除后使用该密钥的客户端会立即收到鉴权失败，且不可恢复。</p><label class="check"><input type="checkbox" required>我确认要删除这把密钥</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="danger">删除</button></div></form>`);$('#key-delete-form').onsubmit=e=>{e.preventDefault();mutate('key-delete','keys/delete',{id},async()=>{if((await api('keys')).keys.some(k=>k.id===id))throw new APIError('request_failed',502);closeDialog();toast('密钥已删除，并从服务端读回。');await reload();});};return;}
+    if(name==='key-copy'){
+      const id=element.dataset.id;
+      openDialog('显示密钥',`<div data-key-reveal><p role="status">正在读取密钥；关闭或打开其他窗口后不会显示迟到的结果。</p><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}</div></div>`);
+      const owner=$('[data-key-reveal]');
+      await mutate('key-copy:'+id,'keys/copy',{id},async data=>{
+        if(!ownsDialog(owner))return;
+        if(!data.key)throw new APIError('request_failed',502,'服务端没有返回密钥。');
+        openDialog('显示密钥',`<p>此密钥只在此刻显示。关闭后可再次点击「显示密钥」。</p><label>密钥<textarea readonly rows="3"></textarea></label><div class="actions">${button('close','关闭')}</div>`);
+        $('#dialog-body textarea').value=String(data.key);
+      });return;
+    }
+    if(name==='key-toggle'){
+      const id=element.dataset.id,want=element.dataset.enabled!=='1';
+      const rows=[...document.querySelectorAll('[data-key-row]')],row=rows.find(candidate=>candidate.dataset.keyRow===id)?.closest('tr'),focused=document.activeElement===element;
+      await mutateKey(id,'keys/update',{id,enabled:want},async()=>{
+        const saved=keyList(await api('keys',{signal:null})).find(key=>key.id===id);
+        if(!saved||saved.enabled!==want)throw new APIError('request_failed',502);
+        state.keys=state.keys.map(key=>key.id===id?saved:key);
+        if(row?.isConnected){
+          row.querySelector('[data-key-enabled]').innerHTML=badge(saved.enabled?'ready':'disabled',saved.enabled?'启用':'停用');
+          const toggle=row.querySelector('[data-action="key-toggle"]');
+          if(toggle){toggle.dataset.enabled=saved.enabled?'1':'0';toggle.textContent=saved.enabled?'停用':'启用';}
+        }
+        if(focused&&element.isConnected)element.focus({preventScroll:true});
+        toast(want?'密钥已启用。':'密钥已停用。');
+      });return;
+    }
+    if(name==='key-delete'){
+      const id=element.dataset.id,row=keyRow(id),generation=state.version;
+      openDialog('删除 API 密钥',`<form id="key-delete-form" class="form"><p>删除后使用该密钥的客户端会立即收到鉴权失败，且不可恢复。</p><label class="check"><input type="checkbox" required>我确认要删除这把密钥</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="danger">删除</button></div></form>`);
+      const form=$('#key-delete-form');
+      form.onsubmit=e=>{
+        e.preventDefault();
+        mutateKey(id,'keys/delete',{id},async()=>{
+          if(keyList(await api('keys',{signal:null})).some(k=>k.id===id))throw new APIError('request_failed',502);
+          if(generation===state.version){
+            state.keys=state.keys.filter(k=>k.id!==id);
+            if(row?.isConnected)row.remove();
+            const list=$('#key-list');
+            if(list&&!state.keys.length)list.innerHTML=empty('还没有 API 密钥','创建密钥后才能调用模型；接入地址保持不变。');
+          }
+          if(ownsDialog(form)){closeDialog();$('#view [data-action=key-new]')?.focus({preventScroll:true});}
+          toast('密钥已删除，并从服务端读回。');
+        });
+      };return;
+    }
     if(name==='migration-check'){await reload();return;}
     if(name==='password')passwordDialog();
   }
@@ -1188,10 +1716,10 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
   $('#theme').onclick=toggleTheme;$('#dialog-close').onclick=closeDialog;$('#dialog').addEventListener('cancel',e=>{e.preventDefault();closeDialog();});
   // 未确认提交的保护条渲染在任务页上；对话框关闭时若保护仍在，刷新任务页让
   // 用户能看到「核对后解除」。重复关闭不会重复提交任何东西。
-  $('#dialog').addEventListener('close',()=>{if(state.route==='tasks'&&sessionStorage.getItem('loomgate.unconfirmedRun')&&!state.pending.has('run'))reload().catch(()=>{});});
+  $('#dialog').addEventListener('close',()=>{if(['tasks','schedules','runs'].includes(state.route))paintTaskGuard();});
   document.addEventListener('click',e=>{const target=e.target.closest('[data-action]');if(target && !target.disabled)action(target).catch(err=>{if(err.name!=='AbortError')toast(err instanceof APIError?err.message:'操作未完成，请刷新状态后重试。');});});
   $('#logout').onclick=()=>mutate('logout','auth/logout',{},async()=>location.replace('login'));
   const network=()=>{$('#connection').hidden=navigator.onLine;$('#connection').textContent='当前网络离线。页面中的数据可能已过期，恢复连接后请刷新。';};window.addEventListener('offline',network);window.addEventListener('online',network);network();
-  LoomConnections.init({api,esc,openDialog,toast,reload,providerName,accountConnected:f=>{state.accountProvider=f.provider;}});
+  LoomConnections.init({api,esc,openDialog,toast,reload,providerName,dialogRevision:()=>state.taskLogGeneration,accountConnected:f=>{state.accountProvider=f.provider;state.providersDirty=true;}});
   window.addEventListener('hashchange',navigate);window.addEventListener('pagehide',()=>{state.controller?.abort();clearTimeout(state.poll);LoomConnections.stop();});navigate();
 })();

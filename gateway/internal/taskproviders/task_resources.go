@@ -6,7 +6,9 @@ package taskproviders
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/taskengine"
@@ -41,15 +43,58 @@ type resourcesModule struct {
 }
 
 func (m *resourcesModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
-	r, e := m.up.TaskResources(ctx, a)
-	if e != nil {
-		return taskengine.Observation{}, e
+	if m.up == nil {
+		return taskengine.Observation{}, errors.New("resources_unavailable")
 	}
-	st, e := m.up.TaskStreak(ctx, a)
-	if e != nil {
-		return taskengine.Observation{}, e
+	parts := []string{}
+	failed := false
+	read := 0
+	if energy, err := m.up.TaskEnergy(ctx, a); err == nil {
+		read++
+		parts = append(parts, fmt.Sprintf("能量 %d", energy))
+		taskProgress(ctx, fmt.Sprintf("能量余额已读取：%d。", energy))
+	} else {
+		parts = append(parts, "能量未读取")
+		taskProgress(ctx, "能量接口未读取成功；继续读取其他资源。")
+		failed = true
 	}
-	return observation("done", fmt.Sprintf("能量 %d；抽奖机会 %d；可开 Buddy %d；单次上限 %d；连登 %d 天。只读查询，未消耗。", r.Energy, r.Chances, r.Quota.Affordable, r.Quota.MaxOpenCount, st.Streak.Days)), nil
+	if chances, err := m.up.TaskLotteryChances(ctx, a); err == nil {
+		read++
+		parts = append(parts, fmt.Sprintf("抽奖机会 %d", chances))
+		taskProgress(ctx, fmt.Sprintf("抽奖机会已读取：%d。", chances))
+	} else {
+		parts = append(parts, "抽奖机会未读取")
+		taskProgress(ctx, "抽奖机会未读取成功；继续读取其他资源。 ")
+		failed = true
+	}
+	if quota, err := m.up.TaskBuddyQuota(ctx, a); err == nil {
+		read++
+		parts = append(parts, fmt.Sprintf("可开 Buddy %d（单次上限 %d）", quota.Affordable, quota.MaxOpenCount))
+		taskProgress(ctx, fmt.Sprintf("Buddy 额度已读取：可开 %d，单次上限 %d。", quota.Affordable, quota.MaxOpenCount))
+	} else {
+		parts = append(parts, "Buddy 额度未读取")
+		taskProgress(ctx, "Buddy 额度未读取成功；保留其他已读取数据。")
+		failed = true
+	}
+	if streak, err := m.up.TaskStreak(ctx, a); err == nil {
+		read++
+		parts = append(parts, fmt.Sprintf("连登 %d 天", streak.Streak.Days))
+		taskProgress(ctx, fmt.Sprintf("连登状态已读取：%d 天。", streak.Streak.Days))
+	} else {
+		parts = append(parts, "连登状态未读取")
+		taskProgress(ctx, "连登状态未读取成功；保留其他已读取数据。")
+		failed = true
+	}
+	phase := "done"
+	if failed {
+		phase = "blocked"
+		parts = append(parts, "本次仅展示已成功读取字段；失败项保持未知。")
+	}
+	result := taskengine.Observation{Phase: phase, Summary: strings.Join(parts, "；")}
+	if read == 0 {
+		return result, errors.New("resources_unavailable")
+	}
+	return result, nil
 }
 
 func (m *resourcesModule) DiscoverState(ctx context.Context, a *auth.Auth) ([]ModuleTask, error) {

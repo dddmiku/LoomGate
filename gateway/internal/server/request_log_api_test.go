@@ -7,9 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"workbuddy2api/internal/accountvault"
+	"workbuddy2api/internal/inference"
+	"workbuddy2api/internal/providers/autoclaw"
 	"workbuddy2api/internal/requestlog"
 )
 
@@ -54,6 +58,45 @@ func facetsGet(t *testing.T, h *Handler, path string) (int, map[string]any) {
 // TestRequestFacetsListsAllKeysAndModels 下拉必须列出**全部**出现过的密钥与模型，
 // 而不是只列当前这一页的。2026-09-30 用户反馈「箭头点开什么都没有」——
 // 因为旧实现只从当前页 20 条里凑，首次加载前更是空的。
+func TestRequestHistoryProjectsLegacyAutoClawAccountIDs(t *testing.T) {
+	const phone = "13900002222"
+	vault, err := accountvault.Open(filepath.Join(t.TempDir(), "vault"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vault.Close()
+	provider := &autoclaw.Provider{Vault: vault}
+	store, err := requestlog.Open(filepath.Join(t.TempDir(), "requests.jsonl"), requestlog.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	record := requestlog.Record{RequestID: "fixture-request", Protocol: requestlog.ProtocolChat, Model: "autoclaw:zai_auto", StartedAt: now, FinishedAt: now, Status: requestlog.StatusSuccess, Attempts: []requestlog.Attempt{{Number: 1, AccountID: "autoclaw-" + phone, Model: "autoclaw:zai_auto", Status: requestlog.StatusSuccess}}, Decisions: []requestlog.Decision{{Attempt: 1, AccountID: "autoclaw-" + phone, BoundAccountID: "autoclaw-" + phone, ReasonCode: "fixture"}}}
+	if err := store.Append(record); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Requests: store, Inference: map[string]inference.Provider{"autoclaw": provider}})
+	for _, path := range []string{"/requests", "/requests/fixture-request"} {
+		code, body := facetsGet(t, h, path)
+		encoded, _ := json.Marshal(body)
+		if code != http.StatusOK || strings.Contains(string(encoded), phone) {
+			t.Fatalf("legacy identity leaked in %s", path)
+		}
+	}
+	code, body := facetsGet(t, h, "/requests/fixture-request")
+	if code != http.StatusOK {
+		t.Fatal("detail request unavailable")
+	}
+	recordJSON, _ := json.Marshal(body["record"])
+	if strings.Contains(string(recordJSON), "autoclaw-"+phone) {
+		t.Fatal("legacy identity was not projected from the detail")
+	}
+	if strings.Contains(string(recordJSON), "autoclaw-") == false {
+		t.Fatal("public identity lost its provider namespace")
+	}
+}
+
 func TestRequestFacetsListsAllKeysAndModels(t *testing.T) {
 	h := facetsFixture(t, []requestlog.Record{
 		facetsRecord("req_1", "key_a", "热情", "global:deepseek-v4.1-flash"),

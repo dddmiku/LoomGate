@@ -4158,7 +4158,7 @@ async function loadKeyModels(){
     KS.modelItems = (result && Array.isArray(result.items) && result.items.length)
       ? result.items
       : KS.models.map(function(id){ return {id:id}; });
-    // provider_errors 表示某个渠道的目录没读到。不显示它，
+    // provider_errors 表示某个渠道的目录没读到（如豆包超时）。不显示它，
     // 用户会把「这个渠道失败」当成「本来就没有这些模型」，甚至据此删掉已有
     // 绑定。只含 {provider,code}，不展示上游原文。
     KS.providerErrors = (result && Array.isArray(result.provider_errors)) ? result.provider_errors : [];
@@ -4238,7 +4238,7 @@ function renderModelPanel(){
   // 看不出是哪个渠道，也看不出「已有绑定仍然保留」。
   var providerErrors = Array.isArray(KS.providerErrors) ? KS.providerErrors : [];
   // 渠道显示名：只在这一处用，写成局部常量避免依赖 workspace.js 的加载顺序。
-  var providerLabel = {workbuddy:'WorkBuddy',trae:'Trae',autoclaw:'AutoClaw'};
+  var providerLabel = {workbuddy:'WorkBuddy',trae:'Trae',doubao:'豆包'};
   var errorNote = providerErrors.length
     ? '<div class="mempty" role="status">部分渠道目录暂不可用（' +
       esc(providerErrors.map(function(e){ return providerLabel[e.provider] || e.provider; }).join('、')) +
@@ -4653,8 +4653,8 @@ $('#keyForm').addEventListener('submit', async function(event){
   var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value), reasoning_loop_guard:$('#keyGuard').checked, global_fallback_to_cn:$('#keyGlobalFallback').checked};
   if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
   if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
-  // 单项上限与密钥库一致（256 字节）：完整模型名可能带 provider:mode:id 前缀，
-  // 很容易超过 64 字符。旧面板在这里按 64 拦，
+  // 单项上限与密钥库一致（256 字节）：豆包的完整模型名是
+  // doubao:<mode>:<上游 ID>，很容易超过 64 字符。旧面板在这里按 64 拦，
   // 而同一份绑定从新控制台/API 保存是成功的——同一份配置两个入口结论不同。
   if (body.models.some(function(item){return item.length > 256;})){keyFormError('单个模型名不能超过 256 个字符');$('#keyModels').focus();return;}
   // 绑定按完整模型名逐字比对，裸名一条也匹配不上（模型列表里没有裸名）。
@@ -5647,6 +5647,13 @@ function upDownBytes(n){
   return n === 0 ? '0 B' : upBytes(n);
 }
 
+// Go 的 time.Time 零值会序列化成 0001-01-01；只有可解析的时间才可作为
+// 构建、发布或检查证据，不能把零值当成「已是最新」。
+function validUpdateTime(value){
+  if (typeof value !== 'string' || !value.trim() || value.indexOf('0001-') === 0) return false;
+  return Number.isFinite(Date.parse(value));
+}
+
 function renderUpdate(){
   var r = UP.data, box = $('#updRows');
   if (!box) return;
@@ -5684,15 +5691,17 @@ function renderUpdate(){
   var busy = !!UP_BUSY[s.state];
   var current = s.current || '—';
   var commit = (s.commit && s.commit !== 'unknown') ? ' · ' + s.commit.slice(0, 7) : '';
-  var latest = s.latest_tag || (s.checked_at ? '已是最新' : '未检查');
+  var latest = s.latest_tag || (validUpdateTime(s.checked_at) ? '已是最新' : '未检查');
   var rows =
     mrow('当前版本', current + commit) +
-    mrow('构建时间', s.built_at && s.built_at !== 'unknown' ? fmtTime(s.built_at) : '—') +
+    mrow('构建时间', validUpdateTime(s.built_at) ? fmtTime(s.built_at) : '未记录') +
+    mrow('部署时间', validUpdateTime(s.deployed_at) ? fmtTime(s.deployed_at) : '未记录') +
+    mrow('远端发布时间', validUpdateTime(s.latest_at) ? fmtTime(s.latest_at) : '未记录') +
     mrow('远端最新', latest, s.update_ready ? 'w' : 'ok') +
     mrow('更新状态', UP_STATE[s.state] ? UP_STATE[s.state].t : (s.state || '—'),
       (UP_STATE[s.state] || {}).cls || '') +
     mrow('下载包', s.asset_name ? (s.asset_name + ' · ' + upBytes(s.asset_size)) : '—') +
-    mrow('上次检查', s.checked_at ? relTime(s.checked_at) : '—') +
+    mrow('上次成功检查', validUpdateTime(s.checked_at) ? relTime(s.checked_at) : '未记录') +
     mrow('仓库', s.repo || '—');
   box.innerHTML = rows;
   $('#updState').innerHTML = upState(s.state);
@@ -5701,14 +5710,14 @@ function renderUpdate(){
   //   - 检查过且 update_ready=true → 可点；
   //   - 还没检查过（latest_tag 为空且无 checked_at）→ 可点，网关会先查一次远端；
   //   - 检查过但没有可升级版本（已是最新）→ 禁用，否则点下去会把服务白重启一遍。
-  var checked = !!s.checked_at;
+  var checked = validUpdateTime(s.checked_at);
   var canApply = !busy && (!checked || !!s.update_ready);
   $('#btnUpdApply').disabled = !canApply;
   var hint;
   if (s.state === 'failed') hint = s.last_error || '更新失败';
   else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
-  else if (s.checked_at) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
+  else if (checked) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
   else hint = '点「立即更新」会先检查远端版本';
   $('#updHint').textContent = hint;
   renderUpdateModal(s);
@@ -5877,7 +5886,7 @@ async function actUpdateCheck(){
 async function actUpdateApply(){
   var s = (UP.data && UP.data.status) || {};
   // 兜底：按钮已按 update_ready 禁用，这里再挡一次，避免通过其它入口触发无意义的重启。
-  if (s.checked_at && !s.update_ready){
+  if (validUpdateTime(s.checked_at) && !s.update_ready){
     toast('已是最新版本（' + (s.latest_tag || s.current || '') + '），无需更新', 'ok');
     return;
   }
@@ -6053,7 +6062,7 @@ document.addEventListener('change', function(e){
 
 "use strict";
 var LW={providers:[],schedules:[],runs:[],tasks:[],models:[],offset:0,epoch:0};
-var LP={workbuddy:'WorkBuddy',trae:'Trae',autoclaw:'AutoClaw'};
+var LP={workbuddy:'WorkBuddy',trae:'Trae',doubao:'豆包'};
 var LSTATUS={queued:'排队中',running:'执行中',succeeded:'已核实完成',failed:'失败',canceled:'已取消',uncertain:'结果待核实',skipped:'已跳过',manual_action:'需要人工操作'};
 function loomEmpty(title,text){return '<div class="loom-state"><strong>'+esc(title)+'</strong>'+esc(text)+'</div>';}
 function loomNotice(id,text){var el=$('#'+id);if(el)el.innerHTML=text?'<div class="loom-notice" role="alert">'+esc(text)+'</div>':'';}

@@ -441,25 +441,37 @@ func SaveProfile(vault *accountvault.Vault) func(context.Context, []byte) (strin
 		if json.Unmarshal(profile, &s) != nil || s.Phone == "" {
 			return "", errors.New("autoclaw_profile_invalid")
 		}
-		id := "autoclaw-" + digits(s.Phone)
-		// Reuse the existing row so re-login updates instead of duplicating.
+		// Keep physical legacy rows for compatibility, but never return their
+		// phone-bearing IDs to the login view or the account catalog.
+		phoneDigits := digits(s.Phone)
+		if !isPhone(phoneDigits) {
+			return "", errors.New("autoclaw_profile_invalid")
+		}
+		opaqueID := vault.OpaqueID("autoclaw", phoneDigits)
+		if opaqueID == "" {
+			return "", errors.New("autoclaw_vault_unavailable")
+		}
+		legacyID := "autoclaw-" + phoneDigits
 		var revision uint64
+		id := opaqueID
 		rows, err := vault.List()
 		if err != nil {
 			return "", err
 		}
 		for _, a := range rows {
-			if a.ID == id {
-				if a.Provider != "autoclaw" {
-					return "", errors.New("account_provider_conflict")
-				}
-				revision = a.Revision
+			if a.ID != opaqueID && a.ID != legacyID {
+				continue
 			}
+			if a.Provider != "autoclaw" {
+				return "", errors.New("account_provider_conflict")
+			}
+			id, revision = a.ID, a.Revision
+			break
 		}
 		if _, err := vault.Put(accountvault.Account{ID: id, Provider: "autoclaw", Enabled: true}, profile, revision); err != nil {
 			return "", err
 		}
-		return id, nil
+		return opaqueID, nil
 	}
 }
 

@@ -52,6 +52,10 @@ type Status struct {
 	Current           string    `json:"current"`
 	Commit            string    `json:"commit"`
 	BuiltAt           string    `json:"built_at"`
+	// DeployedAt 是当前运行文件在本机的落盘时间（RFC3339）。它不是构建时间：
+	// 手动替换、完整运行包解压或热更新提交 current 指针时，文件 mtime 会更新，
+	// 运维据此判断「这个进程是什么时候换上的」。无法读取时为 null，不猜。
+	DeployedAt *time.Time `json:"deployed_at,omitempty"`
 	Repo              string    `json:"repo"`
 	Dir               string    `json:"dir"`
 	State             State     `json:"state"`
@@ -513,8 +517,7 @@ func writeCurrentPointer(dir, binaryPath string) error {
 }
 
 // CurrentBinary 返回 current 指针指向的二进制（不存在时返回空串）。
-func CurrentBinary(dir string) string {
-	// #nosec G304 -- current 指针位于更新目录，非请求输入
+func CurrentBinary(dir string) string {	// #nosec G304 -- current 指针位于更新目录，非请求输入
 	raw, err := os.ReadFile(filepath.Join(dir, "current"))
 	if err != nil {
 		return ""
@@ -530,6 +533,32 @@ func CurrentBinary(dir string) string {
 	return path
 }
 
+// runningBinaryTime 返回当前进程可执行文件的落盘修改时间。
+//
+// 为什么不复用 version.BuiltAt：那是**构建**时的编译时间，热更新或手工部署
+// 只替换文件，构建时间不会变。运维问「什么时候更新的」指的是这份文件何时
+// 被放上这台机器，所以读 /proc/self/exe（或 os.Executable）的 mtime。
+// 无法读取时返回 nil（JSON 中省略），不编造时间。
+func runningBinaryTime() *time.Time {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	info, err := os.Stat(exe)
+	if err != nil || info.IsDir() {
+		return nil
+	}
+	at := info.ModTime().UTC()
+	// 零值或明显无效的时间不展示；文件系统时间早于 2000 年说明来源不可信。
+	if at.IsZero() || at.Year() < 2000 {
+		return nil
+	}
+	return &at
+}
+
 func (m *Manager) statusLocked() Status {
 	available, reason := m.availabilityLocked()
 	return Status{
@@ -539,6 +568,7 @@ func (m *Manager) statusLocked() Status {
 		Current:           version.Version,
 		Commit:            version.Commit,
 		BuiltAt:           version.BuiltAt,
+		DeployedAt:        runningBinaryTime(),
 		Repo:              m.client.Repo,
 		Dir:               m.opts.Dir,
 		State:             m.state,

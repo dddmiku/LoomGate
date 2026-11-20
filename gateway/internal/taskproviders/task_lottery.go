@@ -45,13 +45,9 @@ func (m *lotteryModule) inspectRead(ctx context.Context, a *auth.Auth) (taskengi
 	if a.Realm() != "cn" || m.up == nil {
 		return taskengine.Observation{}, errors.New("lottery_unavailable")
 	}
-	resources, err := m.up.TaskResources(ctx, a)
+	chances, err := m.up.TaskLotteryChances(ctx, a)
 	if err != nil {
 		return taskengine.Observation{}, err
-	}
-	chances := resources.Chances
-	if chances < 0 {
-		return taskengine.Observation{}, errors.New("lottery_state_invalid")
 	}
 	if chances == 0 {
 		// No submission happened. Returning done here would persist a false
@@ -106,20 +102,20 @@ func (m *lotteryModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.
 		_ = m.finishSpend(a, journal, rev, "unknown", "抽奖响应缺少奖品回执，保留待核验，不重试。", journal.Before)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "抽奖响应缺少可绑定奖品，保留待核验，不重试。")), errors.New("lottery_receipt_missing")
 	}
-	resources, readErr := m.up.TaskResources(ctx, a)
+	chances, readErr := m.up.TaskLotteryChances(ctx, a)
 	if readErr != nil {
 		_ = m.finishSpend(a, journal, rev, "unknown", "抽奖已返回奖品但机会余额未能回读，保留待核验。", journal.Before)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "抽奖已返回奖品但机会余额未能回读，保留待核验。")), readErr
 	}
-	if resources.Chances >= journal.Before {
-		_ = m.finishSpend(a, journal, rev, "unknown", "抽奖有奖品回执但机会余额未减少，保留待核验。", resources.Chances)
+	if chances >= journal.Before {
+		_ = m.finishSpend(a, journal, rev, "unknown", "抽奖有奖品回执但机会余额未减少，保留待核验。", chances)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "抽奖有奖品回执但机会余额未减少，保留待核验。")), errors.New("lottery_state_unconfirmed")
 	}
 	summary := "官方返回抽奖结果：" + firstNonEmpty(result.PrizeName, result.PrizeCode)
 	if result.PrizeType == "physical" {
 		summary += "（实物奖，需到官方成长中心填写收件信息）"
 	}
-	if err = m.finishSpend(a, journal, rev, "accepted", summary, resources.Chances); err != nil {
+	if err = m.finishSpend(a, journal, rev, "accepted", summary, chances); err != nil {
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "抽奖已成功但结果未能安全保存，保留待核验。")), err
 	}
 	return taskengine.Accepted(t, taskengine.StageExecute, taskengine.Observation{Phase: "done", Summary: summary}), nil

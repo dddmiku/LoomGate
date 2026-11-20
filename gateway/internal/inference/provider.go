@@ -18,20 +18,16 @@ type Model struct {
 }
 type Result struct {
 	Text, AccountRef, RequestDigest   string
+	Reasoning                         string // Buffered reasoning, separate from the answer.
 	Attempted, Acknowledged, Complete bool
 	Events, Attempts                  int
-	// Missing usage remains unknown; providers must not estimate billed tokens.
-	//
-	// UsageReported says the upstream told us the counts; the counts themselves
-	// live below. A provider that reports nothing must leave all three at zero
-	// and UsageReported false, so the log shows "unknown" rather than a
-	// fabricated 0.
-	UsageReported   bool
-	PromptTokens    int
-	CompletionTokens int
-	CachedTokens    int
-	AttemptRecords  []Attempt
-	ConversationRef string
+	Usage                             TokenUsage
+	UsageReported                     bool
+	PromptTokens                      int
+	CompletionTokens                  int
+	CachedTokens                      int
+	AttemptRecords                    []Attempt
+	ConversationRef                   string
 	// FinishReason is the upstream's own termination cause (stop, length,
 	// content_filter, tool_calls). Empty means the provider does not report
 	// one, in which case the caller falls back to "stop".
@@ -42,7 +38,7 @@ type Result struct {
 	// MessageID is private attribution metadata for a bound work task. It must
 	// never appear in a public provider response.
 	MessageID string `json:"-"`
-	Recovery        []byte `json:"-"`
+	Recovery  []byte `json:"-"`
 }
 
 // Message is one conversation turn.
@@ -59,10 +55,10 @@ type Message struct {
 
 // ToolCall is one requested function invocation, in OpenAI shape.
 type ToolCall struct {
-	ID        string           `json:"id"`
-	Type      string           `json:"type"`
-	Function  ToolCallFunction `json:"function"`
-	Index     *int             `json:"index,omitempty"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+	Index    *int             `json:"index,omitempty"`
 }
 
 // ToolCallFunction carries the name and the JSON-encoded arguments.
@@ -137,10 +133,27 @@ type ToolCapableProvider interface {
 	ToolProvider
 	CompleteDialogueTools(context.Context, Dialogue, func(string) error, func(string) error, func(ToolCallDelta) error) (Result, error)
 }
+
+// TokenUsage preserves the difference between an omitted metric and a reported zero.
+type TokenUsage struct {
+	Prompt, Completion, Cached *int
+}
+
+func (u TokenUsage) Reported() bool {
+	return u.Prompt != nil || u.Completion != nil || u.Cached != nil
+}
+
+func (u TokenUsage) Complete() bool { return u.Prompt != nil && u.Completion != nil }
+
 type Attempt struct {
+	// AccountRef identifies the provider account used for this upstream call.
+	AccountRef            string
 	StartedAt, FinishedAt time.Time
-	HTTPStatus            int
-	ErrorCode             string
+	// HTTPStatus is zero if no response headers arrived.
+	HTTPStatus   int
+	ErrorCode    string
+	Usage        TokenUsage
+	FinishReason string
 }
 
 func (Result) String() string   { return "inference.Result[redacted]" }

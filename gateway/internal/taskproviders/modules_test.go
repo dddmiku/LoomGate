@@ -3,6 +3,7 @@ package taskproviders
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,8 @@ type businessFixture struct {
 	mu                                                                                                      sync.Mutex
 	counts                                                                                                  map[string]int
 	checked, claimed, accepted, notAccepted, workDone, rejectAccept, failGrowth, brokenBalance, slowBalance bool
+	claimMalformed                                                                                          bool
+	claimCredit, claimEnergy                                                                                int
 }
 
 func (f *businessFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -91,8 +94,13 @@ func (f *businessFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case "/activity/growth/tasks/synthetic-reward/claim":
 		f.mu.Lock()
 		f.claimed = true
+		malformed, credit, energy := f.claimMalformed, f.claimCredit, f.claimEnergy
 		f.mu.Unlock()
-		data = map[string]any{}
+		if malformed {
+			data = map[string]any{}
+		} else {
+			data = map[string]any{"credit": credit, "energy": energy, "already_claimed": false}
+		}
 	case "/v2/billing/meter/checkin-activity-status":
 		data = map[string]any{"today_checked_in": checked, "active": true}
 	case "/v2/billing/meter/daily-checkin":
@@ -199,6 +207,58 @@ func TestBalanceIsIndependentScopedReadAndUpdatesPool(t *testing.T) {
 		t.Fatalf("balance performed signin or extra fetch: %v", f.counts)
 	}
 }
+func TestWorkBuddyGrowthPacingIsGlobalAndCancelable(t *testing.T) {
+	a, _, p := setupModules(t)
+	clock := time.Date(2099, 1, 2, 0, 0, 0, 0, time.UTC)
+	a.pacingNow = func() time.Time { return clock }
+	waits := []time.Duration{}
+	a.pacingWait = func(ctx context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		clock = clock.Add(delay)
+		return nil
+	}
+	secondRaw, _ := json.Marshal(map[string]any{"uid": "cn-second", "realm": "cn", "domain": "copilot.tencent.com", "accessToken": "synthetic-only"})
+	second, err := auth.Parse(secondRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Add(second)
+	firstTask := taskengine.Task{Definition: taskengine.Definition{ProviderID: "workbuddy", Key: "growth/fixture"}, Target: taskengine.Target{AccountID: "cn-fixture"}}
+	secondTask := firstTask
+	secondTask.AccountID = "cn-second"
+	release, err := a.AcquireTask(context.Background(), firstTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err = a.AcquireTask(ctx, secondTask); !errors.Is(err, context.Canceled) {
+		t.Fatal("paced queue ignored cancellation")
+	}
+	waits = nil
+	release, err = a.AcquireTask(context.Background(), secondTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if len(waits) != 1 || waits[0] != 800*time.Millisecond {
+		t.Fatal("different WorkBuddy accounts were admitted without the exact pacing gap")
+	}
+	waits = nil
+	release, err = a.AcquireTask(context.Background(), secondTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if len(waits) != 0 {
+		t.Fatal("same-account subtask incorrectly paid another account gap")
+	}
+}
+
 func TestWildcardContinuesModulesButPersistsPartialFailure(t *testing.T) {
 	a, f, p := setupModules(t)
 	f.failGrowth = true
@@ -310,6 +370,7 @@ func TestGrowthAcceptStartsTrackingButDoesNotClaimUnfinishedWork(t *testing.T) {
 
 func TestGrowthClaimRequiresServerCompletionAndVerify(t *testing.T) {
 	a, f, _ := setupModules(t)
+	f.claimCredit, f.claimEnergy = 37, 2
 	e, _ := taskengine.Open(taskengine.Options{Path: filepath.Join(t.TempDir(), "tasks.json"), PollMin: time.Millisecond, PollMax: time.Millisecond})
 	defer e.Close()
 	e.Register("workbuddy", a)
@@ -322,6 +383,18 @@ func TestGrowthClaimRequiresServerCompletionAndVerify(t *testing.T) {
 		if run.Status != taskengine.StatusSucceeded {
 			t.Fatalf("reward readback failed: %s", run.Status)
 		}
+		if i == 0 {
+			log, err := e.TaskLogFor("workbuddy", "growth/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := strings.Join(log.Lines, "\n")
+			for _, want := range []string{"合成任务", "37 积分", "2 能量"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("actual award output missing %q: %s", want, text)
+				}
+			}
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -329,6 +402,34 @@ func TestGrowthClaimRequiresServerCompletionAndVerify(t *testing.T) {
 		t.Fatal("already claimed reward replayed")
 	}
 }
+func TestGrowthClaimReceiptMissingKeepsUnknownAndDoesNotRetry(t *testing.T) {
+	a, f, _ := setupModules(t)
+	f.claimMalformed = true
+	e, err := taskengine.Open(taskengine.Options{Path: filepath.Join(t.TempDir(), "tasks.json"), PollMin: time.Millisecond, PollMax: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err = e.Register("workbuddy", a); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.Submit(taskengine.Request{ProviderID: "workbuddy", TaskKey: "growth/synthetic-reward", AccountIDs: []string{"cn-fixture"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := waitModuleRun(t, e, r.ID)
+	if run.Status != taskengine.StatusUncertain {
+		t.Fatalf("missing receipt reported %s", run.Status)
+	}
+	if f.counts["/activity/growth/tasks/synthetic-reward/claim"] != 1 {
+		t.Fatal("unconfirmed reward claim was repeated")
+	}
+	log, err := e.TaskLogFor("workbuddy", "growth/")
+	if err != nil || !strings.Contains(strings.Join(log.Lines, "\n"), "合成任务") {
+		t.Fatal("unknown claim log lost its discovered task name")
+	}
+}
+
 func TestBalanceMalformedCancellationDisabledAndForeignScope(t *testing.T) {
 	a, f, p := setupModules(t)
 	p.SetCreditsDetailed("cn-fixture", 777, 7)

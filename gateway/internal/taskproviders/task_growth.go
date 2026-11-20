@@ -32,7 +32,8 @@ func newGrowthModule(a *Accounts) (Module, error) {
 				Stages:      []taskengine.Stage{taskengine.StageInspect, taskengine.StageClaim, taskengine.StageVerify},
 			},
 		},
-		up: a.Upstream,
+		up:    a.Upstream,
+		owner: a,
 	}, nil
 }
 
@@ -40,7 +41,15 @@ var growthPlan = &DefaultPlan{ID: "legacy-growth", TaskKey: "growth/", Hours: []
 
 type growthModule struct {
 	moduleBase
-	up *upstream.Client
+	up    *upstream.Client
+	owner *Accounts
+}
+
+func (m *growthModule) AcquireTask(ctx context.Context, a *auth.Auth, t taskengine.Task) (func(), error) {
+	if m.owner == nil {
+		return func() {}, nil
+	}
+	return m.owner.acquireLegacyAccountPacing(ctx, t.AccountID)
 }
 
 func (m *growthModule) Discover(ctx context.Context, a *auth.Auth) ([]taskengine.Definition, error) {
@@ -100,6 +109,7 @@ func growthCode(t taskengine.Task) (string, bool) {
 
 func (m *growthModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
 	code, accept := growthCode(t)
+	taskProgress(ctx, "正在从官方成长目录读取任务「"+strings.TrimSpace(t.Name)+"」。")
 	items, err := m.up.TaskCatalog(ctx, a)
 	if err != nil {
 		return taskengine.Observation{}, err
@@ -109,10 +119,15 @@ func (m *growthModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.T
 			continue
 		}
 		if accept {
-			return growthAcceptState(x), nil
+			state := growthAcceptState(x)
+			taskProgress(ctx, state.Summary)
+			return state, nil
 		}
-		return growthClaimState(x), nil
+		state := growthClaimState(x)
+		taskProgress(ctx, state.Summary)
+		return state, nil
 	}
+	taskProgress(ctx, "该任务本轮不在官方动态目录中。")
 	return taskengine.Observation{Phase: "blocked", Summary: "该任务已不在官方目录。"}, nil
 }
 
@@ -162,8 +177,10 @@ func (m *growthModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.T
 	if err != nil || current.Phase != "ready" {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, current), err
 	}
+	taskProgress(ctx, "正在提交官方成长任务接单：「"+strings.TrimSpace(t.Name)+"」。")
 	results, err := m.up.TaskGrowthAccept(ctx, a, []string{code})
 	if err != nil {
+		taskProgress(ctx, "接单响应未确认；已保留待核验，不会重放。")
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "接单结果未知，保留待核验，不重复接单。")), err
 	}
 	status := results[code]
@@ -184,8 +201,20 @@ func (m *growthModule) Claim(ctx context.Context, a *auth.Auth, t taskengine.Tas
 	if err != nil || current.Phase != "claimable" {
 		return taskengine.NotSubmitted(t, taskengine.StageClaim, current), err
 	}
-	err = m.up.TaskClaim(ctx, a, code)
-	return taskengine.UnknownAction(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending"}), err
+	taskProgress(ctx, "正在领取已达标的官方奖励：「"+strings.TrimSpace(t.Name)+"」。")
+	result, err := m.up.TaskClaim(ctx, a, code)
+	if err != nil {
+		taskProgress(ctx, "领取回执未确认；保留待核验，不重复领取。")
+		return taskengine.UnknownAction(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending", Summary: "官方领取已提交，回执未确认；保留待核验，不重复领取。"}), err
+	}
+	if result.AlreadyClaimed {
+		summary := "官方确认该任务此前已领取，等待目录状态复核。"
+		taskProgress(ctx, summary)
+		return taskengine.Accepted(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending", Summary: summary}), nil
+	}
+	summary := fmt.Sprintf("官方确认已领取「%s」：+%d 积分、+%d 能量。", strings.TrimSpace(t.Name), result.Credit, result.Energy)
+	taskProgress(ctx, summary)
+	return taskengine.Accepted(t, taskengine.StageClaim, taskengine.Observation{Phase: "pending", Summary: summary}), nil
 }
 
 func (m *growthModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {

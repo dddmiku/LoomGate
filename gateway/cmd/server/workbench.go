@@ -189,7 +189,7 @@ func openWorkbenchWithBuiltinSchedules(stateDir string, p *pool.Pool, up *upstre
 	if err != nil {
 		return nil, nil, err
 	}
-	count, importErr := workbench.engine.ImportDefaultSchedulesOnce("loomgate-builtin-v1", taskproviders.BuiltinSchedules())
+	count, importErr := workbench.engine.ImportDefaultSchedulesOnce("loomgate-builtin-v2", taskproviders.BuiltinSchedules())
 	if importErr != nil {
 		log.Printf("[task-engine] 内置计划补齐失败（下次启动会重试）：%v", importErr)
 	} else if count > 0 {

@@ -9,7 +9,9 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(__dirname + '/app.js', 'utf8');
 function seam() {
-  const body = source.slice(source.indexOf('  const updateStateLabels ='), source.indexOf('  async function settings() {'));
+  // Include the small timestamp helpers used by updateView; the seam must execute
+  // the same zero-value filtering as the shipped console, not just copy the branch.
+  const body = source.slice(source.indexOf('  const date ='), source.indexOf('  async function settings() {'));
   const context = {};
   vm.createContext(context);
   vm.runInContext(body + '\nthis.updateView = updateView;', context);
@@ -92,6 +94,81 @@ test('checked with no update is 已是最新; never-checked is 尚未检查', ()
   }}));
   assert.equal(never.badgeText, '未检查');
   assert.ok(!never.lines.join('|').includes('已是最新'));
+});
+
+test('Go zero checked_at means never checked, not latest', () => {
+  const view = seam()(publicStatus({status: {
+    enabled: true, state: 'idle', checked_at: '0001-01-01T00:00:00Z',
+    signature_verification: true,
+  }}));
+  assert.equal(view.badgeText, '未检查');
+  assert.ok(!view.lines.some(line => line.startsWith('上次检查：')));
+});
+
+test('invalid checked_at is not a successful check', () => {
+  for (const checked_at of ['invalid', 'unknown', null, 0]) {
+    const view = seam()(publicStatus({status: {enabled: true, state: 'idle', checked_at}}));
+    assert.equal(view.badgeText, '未检查');
+  }
+});
+
+test('a signed ready release offers a confirmed apply action', () => {
+  const view = seam()(publicStatus({status: {
+    enabled: true, state: 'idle', signature_verification: true,
+    repo: 'owner/loomgate', current: 'v1.0.0', latest_tag: 'v1.0.2',
+    asset_name: 'fixture-runtime.zip', update_ready: true,
+  }}));
+  assert.equal(view.canApply, true);
+});
+
+test('unread, disabled and unsigned statuses never offer apply', () => {
+  for (const value of [undefined, {ok: false}, publicStatus(), publicStatus({status: {
+    enabled: true, state: 'idle', signature_verification: false,
+    repo: 'owner/loomgate', latest_tag: 'v1.0.2', asset_name: 'fixture.zip', update_ready: true,
+  }})]) assert.equal(seam()(value).canApply, false);
+});
+
+test('busy update states block both checking and applying', () => {
+  for (const state of ['checking', 'downloading', 'handover']) {
+    const view = seam()(publicStatus({status: {enabled: true, state, signature_verification: true,
+      latest_tag: 'v1.0.2', asset_name: 'fixture.zip', update_ready: true}}));
+    assert.equal(view.canCheck, false);
+    assert.equal(view.canApply, false);
+  }
+});
+
+test('apply requires a valid frozen tag, repository and selected asset', () => {
+  const ready = {enabled: true, state: 'idle', signature_verification: true,
+    repo: 'owner/loomgate', latest_tag: 'v1.0.2', asset_name: 'fixture.zip', update_ready: true};
+  for (const override of [{latest_tag: ''}, {latest_tag: '../bad'}, {repo: ''}, {asset_name: ''}]) {
+    assert.equal(seam()(publicStatus({status: {...ready, ...override}})).canApply, false);
+  }
+});
+
+test('build, deployment and remote publication timestamps are visible and distinct', () => {
+  const view = seam()(publicStatus({status: {
+    enabled: true, state: 'idle', built_at: '2026-11-20T00:00:00Z',
+    deployed_at: '2026-11-20T00:30:00Z',
+    latest_at: '2026-11-20T01:02:03Z', checked_at: '2026-11-20T02:03:04Z',
+  }}));
+  assert.ok(view.lines.some(line => line.startsWith('构建时间：')), view.lines.join('|'));
+  assert.ok(view.lines.some(line => line.startsWith('部署时间：')), view.lines.join('|'));
+  assert.ok(view.lines.some(line => line.startsWith('远端发布时间：')), view.lines.join('|'));
+  assert.ok(view.lines.some(line => line.startsWith('上次成功检查：')), view.lines.join('|'));
+});
+
+test('zero and invalid update timestamps are omitted instead of rendered as dates', () => {
+  const view = seam()(publicStatus({status: {
+    enabled: true, state: 'idle', built_at: '0001-01-01T00:00:00Z',
+    deployed_at: '0001-01-01T00:00:00Z', latest_at: 'invalid', checked_at: 'unknown',
+  }}));
+  assert.ok(!view.lines.some(line => /时间|检查/.test(line)), view.lines.join('|'));
+});
+
+test('download byte progress uses only observed values', () => {
+  const view = seam()(publicStatus({status: {enabled: true, state: 'downloading',
+    downloaded_bytes: 1048576, asset_size: 2097152}}));
+  assert.ok(view.lines.some(line => line.includes('已下载：1 / 2 MB')));
 });
 
 test('signature capability is stated from the real field on every branch', () => {

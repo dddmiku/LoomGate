@@ -41,6 +41,17 @@ func (moduleBase) Claim(_ context.Context, _ *auth.Auth, t taskengine.Task) (tas
 	return taskengine.NotSubmitted(t, taskengine.StageClaim, taskengine.Observation{}), errors.New("claim_unsupported")
 }
 
+// sequenceMarkerModule reserves a stable plan anchor. It is intentionally
+// omitted from the dynamic catalog and cannot itself submit a provider action.
+type sequenceMarkerModule struct{ moduleBase }
+
+func (*sequenceMarkerModule) Inspect(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error) {
+	return taskengine.Observation{Phase: "manual", Summary: "该计划仅通过引擎保存的 task_sequence 启动。"}, nil
+}
+func (m *sequenceMarkerModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
+	return m.Inspect(ctx, a, t)
+}
+
 // AccountsOptions carries the optional stores a task may need. Each task that
 // requires one checks for it and simply stays unregistered when it is absent,
 // so a deployment without the vault never advertises a task it cannot prove.
@@ -56,13 +67,16 @@ type AccountsOptions struct {
 }
 
 // DefaultPlan is the schedule a task ships with. Hours/minute are Asia/Shanghai.
-// StartEnabled is true only for the read-only balance refresh; every plan that
+// A sequence stays in one taskengine run and retains ordered per-stage evidence.
+// StartEnabled is true only for read-only balance refresh. Every plan that
 // writes upstream is imported paused so an upgrade never arms a write.
 type DefaultPlan struct {
 	ID            string
 	TaskKey       string
+	TaskSequence  []string
 	Hours         []int
 	Minute        int
+	OncePerDay    bool
 	StartEnabled  bool
 	LegacyEnabled *bool
 }
@@ -118,14 +132,11 @@ func BuiltinSchedules() []taskengine.Schedule {
 				continue
 			}
 			out = append(out, taskengine.Schedule{
-				ID:         entry.plan.ID,
-				ProviderID: entry.provider,
-				TaskKey:    entry.plan.TaskKey,
-				Enabled:    entry.plan.StartEnabled,
-				Hours:      append([]int{}, entry.plan.Hours...),
-				Minute:     entry.plan.Minute,
-				Timezone:   "Asia/Shanghai",
-				AccountIDs: []string{},
+				ID: entry.plan.ID, ProviderID: entry.provider, TaskKey: entry.plan.TaskKey,
+				TaskSequence: append([]string{}, entry.plan.TaskSequence...),
+				OncePerDay:   entry.plan.OncePerDay,
+				Enabled:      entry.plan.StartEnabled, Hours: append([]int{}, entry.plan.Hours...),
+				Minute: entry.plan.Minute, Timezone: "Asia/Shanghai", AccountIDs: []string{},
 				LegacyEnabled: func() *bool {
 					if entry.plan.LegacyEnabled == nil {
 						return nil

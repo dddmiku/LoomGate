@@ -1,16 +1,37 @@
 # 统一任务模块
 
-WorkBuddy/Trae 的任务由独立 provider 模块接入统一引擎。Phase14 增加旅行、动态兑换、日历补登、资源状态和补偿领取。**不是全部旧任务迁移完成**，生产仍使用旧发布版本。逐个旧入口及子步骤见[完整覆盖矩阵](legacy-task-coverage.md)。
+WorkBuddy/Trae 的任务由独立 provider 模块接入统一引擎。随包入口和计划来自本地任务文件，活动 ID、周期与奖励来自实时官方目录。任务日志采用运行中逐行追加、空闲时查询最近一轮的文本输出。逐个旧入口及子步骤见[完整覆盖矩阵](legacy-task-coverage.md)；未验证的真实活动与平台交付不因模块测试通过而变成已完成。
 
 ## 模块契约
 
 `internal/taskproviders.Module` 提供 `Spec`、`Discover`、`Inspect`、`Execute`、`Claim`、`Verify`。`ModuleSpec` 说明本模块负责的任务 key 或前缀、服务区域；注册时拒绝重叠路由。新增业务模块在组合处注册，不需要修改 taskengine 的核心执行/调度代码。
 
-公共任务定义放在 `definitions.json`：名称、说明、阶段与周期语义由该资源加载；动态成长任务的 ID、名称和奖励仍从上游响应取得。它不是允许任意 HTTP 请求的可执行配置文件。provider 业务操作保留在实现了接口的模块中，后续新任务可按同一契约扩展。
+公共任务定义、实现和默认计划分别位于各自的 `task_*.go` 文件；`workbuddy_modules.go` / `trae_modules.go` 只登记现有任务文件。删除任务就是删除对应文件和注册表一行，避免定义和实现脱节。动态成长任务的 ID、名称、周期与奖励仍从官方目录读取，随包入口不能把过期活动 ID 写死。
 
 `Accounts` 负责账号范围、启用状态、provider/realm 校验和模块路由。每次实际操作重新检查账号；执行单一任务时仅发现对应模块，不因其他模块目录故障阻断。发现模块有上下文期限，panic 和正常失败转换为固定错误码，不暴露上游原始错误。
 
 有完整状态读取的模块实现可选 `CatalogModule.DiscoverState`，同次返回定义和观测值，避免页面为了展示进度重复执行任务。其余模块继续使用原 `Discover`。模块目录最多256项；重复key和越界归属会变成独立发现错误。新增模块不修改核心调度器的任务表。
+
+## 任务输出日志
+
+新引擎通过 `taskengine.Output(ctx, line)` 给模块提供旧版脚本式的有界输出通道。输出会绑定当前 run、provider、账号、任务键、阶段并在阶段返回前持久化，因此面板查询 `/workbench/task/log?provider=<provider>&key=<key>` 时可以看到正在增长的当前执行日志；刷新或重启只读回已有行。输出仅是诊断信息，不是提交/领取成功证据，unknown、receipt、cursor 仍由动作持久化链独立决定。
+
+模块输出会脱敏凭据、URL、邮箱、手机号和控制字符，并受单行、单次、单 run 及全局上限约束；诊断截断不清除业务回执，日志保存失败也不允许重放已提交动作。账号和 provider 归属校验防止同名任务串日志。成长领奖日志包含动态任务名称及官方领取回执明确返回的积分/能量；没有回执字段时保持待核验，不补写目录预告奖励。资源页按能量、抽奖机会、Buddy 额度和连登分别读取，未读字段显示未知，不把失败当零。
+
+## 有序组合与兼容计划
+
+`Schedule`、`Request`、`Run` 的可选 `task_sequence` 保存有序的模块 selector，仍由同一个 taskengine 派发，不启动旧 scheduler。组合入口是：
+
+- `growth-sequence`：旅行 → 成长接单/可领取奖励 → 补登 → 连登兑换 → 抽奖 → Buddy 开箱 → 资源读取。每阶段重新发现，不冻结过期任务 ID，不伪造活动进度。
+- `checkin-balance-sequence`：`credential-preflight` → 适用区域的签到 → 余额读取。预检在凭据进入 10 分钟窗口时才委托既有加密 journal/CAS/attempt 续期；窗口外只读核对凭据文件。没有安全存储或文件版本不一致时不提交签到。普通 `keepalive` 的显式续期语义不变。
+
+每个账号按阶段顺序执行；每阶段的任务列表、当前位置与确认记录一起持久化。一个账号的 unknown 会保留该账号的原任务、周期和游标，阻断其后续写操作，其他账号继续。重新触发同一序列只在原 runID 核验未完成账号，已完成账号不重做。手动请求的明确账号列表只有与默认计划**此前冻结的完整范围相同**时，才可恢复其 unknown；不会用今天的账号池重新扩大旧范围。
+
+某一步明确失败或 unknown 后，后续独立读取可以继续，但只接受 `Idempotent && !SideEffect` 的任务且只调用 `Inspect`，从不调用 `Execute`/`Claim`、不清除 unknown 或伪造完成证明。例如签到失败后仍读取余额；取消后不再发起该读取。需人工的独立成长任务保留人工状态，不阻塞其他可执行任务。
+
+序列最多 16 个非重叠 selector，每项最多 512 字节，总长最多 4096 字节；账号最多 500，单 run 的累计任务发现上限 1000，失败后的只读尾部每账号最多 64 项。检查点重开时再次校验 provider、账号、阶段、任务与确认记录归属，损坏的语义状态拒绝加载，不清空成新库。
+
+`loomgate-builtin-v2` 仅补齐缺失的两个组合计划，新增写计划默认暂停。已有单项兼容计划的时刻、账号、开关和删除记录保持不变，不静默把旧单项计划扩大成组合。控制台保存/切换/编辑时间均保留 `task_sequence`，手动运行发送确认框里的明确账号范围；目录未读且无明确范围时不提交。
 
 ## 目录部分失败
 
@@ -33,7 +54,8 @@ WorkBuddy/Trae 的任务由独立 provider 模块接入统一引擎。Phase14 �
 | 成长资源 | Phase14 只读接线 | 能量、抽奖机会、开箱额度与连登展示；不会消耗机会或能量 |
 | 补偿领取 | Phase14 已接线 | active/claimed/额度/截止字段驱动；不固定活动日期，以领取标记回读 |
 | 账号保活 | Phase16 已接线 | CN/global/Trae官方续期、加密恢复、版本校验、原子保存与回读、会话失效恢复；人工/审核停用不复活 |
-| 活动/开学季/夜猫实际工作/抽奖/开盲盒 | 未完整迁入 | 完整剩余清单及限制见覆盖矩阵 |
+| 抽奖/开盲盒 | 已模块化 | 持久化消费尝试、官方奖品回执与机会/额度减少绑定；丢响应只核验，不重抽 |
+| 活动/开学季/夜猫实际工作 | 未完整迁入 | 只执行真实官方业务；剩余清单及限制见覆盖矩阵 |
 | 原“任务点亮”及伪造活跃报告 | 不照搬伪造行为 | 用户已要求实际工作，需改为真实业务动作或明确人工步骤 |
 
 旧项目国际版的约定是只查余额，不执行签到写操作。早期重构适配器遗漏了该约束，本阶段恢复：global 不发现 checkin，直接强制提交也不会进入签到模块。
@@ -58,18 +80,24 @@ Trae余额与签到现为独立模块：即使签到9074退避或今日已签，
 
 ## 验证与限制
 
-模块测试使用真实 `httptest` 上游及真实任务引擎/账号池，覆盖独立余额读取、部分故障、claim 前复核/已领去重、取消、缺失字段、禁用/跨 provider 拒绝、扩展模块、panic 隔离和 Trae 契约。HTTP 目录与执行记录的部分失败跨重启也有回归。
+控制台交互统一验收入口（Node 行为测试 + 当前静态资源的 Chromium 回归；API 均为本地合成夹具，不接真实账号）：
 
-浏览器测试模式：
-
-```powershell
-go build -o D:/LoomGate-work/build/phase05/catalog-fixture.exe ./tests/catalog-workbench
-D:/LoomGate-work/build/phase05/catalog-fixture.exe -root D:/LoomGate-work/private/phase05/catalog-fixture -listen 127.0.0.1:17863 -task-modules
-python tests/task_modules_browser.py --runtime D:/LoomGate-work/private/phase05/catalog-fixture --output D:/LoomGate-work/evidence/phase05
+```text
+python -m pip install -r gateway/tests/requirements-browser.txt
+python -m playwright install chromium
+python -I -B gateway/scripts/run_console_tests.py --browser --browser-output D:/LoomGate-work/evidence/console-interactions
 ```
 
-该模式只写合成账号并截获所有上游请求。测试核对真实池余额、执行 ID、服务端记录、计划保存和窄屏布局；不能替代真实账号迁移或业务验收。新模块需要遵守 context；任意第三方不合作的 Go 实现不会被当作安全沙箱。
+`--browser-output` 必须在源码树之外。手动构建 CI 使用相同入口并保留结果 JSON；新增用例不会被 Go 测试或 Node 字符串断言自动覆盖。该组交互测试不替代真实 Go panel Handler 的端到端验收。
 
-本阶段没有真实账号查询/签到/领奖/生成、没有新的短信或二维码请求。豆包实时 SDK、登录、推理及任务奖励和三平台/迁移验收仍按总 checkpoint 继续。
+模块测试使用真实 `httptest` 上游及真实任务引擎/账号池，覆盖独立余额读取、部分故障、claim 前复核/已领去重、取消、缺失字段、禁用/跨 provider 拒绝、扩展模块、panic 隔离和 Trae 契约。HTTP 目录与执行记录的部分失败跨重启也有回归。
 
-Phase14 新增 `tests/lifecycle_modules_browser.py`，使用 `catalog-workbench -lifecycle-modules`：真实生产模块与真实加密管理服务连接合成HTTP transport，覆盖9项目录/操作/计划/重启/窄屏场景。测试账号与上游全部合成；本轮新增 WorkBuddy 业务的真实账号执行和奖励到账均为 `NOT RUN`。
+真实 panel → 进程内 ManagementClient → taskengine Handler 的组合回归：
+
+```text
+go test ./internal/panel -run '^TestWorkbenchSequenceUsesRealPanelAndEngineHandlers$' -count=1
+```
+
+该测试验证计划保存保留 selector、原 runID、阶段返回前的实时日志以及重启后的读取；模块业务另用真实账号池/加密库配合合成上游测试。Chromium 交互组依然使用本地合成 API，不冒充浏览器已连通全部真实 Handler 或真实账号。历史 `tests/catalog-workbench` 夹具不在当前源码中，不能用其旧命令作为本版本验收入口。第三方 Go 模块必须配合 context；引擎不是不合作代码的进程沙箱。
+
+本次组合与输出验收不调用真实登录、刷新、签到、领取、生成，也不切换部署、不推送或发布。

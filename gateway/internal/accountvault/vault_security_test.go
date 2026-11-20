@@ -110,6 +110,32 @@ func writeEnvelope(t *testing.T, path string, doc map[string]any) {
 	writeFixture(t, path, b)
 }
 
+func TestOpaqueIDIsStableAcrossReopenAndScopedToVault(t *testing.T) {
+	v, dir := openFixture(t)
+	before := v.OpaqueID("autoclaw", "synthetic-identity")
+	if before == "" || strings.Contains(before, "synthetic-identity") {
+		t.Fatal("opaque identity was empty or exposed its source")
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal("cannot close synthetic vault")
+	}
+	reopened, err := accountvault.Open(dir)
+	if err != nil {
+		t.Fatal("cannot reopen synthetic vault")
+	}
+	defer reopened.Close()
+	if got := reopened.OpaqueID("autoclaw", "synthetic-identity"); got != before {
+		t.Fatal("opaque identity changed across vault reopen")
+	}
+	other, _ := openFixture(t)
+	if other.OpaqueID("autoclaw", "synthetic-identity") == before {
+		t.Fatal("independent vaults produced correlatable public identities")
+	}
+	if reopened.Close() != nil || reopened.OpaqueID("autoclaw", "synthetic-identity") != "" {
+		t.Fatal("closed vault continued issuing identities")
+	}
+}
+
 func TestVaultEncryptsSecretsAndReopensWithoutDisclosure(t *testing.T) {
 	v, dir := openFixture(t)
 	secret := []byte("synthetic-session-private-material-for-at-rest-test")

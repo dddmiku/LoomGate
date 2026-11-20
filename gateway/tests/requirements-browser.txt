@@ -1,0 +1,2 @@
+# Chromium version is resolved by this exact Playwright package.
+playwright==1.59.0

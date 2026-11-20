@@ -44,11 +44,10 @@ func (m *buddyBoxModule) inspectRead(ctx context.Context, a *auth.Auth) (taskeng
 	if a.Realm() != "cn" || m.up == nil {
 		return taskengine.Observation{}, errors.New("buddy_box_unavailable")
 	}
-	resources, err := m.up.TaskResources(ctx, a)
+	quota, err := m.up.TaskBuddyQuota(ctx, a)
 	if err != nil {
 		return taskengine.Observation{}, err
 	}
-	quota := &resources.Quota
 	if quota.Affordable < 0 || quota.MaxOpenCount < 0 {
 		return taskengine.Observation{}, errors.New("buddy_box_state_invalid")
 	}
@@ -97,20 +96,20 @@ func (m *buddyBoxModule) Execute(ctx context.Context, a *auth.Auth, t taskengine
 		_ = m.finishSpend(a, journal, rev, "unknown", "开箱结果未知，保留待核验，不重试。", journal.Before)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "开箱结果未知，保留待核验，不重试。")), err
 	}
-	resources, readErr := m.up.TaskResources(ctx, a)
+	quota, readErr := m.up.TaskBuddyQuota(ctx, a)
 	if readErr != nil {
 		_ = m.finishSpend(a, journal, rev, "unknown", "开箱已提交但额度未能回读，保留待核验。", journal.Before)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "开箱已提交但额度未能回读，保留待核验。")), readErr
 	}
-	if resources.Quota.Affordable >= journal.Before {
-		_ = m.finishSpend(a, journal, rev, "unknown", "开箱请求返回但官方额度未减少，保留待核验。", resources.Quota.Affordable)
+	if quota.Affordable >= journal.Before {
+		_ = m.finishSpend(a, journal, rev, "unknown", "开箱请求返回但官方额度未减少，保留待核验。", quota.Affordable)
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "开箱请求返回但官方额度未减少，保留待核验。")), errors.New("buddy_box_state_unconfirmed")
 	}
 	summary := "已按官方额度开一个 Buddy 盲盒"
 	if name != "" {
 		summary += "：" + name
 	}
-	if err = m.finishSpend(a, journal, rev, "accepted", summary, resources.Quota.Affordable); err != nil {
+	if err = m.finishSpend(a, journal, rev, "accepted", summary, quota.Affordable); err != nil {
 		return taskengine.UnknownAction(t, taskengine.StageExecute, observation("pending", "开箱已成功但结果未能安全保存，保留待核验。")), err
 	}
 	return taskengine.Accepted(t, taskengine.StageExecute, taskengine.Observation{Phase: "done", Summary: summary}), nil

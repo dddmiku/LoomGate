@@ -2,6 +2,7 @@ package autoclaw
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/accountvault"
@@ -32,6 +33,25 @@ func (Source) StaticModels() []providercatalog.Model {
 		})
 	}
 	return out
+}
+
+// PublicAccountID projects legacy phone-bearing IDs without rewriting vault
+// files or invalidating saved account revisions.
+func (s Source) PublicAccountID(id string) string {
+	return publicAccountID(s.Vault, id)
+}
+
+func publicAccountID(vault *accountvault.Vault, id string) string {
+	if strings.HasPrefix(id, "autoclaw-") {
+		phone := strings.TrimPrefix(id, "autoclaw-")
+		if isPhone(phone) {
+			if vault == nil {
+				return ""
+			}
+			return vault.OpaqueID("autoclaw", phone)
+		}
+	}
+	return id
 }
 
 // Display exposes the account's phone number only when the stored profile has

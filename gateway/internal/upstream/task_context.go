@@ -55,9 +55,23 @@ func (c *Client) TaskCatalog(ctx context.Context, a *auth.Auth) ([]GrowthTask, e
 	}
 	return s.Tasks, err
 }
-func (c *Client) TaskClaim(ctx context.Context, a *auth.Auth, key string) error {
-	_, err := c.growthJSONContext(strictTaskContext(ctx), a, http.MethodPost, growthTaskClaimPrefix+url.PathEscape(key)+"/claim", map[string]any{})
-	return err
+func (c *Client) TaskClaim(ctx context.Context, a *auth.Auth, key string) (*GrowthTaskClaimResult, error) {
+	if !taskIdentifier.MatchString(key) {
+		return nil, errors.New("task_identifier_invalid")
+	}
+	raw, err := c.growthJSONContext(strictTaskContext(ctx), a, http.MethodPost, growthTaskClaimPrefix+url.PathEscape(key)+"/claim", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if len(raw) == 0 || !jsonObject(raw) || json.Unmarshal(raw, &fields) != nil || fields == nil || fields["credit"] == nil || fields["energy"] == nil || fields["already_claimed"] == nil || string(fields["credit"]) == "null" || string(fields["energy"]) == "null" || string(fields["already_claimed"]) == "null" {
+		return nil, errors.New("task_claim_receipt_invalid")
+	}
+	var result GrowthTaskClaimResult
+	if json.Unmarshal(raw, &result) != nil || result.Credit < 0 || result.Energy < 0 {
+		return nil, errors.New("task_claim_receipt_invalid")
+	}
+	return &result, nil
 }
 
 // TaskGrowthAccept starts official progress tracking for one or more

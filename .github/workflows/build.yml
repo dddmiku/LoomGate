@@ -62,10 +62,26 @@ jobs:
         run: |
           python -m unittest discover -s panel -p 'test_*.py'
           python -m unittest discover -s scripts -p 'test_*.py'
-      - name: Test console behavior and Doubao runtime boundaries
+      - name: Install pinned synthetic browser test dependencies
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
         run: |
-          python gateway/scripts/run_console_tests.py
+          python -m pip install --disable-pip-version-check -r gateway/tests/requirements-browser.txt
+          python -m playwright install --with-deps chromium
+      - name: Test console behavior and Doubao runtime boundaries
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: |
+          python gateway/scripts/run_console_tests.py --browser --browser-output "$LOOMGATE_WORK_ROOT/evidence/console-interactions"
           python -m unittest discover -s tools/doubao-runtime -p 'test_*.py'
+      - name: Retain synthetic console test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-interactions-${{ github.sha }}
+          path: ${{ env.LOOMGATE_WORK_ROOT }}/evidence/console-interactions/result.json
+          if-no-files-found: warn
+          retention-days: 7
 
   build:
     needs: verify

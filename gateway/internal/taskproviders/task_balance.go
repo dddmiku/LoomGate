@@ -45,6 +45,7 @@ func (m *balanceModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.
 	if m.owner.Upstream == nil {
 		return taskengine.Observation{}, errors.New("balance_unavailable")
 	}
+	taskProgress(ctx, "正在读取官方余额与快过期积分分桶。")
 	remain, buckets, err := m.owner.Upstream.UserResourceDetailedContext(ctx, a, m.owner.ExpiringSoon)
 	if err != nil {
 		return taskengine.Observation{}, err
@@ -62,6 +63,7 @@ func (m *balanceModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.
 	if buckets.Expiring > 0 {
 		summary += fmt.Sprintf("，其中 %d 快过期", buckets.Expiring)
 	}
+	taskProgress(ctx, summary+"。")
 	return taskengine.Observation{Phase: "done", Current: remain, Summary: summary}, nil
 }
 

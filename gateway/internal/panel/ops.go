@@ -583,8 +583,8 @@ func (s *Server) gatewayAdmin(w http.ResponseWriter, r *http.Request, method, en
 // taskLog 读某个任务的最近日志。
 //
 // 两条来源、优先新引擎：
-//  1. 新任务引擎（/workbench/task/log）把一次执行的持久化步骤渲染成文本行；
-//     它认识随包计划里的所有任务键（growth/、redeem/、buddy_box…）。
+//  1. 新任务引擎（/workbench/task/log）读取运行中已持久化的输出与历史安全摘要；
+//     用 provider 隔离同名任务，认识随包计划的模块前缀与具体任务键。
 //  2. 旧调度器（/tasks/<key>/log）只在旧运行模式下存在——旧版模式里
 //     新引擎根本没启动，所以那时才会落到这里。
 //
@@ -597,7 +597,16 @@ func (s *Server) taskLog(w http.ResponseWriter, r *http.Request) {
 			"message": "缺少任务标识。"})
 		return
 	}
-	if payload := s.gateway.Get(r.Context(), "/workbench/task/log?key="+url.QueryEscape(key)); payload != nil {
+	provider := r.URL.Query().Get("provider")
+	if s.opts.Console && provider == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "lines": []any{}, "message": "日志请求必须指定服务范围。"})
+		return
+	}
+	endpoint := "/workbench/task/log?key=" + url.QueryEscape(key)
+	if provider != "" {
+		endpoint += "&provider=" + url.QueryEscape(provider)
+	}
+	if payload := s.gateway.Get(r.Context(), endpoint); payload != nil {
 		if lines, ok := payload["lines"].([]any); ok {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok": true, "key": key, "lines": lines, "count": len(lines),
@@ -607,6 +616,11 @@ func (s *Server) taskLog(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+	if s.opts.Console {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "lines": []any{},
+			"message": "新任务引擎未返回该任务日志，请先核验任务状态。"})
+		return
 	}
 	if !KnownTask(key) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "lines": []any{},
@@ -637,7 +651,7 @@ func (s *Server) taskLog(w http.ResponseWriter, r *http.Request) {
 //
 // 这里收到的 lines= 是「要多少条**请求**」，不是 docker --tail 的原始行数。日志里
 // 请求行与 WARN/ERR 行混在一起、比例不固定，所以先多取一段原始行，解析后按请求行
-// 裁到目标条数；日志本身不够长时就给多少算多少。
+// 裁到目标条数。
 func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	want := 120
 	if raw := r.URL.Query().Get("lines"); raw != "" {

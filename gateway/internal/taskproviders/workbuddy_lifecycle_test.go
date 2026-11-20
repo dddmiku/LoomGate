@@ -23,6 +23,7 @@ type lifecycleFixture struct {
 	day, travel, tier, offerEnd                        string
 	record                                             int64
 	daily, claimed, noBuddy, reject, silent, malformed bool
+	failRead                                           string
 	refuseDrawOnce                                     bool
 	cards                                              int
 	chances, buddyAffordable                           int
@@ -48,6 +49,10 @@ func (f *lifecycleFixture) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "SYNTHETIC_PRIVATE_ERROR", 503)
 			return
 		}
+	}
+	if !mutation && f.failRead == path {
+		http.Error(w, `{"code":503,"msg":"synthetic read unavailable"}`, 503)
+		return
 	}
 	var data any
 	switch path {
@@ -212,8 +217,13 @@ func TestLifecycleModulesDynamicDiscoveryAndVerifiedMutations(t *testing.T) {
 	}
 	f.travel = "arrived"
 	f.mu.Unlock()
-	if run := runLifecycle(t, e, "travel/claim"); run.Status != taskengine.StatusSucceeded {
+	travelRun := runLifecycle(t, e, "travel/claim")
+	if travelRun.Status != taskengine.StatusSucceeded {
 		t.Fatal("travel reward did not verify settlement")
+	}
+	travelLog, err := e.TaskLogFor("workbuddy", "travel/claim")
+	if err != nil || !strings.Contains(strings.Join(travelLog.Lines, "\n"), "+7 积分") {
+		t.Fatal("travel claim log lost actual credited amount")
 	}
 	f.mu.Lock()
 	if f.writeBodies["/activity/growth/buddy/travel/claim"]["record_id"] != float64(412) {
@@ -230,6 +240,45 @@ func TestLifecycleModulesDynamicDiscoveryAndVerifiedMutations(t *testing.T) {
 		t.Fatal("completed operation replayed")
 	}
 }
+func TestLotteryAndBuddyBoxUseIndependentEligibilityReads(t *testing.T) {
+	t.Run("quota_failure_does_not_block_lottery", func(t *testing.T) {
+		a, f, _ := lifecycleSetup(t)
+		f.failRead = "/activity/growth/buddy/quota"
+		e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+		defer e.Close()
+		run := runLifecycle(t, e, "lottery")
+		if run.Status != taskengine.StatusSucceeded || f.counts["/activity/growth/lottery/draw"] != 1 {
+			t.Fatalf("unrelated Buddy quota failure blocked lottery: %s %v", run.Status, f.counts)
+		}
+	})
+	t.Run("lottery_failure_does_not_block_buddy_box", func(t *testing.T) {
+		a, f, _ := lifecycleSetup(t)
+		f.failRead = "/activity/growth/lottery/chances"
+		e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+		defer e.Close()
+		run := runLifecycle(t, e, "buddy_box")
+		if run.Status != taskengine.StatusSucceeded || f.counts["/activity/growth/buddy/open"] != 1 {
+			t.Fatalf("unrelated lottery read failure blocked Buddy box: %s %v", run.Status, f.counts)
+		}
+	})
+}
+
+func TestResourcesReadFailuresAreIndependentAndUnknownIsNotZero(t *testing.T) {
+	a, f, _ := lifecycleSetup(t)
+	f.failRead = "/activity/growth/energy"
+	e := lifecycleEngine(t, a, filepath.Join(t.TempDir(), "tasks.json"))
+	defer e.Close()
+	run := runLifecycle(t, e, "resources")
+	log, err := e.TaskLogFor("workbuddy", "resources")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(log.Lines, "\n")
+	if run.Status != taskengine.StatusFailed || !strings.Contains(text, "能量未读取") || !strings.Contains(text, "抽奖机会 4") || !strings.Contains(text, "可开 Buddy 2") || !strings.Contains(text, "12 天") || strings.Contains(text, "能量 0") {
+		t.Fatalf("partial resource reads were lost or unknown was shown as zero: %s", text)
+	}
+}
+
 func TestLifecycleUnknownMutationSurvivesPeriodChangesAndRestart(t *testing.T) {
 	for _, key := range []string{"travel/depart", "redeem/future-plan", "makeup", "compensation"} {
 		t.Run(key, func(t *testing.T) {

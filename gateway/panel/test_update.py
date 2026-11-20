@@ -24,7 +24,7 @@ class Handler(app.Handler):
 STATUS = {"enabled": True, "current": "1.3.0", "commit": "abcdef1234567890",
           "state": "idle", "latest_tag": "v1.3.1", "update_ready": True,
           "asset_name": "wb2api-linux-amd64", "asset_size": 12345678,
-          "checked_at": "2026-09-17T02:00:00Z", "inherited_fd": True,
+          "checked_at": "2026-09-17T02:00:00Z", "latest_at": "2026-09-16T22:00:00Z", "inherited_fd": True,
           "repo": "dddmiku/workbuddy2api", "dir": "/opt/workbuddy2api/data/updates",
           "built_at": "2026-09-17T01:00:00Z", "last_error": ""}
 
@@ -68,6 +68,7 @@ class UpdateChannelTests(unittest.TestCase):
             code, result = self.request("/api/update", body=None, method="GET")
             self.assertEqual(code, 200)
             self.assertEqual(result["status"]["current"], "1.3.0")
+            self.assertEqual(result["status"]["latest_at"], "2026-09-16T22:00:00Z")
             upstream.assert_called_once_with("/tmp/test.sock", "GET", "/update", None)
 
     def test_status_reports_unreachable_gateway(self):

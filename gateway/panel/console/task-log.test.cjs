@@ -9,7 +9,8 @@ const path = require('node:path');
 const appSrc = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 
 test('the log dialog requests the task output endpoint', () => {
-  assert.match(appSrc, /api\('task\/log\?key='\+encodeURIComponent\(key\)/, 'log dialog must call /task/log?key=<key>');
+  assert.match(appSrc, /api\('task\/log\?key='\+encodeURIComponent\(key\)\+'\&provider='\+encodeURIComponent\(provider\)/,
+    'log dialog must scope reads to provider + task key');
 });
 
 test('the log dialog renders lines as text, not a step table', () => {
@@ -41,6 +42,15 @@ test('a running task keeps refreshing its log', () => {
   const body = appSrc.slice(start, end);
   assert.match(body, /data\.running/, 'must react to the running flag');
   assert.match(body, /setTimeout\(\(\)=>load\(\)/, 'a running task must re-read the log');
+});
+
+test('late responses from a previous log dialog cannot overwrite a newly opened log', () => {
+  const start = appSrc.indexOf('async function openPlanLog(');
+  const end = appSrc.indexOf('function planRunTask(', start);
+  const body = appSrc.slice(start, end);
+  assert.match(appSrc, /taskLogGeneration/, 'dialog generations must invalidate late requests');
+  assert.match(body, /state\.taskLogGeneration===generation/, 'each response must prove it still owns the dialog');
+  assert.match(body, /if\(!currentDialogOpen\(\)\)return/, 'stale responses must be dropped before painting');
 });
 
 test('the task page no longer renders the execution history block', () => {

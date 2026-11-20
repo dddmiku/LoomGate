@@ -38,7 +38,8 @@ func (e *Engine) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /workbench/task/log", func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Query().Get("key")
-		res, err := e.TaskLog(key)
+		provider := r.URL.Query().Get("provider")
+		res, err := e.TaskLogFor(provider, key)
 		if err != nil {
 			respond(w, 400, map[string]any{"ok": false, "lines": []string{}, "error": "invalid_request", "message": "任务标识无效。"})
 			return

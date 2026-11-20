@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -76,7 +77,7 @@ func (e *Engine) Register(id string, a Adapter) error {
 	}
 	e.adapters[id] = a
 	for _, r := range e.state.Runs {
-		if r.ProviderID == id {
+		if r.ProviderID == id && r.FinishedAt == nil {
 			if _, ok := e.state.Work[r.ID]; ok {
 				e.startLocked(r)
 			}
@@ -285,19 +286,78 @@ func (e *Engine) Submit(req Request) (Run, error) {
 func (e *Engine) submitLocked(req Request) (Run, error) {
 	return e.submitScheduleLocked(req, nil)
 }
+func sameAccountScope(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]string{}, a...)
+	right := append([]string{}, b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, error) {
-	if e.closed || e.adapters[req.ProviderID] == nil || len(req.AccountIDs) > 500 {
+	if e.closed || e.adapters[req.ProviderID] == nil || !validRunTaskKey(req.TaskKey, req.TaskSequence) || !validAccountScope(req.AccountIDs) || !validateTaskSequence(req.TaskSequence) {
 		return Run{}, ErrInvalid
 	}
-	for _, id := range req.AccountIDs {
-		if !IDPattern.MatchString(id) {
-			return Run{}, ErrInvalid
+	if len(req.TaskSequence) > 0 {
+		for _, old := range e.state.Runs {
+			work, ok := e.state.Work[old.ID]
+			sameScope := sameAccountScope(old.AccountIDs, req.AccountIDs)
+			// The console confirms an explicit, visible account list. It may
+			// reconcile an all-accounts plan only when that exact frozen list
+			// matches; never re-resolve an old unknown against today's pool.
+			if schedule == nil && len(old.AccountIDs) == 0 && len(req.AccountIDs) > 0 && ok && sameAccountScope(work.SequenceAccounts, req.AccountIDs) {
+				sameScope = true
+			}
+			if old.ProviderID != req.ProviderID || old.TaskKey != req.TaskKey || !sameScope || !slices.Equal(old.TaskSequence, req.TaskSequence) {
+				continue
+			}
+			if e.running[old.ID] != nil || old.FinishedAt == nil {
+				return Run{}, ErrBusy
+			}
+			if old.Status != StatusUncertain || !ok {
+				continue
+			}
+			// Scheduled retries may resume only their own saved run. A manual
+			// request can explicitly reconcile a matching sequence from a plan.
+			if schedule != nil && old.ScheduleID != schedule.ID || len(e.running) >= 64 {
+				return Run{}, ErrBusy
+			}
+			if err := e.commit(func(state *persisted) {
+				work.CancelRequested = false
+				state.Work[old.ID] = work
+				for i := range state.Runs {
+					if state.Runs[i].ID == old.ID {
+						state.Runs[i].Status = StatusQueued
+						state.Runs[i].ErrorCode = ""
+						state.Runs[i].FinishedAt = nil
+					}
+				}
+				if schedule != nil {
+					schedule.LastRunID = old.ID
+					state.Schedules[schedule.ID] = *schedule
+				}
+			}); err != nil {
+				return Run{}, err
+			}
+			resumed := old
+			resumed.Status, resumed.ErrorCode, resumed.FinishedAt = StatusQueued, "", nil
+			e.startLocked(resumed)
+			return resumed, nil
 		}
 	}
 	if len(e.running) >= 64 || len(e.state.Work) >= 64 {
 		return Run{}, ErrBusy
 	}
-	r := Run{ID: randomID(), ProviderID: req.ProviderID, TaskKey: req.TaskKey, ScheduleID: req.ScheduleID, Trigger: req.Trigger, Status: StatusQueued, StartedAt: time.Now().UTC(), AccountIDs: append([]string{}, req.AccountIDs...), Steps: []Step{}}
+
+	r := Run{ID: randomID(), ProviderID: req.ProviderID, TaskKey: req.TaskKey, TaskSequence: append([]string{}, req.TaskSequence...), ScheduleID: req.ScheduleID, Trigger: req.Trigger, Status: StatusQueued, StartedAt: time.Now().UTC(), AccountIDs: append([]string{}, req.AccountIDs...), Steps: []Step{}}
 	if err := e.commit(func(s *persisted) {
 		s.Runs = append(s.Runs, r)
 		// Reserve durable work before dispatch; no discovery or action can occur
@@ -420,7 +480,9 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 				x.Status = status
 				x.ErrorCode = code
 			}
-			delete(s.Work, r.ID)
+			if len(r.TaskSequence) == 0 || status != StatusUncertain {
+				delete(s.Work, r.ID)
+			}
 		})
 	}()
 	if err := e.updateRun(r.ID, func(x *Run) { x.Status = StatusRunning }); err != nil {
@@ -431,9 +493,13 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 	a := e.adapters[r.ProviderID]
 	work := cloneState(e.state).Work[r.ID]
 	e.mu.Unlock()
+	if len(r.TaskSequence) > 0 {
+		status, code = e.performSequence(ctx, r, a, work)
+		return
+	}
 	if work.Tasks == nil {
-		catalog, err := e.CatalogDetails(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs}, r.TaskKey)
-		if err != nil {
+		catalog, discoverErr := e.CatalogDetails(ctx, r.ProviderID, Scope{AccountIDs: r.AccountIDs}, r.TaskKey)
+		if discoverErr != nil {
 			code = "discovery_failed"
 			return
 		}
@@ -450,7 +516,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 			work.ErrorCode = "partial_discovery_failed"
 		}
 		e.mu.Lock()
-		err = e.commit(func(s *persisted) {
+		err := e.commit(func(s *persisted) {
 			current := s.Work[r.ID]
 			work.CancelRequested = current.CancelRequested
 			s.Work[r.ID] = work
@@ -473,42 +539,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 		if ctx.Err() != nil {
 			return
 		}
-		result, err := func() (Status, error) {
-			if work.Confirmed[taskKey(t)] {
-				return StatusSucceeded, nil
-			}
-			release, err := e.accountLock(ctx, t)
-			if err != nil {
-				return StatusCanceled, err
-			}
-			defer release()
-			if gate, ok := a.(TaskGate); ok {
-				// Bounded admission covers the maximum registered run queue and the
-				// per-task request limit; a broken gate cannot wait forever.
-				gateCtx, gateCancel := context.WithTimeout(ctx, 64*(e.opts.Timeout+10*time.Second))
-				free, err := safeGate(gateCtx, gate, t)
-				gateCancel()
-				if err != nil {
-					return StatusFailed, err
-				}
-				if free != nil {
-					defer free()
-				}
-			}
-			select {
-			case e.workers <- struct{}{}:
-				defer func() { <-e.workers }()
-			case <-ctx.Done():
-				return StatusCanceled, ctx.Err()
-			}
-			budget := e.opts.Timeout
-			if e.opts.AllowTaskTimeout && t.TimeoutSeconds > 0 && t.TimeoutSeconds <= 900 {
-				budget = time.Duration(t.TimeoutSeconds) * time.Second
-			}
-			bounded, cancel := context.WithTimeout(ctx, budget)
-			defer cancel()
-			return e.runTask(bounded, r.ID, t, a)
-		}()
+		result, err := e.runAdmittedTask(ctx, r.ID, t, a)
 		if err != nil {
 			result = mergeStatus(result, StatusFailed)
 			code = "task_failed"
@@ -602,8 +633,14 @@ func safeStepSummary(summary, phase, code string) string {
 		text = strings.ToValidUTF8(text, "�")
 	}
 	if len(text) > 512 {
-		runes := []rune(text)
-		text = string(runes[:min(len(runes), 500)]) + "…"
+		// Keep the byte bound and UTF-8 boundary consistent. A rune-count
+		// truncation could append an ellipsis without shortening CJK text,
+		// making each read/normalization grow the persisted line again.
+		text = text[:512-len("…")]
+		for !utf8.ValidString(text) {
+			text = text[:len(text)-1]
+		}
+		text += "…"
 	}
 	return text
 }
@@ -631,9 +668,13 @@ func safeErrorSummary(code string) string {
 	}
 }
 
-func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, error)) (Observation, error) {
+func (e *Engine) record(ctx context.Context, id string, t Task, stage Stage, fn func(context.Context) (Observation, error)) (Observation, error) {
 	begin := time.Now().UTC()
-	o, err := safeCall(fn)
+	outputCtx, finishOutput := e.outputContext(ctx, id, t, stage)
+	defer finishOutput()
+	_ = Output(outputCtx, outputStageText(stage))
+	o, err := safeCall(func() (Observation, error) { return fn(outputCtx) })
+	finishOutput()
 	end := time.Now().UTC()
 	status := StatusSucceeded
 	code := ""
@@ -673,7 +714,7 @@ func (e *Engine) record(id string, t Task, stage Stage, fn func() (Observation, 
 	}
 	serr := e.updateRun(id, func(r *Run) {
 		r.Stage = stage
-		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, Summary: safeStepSummary(o.Summary, o.Phase, code), ErrorCode: code, UpstreamCode: upstreamCode, ActionOutcome: outcome})
+		r.Steps = append(r.Steps, Step{AccountID: t.AccountID, TaskKey: t.Key, TaskName: safeOutputText(t.Name, 256), Stage: stage, Status: status, Attempt: 1, StartedAt: begin, FinishedAt: &end, Summary: safeStepSummary(o.Summary, o.Phase, code), ErrorCode: code, UpstreamCode: upstreamCode, ActionOutcome: outcome})
 		if len(r.Steps) > 2000 {
 			r.Steps = r.Steps[len(r.Steps)-2000:]
 		}
@@ -711,9 +752,12 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 	if done && (t.Once || t.OncePerDay) {
 		return StatusSkipped, nil
 	}
-	o, err := e.record(id, t, StageInspect, func() (Observation, error) { return a.Inspect(ctx, t) })
+	o, err := e.record(ctx, id, t, StageInspect, func(stageCtx context.Context) (Observation, error) { return a.Inspect(stageCtx, t) })
 	if err != nil {
 		return StatusFailed, err
+	}
+	if ctx.Err() != nil {
+		return StatusCanceled, ctx.Err()
 	}
 	if o.Phase == "done" {
 		return e.confirm(id, key, t)
@@ -734,7 +778,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			return StatusCanceled, ctx.Err()
 		}
 		var stage Stage
-		var action func() (Observation, error)
+		var action func(context.Context) (Observation, error)
 		switch o.Phase {
 		case "done":
 			return e.confirm(id, key, t)
@@ -753,14 +797,14 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			}
 			executed = true
 			stage = StageExecute
-			action = func() (Observation, error) { return a.Execute(ctx, t) }
+			action = func(stageCtx context.Context) (Observation, error) { return a.Execute(stageCtx, t) }
 		case "claimable":
 			if claimed {
 				return StatusUncertain, ErrUncertain
 			}
 			claimed = true
 			stage = StageClaim
-			action = func() (Observation, error) { return a.Claim(ctx, t) }
+			action = func(stageCtx context.Context) (Observation, error) { return a.Claim(stageCtx, t) }
 		case "pending":
 		default:
 			return StatusFailed, errors.New("unknown_upstream_state")
@@ -801,7 +845,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			if err != nil {
 				return StatusFailed, err
 			}
-			result, actionErr := e.record(id, t, stage, action)
+			result, actionErr := e.record(ctx, id, t, stage, action)
 			outcome := actionOutcome(t, stage, result)
 			if outcome == "not_submitted" || outcome == "rejected" {
 				e.mu.Lock()
@@ -870,7 +914,7 @@ func (e *Engine) runTask(ctx context.Context, id string, t Task, a Adapter) (Sta
 			}
 			return StatusUncertain, ErrUncertain
 		}
-		o, err = e.record(id, t, StageVerify, func() (Observation, error) { return a.Verify(ctx, t) })
+		o, err = e.record(ctx, id, t, StageVerify, func(stageCtx context.Context) (Observation, error) { return a.Verify(stageCtx, t) })
 		if err != nil {
 			if !executed && !claimed {
 				if ctx.Err() != nil {
@@ -933,7 +977,8 @@ func (e *Engine) ImportDefaultSchedulesOnce(generation string, schedules []Sched
 	for i, s := range schedules {
 		s.Hours = append([]int{}, s.Hours...)
 		s.AccountIDs = append([]string{}, s.AccountIDs...)
-		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || len(s.AccountIDs) > 500 || seen[s.ID] {
+		s.TaskSequence = append([]string{}, s.TaskSequence...)
+		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || !validAccountScope(s.AccountIDs) || seen[s.ID] || !validateTaskSequence(s.TaskSequence) || !validRunTaskKey(s.TaskKey, s.TaskSequence) {
 			return 0, ErrInvalid
 		}
 		seen[s.ID] = true
@@ -946,11 +991,6 @@ func (e *Engine) ImportDefaultSchedulesOnce(generation string, schedules []Sched
 				return 0, ErrInvalid
 			}
 			hours[h] = true
-		}
-		for _, id := range s.AccountIDs {
-			if !IDPattern.MatchString(id) {
-				return 0, ErrInvalid
-			}
 		}
 		sort.Ints(s.Hours)
 		s.LastRunID, s.LastDispatched, s.NextRun = "", nil, nil
@@ -1017,7 +1057,8 @@ func (e *Engine) ImportLegacySchedulesOnce(schedules []Schedule) (bool, error) {
 	for i, s := range schedules {
 		s.Hours = append([]int{}, s.Hours...)
 		s.AccountIDs = append([]string{}, s.AccountIDs...)
-		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || len(s.AccountIDs) > 500 || seen[s.ID] {
+		s.TaskSequence = append([]string{}, s.TaskSequence...)
+		if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || !validAccountScope(s.AccountIDs) || seen[s.ID] || !validateTaskSequence(s.TaskSequence) || !validRunTaskKey(s.TaskKey, s.TaskSequence) {
 			return false, ErrInvalid
 		}
 		seen[s.ID] = true
@@ -1030,11 +1071,6 @@ func (e *Engine) ImportLegacySchedulesOnce(schedules []Schedule) (bool, error) {
 				return false, ErrInvalid
 			}
 			hours[hour] = true
-		}
-		for _, id := range s.AccountIDs {
-			if !IDPattern.MatchString(id) {
-				return false, ErrInvalid
-			}
 		}
 		sort.Ints(s.Hours)
 		s.NextRun, s.LastDispatched = nil, nil
@@ -1110,7 +1146,8 @@ func legacyScheduleImportDecision(state persisted) (apply bool, blocked string) 
 func (e *Engine) SaveSchedule(s Schedule) (Schedule, error) {
 	s.Hours = append([]int{}, s.Hours...)
 	s.AccountIDs = append([]string{}, s.AccountIDs...)
-	if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || len(s.AccountIDs) > 500 {
+	s.TaskSequence = append([]string{}, s.TaskSequence...)
+	if !IDPattern.MatchString(s.ID) || !IDPattern.MatchString(s.ProviderID) || s.Minute < 0 || s.Minute > 59 || len(s.Hours) == 0 || len(s.Hours) > 24 || !validAccountScope(s.AccountIDs) || !validateTaskSequence(s.TaskSequence) || !validRunTaskKey(s.TaskKey, s.TaskSequence) {
 		return s, ErrInvalid
 	}
 	if _, err := time.LoadLocation(s.Timezone); err != nil {
@@ -1122,11 +1159,6 @@ func (e *Engine) SaveSchedule(s Schedule) (Schedule, error) {
 			return s, ErrInvalid
 		}
 		seen[h] = true
-	}
-	for _, id := range s.AccountIDs {
-		if !IDPattern.MatchString(id) {
-			return s, ErrInvalid
-		}
 	}
 	sort.Ints(s.Hours)
 	e.mu.Lock()
@@ -1202,7 +1234,15 @@ func (e *Engine) Tick(now time.Time) error {
 			}
 		}
 		s.LastDispatched = &now
-		_, err := e.submitScheduleLocked(Request{ProviderID: s.ProviderID, TaskKey: s.TaskKey, AccountIDs: s.AccountIDs, ScheduleID: s.ID, Trigger: "schedule", ScheduledAt: &due}, &s)
+		_, err := e.submitScheduleLocked(Request{ProviderID: s.ProviderID, TaskKey: s.TaskKey, TaskSequence: append([]string{}, s.TaskSequence...), AccountIDs: s.AccountIDs, ScheduleID: s.ID, Trigger: "schedule", ScheduledAt: &due}, &s)
+		if errors.Is(err, ErrBusy) {
+			// An active lease or the bounded queue coalesces this saved instant.
+			// Keep scheduling other plans rather than terminating the scheduler.
+			if err = e.commit(func(st *persisted) { st.Schedules[s.ID] = s }); err != nil {
+				return err
+			}
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("schedule_dispatch_failed: %w", err)
 		}

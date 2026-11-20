@@ -11,6 +11,42 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+func TestTaskClaimRequiresCompleteActualAwardReceipt(t *testing.T) {
+	for _, body := range []string{`{}`, `{"credit":4}`, `{"energy":2}`, `{"credit":null,"energy":2,"already_claimed":false}`, `{"credit":-1,"energy":2,"already_claimed":false}`, `[]`} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != growthTaskClaimPrefix+"fixture_task_17/claim" {
+				t.Errorf("unexpected task claim path: %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"code":0,"data":`+body+`}`)
+		}))
+		c := &Client{HTTP: s.Client(), ChatBaseCN: s.URL}
+		if _, err := c.TaskClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, "fixture_task_17"); err == nil {
+			t.Fatalf("incomplete claim receipt accepted: %s", body)
+		}
+		s.Close()
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"code":0,"data":{"credit":0,"energy":0,"already_claimed":true}}`)
+	}))
+	defer s.Close()
+	c := &Client{HTTP: s.Client(), ChatBaseCN: s.URL}
+	result, err := c.TaskClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, "fixture_task_17")
+	if err != nil || result == nil || result.Credit != 0 || result.Energy != 0 || !result.AlreadyClaimed {
+		t.Fatal("explicit zero/already-claimed receipt was rejected")
+	}
+}
+
+func TestTaskClaimRejectsMalformedTaskIdentifierBeforeHTTP(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { requests.Add(1) }))
+	defer s.Close()
+	c := &Client{HTTP: s.Client(), ChatBaseCN: s.URL}
+	if _, err := c.TaskClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, "../other"); err == nil || requests.Load() != 0 {
+		t.Fatal("invalid task identifier reached the transport")
+	}
+}
+
 func TestWorkbenchTaskSchemaRejectsMissingEligibilityFields(t *testing.T) {
 	for _, tc := range []struct {
 		name, data string
@@ -73,7 +109,7 @@ func TestTravelAcceptanceRequiresExplicitBusinessCodeAndReward(t *testing.T) {
 			w.Write([]byte(body))
 		}))
 		c := &Client{HTTP: s.Client(), ChatBaseCN: s.URL}
-		err := c.TaskTravelClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, 901)
+		_, err := c.TaskTravelClaim(context.Background(), &auth.Auth{UID: "synthetic", Domain: "copilot.tencent.com"}, 901)
 		s.Close()
 		if err == nil {
 			t.Fatal("HTTP200 without business acceptance manufactured receipt")

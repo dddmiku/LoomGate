@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"workbuddy2api/internal/inference"
-	"workbuddy2api/internal/requestlog"
 )
 
 func providerErrorCode(err error) string {
@@ -36,7 +35,7 @@ func providerErrorCode(err error) string {
 		// Provider-specific credential/quota states the console already has
 		// labels for. Passing them through turns an opaque 502 into a message
 		// the operator can act on.
-		case "access_token_expired", "autoclaw_rate_limited", "autoclaw_quota_exhausted":
+		case "access_token_expired", "autoclaw_rate_limited", "autoclaw_quota_exhausted", "autoclaw_stream_invalid", "autoclaw_stream_incomplete", "autoclaw_stream_limit":
 			return code
 		}
 	}
@@ -331,66 +330,10 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	if result.ConversationRef != "" {
 		w.Header().Set("X-LoomGate-Conversation", result.ConversationRef)
 	}
-	st.upstreamStarted = result.Attempted
-	st.uid = result.AccountRef
-	st.unreported = !result.UsageReported
-	// Carry the upstream's own counts into the request log. Without this the
-	// provider path recorded only "usage was reported" and every row showed a
-	// dash for input/output/cached, even when the upstream had sent exact
-	// numbers.
-	if result.UsageReported {
-		st.prompt = result.PromptTokens
-		st.toks = result.CompletionTokens
-		if result.CachedTokens > 0 {
-			st.cached = result.CachedTokens
-		}
-	} else {
-		st.prompt, st.toks, st.cached = 0, -1, -1
-	}
-	if st.trace != nil {
-		st.trace.account = result.AccountRef
-		st.trace.model = model
-		st.trace.record.UpstreamStarted = result.Attempted
-		records := result.AttemptRecords
-		// Providers that speak a vendor protocol report usage on the result
-		// itself and never build per-attempt records. The request log is
-		// aggregated from attempts, so with zero records every row showed a
-		// dash for input/output/cached even though the gateway log line had the
-		// real numbers. Synthesize the single attempt that actually happened;
-		// it carries the same counts the response already returned.
-		if len(records) == 0 && result.Attempted {
-			records = []inference.Attempt{{HTTPStatus: 200}}
-		}
-		st.trace.record.AttemptCount = len(records)
-		for i, a := range records {
-			status := requestlog.StatusError
-			if a.HTTPStatus == 200 && a.ErrorCode == "" {
-				status = requestlog.StatusSuccess
-			}
-			if a.ErrorCode == "client_canceled" {
-				status = requestlog.StatusCanceled
-			}
-			attempt := requestlog.Attempt{Number: i + 1, AccountID: result.AccountRef, Model: model, StartedAt: a.StartedAt, FinishedAt: a.FinishedAt, DurationMS: max(0, a.FinishedAt.Sub(a.StartedAt).Milliseconds()), HTTPStatus: a.HTTPStatus, Status: status, ErrorCode: traceCode(a.ErrorCode)}
-			// A vendor provider's counts live on the result, not on the attempt.
-			if i == len(records)-1 && result.UsageReported {
-				prompt, completion := int64(result.PromptTokens), int64(result.CompletionTokens)
-				attempt.InputTokens = &prompt
-				attempt.OutputTokens = &completion
-				if result.CachedTokens > 0 {
-					cached := int64(result.CachedTokens)
-					attempt.CachedTokens = &cached
-				}
-				attempt.UsageState = requestlog.UsageComplete
-			} else {
-				attempt.UsageState = requestlog.UsageMissing
-				attempt.UsageReason = "usage_not_reported"
-			}
-			st.trace.record.Attempts = append(st.trace.record.Attempts, attempt)
-		}
-		if len(st.trace.record.Attempts) > 0 {
-			st.trace.last = &st.trace.record.Attempts[len(st.trace.record.Attempts)-1]
-		}
-	}
+	recordProviderAttempts(st, result, model, err)
+	u := providerUsage(result)
+	st.unreported = !u.Complete()
+	st.prompt, st.toks, st.cached = providerTokenValue(u.Prompt), providerTokenValue(u.Completion), providerTokenValue(u.Cached)
 	if err != nil || !result.Complete || !result.Acknowledged {
 		st.status = 502
 		// One structured line naming which contract term failed. Without it a 502
@@ -447,14 +390,16 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	w.Header().Set("X-Gateway-Upstream-Complete", "true")
 	w.Header().Set("X-Gateway-Upstream-Ack", "true")
 	w.Header().Set("X-Gateway-Upstream-Request-Digest", result.RequestDigest)
-	if result.UsageReported {
+	if providerUsage(result).Reported() {
 		w.Header().Set("X-Gateway-Usage-Status", "reported")
 	}
 	if !streaming {
 		message := map[string]any{"role": "assistant", "content": result.Text}
-		finishReason := "stop"
+		if result.Reasoning != "" {
+			message["reasoning_content"] = result.Reasoning
+		}
+		finishReason := providerFinishReason(result.FinishReason, len(result.ToolCalls) > 0)
 		if len(result.ToolCalls) > 0 {
-			finishReason = "tool_calls"
 			calls := make([]any, 0, len(result.ToolCalls))
 			for _, call := range result.ToolCalls {
 				callType := call.Type
@@ -471,24 +416,12 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 				})
 			}
 			message["tool_calls"] = calls
-		} else if result.FinishReason != "" {
-			// The upstream's own cause (length / content_filter) must not be
-			// rewritten to "stop": that hides a truncated answer.
-			finishReason = result.FinishReason
 		}
 		response := map[string]any{"id": id, "object": "chat.completion", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}}}
 		// Report the upstream's own counts when it gave them. Omitted rather
 		// than zero-filled when it did not: clients read a missing usage as
 		// unknown, and a fabricated 0 would look like a real measurement.
-		if result.UsageReported {
-			usage := map[string]any{
-				"prompt_tokens":     result.PromptTokens,
-				"completion_tokens": result.CompletionTokens,
-				"total_tokens":      result.PromptTokens + result.CompletionTokens,
-			}
-			if result.PromptTokens >= result.CachedTokens && result.CachedTokens > 0 {
-				usage["prompt_tokens_details"] = map[string]any{"cached_tokens": result.CachedTokens}
-			}
+		if usage := providerWireUsage(providerUsage(result)); usage != nil {
 			response["usage"] = usage
 		}
 		if result.ConversationRef != "" {

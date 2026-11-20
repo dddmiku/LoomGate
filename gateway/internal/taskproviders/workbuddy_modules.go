@@ -20,4 +20,7 @@ var workbuddyCatalog = []moduleCatalogEntry{
 	{provider: "workbuddy", plan: lotteryPlan, build: newLotteryModule},
 	{provider: "workbuddy", plan: buddyBoxPlan, build: newBuddyBoxModule},
 	{provider: "workbuddy", plan: keepalivePlan, build: newKeepaliveModule},
+	{provider: "workbuddy", plan: nil, build: newCheckinRefreshModule},
+	{provider: "workbuddy", plan: growthSequencePlan, build: newGrowthSequenceModule},
+	{provider: "workbuddy", plan: legacyCheckinSequencePlan, build: newLegacyCheckinSequenceModule},
 }

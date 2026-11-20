@@ -25,6 +25,63 @@ type Module interface {
 	Verify(context.Context, *auth.Auth, taskengine.Task) (taskengine.Observation, error)
 }
 
+func taskProgress(ctx context.Context, line string) {
+	// Progress is diagnostic only; losing a log line cannot change a provider
+	// receipt or make an accepted write eligible for replay.
+	_ = taskengine.Output(ctx, line)
+}
+
+func (a *Accounts) acquireLegacyAccountPacing(ctx context.Context, accountID string) (func(), error) {
+	now := time.Now
+	if a.pacingNow != nil {
+		now = a.pacingNow
+	}
+	waitFor := a.pacingWait
+	if waitFor == nil {
+		waitFor = waitAccountPacing
+	}
+	const interval = 800 * time.Millisecond
+	a.pacingOnce.Do(func() {
+		a.pacingSlot = make(chan struct{}, 1)
+		a.pacingSlot <- struct{}{}
+	})
+	select {
+	case <-a.pacingSlot:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	free := func() { a.pacingSlot <- struct{}{} }
+	if wait := a.lastPacedAt.Sub(now()); a.lastPacedAccount != accountID && wait > 0 {
+		if err := waitFor(ctx, wait); err != nil {
+			free()
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		free()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.lastPacedAt = now().Add(interval)
+			a.lastPacedAccount = accountID
+			free()
+		})
+	}, nil
+}
+
+func waitAccountPacing(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Optional pacing runs outside the per-task request timeout and before any
 // write marker. It cannot submit work; the usual dispatch rechecks the account.
 type GatedModule interface {
@@ -54,6 +111,73 @@ func (a *Accounts) AcquireTask(ctx context.Context, t taskengine.Task) (func(), 
 	return nil, errors.New("task_module_unavailable")
 }
 
+func (a *Accounts) SequenceAccounts(ctx context.Context, requested, selectors []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if a.Pool == nil {
+		return nil, errors.New("account_pool_unavailable")
+	}
+	modules, err := a.modules()
+	if err != nil {
+		return nil, err
+	}
+	if len(selectors) == 0 {
+		return nil, errors.New("task_sequence_empty")
+	}
+	var allowedRealms []string
+	for _, module := range modules {
+		spec := module.Spec()
+		if spec.matches(selectors[0]) {
+			allowedRealms = spec.Realms
+			break
+		}
+	}
+	if len(allowedRealms) == 0 {
+		return nil, errors.New("task_sequence_route_missing")
+	}
+	selected := make(map[string]bool, len(requested))
+	for _, id := range requested {
+		selected[id] = true
+	}
+	eligible := func(realm string) bool {
+		for _, allowed := range allowedRealms {
+			if allowed == realm {
+				return true
+			}
+		}
+		return false
+	}
+	if len(requested) > 0 {
+		accounts := make([]string, 0, len(requested))
+		for _, id := range requested {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			account, accountErr := a.accountForTask(id, true)
+			if accountErr != nil || !eligible(account.Realm()) {
+				return nil, errors.New("task_sequence_scope_invalid")
+			}
+			accounts = append(accounts, id)
+		}
+		return accounts, nil
+	}
+	accounts := make([]string, 0)
+	for _, status := range a.Pool.List() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if status.Disabled && status.DisabledReason != pool.SessionDeadReason() {
+			continue
+		}
+		account, accountErr := a.accountForTask(status.UID, true)
+		if accountErr == nil && eligible(account.Realm()) {
+			accounts = append(accounts, status.UID)
+		}
+	}
+	return accounts, nil
+}
+
 // Stateful modules discover definitions and their matching read snapshot in
 // one pass. This does not call Execute/Claim or refresh credentials.
 type ModuleTask struct {
@@ -66,6 +190,7 @@ type CatalogModule interface {
 type ModuleSpec struct {
 	ID, Key        string
 	Prefix         bool
+	InternalOnly   bool
 	Realms         []string
 	RecoverSession bool
 }
@@ -95,6 +220,12 @@ type Accounts struct {
 	DiscoveryConcurrency int
 	discoverySlots       chan struct{}
 	discoveryOnce        sync.Once
+	pacingOnce           sync.Once
+	pacingSlot           chan struct{}
+	lastPacedAt          time.Time
+	lastPacedAccount     string
+	pacingNow            func() time.Time
+	pacingWait           func(context.Context, time.Duration) error
 	options              AccountsOptions
 }
 
@@ -209,7 +340,7 @@ func (a *Accounts) DiscoverCatalog(ctx context.Context, scope taskengine.Scope, 
 			}
 			for _, m := range modules {
 				s := m.Spec()
-				if status.Disabled && !s.RecoverSession || !s.realm(account.Realm()) || key != "" && key != "*" && !s.matches(key) {
+				if (s.InternalOnly && (key == "" || key == "*")) || status.Disabled && !s.RecoverSession || !s.realm(account.Realm()) || key != "" && key != "*" && !s.matches(key) {
 					continue
 				}
 				select {

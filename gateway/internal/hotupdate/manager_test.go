@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestManagerFailedHandoverPreservesRestartBinary(t *testing.T) {
@@ -185,5 +186,20 @@ func TestFailedCheckDoesNotStampCheckedAt(t *testing.T) {
 	}
 	if status.UpdateReady {
 		t.Fatal("检查失败时不应报告可升级")
+	}
+}
+
+// TestDeployedAtIsRuntimeFileTimeNotBuildTime 部署时间必须来自实际运行文件的
+// 落盘时间，而不是构建注入的 BuiltAt；读不到时保持 nil 让面板显示「未记录」。
+func TestDeployedAtIsRuntimeFileTimeNotBuildTime(t *testing.T) {
+	status := (&Manager{opts: Options{Enabled: false}, client: &Client{Repo: "x/y"}}).Status()
+	if status.DeployedAt == nil {
+		t.Skip("test executable mtime unavailable on this platform")
+	}
+	if status.DeployedAt.IsZero() || status.DeployedAt.Year() < 2000 {
+		t.Fatalf("deployed_at must be a real time, got %v", status.DeployedAt)
+	}
+	if status.BuiltAt != "unknown" && status.DeployedAt.Format(time.RFC3339) == status.BuiltAt {
+		t.Fatal("deployed_at must not be a copy of the build timestamp")
 	}
 }

@@ -45,6 +45,7 @@ func (m *checkinModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.
 		return taskengine.Observation{}, errors.New("checkin_unavailable")
 	}
 	phase := "blocked"
+	taskProgress(ctx, "正在读取官方签到状态。")
 	s, err := m.up.TaskCheckinStatus(ctx, a)
 	if err != nil {
 		return taskengine.Observation{}, err
@@ -55,7 +56,14 @@ func (m *checkinModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.
 	if s.TodayCheckedIn {
 		phase = "done"
 	}
-	return taskengine.Observation{Phase: phase}, nil
+	if phase == "done" {
+		taskProgress(ctx, "官方确认今日已签到。")
+	} else if phase == "ready" {
+		taskProgress(ctx, "官方签到可用，未重复提交。")
+	} else {
+		taskProgress(ctx, "官方签到当前不可用，未提交。")
+	}
+	return taskengine.Observation{Phase: phase, Summary: map[string]string{"done": "官方确认今日已签到。", "ready": "官方签到可用。", "blocked": "官方签到当前不可用。"}[phase]}, nil
 }
 
 func (m *checkinModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
@@ -64,11 +72,18 @@ func (m *checkinModule) Execute(ctx context.Context, a *auth.Auth, t taskengine.
 	if err != nil || s.Phase != "ready" {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, s), err
 	}
+	taskProgress(ctx, "正在提交一次每日签到请求；最终以官方状态复核为准。")
 	err = m.up.TaskCheckin(ctx, a)
 	if upstream.IsAlreadyCheckin(err) {
+		taskProgress(ctx, "官方提示今日已签到，开始只读状态复核。")
 		err = nil
 	}
-	return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending"}), err
+	if err != nil {
+		taskProgress(ctx, "签到请求未确认，保留待核验；不会自动重试。")
+	} else {
+		taskProgress(ctx, "签到请求已返回，等待官方签到状态复核。")
+	}
+	return taskengine.UnknownAction(t, taskengine.StageExecute, taskengine.Observation{Phase: "pending", Summary: "签到请求已发送，等待官方状态复核。"}), err
 }
 
 func (m *checkinModule) Verify(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {

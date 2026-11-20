@@ -57,7 +57,7 @@ type providerStreamSink struct {
 	// legitimately carries no prose.
 	sawToolCalls bool
 	err          error
-	stat      *chatStat
+	stat         *chatStat
 }
 
 func newProviderStreamSink(w http.ResponseWriter, r *http.Request, model string, st *chatStat) *providerStreamSink {
@@ -81,6 +81,21 @@ func (s *providerStreamSink) frame(value any) error {
 	s.err = err
 	return err
 }
+func (s *providerStreamSink) start() bool {
+	if s.started {
+		return false
+	}
+	s.w.Header().Set("Content-Type", "text/event-stream")
+	s.w.Header().Set("Cache-Control", "no-cache")
+	s.w.Header().Set("X-Accel-Buffering", "no")
+	s.w.Header().Set("X-Gateway-Streaming", "incremental")
+	s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
+	s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
+	s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
+	s.started = true
+	return true
+}
+
 func (s *providerStreamSink) chunk(delta map[string]string, finish any) map[string]any {
 	return map[string]any{"id": s.id, "object": "chat.completion.chunk", "created": s.created, "model": s.model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 }
@@ -95,17 +110,7 @@ func (s *providerStreamSink) emit(delta string) error {
 	if delta == "" {
 		return nil
 	}
-	first := !s.started
-	if first {
-		s.w.Header().Set("Content-Type", "text/event-stream")
-		s.w.Header().Set("Cache-Control", "no-cache")
-		s.w.Header().Set("X-Accel-Buffering", "no")
-		s.w.Header().Set("X-Gateway-Streaming", "incremental")
-		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
-		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
-		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
-		s.started = true
-	}
+	first := s.start()
 	content := map[string]string{"content": delta}
 	if first {
 		content["role"] = "assistant"
@@ -127,17 +132,7 @@ func (s *providerStreamSink) emitToolDelta(delta inference.ToolCallDelta) error 
 	if s.err != nil {
 		return s.err
 	}
-	first := !s.started
-	if first {
-		s.w.Header().Set("Content-Type", "text/event-stream")
-		s.w.Header().Set("Cache-Control", "no-cache")
-		s.w.Header().Set("X-Accel-Buffering", "no")
-		s.w.Header().Set("X-Gateway-Streaming", "incremental")
-		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
-		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
-		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
-		s.started = true
-	}
+	first := s.start()
 	index := delta.Index
 	call := map[string]any{
 		"index": index,
@@ -187,17 +182,7 @@ func (s *providerStreamSink) emitReasoning(delta string) error {
 		s.err = inference.ErrStreamContract
 		return s.err
 	}
-	first := !s.started
-	if first {
-		s.w.Header().Set("Content-Type", "text/event-stream")
-		s.w.Header().Set("Cache-Control", "no-cache")
-		s.w.Header().Set("X-Accel-Buffering", "no")
-		s.w.Header().Set("X-Gateway-Streaming", "incremental")
-		s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
-		s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
-		s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
-		s.started = true
-	}
+	first := s.start()
 	content := map[string]string{"reasoning_content": delta}
 	if first {
 		content["role"] = "assistant"
@@ -222,7 +207,12 @@ func (s *providerStreamSink) validate(result inference.Result) error {
 		return nil
 	}
 	if s.text.Len() == 0 {
-		if s.reasoning.Len() > 0 {
+		if result.Text == "" && len(result.ToolCalls) == 0 && result.FinishReason == "content_filter" {
+			// An explicit upstream filter is a terminal outcome, not an empty
+			// transport failure that should be generated again.
+			return nil
+		}
+		if s.reasoning.Len() > 0 && result.Text == "" {
 			// Reasoning was already streamed; treating this as a contract
 			// violation would fail a turn the client watched succeed.
 			return nil
@@ -244,31 +234,19 @@ func (s *providerStreamSink) finish(result inference.Result) error {
 	// "run these and send the results back", stop means the turn is complete.
 	// The upstream's own cause wins when it reported one: rewriting "length" or
 	// "content_filter" to "stop" hid a truncated answer from the caller.
-	reason := "stop"
-	if s.sawToolCalls || len(result.ToolCalls) > 0 {
-		reason = "tool_calls"
-	} else if result.FinishReason != "" {
-		reason = result.FinishReason
-	}
+	reason := providerFinishReason(result.FinishReason, s.sawToolCalls || len(result.ToolCalls) > 0)
 	last := s.chunk(map[string]string{}, reason)
 	// The final chunk is where OpenAI-compatible clients read usage from.
 	// Omitted when the upstream reported none, so a client never sees a
 	// fabricated zero.
-	if result.UsageReported {
-		usage := map[string]any{
-			"prompt_tokens":     result.PromptTokens,
-			"completion_tokens": result.CompletionTokens,
-			"total_tokens":      result.PromptTokens + result.CompletionTokens,
-		}
-		if result.CachedTokens > 0 && result.CachedTokens <= result.PromptTokens {
-			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": result.CachedTokens}
-		}
+	if usage := providerWireUsage(providerUsage(result)); usage != nil {
 		last["usage"] = usage
 	}
 	if result.ConversationRef != "" {
 		last["loomgate_conversation"] = result.ConversationRef
 	}
 
+	s.start()
 	if err := s.frame(last); err != nil {
 		return err
 	}

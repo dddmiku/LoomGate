@@ -221,10 +221,10 @@ func TestStreamSeparatesReasoningFromAnswer(t *testing.T) {
 
 // A reasoning-only stream produced real output. It used to be classified as an
 // empty answer, which made the request retry, rotate accounts and finally tell
-// the client to discard a perfectly good think phase. It is now a valid turn:
-// no answer text, but nothing failed either.
+// the client to discard a perfectly good think phase. A terminal reasoning-only
+// turn is valid: no answer text, but [DONE] confirms it was not cut off.
 func TestReasoningOnlyStreamIsAValidTurn(t *testing.T) {
-	frames := `data: {"choices":[{"delta":{"reasoning_content":"想了很久"}}]}` + "\n\n"
+	frames := `data: {"choices":[{"delta":{"reasoning_content":"想了很久"}}]}` + "\n\ndata: [DONE]\n\n"
 	text, events, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
 	if err != nil {
 		t.Fatalf("reasoning-only stream rejected as %v", err)
@@ -239,7 +239,7 @@ func TestReasoningOnlyStreamIsAValidTurn(t *testing.T) {
 
 // A stream with neither prose, tools nor reasoning is still an empty answer.
 func TestStreamWithNoOutputAtAllIsAnEmptyAnswer(t *testing.T) {
-	frames := `data: {"choices":[{"delta":{}}]}` + "\n\n"
+	frames := `data: {"choices":[{"delta":{}}]}` + "\n\ndata: [DONE]\n\n"
 	_, _, _, err := streamSSE(strings.NewReader(frames), func(string) error { return nil }, nil)
 	var empty *emptyAnswerError
 	if !errors.As(err, &empty) {
@@ -519,14 +519,10 @@ func TestExpiredTokenIsRenewedOnceAndRetried(t *testing.T) {
 	}
 
 	var renewals atomic.Int32
-	previous := refreshAccessToken
-	refreshAccessToken = func(context.Context, string) (string, string, error) {
+	p := offlineRefreshProvider(t, vault, func(r *http.Request) (*http.Response, error) {
 		renewals.Add(1)
-		return "FRESH_TOKEN", "REFRESH_2", nil
-	}
-	t.Cleanup(func() { refreshAccessToken = previous })
-
-	p := &Provider{Vault: vault}
+		return refreshSuccess(r), nil
+	})
 	renewed, err := p.refreshAccount(context.Background(), "autoclaw-test", "REFRESH_1")
 	if err != nil {
 		t.Fatal(err)
@@ -534,8 +530,8 @@ func TestExpiredTokenIsRenewedOnceAndRetried(t *testing.T) {
 	if renewals.Load() != 1 {
 		t.Fatalf("renewals=%d want 1", renewals.Load())
 	}
-	if renewed.AccessToken != "FRESH_TOKEN" || renewed.RefreshToken != "REFRESH_2" {
-		t.Fatalf("renewal did not adopt the new pair: %+v", renewed)
+	if renewed.AccessToken != "fixture-new-access" || renewed.RefreshToken != "fixture-new-refresh" {
+		t.Fatal("renewal did not adopt the new pair")
 	}
 	// The new pair must be durable, or the next request uses the dead token again.
 	_, plain, err := vault.Get("autoclaw-test")
@@ -543,8 +539,8 @@ func TestExpiredTokenIsRenewedOnceAndRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	var persisted stored
-	if json.Unmarshal(plain, &persisted) != nil || persisted.AccessToken != "FRESH_TOKEN" || persisted.RefreshToken != "REFRESH_2" {
-		t.Fatalf("renewed token was not persisted: %+v", persisted)
+	if json.Unmarshal(plain, &persisted) != nil || persisted.AccessToken != "fixture-new-access" || persisted.RefreshToken != "fixture-new-refresh" {
+		t.Fatal("renewed token was not persisted")
 	}
 	// A token-free account must not be treated as renewable.
 	if _, err := p.refreshAccount(context.Background(), "autoclaw-test", ""); err == nil {
@@ -561,7 +557,11 @@ func TestOnlyAuthFailuresTriggerRenewal(t *testing.T) {
 		want   bool
 	}{
 		{401, `{"code":401}`, true},
-		{403, `forbidden`, true},
+		{403, `forbidden`, false},
+		{403, `model access denied: access_token scope`, false},
+		{403, `{"msg":"token expired"}`, true},
+		{400, `{"msg":"invalid token"}`, true},
+		{500, `access_token service unavailable`, false},
 		{400, `{"code":400,"msg":"bad model"}`, false},
 		{422, `invalid request`, false},
 		{429, `rate limited`, false},
@@ -582,7 +582,7 @@ func TestAuthFailuresExposeActionableCodes(t *testing.T) {
 		want   string
 	}{
 		{401, "access_token_expired"},
-		{403, "access_token_expired"},
+		{403, "autoclaw_forbidden"},
 		{429, "autoclaw_rate_limited"},
 		{402, "autoclaw_quota_exhausted"},
 		{500, ""},

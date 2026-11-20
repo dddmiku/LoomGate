@@ -72,6 +72,85 @@ func TaskKeyMatches(pattern, key string) bool {
 	return strings.HasSuffix(pattern, "/") && strings.HasPrefix(key, pattern)
 }
 
+func validTaskSelector(value string) bool {
+	if value == "*" {
+		return true
+	}
+	if value == "" || len(value) > 512 {
+		return false
+	}
+	value = strings.TrimSuffix(value, "/")
+	for _, part := range strings.Split(value, "/") {
+		if !IDPattern.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+func validateTaskSequence(sequence []string) bool {
+	if len(sequence) > 16 {
+		return false
+	}
+	size := 0
+	for i, selector := range sequence {
+		size += len(selector)
+		if !validTaskSelector(selector) || size > 4096 {
+			return false
+		}
+		for _, prior := range sequence[:i] {
+			if TaskKeyMatches(prior, selector) || TaskKeyMatches(selector, prior) {
+				return false
+			}
+		}
+	}
+	return true
+}
+func validRunTaskKey(key string, sequence []string) bool {
+	if len(key) > 512 {
+		return false
+	}
+	if len(sequence) > 0 {
+		return IDPattern.MatchString(key)
+	}
+	return key == "" || validTaskSelector(key)
+}
+func validAccountScope(ids []string) bool {
+	if len(ids) > 500 {
+		return false
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if !IDPattern.MatchString(id) || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return true
+}
+
+func taskIncluded(taskKey string, sequence []string, actual string) bool {
+	if len(sequence) == 0 {
+		return TaskKeyMatches(taskKey, actual)
+	}
+	for _, selector := range sequence {
+		if TaskKeyMatches(selector, actual) {
+			return true
+		}
+	}
+	return false
+}
+func runIncludesLogKey(run Run, key string) bool {
+	if key == run.TaskKey || taskLogMatches(key, run.TaskKey) {
+		return true
+	}
+	for _, selector := range run.TaskSequence {
+		if taskLogMatches(key, selector) {
+			return true
+		}
+	}
+	return false
+}
+
 type Definition struct {
 	Key            string  `json:"key"`
 	ProviderID     string  `json:"provider_id"`
@@ -139,6 +218,13 @@ type TaskGate interface {
 	AcquireTask(context.Context, Task) (func(), error)
 }
 
+// SequenceAccountAdapter enumerates identities without discovering every task
+// family up front. It must not refresh credentials or submit business actions.
+// The engine freezes this scope before starting the first ordered stage.
+type SequenceAccountAdapter interface {
+	SequenceAccounts(context.Context, []string, []string) ([]string, error)
+}
+
 type DiscoveryIssue struct {
 	ProviderID string `json:"provider_id"`
 	AccountID  string `json:"account_id"`
@@ -157,16 +243,17 @@ type CatalogAdapter interface {
 }
 
 type Schedule struct {
-	ID             string     `json:"id"`
-	TaskKey        string     `json:"task_key"`
-	ProviderID     string     `json:"provider_id"`
-	Enabled        bool       `json:"enabled"`
-	Hours          []int      `json:"hours"`
-	Minute         int        `json:"minute"`
-	Timezone       string     `json:"timezone"`
-	AccountIDs     []string   `json:"account_ids"`
-	OncePerDay     bool       `json:"once_per_day"`
-	LegacyEnabled  *bool      `json:"legacy_enabled,omitempty"`
+	ID            string   `json:"id"`
+	TaskKey       string   `json:"task_key"`
+	TaskSequence  []string `json:"task_sequence,omitempty"`
+	ProviderID    string   `json:"provider_id"`
+	Enabled       bool     `json:"enabled"`
+	Hours         []int    `json:"hours"`
+	Minute        int      `json:"minute"`
+	Timezone      string   `json:"timezone"`
+	AccountIDs    []string `json:"account_ids"`
+	OncePerDay    bool     `json:"once_per_day"`
+	LegacyEnabled *bool    `json:"legacy_enabled,omitempty"`
 	// UserEdited marks a plan saved through the operator API. Default-import
 	// repair must never flip a plan the operator deliberately changed.
 	UserEdited     bool       `json:"user_edited,omitempty"`
@@ -175,6 +262,7 @@ type Schedule struct {
 	LastDispatched *time.Time `json:"last_dispatched,omitempty"`
 }
 type Step struct {
+	TaskName      string     `json:"task_name,omitempty"`
 	ActionOutcome string     `json:"action_outcome,omitempty"`
 	TaskKey       string     `json:"task_key,omitempty"`
 	AccountID     string     `json:"account_id,omitempty"`
@@ -187,7 +275,22 @@ type Step struct {
 	ErrorCode     string     `json:"error_code,omitempty"`
 	UpstreamCode  *int       `json:"upstream_code,omitempty"`
 }
+
+// OutputLine is persisted diagnostic progress, not an action receipt. Its run,
+// account and task identity are supplied by the engine, never by log text.
+type OutputLine struct {
+	At        time.Time `json:"at"`
+	AccountID string    `json:"account_id"`
+	TaskKey   string    `json:"task_key"`
+	TaskName  string    `json:"task_name,omitempty"`
+	Stage     Stage     `json:"stage"`
+	Text      string    `json:"text"`
+}
+
 type Run struct {
+	TaskSequence    []string         `json:"task_sequence,omitempty"`
+	Output          []OutputLine     `json:"output,omitempty"`
+	OutputDropped   int              `json:"output_dropped,omitempty"`
 	DiscoveryIssues []DiscoveryIssue `json:"discovery_issues,omitempty"`
 	ID              string           `json:"id"`
 	TaskKey         string           `json:"task_key"`
@@ -217,12 +320,13 @@ type Page struct {
 	Offset int   `json:"offset"`
 }
 type Request struct {
-	TaskKey     string     `json:"task_key"`
-	ProviderID  string     `json:"provider_id"`
-	ScheduleID  string     `json:"schedule_id,omitempty"`
-	Trigger     string     `json:"trigger,omitempty"`
-	AccountIDs  []string   `json:"account_ids"`
-	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
+	TaskKey      string     `json:"task_key"`
+	TaskSequence []string   `json:"task_sequence,omitempty"`
+	ProviderID   string     `json:"provider_id"`
+	ScheduleID   string     `json:"schedule_id,omitempty"`
+	Trigger      string     `json:"trigger,omitempty"`
+	AccountIDs   []string   `json:"account_ids"`
+	ScheduledAt  *time.Time `json:"scheduled_at,omitempty"`
 }
 
 // NextFire uses calendar arithmetic in the configured zone, including DST.

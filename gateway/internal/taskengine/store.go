@@ -25,12 +25,32 @@ type persisted struct {
 }
 
 type runWork struct {
-	Tasks           []Task          `json:"tasks"`
-	Next            int             `json:"next"`
-	Status          Status          `json:"status"`
-	ErrorCode       string          `json:"error_code,omitempty"`
-	Confirmed       map[string]bool `json:"confirmed,omitempty"`
-	CancelRequested bool            `json:"cancel_requested,omitempty"`
+	Tasks            []Task                        `json:"tasks"`
+	Next             int                           `json:"next"`
+	SequenceAccounts []string                      `json:"sequence_accounts"`
+	SequenceAccount  int                           `json:"sequence_account,omitempty"`
+	SequenceIndex    int                           `json:"sequence_index,omitempty"`
+	SequenceCount    int                           `json:"sequence_count,omitempty"`
+	SequenceHolds    map[string]sequenceCheckpoint `json:"sequence_holds,omitempty"`
+	SequenceDone     map[string]bool               `json:"sequence_done,omitempty"`
+	Status           Status                        `json:"status"`
+	ErrorCode        string                        `json:"error_code,omitempty"`
+	Confirmed        map[string]bool               `json:"confirmed,omitempty"`
+	CancelRequested  bool                          `json:"cancel_requested,omitempty"`
+}
+
+type sequenceCheckpoint struct {
+	Tasks     []Task          `json:"tasks"`
+	Next      int             `json:"next"`
+	Index     int             `json:"index"`
+	Confirmed map[string]bool `json:"confirmed,omitempty"`
+}
+
+func cloneWork(work runWork) runWork {
+	raw, _ := json.Marshal(work)
+	var copy runWork
+	_ = json.Unmarshal(raw, &copy)
+	return copy
 }
 
 // errStoreCorrupt marks bytes that are not valid JSON at all. Only this class
@@ -88,6 +108,14 @@ func readState(path string) (persisted, error) {
 	if len(s.Work) > 64 {
 		return s, errors.New("task_work_limit")
 	}
+	for id, schedule := range s.Schedules {
+		if id != schedule.ID || !validAccountScope(schedule.AccountIDs) {
+			return s, errors.New("task_schedule_scope_invalid")
+		}
+		if !validRunTaskKey(schedule.TaskKey, schedule.TaskSequence) || !validateTaskSequence(schedule.TaskSequence) {
+			return s, errors.New("task_schedule_sequence_invalid")
+		}
+	}
 	for id, work := range s.Work {
 		if len(work.Tasks) > 1000 || work.Next < 0 || work.Next > len(work.Tasks) {
 			return s, errors.New("task_work_invalid")
@@ -99,11 +127,67 @@ func readState(path string) (persisted, error) {
 				break
 			}
 		}
-		if run == nil || run.FinishedAt != nil {
+		if run == nil || run.FinishedAt != nil && !(run.Status == StatusUncertain && len(run.TaskSequence) > 0) {
 			return s, errors.New("task_work_orphan")
 		}
-		if run.Status != StatusQueued && run.Status != StatusRunning {
+		if run.FinishedAt == nil && run.Status != StatusQueued && run.Status != StatusRunning || run.FinishedAt != nil && run.Status != StatusUncertain {
 			return s, errors.New("task_work_status_invalid")
+		}
+		if len(run.TaskSequence) > 0 {
+			if work.SequenceIndex < 0 || work.SequenceIndex >= len(run.TaskSequence) || work.SequenceCount < len(work.Tasks) || work.SequenceCount > 1000 || work.SequenceAccount < 0 || work.SequenceAccount > len(work.SequenceAccounts) || len(work.SequenceAccounts) > 500 {
+				return s, errors.New("task_sequence_cursor_invalid")
+			}
+			accounts := map[string]bool{}
+			for _, account := range work.SequenceAccounts {
+				if !IDPattern.MatchString(account) || accounts[account] || len(run.AccountIDs) > 0 && !contains(run.AccountIDs, account) {
+					return s, errors.New("task_sequence_scope_invalid")
+				}
+				accounts[account] = true
+			}
+			if work.SequenceAccounts != nil && len(run.AccountIDs) > 0 && !sameAccountScope(run.AccountIDs, work.SequenceAccounts) {
+				return s, errors.New("task_sequence_scope_invalid")
+			}
+			if work.SequenceAccount == len(work.SequenceAccounts) && (work.Tasks != nil || work.SequenceIndex != 0 || work.Next != 0) {
+				return s, errors.New("task_sequence_cursor_invalid")
+			}
+			if len(work.SequenceHolds)+len(work.SequenceDone) > len(work.SequenceAccounts) {
+				return s, errors.New("task_sequence_scope_invalid")
+			}
+			totalTasks := len(work.Tasks)
+			for account, done := range work.SequenceDone {
+				if !done || !accounts[account] {
+					return s, errors.New("task_sequence_scope_invalid")
+				}
+				if work.SequenceAccount < len(work.SequenceAccounts) && work.SequenceAccounts[work.SequenceAccount] == account {
+					return s, errors.New("task_sequence_cursor_invalid")
+				}
+			}
+			for account, hold := range work.SequenceHolds {
+				if !accounts[account] || work.SequenceDone[account] || hold.Index < 0 || hold.Index >= len(run.TaskSequence) || hold.Next < 0 || hold.Next >= len(hold.Tasks) {
+					return s, errors.New("task_sequence_checkpoint_invalid")
+				}
+				if work.SequenceAccount < len(work.SequenceAccounts) && work.SequenceAccounts[work.SequenceAccount] == account {
+					return s, errors.New("task_sequence_checkpoint_invalid")
+				}
+				totalTasks += len(hold.Tasks)
+				if totalTasks > work.SequenceCount {
+					return s, errors.New("task_sequence_checkpoint_invalid")
+				}
+				keys := map[string]bool{}
+				for _, task := range hold.Tasks {
+					if task.AccountID != account || task.ProviderID != run.ProviderID || task.Key == "" || len(task.Key) > 512 || len(task.PeriodKey) > 512 || !TaskKeyMatches(run.TaskSequence[hold.Index], task.Key) || task.Once && task.OncePerDay || task.OncePerDay && task.PeriodKey == "" || keys[taskKey(task)] {
+						return s, errors.New("task_sequence_checkpoint_invalid")
+					}
+					keys[taskKey(task)] = true
+				}
+				for key, done := range hold.Confirmed {
+					if !done || !keys[key] {
+						return s, errors.New("task_work_confirmation_invalid")
+					}
+				}
+			}
+		} else if work.SequenceIndex != 0 || work.SequenceCount != 0 || work.SequenceAccount != 0 || work.SequenceAccounts != nil || len(work.SequenceHolds) > 0 || len(work.SequenceDone) > 0 {
+			return s, errors.New("task_sequence_cursor_invalid")
 		}
 		switch work.Status {
 		case StatusSkipped, StatusSucceeded, StatusManual, StatusCanceled, StatusFailed, StatusUncertain:
@@ -112,7 +196,7 @@ func readState(path string) (persisted, error) {
 		}
 		keys := map[string]bool{}
 		for _, t := range work.Tasks {
-			if t.ProviderID != run.ProviderID || !IDPattern.MatchString(t.AccountID) || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || len(run.AccountIDs) > 0 && !contains(run.AccountIDs, t.AccountID) || t.Once && t.OncePerDay || t.OncePerDay && t.PeriodKey == "" || keys[taskKey(t)] {
+			if t.ProviderID != run.ProviderID || !IDPattern.MatchString(t.AccountID) || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || !taskIncluded(run.TaskKey, run.TaskSequence, t.Key) || len(run.TaskSequence) > 0 && (work.SequenceAccount >= len(work.SequenceAccounts) || t.AccountID != work.SequenceAccounts[work.SequenceAccount] || work.SequenceIndex >= len(run.TaskSequence) || !TaskKeyMatches(run.TaskSequence[work.SequenceIndex], t.Key)) || len(run.AccountIDs) > 0 && !contains(run.AccountIDs, t.AccountID) || t.Once && t.OncePerDay || t.OncePerDay && t.PeriodKey == "" || keys[taskKey(t)] {
 				return s, errors.New("task_work_invalid")
 			}
 			keys[taskKey(t)] = true
@@ -162,7 +246,13 @@ func readState(path string) (persisted, error) {
 			return s, errors.New("task_attempt_receipt_mismatch")
 		}
 	}
+	if err := validateOutput(s); err != nil {
+		return s, err
+	}
 	for i := range s.Runs {
+		if !validateTaskSequence(s.Runs[i].TaskSequence) || len(s.Runs[i].TaskSequence) > 0 && !IDPattern.MatchString(s.Runs[i].TaskKey) {
+			return s, errors.New("task_run_sequence_invalid")
+		}
 		if s.Runs[i].Status == StatusRunning || s.Runs[i].Status == StatusQueued {
 			if work, ok := s.Work[s.Runs[i].ID]; ok {
 				onlyUnknown := len(work.Tasks) > work.Next
@@ -171,14 +261,25 @@ func readState(path string) (persisted, error) {
 						onlyUnknown = false
 					}
 				}
-				if onlyUnknown {
+				if onlyUnknown && len(s.Runs[i].TaskSequence) == 0 {
 					delete(s.Work, s.Runs[i].ID)
 				} else {
 					if work.CancelRequested {
+						unknown := len(work.SequenceHolds) > 0
+						for _, task := range work.Tasks {
+							if _, pending := s.Uncertain[taskKey(task)]; pending {
+								unknown = true
+							}
+						}
 						s.Runs[i].Status = StatusCanceled
+						if len(s.Runs[i].TaskSequence) > 0 && unknown {
+							s.Runs[i].Status = StatusUncertain
+							s.Runs[i].ErrorCode = "verification_required"
+						} else {
+							delete(s.Work, s.Runs[i].ID)
+						}
 						now := time.Now().UTC()
 						s.Runs[i].FinishedAt = &now
-						delete(s.Work, s.Runs[i].ID)
 					} else {
 						s.Runs[i].Status = StatusQueued
 					}

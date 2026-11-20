@@ -6,7 +6,10 @@ package accountvault
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -34,11 +37,12 @@ type sealed struct {
 	Ciphertext []byte  `json:"ciphertext"`
 }
 type Vault struct {
-	mu     sync.Mutex
-	dir    string
-	aead   cipher.AEAD
-	owner  *os.File
-	closed bool
+	mu          sync.Mutex
+	dir         string
+	aead        cipher.AEAD
+	identityKey [32]byte
+	owner       *os.File
+	closed      bool
 }
 
 func Open(dir string) (*Vault, error) {
@@ -131,9 +135,32 @@ func openProtected(abs string) (*Vault, error) {
 	if err != nil {
 		return nil, errors.New("vault_cipher_failed")
 	}
+	// Domain-separated from encryption; migrated copies keep the same public
+	// identities, but someone without this vault's key cannot enumerate phones.
+	identityMAC := hmac.New(sha256.New, key)
+	_, _ = identityMAC.Write([]byte("LoomGate/account-identity/v1"))
+	var identityKey [32]byte
+	copy(identityKey[:], identityMAC.Sum(nil))
+	for i := range key {
+		key[i] = 0
+	}
 	success = true
-	return &Vault{dir: abs, aead: aead, owner: owner}, nil
+	return &Vault{dir: abs, aead: aead, identityKey: identityKey, owner: owner}, nil
 }
+
+// OpaqueID returns a stable, vault-scoped public identifier without revealing
+// the source value. It does not create records or alter encrypted metadata.
+func (v *Vault) OpaqueID(namespace, value string) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || !validID.MatchString(namespace) || value == "" || len(value) > 1024 {
+		return ""
+	}
+	mac := hmac.New(sha256.New, v.identityKey[:])
+	_, _ = mac.Write([]byte(namespace + "\x00" + value))
+	return namespace + "-" + hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
 func (v *Vault) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -141,6 +168,9 @@ func (v *Vault) Close() error {
 		return nil
 	}
 	v.closed = true
+	for i := range v.identityKey {
+		v.identityKey[i] = 0
+	}
 	return v.owner.Close()
 }
 func (v *Vault) load(id string) (sealed, error) {

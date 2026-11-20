@@ -18,12 +18,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--console", default="", help="console directory (default: gateway/panel/console)")
     parser.add_argument("--node", default="node", help="node executable")
+    parser.add_argument("--browser", action="store_true", help="also run synthetic-loopback Chromium interaction regressions")
+    parser.add_argument("--browser-output", type=Path, help="evidence directory outside the source tree (required with --browser)")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
-    console = Path(args.console) if args.console else root / "panel" / "console"
+    output = args.browser_output.resolve() if args.browser_output else None
+    if args.browser and (output is None or output.is_relative_to(root.parent)):
+        parser.error("--browser requires --browser-output outside the source tree")
+    console = Path(args.console).resolve() if args.console else root / "panel" / "console"
     if not console.is_dir():
         print(f"console directory not found: {console}", file=sys.stderr)
+        return 1
+    if args.browser and console != (root / "panel" / "console").resolve():
+        print("browser mode only supports gateway/panel/console", file=sys.stderr)
         return 1
 
     tests = sorted(console.glob("*.test.cjs"))
@@ -32,8 +40,13 @@ def main() -> int:
         return 1
 
     command = [args.node, "--test", *[str(path) for path in tests]]
-    print("running:", " ".join(str(path.name) for path in tests))
-    return subprocess.run(command, cwd=console, check=False).returncode
+    print("running:", " ".join(str(path.name) for path in tests), flush=True)
+    code = subprocess.run(command, cwd=console, check=False).returncode
+    if code or not args.browser:
+        return code
+    command = [sys.executable, "-I", "-B", str(root / "tests" / "console_interactions_browser.py"),
+               "--output", str(output), "--assets", str(console.parent)]
+    return subprocess.run(command, cwd=root, check=False).returncode
 
 
 if __name__ == "__main__":
