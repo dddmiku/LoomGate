@@ -192,6 +192,31 @@ func TestUpdateAvailableComparesVersions(t *testing.T) {
 	}
 }
 
+// v3.17.0 是旧线过渡版本，内部已是 LoomGate。按数字比较会把 LoomGate 1.x
+// 判成降级，过渡版就永远升不上去；但同一产品线内的防降级必须保留。
+func TestTransitionalLegacyAcceptsLoomGateLine(t *testing.T) {
+	original := versionpkg.Version
+	defer func() { versionpkg.Version = original }()
+	for _, test := range []struct {
+		current string
+		tag     string
+		want    bool
+	}{
+		{"v3.17.0", "v1.0.4", true},   // 过渡到 LoomGate 1.x
+		{"v3.17.0", "v1.9.0", true},   // 未来 1.x 也算
+		{"v3.17.0", "v3.17.0", false}, // 自身不算
+		{"v3.17.0", "v3.16.1", false}, // 旧线防降级
+		{"v3.16.1", "v1.0.4", false},  // 未升级的旧客户端仍按原规则
+		{"v1.0.4", "v1.0.3", false},   // LoomGate 自身防降级
+		{"v1.0.4", "v1.0.5", true},
+	} {
+		versionpkg.Version = test.current
+		if got := (Release{Tag: test.tag}).UpdateAvailable(); got != test.want {
+			t.Errorf("current=%s tag=%s: got %v want %v", test.current, test.tag, got, test.want)
+		}
+	}
+}
+
 // TestReleaseAssetNamesMatchManifest 对照构建清单与实际取件函数，独立于仓库布局和 CI 文本。
 func TestReleaseAssetNamesMatchManifest(t *testing.T) {
 	var manifest struct {

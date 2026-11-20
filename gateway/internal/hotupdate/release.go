@@ -85,6 +85,11 @@ type Release struct {
 // 镜像 CI 注入的 `v3.14.2-6-gabc` 与 Release 的 `v3.14.2` 不是同一个版本，
 // 前者更新，不能被判成「已是最新」而挡住后续升级。
 // 任一边无法解析时退回名称比较——宁可让用户自己判断，也不静默认为最新。
+//
+// 跨产品线例外：v3.17.0 是旧线的过渡版本，它内部已是 LoomGate。旧线的
+// "v3.x" 与 LoomGate 的 "v1.x" 不能按数字比较——按数字比会把 v1.0.4 判成
+// 降级，过渡版本就永远上不去。所以从 3.17.0 起，远端任何 LoomGate 1.x/
+// 更高版本都算升级；这只是单向过渡，不影响同一产品线内的防降级。
 func (r Release) UpdateAvailable() bool {
 	current := strings.TrimSpace(version.Version)
 	if r.Tag == "" {
@@ -94,12 +99,25 @@ func (r Release) UpdateAvailable() bool {
 		// 开发构建：只要远端有 tag 就认为可更新，交由使用者判断。
 		return true
 	}
-	if candidate, ok := parseBuildVersion(r.Tag); ok {
-		if running, ok := parseBuildVersion(current); ok {
-			return candidate.compare(running) > 0
-		}
+	candidate, candidateOK := parseBuildVersion(r.Tag)
+	running, runningOK := parseBuildVersion(current)
+	if candidateOK && runningOK && isTransitionalLegacy(running) && isLoomGateLine(candidate) {
+		return true
+	}
+	if candidateOK && runningOK {
+		return candidate.compare(running) > 0
 	}
 	return strings.TrimPrefix(r.Tag, "v") != strings.TrimPrefix(current, "v")
+}
+
+// isTransitionalLegacy 报告当前进程是否为旧线的过渡版本（>= v3.17.0）。
+func isTransitionalLegacy(v buildVersion) bool {
+	return v.nums[0] == 3 && v.nums[1] >= 17
+}
+
+// isLoomGateLine 报告候选版本是否属于 LoomGate 1.x 线。
+func isLoomGateLine(v buildVersion) bool {
+	return v.nums[0] == 1
 }
 
 // buildVersion 是「可比较的版本」：vX.Y.Z 加上可选的 git describe 后缀。

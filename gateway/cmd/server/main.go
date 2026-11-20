@@ -41,6 +41,7 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
+	"workbuddy2api/internal/version"
 )
 
 func main() {
@@ -68,6 +69,22 @@ func main() {
 	cfg, err := loadConfigOrEnv(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+
+	// v3.17.0 transitional hand-off: a legacy deployment still points its update
+	// source at the old maintenance repository. Without this it would stay on
+	// 3.17.0 forever and never see LoomGate 1.x. Runs once, keeps a rollback copy
+	// and never touches a repo the operator set deliberately.
+	if strings.HasPrefix(strings.TrimSpace(version.Version), "v3.") {
+		changed, migrateErr := migrateUpdateRepo(*cfgPath)
+		if migrateErr != nil {
+			log.Printf("WARN: [transition] 更新源迁移未完成（保留原配置）：%v", migrateErr)
+		} else if changed {
+			log.Printf("INFO: [transition] 更新源已切换到 %s（原配置备份见 config.json%s）", loomGateRepo, transitionBackupSuffix)
+			if reloaded, loadErr := loadConfigOrEnv(*cfgPath); loadErr == nil {
+				cfg = reloaded
+			}
+		}
 	}
 
 	layout, err := prepareUnified(cfg, *cfgPath)
