@@ -12,6 +12,7 @@ def run(installer,root,out):
  out.mkdir(parents=True,exist_ok=True);root.parent.mkdir(parents=True,exist_ok=True)
  report={'checks':[],'commands':[],'real_provider_requests':0,'page_errors':[],'console_errors':[],'external_requests':[],'screenshots':[],'result':'INCOMPLETE'}
  env={**os.environ,'TEMP':str(out/'tmp'),'TMP':str(out/'tmp'),'LOOMGATE_DESKTOP_HEADLESS':'1','PYTHONDONTWRITEBYTECODE':'1'};Path(env['TEMP']).mkdir(exist_ok=True)
+ env.pop('LOOMGATE_LEGACY_SCHEDULER',None)
  for key in list(env):
   if key.startswith(('WB2A_','WB2API_','LOOMGATE_DOUBAO_')):env.pop(key)
  installer_digest=sha(installer);child=None;log=None
@@ -59,8 +60,32 @@ def run(installer,root,out):
    fields=dict(x.split(':',1) for x in (workspace/'panel-data/initial-password.txt').read_text(encoding='utf-8').splitlines() if ':' in x)
    page.goto('http://127.0.0.1:17864/admin/');page.locator('#username').fill(fields['username'].strip());page.locator('#password').fill(fields['password'].strip());page.locator('#login-submit').click();page.locator('[data-workspace-overview]').wait_for()
    def api(path):return page.request.get('http://127.0.0.1:17864/admin/api/'+path).json()
-   assert api('workbench')['schedules']==[] and api('workbench/accounts')['accounts']==[]
-   page.locator('#navigation a[href="#tasks"]').click();page.locator('#task-list.loading').wait_for(state='detached');page.screenshot(path=str(out/'installed-desktop.png'),full_page=True);report['screenshots'].append('installed-desktop.png')
+   work=api('workbench');account_view=api('workbench/accounts');legacy=api('state');requests=api('requests?limit=1&offset=0')
+   assert isinstance(work['schedules'],list) and len(work['schedules'])==16 and account_view['accounts']==[] and legacy['accounts']==[]
+   assert len({plan['id'] for plan in work['schedules']})==16
+   assert {plan['id'] for plan in work['schedules'] if plan['enabled']}=={'legacy-balance','legacy-trae-balance'}
+   assert isinstance(work['runs'],list) and work['runs']==[]
+   assert isinstance(requests['total'],int) and requests['total']==0
+   for plan in work['schedules']:
+    assert isinstance(plan,dict) and plan['provider_id'] in ('workbuddy','trae')
+    assert isinstance(plan['id'],str) and plan['id'] and isinstance(plan['task_key'],str) and plan['task_key']
+    assert plan['account_ids']==[] and isinstance(plan['enabled'],bool)
+    assert isinstance(plan['hours'],list) and plan['hours'] and all(isinstance(hour,int) and 0<=hour<24 for hour in plan['hours'])
+    assert isinstance(plan['minute'],int) and 0<=plan['minute']<60 and plan['timezone']=='Asia/Shanghai'
+    assert not plan.get('last_run_id') and not plan.get('last_dispatched') and not plan.get('user_edited')
+    assert not plan['enabled'] or plan['task_key']=='balance'
+   report['empty_workspace_contract']={'schedules':len(work['schedules']),'enabled_readonly_schedules':sum(plan['enabled'] for plan in work['schedules']),'bound_accounts':0,'vault_accounts':0,'legacy_accounts':0,'runs':0,'inference_requests':0}
+   report['checks'].append('empty_accounts_allow_shipped_readonly_plans_without_execution')
+   with page.expect_response('**/admin/api/workbench/catalog?*') as catalog_response:
+    page.locator('#navigation a[href="#tasks"]').click()
+   assert catalog_response.value.status==200
+   catalog=catalog_response.value.json();assert catalog['tasks']==[] and catalog['issues']==[]
+   page.wait_for_function("location.hash==='#tasks'&&document.querySelector('#task-list:not(.loading)')&&document.querySelectorAll('#task-list [data-plan-row]').length===13&&!document.querySelector('#task-list').textContent.includes('正在读取账号状态')&&document.querySelector('#view').dataset.loadState==='ready'")
+   assert page.locator('#navigation a[href="#tasks"]').get_attribute('aria-current')=='page'
+   assert page.locator('#task-list [data-plan-row]').count()==13
+   assert api('workbench')['runs']==[] and api('requests?limit=1&offset=0')['total']==0
+   report['task_ui_contract']={'catalog_tasks':0,'catalog_issues':0,'visible_workbuddy_plan_rows':13,'runs':0,'inference_requests':0}
+   page.screenshot(path=str(out/'installed-desktop.png'),full_page=True);report['screenshots'].append('installed-desktop.png')
    page.set_viewport_size({'width':390,'height':844});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1');page.screenshot(path=str(out/'installed-mobile.png'),full_page=True);report['screenshots'].append('installed-mobile.png')
    assert not report['page_errors'] and not report['console_errors'] and not report['external_requests'];browser.close()
   stop();assert sha(config_path)==original_config;report['checks'].append('installed_launcher_new_engine_login_ui_and_graceful_shutdown')
