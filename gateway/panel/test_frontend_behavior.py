@@ -68,7 +68,7 @@ const context = {console, Date, Promise, Map, window:win, URLSearchParams, JSON,
     // 整个模块在 init() 里抛错，测试永远进不到断言（此前 requests.js 从未被测过）。
     getElementById:node, querySelector:node, querySelectorAll(){return []}, addEventListener(){}}};
 vm.createContext(context);
-for (const source of ['app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
+for (const source of ['console/token-format.js','app.js','usage.js'].concat(String(process.argv[3]||'').split(',').filter(Boolean)))
   vm.runInContext(fs.readFileSync(path.join(process.argv[1],source),'utf8'),context);
 // 预加载 fixture：变量名 = 去掉 .json 的文件名，表达式里直接引用。
 for (const name of String(process.argv[4]||'').split(',').filter(Boolean)) {

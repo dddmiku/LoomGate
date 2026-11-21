@@ -81,7 +81,7 @@ func (m *traeCheckinModule) AcquireTask(ctx context.Context, a *auth.Auth, t tas
 	}
 	release := func() { <-m.store.claimGate }
 	stored := m.store.read(a.UID)
-	if stored.CheckedDay == t.PeriodKey || t.PeriodKey != m.day() || m.now().Before(stored.RetryAt) {
+	if stored.CheckedDay == t.PeriodKey || t.PeriodKey != m.day() || traeCooldownActive(stored, m.now()) {
 		return release, nil
 	}
 	m.store.mu.Lock()
@@ -105,7 +105,7 @@ func (m *traeCheckinModule) AcquireTask(ctx context.Context, a *auth.Auth, t tas
 }
 
 func (m *traeCheckinModule) day() string {
-	return m.now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	return traeBusinessDay(m.now())
 }
 
 func (m *traeCheckinModule) DiscoverState(ctx context.Context, a *auth.Auth) ([]ModuleTask, error) {
@@ -116,15 +116,50 @@ func (m *traeCheckinModule) DiscoverState(ctx context.Context, a *auth.Auth) ([]
 }
 
 func (m *traeCheckinModule) backoff(a *auth.Auth, code int) error {
+	return m.backoffWithRecovery(a, code, true)
+}
+
+func (m *traeCheckinModule) backoffWithRecovery(a *auth.Auth, code int, automatic bool) error {
 	return m.store.change(a.UID, func(s *traeTaskState, _ *traeTaskStateData) error {
+		if s.RetryDay != m.day() {
+			s.RetryDay = m.day()
+			s.AutoAttempts = 0
+			s.NextAutoAt = time.Time{}
+			s.Failures = 0
+		}
 		s.Failures = min(s.Failures+1, 1000)
 		s.Code = code
 		s.RetryAt = m.now().Add(time.Minute << min(s.Failures-1, 3))
+		s.AutoPending = code == 9074 && automatic
+		return nil
+	})
+}
+
+func (m *traeCheckinModule) stopAutomaticRetry(a *auth.Auth) error {
+	stored := m.store.read(a.UID)
+	if !stored.AutoPending && !(stored.RetryDay == "" && stored.Code == 9074) {
+		return nil
+	}
+	return m.store.change(a.UID, func(s *traeTaskState, _ *traeTaskStateData) error {
+		s.AutoPending = false
+		// Also close the legacy same-day migration path. Keep the day/count so a
+		// later genuine refusal cannot reset this business day retry budget.
+		if s.RetryDay == "" {
+			s.RetryDay = m.day()
+		}
 		return nil
 	})
 }
 
 func (m *traeCheckinModule) Inspect(ctx context.Context, a *auth.Auth, t taskengine.Task) (taskengine.Observation, error) {
+	if t.PendingVerification {
+		// Discovery may have encountered a status refusal before the engine
+		// attaches its exact pending marker. Close that local retry permission
+		// even when the cooldown prevents another status request here.
+		if err := m.stopAutomaticRetry(a); err != nil {
+			return taskengine.Observation{}, err
+		}
+	}
 	if t.PeriodKey != m.day() {
 		return observation("blocked", "签到业务日已变化，请保留旧操作并核验。"), nil
 	}
@@ -132,16 +167,19 @@ func (m *traeCheckinModule) Inspect(ctx context.Context, a *auth.Auth, t taskeng
 	if stored.CheckedDay == t.PeriodKey {
 		return observation("done", "已通过官方状态确认此业务日签到。"), nil
 	}
-	if m.now().Before(stored.RetryAt) {
+	if traeCooldownActive(stored, m.now()) {
 		return observation("manual", fmt.Sprintf("官方限流退避中，%s 后可再次核验；余额查询仍可独立执行。", stored.RetryAt.Format(time.RFC3339))), nil
 	}
 	state, err := m.api.Status(ctx, a)
 	if err != nil {
 		if trae.IsRateLimited(err) {
-			if err = m.backoff(a, 9074); err != nil {
+			if err = m.backoffWithRecovery(a, 9074, !t.PendingVerification); err != nil {
 				return taskengine.Observation{}, err
 			}
 			return observation("manual", "官方返回 9074，已持久化退避。"), nil
+		}
+		if saveErr := m.stopAutomaticRetry(a); saveErr != nil {
+			return taskengine.Observation{}, saveErr
 		}
 		return taskengine.Observation{}, err
 	}
@@ -151,6 +189,7 @@ func (m *traeCheckinModule) Inspect(ctx context.Context, a *auth.Auth, t taskeng
 			s.RetryAt = time.Time{}
 			s.Failures = 0
 			s.Code = 0
+			s.AutoPending = false
 			return nil
 		}); err != nil {
 			return taskengine.Observation{}, err
@@ -158,6 +197,9 @@ func (m *traeCheckinModule) Inspect(ctx context.Context, a *auth.Auth, t taskeng
 		return observation("done", "官方状态确认本账号今日已签到。"), nil
 	}
 	if !state.Enabled {
+		if err = m.stopAutomaticRetry(a); err != nil {
+			return taskengine.Observation{}, err
+		}
 		return observation("manual", "官方当前未开放签到。"), nil
 	}
 	return observation("ready", "可提交一次签到，并再次读取官方账号状态。"), nil
@@ -173,11 +215,18 @@ func (m *traeCheckinModule) Execute(ctx context.Context, a *auth.Auth, t taskeng
 	if ctx.Err() != nil {
 		return taskengine.NotSubmitted(t, taskengine.StageExecute, o), ctx.Err()
 	}
-	err = m.store.change(a.UID, func(_ *traeTaskState, state *traeTaskStateData) error {
+	err = m.store.change(a.UID, func(s *traeTaskState, state *traeTaskStateData) error {
 		if m.now().Before(state.NextClaim) {
 			return errTraeClaimGap
 		}
 		state.NextClaim = m.now().Add(3 * time.Second)
+		// A submitted request has no automatic replay permission. Only a new
+		// explicit 9074 response may put it back in the deferred queue.
+		s.AutoPending = false
+		s.Code = 0
+		// Inspect already admitted this period. An old-day cooldown must not
+		// become an unclassified future gate when Code is cleared for sending.
+		s.RetryAt = time.Time{}
 		return nil
 	})
 	if errors.Is(err, errTraeClaimGap) {
@@ -205,6 +254,7 @@ func (m *traeCheckinModule) Execute(ctx context.Context, a *auth.Auth, t taskeng
 				day, _ := time.ParseInLocation("2006-01-02", m.day(), time.FixedZone("CST", 8*3600))
 				s.RetryAt = day.AddDate(0, 0, 1)
 				s.Code = 9095
+				s.AutoPending = false
 				return nil
 			})
 			if saveErr != nil {

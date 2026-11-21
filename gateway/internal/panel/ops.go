@@ -610,9 +610,10 @@ func (s *Server) taskLog(w http.ResponseWriter, r *http.Request) {
 		if lines, ok := payload["lines"].([]any); ok {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok": true, "key": key, "lines": lines, "count": len(lines),
-				"running": jsonBool(payload["running"], false),
-				"endedAt": jsonString(payload["ended_at"]),
-				"message": jsonString(payload["message"]),
+				"running":    jsonBool(payload["running"], false),
+				"endedAt":    jsonString(payload["ended_at"]),
+				"message":    jsonString(payload["message"]),
+				"statistics": payload["statistics"],
 			})
 			return
 		}

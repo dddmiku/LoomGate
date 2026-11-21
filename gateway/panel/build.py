@@ -52,8 +52,10 @@ def main():
         sys.stderr.write("body.html 缺少请求明细占位符\n")
         return 1
     body = body.replace("<!--__REQUESTS_VIEW__-->", read("requests.html"))
-    with open(os.path.join(HERE, "app.js"), "r", encoding="utf-8") as fh:
+    with open(os.path.join(HERE, "console", "token-format.js"), "r", encoding="utf-8") as fh:
         js = fh.read()
+    with open(os.path.join(HERE, "app.js"), "r", encoding="utf-8") as fh:
+        js += "\n" + fh.read()
     with open(os.path.join(HERE, "keys.js"), "r", encoding="utf-8") as fh:
         js += "\n" + fh.read()
     with open(os.path.join(HERE, "usage.js"), "r", encoding="utf-8") as fh:

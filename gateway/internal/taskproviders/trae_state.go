@@ -12,10 +12,14 @@ import (
 )
 
 type traeTaskState struct {
-	CheckedDay string    `json:"checked_day,omitempty"`
-	RetryAt    time.Time `json:"retry_at,omitempty"`
-	Failures   int       `json:"failures,omitempty"`
-	Code       int       `json:"code,omitempty"`
+	CheckedDay   string    `json:"checked_day,omitempty"`
+	RetryAt      time.Time `json:"retry_at,omitempty"`
+	Failures     int       `json:"failures,omitempty"`
+	Code         int       `json:"code,omitempty"`
+	RetryDay     string    `json:"retry_day,omitempty"`
+	AutoAttempts int       `json:"auto_attempts,omitempty"`
+	NextAutoAt   time.Time `json:"next_auto_at,omitempty"`
+	AutoPending  bool      `json:"auto_pending,omitempty"`
 }
 type traeTaskStateData struct {
 	Accounts  map[string]traeTaskState `json:"accounts"`
@@ -69,6 +73,19 @@ func NewTraeTaskStore(v *accountvault.Vault) (*TraeTaskStore, error) {
 			}
 		}
 		if a.Failures < 0 || a.Failures > 1000 || a.CheckedDay != "" && len(a.CheckedDay) != 10 {
+			return nil, errors.New("trae_task_state_invalid")
+		}
+		if a.AutoAttempts < 0 || a.AutoAttempts > traeAutoRetryLimit {
+			return nil, errors.New("trae_task_state_invalid")
+		}
+		if a.RetryDay == "" {
+			if a.AutoAttempts != 0 || !a.NextAutoAt.IsZero() || a.AutoPending {
+				return nil, errors.New("trae_task_state_invalid")
+			}
+		} else if day, err := time.Parse("2006-01-02", a.RetryDay); err != nil || day.Format("2006-01-02") != a.RetryDay {
+			return nil, errors.New("trae_task_state_invalid")
+		}
+		if a.AutoPending && (a.Code != 9074 || a.RetryAt.IsZero()) || a.AutoAttempts > 0 && a.NextAutoAt.IsZero() {
 			return nil, errors.New("trae_task_state_invalid")
 		}
 	}

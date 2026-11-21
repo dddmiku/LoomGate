@@ -49,6 +49,9 @@ func (e *Engine) Handler() http.Handler {
 			lines = []string{}
 		}
 		body := map[string]any{"ok": true, "key": key, "lines": lines, "count": len(lines), "running": res.Running}
+		if res.Statistics != nil {
+			body["statistics"] = res.Statistics
+		}
 		if res.Message != "" {
 			body["message"] = res.Message
 		}

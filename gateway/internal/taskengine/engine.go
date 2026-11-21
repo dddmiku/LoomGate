@@ -28,18 +28,19 @@ type Options struct {
 	AllowTaskTimeout bool
 }
 type Engine struct {
-	mu       sync.Mutex
-	state    persisted
-	opts     Options
-	owner    *os.File
-	adapters map[string]Adapter
-	running  map[string]context.CancelFunc
-	accounts map[string]chan struct{}
-	closed   bool
-	draining bool
-	workers  chan struct{}
-	wake     chan struct{}
-	wg       sync.WaitGroup
+	mu         sync.Mutex
+	deferredMu sync.Mutex
+	state      persisted
+	opts       Options
+	owner      *os.File
+	adapters   map[string]Adapter
+	running    map[string]context.CancelFunc
+	accounts   map[string]chan struct{}
+	closed     bool
+	draining   bool
+	workers    chan struct{}
+	wake       chan struct{}
+	wg         sync.WaitGroup
 }
 
 func Open(opts Options) (*Engine, error) {
@@ -354,7 +355,7 @@ func sameAccountScope(a, b []string) bool {
 }
 
 func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, error) {
-	if e.closed || e.draining || e.adapters[req.ProviderID] == nil || !validRunTaskKey(req.TaskKey, req.TaskSequence) || !validAccountScope(req.AccountIDs) || !validateTaskSequence(req.TaskSequence) {
+	if e.closed || e.draining || e.adapters[req.ProviderID] == nil || !validRunTaskKey(req.TaskKey, req.TaskSequence) || !validAccountScope(req.AccountIDs) || !validateTaskSequence(req.TaskSequence) || len(req.ExpectedPeriodKey) > 512 || !utf8.ValidString(req.ExpectedPeriodKey) || req.ExpectedPeriodKey != "" && (req.Trigger != "retry" || len(req.TaskSequence) != 0) {
 		return Run{}, ErrInvalid
 	}
 	if len(req.TaskSequence) > 0 {
@@ -408,7 +409,7 @@ func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, err
 		return Run{}, ErrBusy
 	}
 
-	r := Run{ID: randomID(), ProviderID: req.ProviderID, TaskKey: req.TaskKey, TaskSequence: append([]string{}, req.TaskSequence...), ScheduleID: req.ScheduleID, Trigger: req.Trigger, Status: StatusQueued, StartedAt: time.Now().UTC(), AccountIDs: append([]string{}, req.AccountIDs...), Steps: []Step{}}
+	r := Run{ID: randomID(), ProviderID: req.ProviderID, TaskKey: req.TaskKey, TaskSequence: append([]string{}, req.TaskSequence...), ScheduleID: req.ScheduleID, Trigger: req.Trigger, ExpectedPeriodKey: req.ExpectedPeriodKey, TaskResultTracking: true, Status: StatusQueued, StartedAt: time.Now().UTC(), AccountIDs: append([]string{}, req.AccountIDs...), Steps: []Step{}}
 	if err := e.commit(func(s *persisted) {
 		s.Runs = append(s.Runs, r)
 		// Reserve durable work before dispatch; no discovery or action can occur
@@ -557,7 +558,7 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 		work.Tasks = []Task{}
 		work.Confirmed = map[string]bool{}
 		for _, t := range catalog.Tasks {
-			if TaskKeyMatches(r.TaskKey, t.Key) {
+			if TaskKeyMatches(r.TaskKey, t.Key) && (r.ExpectedPeriodKey == "" || t.PeriodKey == r.ExpectedPeriodKey) {
 				t.State = nil
 				work.Tasks = append(work.Tasks, t)
 			}
@@ -587,6 +588,13 @@ func (e *Engine) perform(ctx context.Context, r Run) {
 	code = work.ErrorCode
 	for index := work.Next; index < len(work.Tasks); index++ {
 		t := work.Tasks[index]
+		if r.ExpectedPeriodKey != "" && t.PeriodKey != r.ExpectedPeriodKey {
+			// Fail closed if a recovered checkpoint no longer belongs to the
+			// reserved period. Never rediscover it as a fresh day's action.
+			status = StatusFailed
+			code = "recovery_period_changed"
+			return
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -1261,6 +1269,13 @@ func (e *Engine) DeleteSchedule(id string) error {
 	return err
 }
 func (e *Engine) Tick(now time.Time) error {
+	if err := e.tickSchedules(now); err != nil {
+		return err
+	}
+	return e.tickDeferred(now)
+}
+
+func (e *Engine) tickSchedules(now time.Time) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {

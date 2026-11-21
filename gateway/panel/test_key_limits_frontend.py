@@ -33,7 +33,7 @@ const c={console,Date,Promise,Map,setTimeout(){},clearTimeout(){},setInterval(){
  location:{origin:'https://fixture.invalid',hash:'#keys'},history:{replaceState(){}},localStorage:{getItem(){return null},setItem(){}},
  document:{readyState:'loading',documentElement:node('html'),querySelector:node,querySelectorAll(){return []},addEventListener(){}}};
 c.window=c;vm.createContext(c);
-for(const name of ['app.js','usage.js','keys.js'])vm.runInContext(fs.readFileSync(path.join(process.argv[1],name),'utf8'),c);
+for(const name of ['console/token-format.js','app.js','usage.js','keys.js'])vm.runInContext(fs.readFileSync(path.join(process.argv[1],name),'utf8'),c);
 Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',c)).then(v=>console.log(JSON.stringify(v))).catch(e=>{console.error(e);process.exitCode=1});
 """
         result = subprocess.run([NODE, "-e", program, str(PANEL), expression], capture_output=True,
@@ -77,7 +77,7 @@ key.total_tokens=0;renderKeys();return {unknown,zero:$('#keyRows').innerHTML};
         self.assertIn('title="累计用量暂不可读">—', result["unknown"])
         # 真 0 必须渲染成 0（与「不可读」的「—」区分开）。2026-10-12 起 token 与
         # 积分合成一列，数字包在 <b> 里，断言跟着改（语义不变）。
-        self.assertIn('class="mono">0</b>', result["zero"])
+        self.assertIn('class="mono"><span title="0 tokens">0</span></b>', result["zero"])
         self.assertNotIn('title="累计用量暂不可读"', result["zero"])
 
     def test_snapshot_error_does_not_hide_keys_or_claim_zero_active(self):
@@ -138,7 +138,7 @@ const c={console,Date,Promise,Map,setTimeout(){},clearTimeout(){},setInterval(){
  location:{origin:'https://fixture.invalid',hash:'#keys'},history:{replaceState(){}},localStorage:{getItem(){return null},setItem(){}},
  document:{readyState:'loading',documentElement:node('html'),querySelector:node,querySelectorAll(){return []},addEventListener(){}}};
 c.window=c;vm.createContext(c);
-for(const name of ['app.js','usage.js','keys.js'])vm.runInContext(fs.readFileSync(path.join(process.argv[1],name),'utf8'),c);
+for(const name of ['console/token-format.js','app.js','usage.js','keys.js'])vm.runInContext(fs.readFileSync(path.join(process.argv[1],name),'utf8'),c);
 Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',c)).then(v=>console.log(JSON.stringify(v))).catch(e=>{console.error(e);process.exitCode=1});
 """
         result = subprocess.run([NODE, "-e", program, str(PANEL), expression], capture_output=True,

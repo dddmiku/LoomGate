@@ -19,6 +19,7 @@
     return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const number = value => typeof value === 'number' ? value.toLocaleString('zh-CN') : '—';
+  const token = value => window.LoomGateTokens.html(value);
   const state = {route:'', version:0, controller:null, providers:null, models:[], catalogs:[], modelProvider:'', modelAccount:'', modelOffset:0, modelGroupPage:0, modelChannel:'', search:'', capability:'', taskProvider:'', tasks:[], usageRange:null, taskCache:null, schedules:[], runs:[], keys:[], pending:new Set(), poll:null, taskLogGeneration:0};
   // Task names are a display convenience, not state: remember the last names the
   // server actually returned so a page refresh on 执行计划/执行记录 still shows
@@ -590,7 +591,7 @@
     document.querySelectorAll('[data-action=select-model-group]').forEach((b,i)=>b.setAttribute('aria-selected',String(i===index)));
     const m=g.model,p=state.providers.find(p=>p.id===state.modelProvider),callable=m.inference_available??p.inference_available;
     const entries=g.entries;
-    $('#model-detail').innerHTML=`${button('model-back','返回模型列表','','detail-back')}<div class="detail-subtitle">${esc(g.channels.map(c=>channelName(c)).join(' / ')||p.name)}${g.accounts.length?' · '+g.accounts.length+' 个账号可见':''}</div><h2 class="detail-title">${esc(g.name)}</h2><p class="detail-body">${callable?(p.catalog_scope==='account'?(m.supports_multi_turn?'支持网关普通文本调用及多轮上下文；文件和调用方工具仍受协议限制。实际可用性以当前账号为准。':'支持网关普通文本调用；多轮能力未在此目录声明，以实际请求结果为准。'):'可通过网关调用，实际请求受上游与账号状态约束。'):'此模型目前仅提供目录，尚不能通过网关 API 调用。下列能力与档位均按上游声明展示。'}</p>${g.stale?notice('部分账号显示的是旧缓存，最新刷新未成功。请核对账号目录状态。','warn'):''}<dl class="detail-specs">${callable&&entries.some(e=>state.catalogs.find(c=>c.account_id===e.account_id)?.streaming_mode==='incremental')?'<div><dt>文本流</dt><dd>支持即时输出；上游重写已发内容时明确中止，未完成的回答不可视为成功。</dd></div>':''}<div><dt>计费倍率</dt><dd class="value-large">${esc(m.credits||'上游未公布')}</dd></div><div><dt>上下文窗口</dt><dd class="value-large">${m.context_length?number(m.context_length):'未声明'}</dd></div><div><dt>推理档位</dt><dd>${esc((m.reasoning_efforts||[]).map(x=>x.name||x.level).join(' / ')||'上游未声明')}</dd></div>${[['官方工作工具','native_tools'],['API 工具调用','supports_tool_call'],['图像输入','supports_images'],['推理','supports_reasoning']].filter(([,k])=>m[k]===true).map(([label])=>`<div><dt>${label}</dt><dd>上游已声明支持</dd></div>`).join('')}${m.tiers?.length?`<div><dt>档位说明</dt><dd>${esc(m.tiers.join(' / '))}</dd></div>`:''}</dl>${entries.length>1?`<details class="quiet-detail" open><summary> ${entries.length} 个账号来源</summary><div class="model-source-list">${entries.map(e=>`<div class="model-source-row"><div><code>${esc(e.account_id||'服务目录')}</code><p class="small muted">${esc(channelName(e.id.includes(':')?e.id.slice(0,e.id.indexOf(':')):''))} · ${esc(e.catalog_status==='stale'?'旧缓存':'已同步')}</p></div></div>`).join('')}</div></details>`:''}<details class="quiet-detail"><summary>查看模型标识与目录时间</summary><code>${esc(m.id)}</code><p>${g.entries[0].account_id?'由账号 '+esc(g.entries[0].account_id)+' 的目录提供。':'由服务级目录提供。'}</p></details>`;
+    $('#model-detail').innerHTML=`${button('model-back','返回模型列表','','detail-back')}<div class="detail-subtitle">${esc(g.channels.map(c=>channelName(c)).join(' / ')||p.name)}${g.accounts.length?' · '+g.accounts.length+' 个账号可见':''}</div><h2 class="detail-title">${esc(g.name)}</h2><p class="detail-body">${callable?(p.catalog_scope==='account'?(m.supports_multi_turn?'支持网关普通文本调用及多轮上下文；文件和调用方工具仍受协议限制。实际可用性以当前账号为准。':'支持网关普通文本调用；多轮能力未在此目录声明，以实际请求结果为准。'):'可通过网关调用，实际请求受上游与账号状态约束。'):'此模型目前仅提供目录，尚不能通过网关 API 调用。下列能力与档位均按上游声明展示。'}</p>${g.stale?notice('部分账号显示的是旧缓存，最新刷新未成功。请核对账号目录状态。','warn'):''}<dl class="detail-specs">${callable&&entries.some(e=>state.catalogs.find(c=>c.account_id===e.account_id)?.streaming_mode==='incremental')?'<div><dt>文本流</dt><dd>支持即时输出；上游重写已发内容时明确中止，未完成的回答不可视为成功。</dd></div>':''}<div><dt>计费倍率</dt><dd class="value-large">${esc(m.credits||'上游未公布')}</dd></div><div><dt>上下文窗口</dt><dd class="value-large">${m.context_length?token(m.context_length):'未声明'}</dd></div><div><dt>推理档位</dt><dd>${esc((m.reasoning_efforts||[]).map(x=>x.name||x.level).join(' / ')||'上游未声明')}</dd></div>${[['官方工作工具','native_tools'],['API 工具调用','supports_tool_call'],['图像输入','supports_images'],['推理','supports_reasoning']].filter(([,k])=>m[k]===true).map(([label])=>`<div><dt>${label}</dt><dd>上游已声明支持</dd></div>`).join('')}${m.tiers?.length?`<div><dt>档位说明</dt><dd>${esc(m.tiers.join(' / '))}</dd></div>`:''}</dl>${entries.length>1?`<details class="quiet-detail" open><summary> ${entries.length} 个账号来源</summary><div class="model-source-list">${entries.map(e=>`<div class="model-source-row"><div><code>${esc(e.account_id||'服务目录')}</code><p class="small muted">${esc(channelName(e.id.includes(':')?e.id.slice(0,e.id.indexOf(':')):''))} · ${esc(e.catalog_status==='stale'?'旧缓存':'已同步')}</p></div></div>`).join('')}</div></details>`:''}<details class="quiet-detail"><summary>查看模型标识与目录时间</summary><code>${esc(m.id)}</code><p>${g.entries[0].account_id?'由账号 '+esc(g.entries[0].account_id)+' 的目录提供。':'由服务级目录提供。'}</p></details>`;
     if(open){$('#model-browser').classList.add('detail-open');$('#model-detail').focus({preventScroll:true});}
   }
 
@@ -1083,7 +1084,7 @@
       </div>`+
       `<div class="usage-tiles">
         ${tile('总请求',number(scopedTotals.requests),`${number(scopedTotals.failed_requests||0)} 次失败 · ${number(scopedTotals.unreported_requests||0)} 次未报告用量`,'data-total-requests')}
-        ${tile('总 Token',number(scopedTotals.total_tokens),`输入 ${number(scopedTotals.prompt_tokens)} / 输出 ${number(scopedTotals.completion_tokens)}${scopedTotals.cached_tokens?` / 缓存 ${number(scopedTotals.cached_tokens)}`:''}`)}
+        ${tile('总 Token',token(scopedTotals.total_tokens),`输入 ${token(scopedTotals.prompt_tokens)} / 输出 ${token(scopedTotals.completion_tokens)}${scopedTotals.cached_tokens?` / 缓存 ${token(scopedTotals.cached_tokens)}`:''}`)}
         ${tile('已报告消耗',number(scopedTotals.credit),'只累计上游明确报告的数值')}
         ${tile('调用方',number(keys.length),'按 API 密钥统计')}
       </div>`+
@@ -1091,18 +1092,18 @@
         <section class="usage-card">
           <div class="usage-card-head"><h2>模型分布</h2><span class="small muted">按 Token</span></div>
           ${modelCoverage}
-          ${segments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(segments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${number(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
+          ${segments.length?`<div class="donut-wrap"><div class="donut" style="background:${donut(segments)}"></div><table class="donut-legend"><thead><tr><th>模型</th><th>Token</th><th>占比</th></tr></thead><tbody>${models.slice(0,8).map((e,i)=>`<tr><td><span class="dot" style="background:${palette[i%palette.length]}"></span><code>${esc(e[0])}</code></td><td>${token(e[1].prompt+e[1].completion)}</td><td>${pct(e[1].prompt+e[1].completion,modelTotal)}%</td></tr>`).join('')}</tbody></table></div>`:empty('暂无模型用量','网关收到实际模型调用后写入。')}
         </section>
         <section class="usage-card">
           <div class="usage-card-head"><h2>调用方</h2><span class="small muted">按 Token</span></div>
           ${callerCoverage}
-          ${keys.length?table(['调用方','请求','Token'],[...keys].sort((a,b)=>(b.totals?.total_tokens||0)-(a.totals?.total_tokens||0)).slice(0,10).map(k=>[esc(k.name||k.masked_key||k.key_id||'未命名'),number(k.totals?.requests||0),number(k.totals?.total_tokens||0)])):empty('暂无调用方用量','按 API 密钥统计。')}
+          ${keys.length?table(['调用方','请求','Token'],[...keys].sort((a,b)=>(b.totals?.total_tokens||0)-(a.totals?.total_tokens||0)).slice(0,10).map(k=>[esc(k.name||k.masked_key||k.key_id||'未命名'),number(k.totals?.requests||0),token(k.totals?.total_tokens)])):empty('暂无调用方用量','按 API 密钥统计。')}
         </section>
       </div>`+
       `<section class="usage-card">
         <div class="usage-card-head"><h2>按模型明细</h2><span class="small muted">${esc(rangeLabel)}</span></div>
         ${modelCoverage}
-        ${models.length?table(['模型','请求','输入','输出','缓存','消耗'],[...models].map(e=>[`<code>${esc(e[0])}</code>`,number(e[1].requests),number(e[1].prompt),number(e[1].completion),number(e[1].cached),number(e[1].credit)])):empty('暂无明细','')}
+        ${models.length?table(['模型','请求','输入','输出','缓存','消耗'],[...models].map(e=>[`<code>${esc(e[0])}</code>`,number(e[1].requests),token(e[1].prompt),token(e[1].completion),token(e[1].cached),number(e[1].credit)])):empty('暂无明细','')}
       </section>`+
       notice(`账本开始于 ${date(data.since)}。缺失数据不会按零消耗推断。本页读取于 ${date(state.usageReadAt)}；刷新用量可读取最新记录。`,'');
   }
@@ -1114,8 +1115,8 @@
   const protocolName=value=>protocolNames[value]||value||'—';
   const statusTone=value=>['success','ok'].includes(value)?'ready':['rejected','failed','error'].includes(value)?'failed':'manual_action';
   function tokensCell(r){
-    const input=r.input_tokens==null?'—':number(r.input_tokens);
-    const output=r.output_tokens==null?'—':number(r.output_tokens);
+    const input=r.input_tokens==null?'—':token(r.input_tokens);
+    const output=r.output_tokens==null?'—':token(r.output_tokens);
     return `<span class="tok">↓ ${input}</span> <span class="tok">↑ ${output}</span>`;
   }
   function requestRow(r,i,open){
@@ -1125,7 +1126,7 @@
     // The log records one cached-token figure; Anthropic splits it into write and
     // read tiers, which this ledger does not separate. Showing one number is
     // honest; inventing a second would not be.
-    const hit=r.cached_tokens!=null?number(r.cached_tokens):'—';
+    const hit=r.cached_tokens!=null?token(r.cached_tokens):'—';
     return `<tr class="log-row" data-request-row="${i}">
       <td class="log-expander"><button type="button" data-action="request-expand" data-index="${i}" aria-expanded="${open?'true':'false'}" aria-label="展开日志详情">${open?'▾':'▸'}</button></td>
       <td><time>${esc(date(r.started_at))}</time></td>
@@ -1133,9 +1134,9 @@
       <td><span class="small">${esc(protocolName(r.protocol))}</span></td>
       <td><strong>${esc(r.model||'—')}</strong></td>
       <td>${secs(r.ttfb_ms)} / ${secs(r.duration_ms)}</td>
-      <td>${r.input_tokens==null?'—':number(r.input_tokens)}</td>
+      <td>${r.input_tokens==null?'—':token(r.input_tokens)}</td>
       <td>${hit}</td>
-      <td>${r.output_tokens==null?'—':number(r.output_tokens)}</td>
+      <td>${r.output_tokens==null?'—':token(r.output_tokens)}</td>
       <td>${tps==null?'—':tps+' tok/s'}</td>
       <td>${badge(tone,r.status||'未知')}${r.error_code?`<p class="small muted">${esc(r.error_code)}</p>`:''}</td>
       <td>${requestCredit(r)}</td>
@@ -1497,7 +1498,7 @@
   const keyColumns=['名称','密钥','状态','有效期','限流','累计 Token','操作'];
   function keyCells(k,live=null){
     const liveText=live?`${number(live.requests)} 次/分窗口 · 进行 ${number(live.active)} · 排队 ${number(live.queued)}`:'实时快照未读取';
-    const tokens=k.total_tokens===undefined?'—':number(k.total_tokens);
+    const tokens=k.total_tokens===undefined?'—':token(k.total_tokens);
     return [`<span data-key-row="${esc(k.id)}"><strong>${esc(k.name||'未命名')}</strong><p class="small muted">${esc(k.note||'')}</p></span>`,`<code>${esc(k.masked_key||'')}</code><p class="small muted">${esc(keyModelsText(k.models))}</p>`, `<span data-key-enabled>${badge(k.enabled?'ready':'disabled',k.enabled?'启用':'停用')}</span>`,esc(k.expires_at?date(k.expires_at):'无限制'),`<span data-key-limits>${esc(limitSummary(k.limits))}</span><p class="small muted">${esc(liveText)}</p>`,tokens,button('key-edit','编辑',`data-id="${esc(k.id)}"`,'quiet')+button('key-toggle',k.enabled?'停用':'启用',`data-id="${esc(k.id)}" data-enabled="${k.enabled?'1':'0'}"`,'quiet')+button('key-copy','显示密钥',`data-id="${esc(k.id)}"`,'quiet')+button('key-delete','删除',`data-id="${esc(k.id)}"`,'quiet danger')];
   }
   function insertKeyRow(saved){

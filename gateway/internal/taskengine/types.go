@@ -211,6 +211,16 @@ type Adapter interface {
 	Verify(context.Context, Task) (Observation, error)
 }
 
+// DeferredRequestAdapter reserves bounded recovery work from a provider's local
+// durable journal. It must honor ctx and must not perform network requests or
+// business actions. Only currently enabled, idle plans are supplied. A returned
+// request selects one concrete task and account under one supplied plan; the
+// engine rechecks that scope before using its normal durable execution path.
+// Successfully reserved requests remain usable if a later reservation fails.
+type DeferredRequestAdapter interface {
+	TakeDeferredRequests(context.Context, time.Time, []Schedule) ([]Request, error)
+}
+
 // TaskGate owns provider pacing before the action timeout and write marker.
 // The release always runs, including storage failure, cancellation and panic.
 // Waiting must not submit requests. Inspect/Execute recheck eligibility after it.
@@ -287,26 +297,39 @@ type OutputLine struct {
 	Text      string    `json:"text"`
 }
 
+// TaskResult is an execution result used only by the log projection. It is not
+// an action receipt, a completion marker or permission to retry a business action.
+type TaskResult struct {
+	AccountID string `json:"account_id"`
+	TaskKey   string `json:"task_key"`
+	PeriodKey string `json:"period_key,omitempty"`
+	Status    Status `json:"status"`
+}
+
 type Run struct {
-	TaskSequence    []string         `json:"task_sequence,omitempty"`
-	Output          []OutputLine     `json:"output,omitempty"`
-	OutputDropped   int              `json:"output_dropped,omitempty"`
-	DiscoveryIssues []DiscoveryIssue `json:"discovery_issues,omitempty"`
-	ID              string           `json:"id"`
-	TaskKey         string           `json:"task_key"`
-	ProviderID      string           `json:"provider_id"`
-	ScheduleID      string           `json:"schedule_id,omitempty"`
-	Trigger         string           `json:"trigger"`
-	Status          Status           `json:"status"`
-	Stage           Stage            `json:"stage,omitempty"`
-	StartedAt       time.Time        `json:"started_at"`
-	FinishedAt      *time.Time       `json:"finished_at,omitempty"`
-	AccountIDs      []string         `json:"account_ids"`
-	Summary         string           `json:"summary,omitempty"`
-	ErrorCode       string           `json:"error_code,omitempty"`
-	Steps           []Step           `json:"steps"`
-	SideEffect      bool             `json:"side_effect"`
-	Idempotent      bool             `json:"idempotent"`
+	TaskResultTracking bool         `json:"task_result_tracking,omitempty"`
+	TaskResults        []TaskResult `json:"task_results,omitempty"`
+	// A recovery reservation belongs to one upstream period, even on restart.
+	ExpectedPeriodKey string           `json:"expected_period_key,omitempty"`
+	TaskSequence      []string         `json:"task_sequence,omitempty"`
+	Output            []OutputLine     `json:"output,omitempty"`
+	OutputDropped     int              `json:"output_dropped,omitempty"`
+	DiscoveryIssues   []DiscoveryIssue `json:"discovery_issues,omitempty"`
+	ID                string           `json:"id"`
+	TaskKey           string           `json:"task_key"`
+	ProviderID        string           `json:"provider_id"`
+	ScheduleID        string           `json:"schedule_id,omitempty"`
+	Trigger           string           `json:"trigger"`
+	Status            Status           `json:"status"`
+	Stage             Stage            `json:"stage,omitempty"`
+	StartedAt         time.Time        `json:"started_at"`
+	FinishedAt        *time.Time       `json:"finished_at,omitempty"`
+	AccountIDs        []string         `json:"account_ids"`
+	Summary           string           `json:"summary,omitempty"`
+	ErrorCode         string           `json:"error_code,omitempty"`
+	Steps             []Step           `json:"steps"`
+	SideEffect        bool             `json:"side_effect"`
+	Idempotent        bool             `json:"idempotent"`
 }
 type Query struct {
 	TaskKey, ProviderID string
@@ -320,13 +343,15 @@ type Page struct {
 	Offset int   `json:"offset"`
 }
 type Request struct {
-	TaskKey      string     `json:"task_key"`
-	TaskSequence []string   `json:"task_sequence,omitempty"`
-	ProviderID   string     `json:"provider_id"`
-	ScheduleID   string     `json:"schedule_id,omitempty"`
-	Trigger      string     `json:"trigger,omitempty"`
-	AccountIDs   []string   `json:"account_ids"`
-	ScheduledAt  *time.Time `json:"scheduled_at,omitempty"`
+	// Internal only: API clients cannot turn manual runs into deferred work.
+	ExpectedPeriodKey string     `json:"-"`
+	TaskKey           string     `json:"task_key"`
+	TaskSequence      []string   `json:"task_sequence,omitempty"`
+	ProviderID        string     `json:"provider_id"`
+	ScheduleID        string     `json:"schedule_id,omitempty"`
+	Trigger           string     `json:"trigger,omitempty"`
+	AccountIDs        []string   `json:"account_ids"`
+	ScheduledAt       *time.Time `json:"scheduled_at,omitempty"`
 }
 
 // NextFire uses calendar arithmetic in the configured zone, including DST.

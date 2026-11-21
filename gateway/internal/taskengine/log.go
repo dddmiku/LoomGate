@@ -13,9 +13,10 @@ import (
 // 当前运行的模块输出按行持久化；历史只有 Steps 的运行仍可读，但不伪造实时输出。
 // 日志与动作回执独立，任何输出文本都不构成任务成功证明。
 type TaskLogResult struct {
-	Lines   []string
-	Running bool
-	EndedAt time.Time
+	Statistics *TaskLogStatistics
+	Lines      []string
+	Running    bool
+	EndedAt    time.Time
 	// Message 说明为什么没有行可显示（从未执行、任务名不匹配等）。
 	Message string
 }
@@ -71,11 +72,30 @@ func (e *Engine) TaskLogFor(provider, key string) (TaskLogResult, error) {
 		}
 	}
 	r.Output = output
+	results := []TaskResult{}
+	for _, result := range r.TaskResults {
+		if key == r.TaskKey || TaskKeyMatches(key, result.TaskKey) {
+			results = append(results, result)
+		}
+	}
+	r.TaskResults = results
+	issues := []DiscoveryIssue{}
+	for _, issue := range r.DiscoveryIssues {
+		if key == r.TaskKey || TaskKeyMatches(key, issue.ModuleID) || strings.HasPrefix(key, issue.ModuleID+"/") {
+			issues = append(issues, issue)
+		}
+	}
+	r.DiscoveryIssues = issues
 	out := TaskLogResult{Running: r.Status == StatusRunning || r.Status == StatusQueued}
+	e.mu.Lock()
+	pending := taskLogPendingAccounts(r, e.state.Work[r.ID], key)
+	e.mu.Unlock()
+	statistics := taskLogStatisticsWithPending(r, pending)
+	out.Statistics = &statistics
 	if r.FinishedAt != nil {
 		out.EndedAt = *r.FinishedAt
 	}
-	out.Lines = taskLogLines(r)
+	out.Lines = taskLogLinesWithStatistics(r, statistics)
 	return out, nil
 }
 
@@ -124,6 +144,8 @@ func logTrigger(trigger string) string {
 		return "手动触发"
 	case "schedule":
 		return "按计划触发"
+	case "retry":
+		return "退避后自动核验"
 	}
 	if trigger == "" {
 		return "触发"
@@ -230,6 +252,11 @@ func stepLine(stamp func(time.Time) string, s Step) string {
 // taskLogLines renders one run as the plain output the old task scripts
 // produced: a header, then one short sentence per account.
 func taskLogLines(r Run) []string {
+	return taskLogLinesWithStatistics(r, taskLogStatistics(r))
+}
+
+func taskLogLinesWithStatistics(r Run, stats TaskLogStatistics) []string {
+	statistics := stats.lines()
 	location, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
 		location = time.UTC
@@ -244,8 +271,9 @@ func taskLogLines(r Run) []string {
 		fmt.Sprintf("%s 开始执行（%s）", stamp(r.StartedAt), logTrigger(r.Trigger)),
 	}
 	if n := len(r.AccountIDs); n > 0 {
-		lines = append(lines, fmt.Sprintf("账号范围：%d 个账号；每行一个账号，按完成顺序排列。", n))
+		lines = append(lines, fmt.Sprintf("账号范围：%d 个账号；统计按账号去重，下面保留各步骤明细。", n))
 	}
+	lines = append(lines, statistics...)
 	if r.Status == StatusQueued {
 		lines = append(lines, "等待执行槽位；开始后会继续追加输出。")
 		return lines
@@ -279,6 +307,7 @@ func taskLogLines(r Run) []string {
 	for _, row := range entries {
 		lines = append(lines, row.line)
 	}
+	tailStart := len(lines)
 	if r.FinishedAt != nil {
 		lines = append(lines, fmt.Sprintf("%s 结束，耗时 %s，%s",
 			stamp(*r.FinishedAt), r.FinishedAt.Sub(r.StartedAt).Round(time.Second), logStatus(r.Status)))
@@ -288,9 +317,17 @@ func taskLogLines(r Run) []string {
 	if r.Summary != "" {
 		lines = append(lines, r.Summary)
 	}
+	if r.FinishedAt != nil {
+		lines = append(lines, statistics...)
+	}
 	// 与执行记录本身的 2000 步上限同量级；日志是给人看的，再多也没有价值。
 	if len(lines) > 2000 {
-		lines = append(lines[:1999], fmt.Sprintf("…另有 %d 行未显示", len(lines)-1999))
+		// Preserve the final result and summary when verbose progress exceeds
+		// the display bound; these are the lines the operator needs most.
+		tail := append([]string{}, lines[tailStart:]...)
+		keep := 2000 - len(tail) - 1
+		omitted := tailStart - keep
+		lines = append(append(lines[:keep], fmt.Sprintf("…另有 %d 行未显示", omitted)), tail...)
 	}
 	return lines
 }

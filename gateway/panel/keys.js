@@ -390,7 +390,7 @@ function renderKeys(){
       // 单开第 9 列会让表宽回到 1440 视口放不下的状态——2026-10-09 正是为此把
       // 「有效期」与「创建时间」合成了一列，这里沿用同一取舍。
       '<td data-l="总用量与积分" class="key-tokens"><div class="key-usage"><b class="mono">' +
-        (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? esc(compactTokens(key.total_tokens)) : '<span class="sub" title="累计用量暂不可读">—</span>') +
+        (typeof key.total_tokens === 'number' && Number.isFinite(key.total_tokens) && key.total_tokens >= 0 ? LoomGateTokens.html(key.total_tokens) : '<span class="sub" title="累计用量暂不可读">—</span>') +
         '</b><span class="sub mono key-credit">' + keyCreditCell(key) + ' 积分</span></div></td>' +
       '<td data-l="限流与占用" class="key-limits"><div class="key-limit-content">' + keyLimitsSummary(key) + '<button class="btn sm" data-key-action="limits" data-id="' + esc(key.id) + '">设置限流</button></div></td>' +
       '<td data-l="状态与保护" class="key-state"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span>' +

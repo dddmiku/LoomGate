@@ -628,6 +628,9 @@ class TraeModelBindingTest(unittest.TestCase):
             # DOM harness. The external QR vendor is irrelevant to key binding.
             (runtime / "app.js").write_text(bundled_script, encoding="utf-8")
             (runtime / "usage.js").write_text("", encoding="utf-8")
+            (runtime / "console").mkdir()
+            formatter = Path(__file__).with_name("console") / "token-format.js"
+            (runtime / "console" / "token-format.js").write_text(formatter.read_text(encoding="utf-8"), encoding="utf-8")
             with patch.object(frontend, "PANEL", runtime):
                 return frontend.FrontendHarness.run_frontend(self, expression)
 

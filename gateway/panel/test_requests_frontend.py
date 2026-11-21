@@ -47,6 +47,7 @@ const context={console,Date,Promise,Map,Set,URLSearchParams,encodeURIComponent,
   requestClick(id){return {target:{closest(){return {getAttribute(){return id}}}}}}
 };
 context.window=context;vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(process.argv[1],'console','token-format.js'),'utf8'),context);
 vm.runInContext(fs.readFileSync(path.join(process.argv[1],'requests.js'),'utf8'),context);
 Promise.resolve(vm.runInContext('(async()=>{'+process.argv[2]+'})()',context))
   .then(result=>console.log(JSON.stringify(result)))
@@ -66,6 +67,7 @@ api=async()=>fixturePage([fixtureRow({finish_reason:'length',usage_state:'partia
 await loadRequests();return {html:testNode('requestRows').innerHTML,status:testNode('requestsStatus').textContent};
 """)
         self.assertIn('requests-metric">0<', result["html"])
+        self.assertIn('title="0 tokens">0</span>', result["html"])
         self.assertIn("未知", result["html"])
         self.assertIn("0 ms", result["html"])
         self.assertIn("部分用量", result["html"])

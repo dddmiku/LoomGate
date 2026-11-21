@@ -50,7 +50,8 @@ def main() -> int:
     if code:
         return code
     for script, directory in [("connection_repeat_browser.py", "connections"),
-                              ("usage_filters_browser.py", "usage")]:
+                              ("usage_filters_browser.py", "usage"),
+                              ("token_units_browser.py", "tokens")]:
         command = [sys.executable, "-I", "-B", str(root / "tests" / script),
                    "--output", str(output / directory)]
         code = subprocess.run(command, cwd=root, check=False).returncode

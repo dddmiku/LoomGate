@@ -17,10 +17,11 @@ class UsageIntegrityTests(unittest.TestCase):
     def run_usage(self, expression):
         source = Path(__file__).with_name("usage.js")
         program = """
-const vm = require('vm'); const fs = require('fs');
+const vm = require('vm'); const fs = require('fs'); const path = require('path');
 const nodes = {usageFilter:{innerHTML:''},usageTiles:{innerHTML:''},
   usageCoverage:{textContent:'',classList:{toggle(){}}}};
 const context = {document:{addEventListener(){}}, Date, console,
+  LoomGateTokens:require(path.join(path.dirname(process.argv[1]),'console','token-format.js')),
   $:s=>nodes[s.slice(1)] || null, esc:x=>String(x), exactTokens:x=>String(x)};
 vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
 console.log(JSON.stringify(vm.runInContext(process.argv[2], context)));

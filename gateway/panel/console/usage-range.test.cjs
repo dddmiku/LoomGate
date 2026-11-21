@@ -46,6 +46,7 @@ function harness(data, range, clock = Date) {
     navigator: {onLine: true}, toast() {},
     esc: x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
     number: n => typeof n === 'number' ? n.toLocaleString('zh-CN') : '—',
+    token: require('./token-format.js').html,
     date: x => x, heading: () => '', button: () => '',
     empty: (title, detail = '') => `<div class="empty">${title} ${detail}</div>`,
     notice: text => `<div class="notice">${text}</div>`,
@@ -71,13 +72,13 @@ test('selected day scopes model chart, model details and caller list together wi
   assert.match(tile(html, '总请求'), /<strong[^>]*>3<\/strong>/);
   assert.match(tile(html, '调用方'), /<strong[^>]*>1<\/strong>/);
   assert.match(card(html, '模型分布'), /fixture:daily-model/);
-  assert.match(card(html, '模型分布'), /<td>300<\/td><td>100%<\/td>/);
+  assert.match(card(html, '模型分布'), /<td><span title="300 tokens">300<\/span><\/td><td>100%<\/td>/);
   assert.doesNotMatch(html, /fixture:lifetime-model|fixture:old-model|历史调用方/);
   assert.match(card(html, '调用方'), /当前调用方/);
   assert.match(card(html, '调用方'), /<div>3<\/div>/);
-  assert.match(card(html, '调用方'), /<div>300<\/div>/);
-  assert.match(card(html, '按模型明细'), /<div>270<\/div>/);
-  assert.match(card(html, '按模型明细'), /<div>30<\/div>/);
+  assert.match(card(html, '调用方'), /<div><span title="300 tokens">300<\/span><\/div>/);
+  assert.match(card(html, '按模型明细'), /<div><span title="270 tokens">270<\/span><\/div>/);
+  assert.match(card(html, '按模型明细'), /<div><span title="30 tokens">30<\/span><\/div>/);
   assert.match(card(html, '按模型明细'), /<div>2<\/div>/);
 });
 
@@ -89,12 +90,12 @@ test('custom ranges merge the same model across days and callers and sort by sel
   const h = harness(data, {from: '2026-11-19', to: '2026-11-20'});
   await h.render();
   const html = h.view.innerHTML;
-  assert.match(card(html, '模型分布'), /<td>550<\/td><td>100%<\/td>/);
+  assert.match(card(html, '模型分布'), /<td><span title="550 tokens">550<\/span><\/td><td>100%<\/td>/);
   assert.match(card(html, '按模型明细'), /<div>6<\/div>/);
   const callers = card(html, '调用方');
   assert.ok(callers.indexOf('当前调用方') < callers.indexOf('历史调用方'), 'sort must follow selected totals, not lifetime totals');
-  assert.match(callers, /<div>500<\/div>/);
-  assert.match(callers, /<div>50<\/div>/);
+  assert.match(callers, /<div><span title="500 tokens">500<\/span><\/div>/);
+  assert.match(callers, /<div><span title="50 tokens">50<\/span><\/div>/);
   assert.match(tile(html, '调用方'), /<strong[^>]*>2<\/strong>/);
 });
 

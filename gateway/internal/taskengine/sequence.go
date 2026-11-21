@@ -308,7 +308,12 @@ func (e *Engine) inspectSequenceTail(ctx context.Context, run Run, adapter Adapt
 
 // Ordinary tasks, sequence items and read-only diagnostic tails share account
 // isolation, cancellation, admission limits and a per-task request timeout.
-func (e *Engine) runAdmittedTask(ctx context.Context, runID string, task Task, adapter Adapter) (Status, error) {
+func (e *Engine) runAdmittedTask(ctx context.Context, runID string, task Task, adapter Adapter) (status Status, err error) {
+	defer func() {
+		// A diagnostic write must never change the action result, completion
+		// ledger or retry behavior. Missing results remain visibly unclassified.
+		_ = e.recordTaskResult(runID, task, normalizeTaskResult(status, err))
+	}()
 	e.mu.Lock()
 	confirmed := e.state.Work[runID].Confirmed[taskKey(task)]
 	e.mu.Unlock()

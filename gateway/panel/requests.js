@@ -73,7 +73,7 @@
     if(started === false) return '<span class="requests-null" title="未调用上游">—</span>';
     if(!finite(value)) return '<span class="requests-null" title="上游没有上报此项，不能按零计算">未知</span>';
     var note=count(missing) > 0 ? '<span class="requests-partial" title="'+escapeHTML(missing)+' 次尝试未上报此项，仅显示已知消耗">部分</span>' : '';
-    return '<span class="requests-metric">'+escapeHTML(metric(value,credit))+'</span>'+note;
+    return '<span class="requests-metric">'+(credit ? escapeHTML(metric(value,true)) : LoomGateTokens.html(value))+'</span>'+note;
   }
   function decisionCell(d,item){
     var total=count(item && item.decision_count), truncated=!!(item && item.decisions_truncated);
@@ -255,7 +255,7 @@
     var result='<li class="requests-attempt"><div class="requests-attempt-head"><b>第 '+escapeHTML(a.number)+' 次尝试</b>'+statusBadge(a.status,a.http_status)+'<span class="sp"></span><span class="requests-sub">'+escapeHTML(duration(a.duration_ms))+'</span></div>';
     var account=a.account_name && a.account_id ? a.account_name+' · '+a.account_id : (a.account_name || a.account_id);
     result+='<dl class="requests-detail-meta">'+meta('账号',account)+meta('开始时间',when(a.started_at,true))+meta('结束时间',when(a.finished_at,true))+meta('排队',duration(a.queue_ms))+meta('完整模型',a.model,true)+'</dl>';
-    result+='<div class="requests-attempt-metrics">'+[['输入',a.input_tokens],['输出',a.output_tokens],['缓存',a.cached_tokens],['推理',a.reasoning_tokens],['积分',a.credit,true]].map(function(m){return '<div><span>'+m[0]+'</span><b>'+escapeHTML(metric(m[1],m[2]))+'</b></div>';}).join('')+'</div>';
+    result+='<div class="requests-attempt-metrics">'+[['输入',a.input_tokens],['输出',a.output_tokens],['缓存',a.cached_tokens],['推理',a.reasoning_tokens],['积分',a.credit,true]].map(function(m){return '<div><span>'+m[0]+'</span><b>'+(m[2] ? escapeHTML(metric(m[1],true)) : LoomGateTokens.html(m[1]))+'</b></div>';}).join('')+'</div>';
     var usage=a.usage_state==='complete' ? '输入、输出已上报；可选计量仍可能缺失。' : (a.usage_state==='partial' ? '只收到了部分计量，未知部分没有按零补齐。' : '上游未上报用量，不能判断本次实际消耗。');
     result+='<p class="requests-attempt-explanation">'+usage+'</p>';
     if(a.finish_reason) result+='<p class="requests-attempt-explanation">结束原因：'+escapeHTML(finishLabel(a.finish_reason))+' <span class="requests-code">'+escapeHTML(a.finish_reason)+'</span></p>';

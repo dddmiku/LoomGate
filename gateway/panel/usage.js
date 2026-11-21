@@ -14,18 +14,8 @@
 // 单日筛选就是 from == to。账本按天分桶，区间求和即可。
 var US = {data: null, loading: false, error: '', open: {}, from: '', to: '', label: '全部'};
 
-function compactTokens(value){
-  var n = Number(value) || 0;
-  if (n >= 1000000000) return (n / 1000000000).toFixed(2) + 'B';
-  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
-
-function exactTokens(value){
-  var n = Number(value) || 0;
-  return n.toLocaleString('zh-CN');
-}
+function compactTokens(value){ return LoomGateTokens.compact(value); }
+function exactTokens(value){ return LoomGateTokens.exact(value); }
 
 function usageTime(value){
   if (!value) return '—';
@@ -40,24 +30,24 @@ function renderUsageTiles(totals){
   var t = totals || {};
   var cached = Number(t.cached_tokens) || 0;
   var prompt = Number(t.prompt_tokens) || 0;
-  var promptNote = exactTokens(t.prompt_tokens) + ' tokens';
+  var promptNote = '每轮输入（含缓存命中）';
   if (cached > 0 && prompt > 0){
     promptNote += '（缓存命中 ' + Math.round(cached / prompt * 100) + '%）';
   }
   var tiles = [
     {k: '请求数', v: exactTokens(t.requests), s: '已结束的调用，含失败与中断', i: 'pulse'},
-    {k: '合计 tokens', v: compactTokens(t.total_tokens), s: exactTokens(t.total_tokens) + ' tokens', i: 'sum'},
-    {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: promptNote, i: 'in'},
-    {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens（含思考）', i: 'out'}
+    {k: '合计 tokens', v: compactTokens(t.total_tokens), title: exactTokens(t.total_tokens) + ' tokens', s: '按上游报告累计', i: 'sum'},
+    {k: '输入 tokens', v: compactTokens(t.prompt_tokens), title: exactTokens(t.prompt_tokens) + ' tokens', s: promptNote, i: 'in'},
+    {k: '输出 tokens', v: compactTokens(t.completion_tokens), title: exactTokens(t.completion_tokens) + ' tokens', s: '含思考用量', i: 'out'}
   ];
-  if (cached > 0) tiles.push({k: '缓存命中输入', v: compactTokens(cached), s: exactTokens(cached) + ' tokens', i: 'zap'});
+  if (cached > 0) tiles.push({k: '缓存命中输入', v: compactTokens(cached), title: exactTokens(cached) + ' tokens', s: '输入中命中的缓存', i: 'zap'});
   if (t.credit) tiles.push({k: '上游计费', v: Number(t.credit).toFixed(2), s: 'usage.credit 累计', i: 'coins'});
   if (Number(t.failed_requests) > 0) tiles.push({k: '失败或中断', v: exactTokens(t.failed_requests), s: '已包含在请求数中', i: 'pulse'});
   if (Number(t.unreported_requests) > 0) tiles.push({k: '用量未完整返回', v: exactTokens(t.unreported_requests), s: '仅累计已返回的部分', i: 'clock'});
   $('#usageTiles').innerHTML = tiles.map(function(tile){
     return '<div class="usage-tile">' +
       '<div class="k"><span class="uz-ico">' + usageIcon(tile.i) + '</span>' + esc(tile.k) + '</div>' +
-      '<div class="v">' + esc(tile.v) + '</div>' +
+      '<div class="v"'+(tile.title ? ' title="'+esc(tile.title)+'"' : '')+'>' + esc(tile.v) + '</div>' +
       '<div class="s">' + esc(tile.s) + '</div></div>';
   }).join('');
   var coverage = $('#usageCoverage');
@@ -125,7 +115,7 @@ function renderUsageRows(keys, totals){
       // 每行同时给 token 与积分：按模型看「贵不贵」比看 token 量更直接
       // （实测同一密钥下不同模型的倍率差几十倍）。
       return '<li><span>' + esc(model.model) + '</span><span>' +
-        esc(compactTokens(model.totals.total_tokens)) + ' · ' +
+        LoomGateTokens.html(model.totals.total_tokens) + ' · ' +
         usageCreditText(model.totals) + '</span></li>';
     }).join('');
     var name = item.name ? esc(item.name) : '未命名密钥';
@@ -134,10 +124,10 @@ function renderUsageRows(keys, totals){
       '<td data-l="密钥"><div class="usage-key"><b>' + name + '</b>' + mask +
         '<div class="usage-bar"><i style="width:' + share + '%"></i></div></div></td>' +
         '<td class="num" data-l="请求">' + esc(exactTokens(t.requests)) + '</td>' +
-        '<td class="num" data-l="输入">' + esc(exactTokens(t.prompt_tokens)) + '</td>' +
-        '<td class="num" data-l="缓存命中">' + esc(exactTokens(t.cached_tokens)) + '</td>' +
-        '<td class="num" data-l="输出">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
-      '<td class="num" data-l="合计">' + esc(exactTokens(t.total_tokens)) + '</td>' +
+        '<td class="num" data-l="输入">' + LoomGateTokens.html(t.prompt_tokens) + '</td>' +
+        '<td class="num" data-l="缓存命中">' + LoomGateTokens.html(t.cached_tokens) + '</td>' +
+        '<td class="num" data-l="输出">' + LoomGateTokens.html(t.completion_tokens) + '</td>' +
+      '<td class="num" data-l="合计">' + LoomGateTokens.html(t.total_tokens) + '</td>' +
       '<td class="num" data-l="已用积分">' + usageCreditCell(t) + '</td>' +
       '<td data-l="最近使用">' + esc(usageTime(usageLastUsedFor(item))) + '</td>' +
       '<td class="r" data-l="">' + (models

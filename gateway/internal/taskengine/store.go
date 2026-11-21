@@ -196,6 +196,9 @@ func readState(path string) (persisted, error) {
 		}
 		keys := map[string]bool{}
 		for _, t := range work.Tasks {
+			if run.ExpectedPeriodKey != "" && t.PeriodKey != run.ExpectedPeriodKey {
+				return s, errors.New("task_work_period_invalid")
+			}
 			if t.ProviderID != run.ProviderID || !IDPattern.MatchString(t.AccountID) || t.Key == "" || len(t.Key) > 512 || len(t.PeriodKey) > 512 || !taskIncluded(run.TaskKey, run.TaskSequence, t.Key) || len(run.TaskSequence) > 0 && (work.SequenceAccount >= len(work.SequenceAccounts) || t.AccountID != work.SequenceAccounts[work.SequenceAccount] || work.SequenceIndex >= len(run.TaskSequence) || !TaskKeyMatches(run.TaskSequence[work.SequenceIndex], t.Key)) || len(run.AccountIDs) > 0 && !contains(run.AccountIDs, t.AccountID) || t.Once && t.OncePerDay || t.OncePerDay && t.PeriodKey == "" || keys[taskKey(t)] {
 				return s, errors.New("task_work_invalid")
 			}
@@ -249,7 +252,13 @@ func readState(path string) (persisted, error) {
 	if err := validateOutput(s); err != nil {
 		return s, err
 	}
+	if err := validateTaskResults(s); err != nil {
+		return s, err
+	}
 	for i := range s.Runs {
+		if len(s.Runs[i].ExpectedPeriodKey) > 512 || s.Runs[i].ExpectedPeriodKey != "" && (s.Runs[i].Trigger != "retry" || len(s.Runs[i].TaskSequence) != 0) {
+			return s, errors.New("task_run_period_invalid")
+		}
 		if !validateTaskSequence(s.Runs[i].TaskSequence) || len(s.Runs[i].TaskSequence) > 0 && !IDPattern.MatchString(s.Runs[i].TaskKey) {
 			return s, errors.New("task_run_sequence_invalid")
 		}

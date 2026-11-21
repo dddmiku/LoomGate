@@ -17,6 +17,7 @@ ASSETS = {
     '/': ('console/index.html', 'text/html'),
     '/console/style.css': ('console/style.css', 'text/css'),
     '/console/app.js': ('console/app.js', 'application/javascript'),
+    '/console/token-format.js': ('console/token-format.js', 'application/javascript'),
     '/console/connections.js': ('console/connections.js', 'application/javascript'),
     '/console/plan-editor.js': ('console/plan-editor.js', 'application/javascript'),
     '/console/model-picker.js': ('console/model-picker.js', 'application/javascript'),

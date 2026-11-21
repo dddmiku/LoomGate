@@ -27,17 +27,8 @@ function esc(t){ return String(t == null ? '' : t).replace(/[&<>"']/g, function(
   return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
 function pad(n){ return n < 10 ? '0' + n : '' + n; }
 function num(n){ return (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US'); }
-// compactNum：日志表里的输入/缓存列。非数字（"-" 等缺失标记）原样返回，
-// 数字按 k/M 缩写，鼠标悬浮看原值（title 由调用方给出）。
-function compactNum(v){
-  if (v == null || v === '') return '-';
-  var n = Number(String(v).replace(/[, ]/g, ''));
-  if (isNaN(n)) return String(v);
-  if (n >= 1000000000) return (n / 1000000000).toFixed(2) + 'B';
-  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
+// 日志兼容入口，统一复用两套面板的 Token 展示与进位口径。
+function compactNum(value){ return LoomGateTokens.compact(value); }
 // cacheLabel / cacheHint 渲染网关请求行的 cache= 列（v2.6.19）。
 // 这一列回答「这次该不该命中」：hit= 只说命中了多少，不说该不该有命中。
 //   cold       本会话首次请求，hit=0 属正常（前缀本来就没写过）
@@ -2152,10 +2143,10 @@ async function loadLogs(){
           '<td>' + esc(it.key) + '</td>' +
           '<td class="mono">' + esc(it.uid) + '</td>' +
           '<td class="mono num">' + esc(it.ttfb) + '</td>' +
-          '<td class="mono num" title="输入 tokens（每轮重发整段上下文）">' + esc(compactNum(it.in)) + '</td>' +
-          '<td class="mono num" title="输入里命中提示缓存的 tokens">' + esc(compactNum(it.hit)) + '</td>' +
+          '<td class="mono num" title="输入 tokens（每轮重发整段上下文）：' + esc(LoomGateTokens.exact(it.in)) + '">' + esc(compactNum(it.in)) + '</td>' +
+          '<td class="mono num" title="输入里命中提示缓存的 tokens：' + esc(LoomGateTokens.exact(it.hit)) + '">' + esc(compactNum(it.hit)) + '</td>' +
           '<td class="mono" title="' + esc(cacheHint(it)) + '">' + esc(cacheLabel(it)) + '</td>' +
-          '<td class="mono num">' + esc(it.tok) + '</td>' +
+          '<td class="mono num">' + LoomGateTokens.html(it.tok) + '</td>' +
           '<td class="mono num">' + esc(it.rate) + '</td>' +
           '<td class="mono num">' + esc(it.total) + '</td>' +
           '</tr>';

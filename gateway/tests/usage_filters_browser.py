@@ -86,17 +86,18 @@ def exercise(browser, base, output):
         def check(label, requests, callers, tokens, model_name, model_tokens, caller_requests, caller_tokens):
             expect(page.locator('#view[data-load-state=ready]')).to_be_visible()
             expect(tile('总请求')).to_have_text(str(requests))
-            expect(tile('总 Token')).to_have_text(f'{tokens:,}')
+            expect(tile('总 Token')).to_have_text({2500:'2.5K',1000:'1K'}.get(tokens,str(tokens)))
+            expect(tile('总 Token').locator('[title]')).to_have_attribute('title',f'{tokens:,} tokens')
             expect(tile('调用方')).to_have_text(str(callers))
             rows = card('调用方').locator('tbody tr')
             assert rows.count() == callers
             if model_name:
                 expect(card('模型分布')).to_contain_text(model_name)
-                expect(card('模型分布').locator('tbody tr').filter(has_text=model_name).locator('td').nth(1)).to_have_text(f'{model_tokens:,}')
+                expect(card('模型分布').locator('tbody tr').filter(has_text=model_name).locator('td').nth(1)).to_have_text({1000:'1K'}.get(model_tokens,str(model_tokens)))
                 expect(card('按模型明细')).to_contain_text(model_name)
                 active = rows.filter(has_text='当前调用方')
                 expect(active.locator('td').nth(1)).to_have_text(str(caller_requests))
-                expect(active.locator('td').nth(2)).to_have_text(f'{caller_tokens:,}')
+                expect(active.locator('td').nth(2)).to_have_text({1000:'1K'}.get(caller_tokens,str(caller_tokens)))
             observed.append(dict(case=label, requests=requests, callers=callers, tokens=tokens,
                                  model=model_name, model_tokens=model_tokens, usage_reads=f.usage_reads))
 
