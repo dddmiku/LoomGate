@@ -2008,7 +2008,7 @@ return {unknown:$('#updModalBar').classList.contains('unknown'),
         self.assertTrue(result["unknown"], "总大小未知时必须走不确定态")
         self.assertIn("1.1 MB", result["note"])
 
-    def test_handover_shows_full_bar_and_reassures(self):
+    def test_handover_shows_full_bar_and_waits_for_runtime(self):
         result = self.run_frontend("""
 UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'handover',asset_size:100}};
 openUpdateModal(); renderUpdate();
@@ -2017,7 +2017,9 @@ return {text:$('#updModalText').textContent, note:$('#updModalNote').textContent
 """, extra_sources=("update.js",))
         self.assertEqual(result["width"], "100%")
         self.assertIn("切换", result["text"])
-        self.assertIn("不会中断", result["note"])
+        self.assertIn("运行版本", result["note"])
+        self.assertIn("无需再次点击", result["note"])
+        self.assertNotIn("不会中断", result["note"])
 
     def test_failure_stops_and_reports_the_reason(self):
         result = self.run_frontend("""
@@ -2050,9 +2052,9 @@ return {afterFail:afterFail, afterReopen:$('#updModalIcon').className,
 
     def test_completion_switches_to_done(self):
         result = self.run_frontend("""
-UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'handover',asset_size:100}};
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',target_version:'v3.0.1',state:'handover',asset_size:100}};
 openUpdateModal(); renderUpdate();
-UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',asset_size:100}};
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',ready:true,healthy:true,asset_size:100}};
 renderUpdate();
 return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
         icon:$('#updModalIcon').className, width:$('#updModalBar i').style.width};
@@ -2061,6 +2063,30 @@ return {title:$('#updModalTitle').textContent, text:$('#updModalText').textConte
         self.assertIn("v3.0.1", result["text"])
         self.assertIn("ok", result["icon"])
         self.assertEqual(result["width"], "100%")
+
+    def test_old_runtime_after_handover_is_not_reported_as_done(self):
+        result = self.run_frontend("""
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',target_version:'v3.0.1',state:'handover'}};
+openUpdateModal(); renderUpdate();
+UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'idle',ready:true,healthy:true}};
+renderUpdate();
+return {title:$('#updModalTitle').textContent,icon:$('#updModalIcon').className};
+""", extra_sources=("update.js",))
+        self.assertNotEqual(result["title"], "更新完成")
+        self.assertNotIn("ok", result["icon"])
+
+    def test_unready_or_unhealthy_target_is_not_reported_as_done(self):
+        for field in ("ready", "healthy"):
+            with self.subTest(field=field):
+                result = self.run_frontend("""
+UP.target='v3.0.1';
+UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',ready:true,healthy:true}};
+""" + "UP.data.status." + field + "=false;" + """
+openUpdateModal(); renderUpdate();
+return {title:$('#updModalTitle').textContent,icon:$('#updModalIcon').className};
+""", extra_sources=("update.js",))
+                self.assertNotEqual(result["title"], "更新完成")
+                self.assertNotIn("ok", result["icon"])
 
     def test_modal_closed_means_no_rendering(self):
         """没打开对话框时，状态变化不得把对话框内容改掉（避免下次打开看到旧值）。"""
@@ -2079,7 +2105,7 @@ return {open:$('#updModal').classList.contains('on'),
     def test_idle_before_any_progress_is_not_reported_as_done(self):
         """提交更新后的第一次轮询可能比网关状态更新更早，此时 state 仍是 idle。
 
-        若不看「是否经历过进行中的阶段」，会把「刚开始」直接误报成「更新完成」
+        若不核对目标版本实际运行，会把「刚开始」直接误报成「更新完成」
         ——用户看到「已切换到新版本」，而实际上什么都没发生。
         """
         result = self.run_frontend("""
