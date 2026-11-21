@@ -18,6 +18,8 @@ const (
 	creditFailureBackoff = 12 * time.Second
 )
 
+var errWalletAuthentication = errors.New("autoclaw_credit_authentication_required")
+
 type creditCacheEntry struct {
 	value   providercatalog.CreditView
 	at      time.Time
@@ -131,7 +133,7 @@ func (s Source) fetchCredits(ctx context.Context, account string) (providercatal
 	}
 	client := p.httpClient()
 	value, status, err := fetchCreditWith(ctx, session.AccessToken, client, s.BaseURL)
-	if status == http.StatusUnauthorized && value.Remain == nil && session.RefreshToken != "" {
+	if (status == http.StatusUnauthorized || errors.Is(err, errWalletAuthentication)) && value.Remain == nil && session.RefreshToken != "" {
 		// RefreshToken is single-use; reuse the provider's durable intent path.
 		if renewed, refreshErr := p.refreshAccount(ctx, account, session.RefreshToken); refreshErr == nil {
 			value, status, err = fetchCreditWith(ctx, renewed.AccessToken, client, s.BaseURL)
@@ -177,7 +179,16 @@ func fetchCreditWith(ctx context.Context, token string, client *http.Client, bas
 			TotalBalance *int64 `json:"total_balance"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(total, &wallet) != nil || wallet.Code == nil || *wallet.Code != 0 || wallet.Data.TotalBalance == nil {
+	if json.Unmarshal(total, &wallet) != nil || wallet.Code == nil {
+		return view, status, errors.New("autoclaw_credit_response_invalid")
+	}
+	// The wallet reports expired sessions as HTTP 200 with this exact business
+	// code. Keep the observed status; only this definite authentication result
+	// may enter the durable, single-use refresh path alongside HTTP 401.
+	if *wallet.Code == 410000 {
+		return view, status, errWalletAuthentication
+	}
+	if *wallet.Code != 0 || wallet.Data.TotalBalance == nil {
 		return view, status, errors.New("autoclaw_credit_response_invalid")
 	}
 	view.Remain = wallet.Data.TotalBalance

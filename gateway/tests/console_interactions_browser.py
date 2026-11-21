@@ -1058,6 +1058,15 @@ def ready_update(f):
     f.page.evaluate("window.fixtureLoopCard=document.querySelector('#setting-loop');window.fixtureUpdateCard=document.querySelector('#setting-update')")
 
 
+def wait_for_update_frontend_reload(f, previous_origin):
+    f.page.wait_for_function("""previous => performance.timeOrigin !== previous &&
+        JSON.parse(sessionStorage.getItem('loomgate.frontendReload'))?.tag === 'v1.0.2' &&
+        !sessionStorage.getItem('loomgate.unconfirmedUpdate') &&
+        document.querySelector('#setting-update .update-facts')?.textContent.includes('v1.0.2')
+        """, arg=previous_origin)
+    assert f.page.url == f.base + '/#settings'
+
+
 def stale_update_intent_recovers_automatically(browser, base, failed=False):
     f = Fixture(browser, base)
     try:
@@ -1115,8 +1124,9 @@ def accepted_idle_update_reconnects_without_replay(browser, base):
         f.hold('/api/update')
         f.wait_held('/api/update', timeout_ms=4000)
         f.release('/api/update', {'ok': False, 'error': 'fixture_reconnect'}, status=503)
+        previous_origin = f.page.evaluate('performance.timeOrigin')
         f.update['status'].update(current='v1.0.2', state='idle', update_ready=False, healthy=True)
-        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        wait_for_update_frontend_reload(f, previous_origin)
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
     finally:
         f.close()
@@ -1130,8 +1140,9 @@ def revisited_update_recovers_automatically(browser, base):
         f.update['status'].update(state='handover', target_version='v1.0.2', auto_restart=True)
         f.page.reload()
         f.page.wait_for_function("document.querySelector('#setting-update')?.textContent.includes('自动切换中')")
+        previous_origin = f.page.evaluate('performance.timeOrigin')
         f.update['status'].update(current='v1.0.2', state='idle', update_ready=False)
-        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        wait_for_update_frontend_reload(f, previous_origin)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 0
     finally:
@@ -1227,8 +1238,9 @@ def lost_update_response_is_not_replayed(browser, base):
         f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('自动')")
         assert f.page.locator('[data-action=update-apply]').is_hidden()
         assert f.page.evaluate("Boolean(sessionStorage.getItem('loomgate.unconfirmedUpdate'))")
+        previous_origin = f.page.evaluate('performance.timeOrigin')
         f.update['status'].update(current='v1.0.2', state='idle', update_ready=False, staged_version='', restart_required=False, healthy=True)
-        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        wait_for_update_frontend_reload(f, previous_origin)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
     finally:
@@ -1277,8 +1289,9 @@ def update_completion_requires_running_version(browser, base):
         f.update['status'].update(current='v1.0.2', commit='fixture-new-commit', state='idle', update_ready=False, healthy=False)
         f.page.wait_for_timeout(2100)
         assert '运行版本已核验' not in f.page.locator('[data-update-action-status]').inner_text(), 'unhealthy target was reported as complete'
+        previous_origin = f.page.evaluate('performance.timeOrigin')
         f.update['status']['healthy'] = True
-        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        wait_for_update_frontend_reload(f, previous_origin)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
         assert '构建时间' in f.page.locator('#setting-update .update-facts').inner_text()

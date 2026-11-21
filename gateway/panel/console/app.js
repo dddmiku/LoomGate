@@ -1274,6 +1274,19 @@
     return {...base,badge:'manual_action',badgeText:'未检查',detail:'尚未读取远端发布；点击「检查更新」后再确认是否有新版本。'};
   }
   const updateIntentKey='loomgate.unconfirmedUpdate';
+  let updateFrontendReloadPending=false;
+  function reloadUpdatedFrontend(status){
+    if(updateFrontendReloadPending||typeof status.repo!=='string'||!status.repo||typeof status.current!=='string'||!status.current)return;
+    const key='loomgate.frontendReload',marker=JSON.stringify({repo:status.repo,tag:status.current,commit:status.commit||''});
+    // Persist one bounded marker before navigating, so an uncleared intent cannot reload forever.
+    try{
+      if(sessionStorage.getItem(key)===marker)return;
+      sessionStorage.setItem(key,marker);
+      if(sessionStorage.getItem(key)!==marker)return;
+    }catch{return;}
+    updateFrontendReloadPending=true;
+    setTimeout(()=>window.location.reload(),0);
+  }
   function readUpdateIntent(){
     if(state.updateIntent)return state.updateIntent;
     try{
@@ -1311,7 +1324,7 @@
     const info=updateView(update),status=update?.status||{};
     let intent=readUpdateIntent(),completed=false;
     if(intent&&update?.ok===true&&updateRunningTarget(status,intent)){
-      completed=clearUpdateIntent(intent);if(completed){intent=null;card._updateCompleted={repo:status.repo,tag:status.current};}
+      completed=clearUpdateIntent(intent);if(completed){intent=null;card._updateCompleted={repo:status.repo,tag:status.current};reloadUpdatedFrontend(status);}
     }else if(intent&&update?.ok===true&&!updateTransitioning(status)&&
       (status.state==='failed'||status.state==='idle'&&(status.current!==intent.tag||status.repo!==intent.repo)&&!(Number.isFinite(intent.started_at)&&Date.now()-intent.started_at>=0&&Date.now()-intent.started_at<15000))){
       clearUpdateIntent(intent);intent=null;card._updateCompleted=null;

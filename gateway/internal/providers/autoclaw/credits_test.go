@@ -218,6 +218,221 @@ func TestCreditsRefreshesUnauthorizedSessionBeforeRetryingWallet(t *testing.T) {
 	}
 }
 
+func TestFetchCreditWalletAuthenticationBusinessCodeKeepsHTTP200(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/wallets") {
+			t.Error("authentication failure must not query expiring points")
+		}
+		return creditResponse(r, http.StatusOK, `{"code":410000,"msg":"fixture authentication required"}`)
+	})}
+	view, status, err := fetchCreditWith(t.Context(), "fixture-access", client, "")
+	if status != http.StatusOK || err == nil || err.Error() != "autoclaw_credit_authentication_required" || view.Remain != nil {
+		t.Fatalf("wallet business authentication status=%d err=%v remain_known=%t", status, err, view.Remain != nil)
+	}
+}
+
+func TestCreditsRefreshesWalletBusinessAuthenticationBeforeRetry(t *testing.T) {
+	resetCreditCacheForTest(t)
+	v, account := creditFixtureVault(t, "fixture-old-access", "fixture-old-refresh")
+	var wallets, refreshes, expirings atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/wallets"):
+			if wallets.Add(1) == 1 {
+				return creditResponse(r, http.StatusOK, `{"code":410000,"msg":"fixture authentication required"}`)
+			}
+			if r.Header.Get("X-Authorization") != "Bearer fixture-new-access" {
+				t.Error("wallet retry did not use the renewed session")
+			}
+			return creditResponse(r, http.StatusOK, `{"code":0,"data":{"total_balance":9}}`)
+		case r.URL.Path == refreshPt:
+			refreshes.Add(1)
+			metadata, profile := readRefreshState(t, v, account.ID)
+			if metadata.Revision <= account.Revision || profile["refresh_pending"] != true {
+				t.Error("wallet refresh was sent before its durable intent")
+			}
+			return refreshSuccess(r), nil
+		case strings.HasSuffix(r.URL.Path, "/expiring"):
+			expirings.Add(1)
+			return creditResponse(r, http.StatusOK, `{"code":0,"data":{"expiring_points":2}}`)
+		default:
+			return nil, errors.New("fixture_unexpected_endpoint")
+		}
+	})}
+	s := Source{Vault: v, Client: client}
+	view, err := s.Credits(t.Context(), account.ID, true)
+	if err != nil || view.Remain == nil || *view.Remain != 9 || view.Expiring == nil || *view.Expiring != 2 {
+		t.Fatalf("business authentication did not recover err=%v remain_known=%t", err, view.Remain != nil)
+	}
+	if wallets.Load() != 2 || refreshes.Load() != 1 || expirings.Load() != 1 {
+		t.Fatalf("endpoint counts wallet=%d refresh=%d expiring=%d", wallets.Load(), refreshes.Load(), expirings.Load())
+	}
+	_, saved := readRefreshState(t, v, account.ID)
+	if saved["accessToken"] != "fixture-new-access" || saved["refreshToken"] != "fixture-new-refresh" || saved["refresh_pending"] == true {
+		t.Fatal("renewed session was not committed")
+	}
+}
+
+func TestCreditsWalletBusinessAuthenticationRetriesOnlyOnce(t *testing.T) {
+	resetCreditCacheForTest(t)
+	v, account := creditFixtureVault(t, "fixture-old-access", "fixture-old-refresh")
+	var wallets, refreshes atomic.Int32
+	s := Source{Vault: v, Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == refreshPt {
+			refreshes.Add(1)
+			return refreshSuccess(r), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/wallets") {
+			wallets.Add(1)
+			return creditResponse(r, http.StatusOK, `{"code":410000}`)
+		}
+		return nil, errors.New("fixture_unexpected_endpoint")
+	})}}
+	view, err := s.Credits(t.Context(), account.ID, true)
+	if err == nil || view.Remain != nil || wallets.Load() != 2 || refreshes.Load() != 1 {
+		t.Fatalf("unbounded or missing retry err=%v wallets=%d refreshes=%d", err, wallets.Load(), refreshes.Load())
+	}
+}
+
+func TestCreditsWalletBusinessAuthenticationRefreshLostResponseIsNotReplayed(t *testing.T) {
+	resetCreditCacheForTest(t)
+	v, account := creditFixtureVault(t, "fixture-old-access", "fixture-old-refresh")
+	var wallets, refreshes atomic.Int32
+	s := Source{Vault: v, Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == refreshPt {
+			refreshes.Add(1)
+			return nil, errors.New("fixture_response_lost")
+		}
+		if strings.HasSuffix(r.URL.Path, "/wallets") {
+			wallets.Add(1)
+			return creditResponse(r, http.StatusOK, `{"code":410000}`)
+		}
+		return nil, errors.New("fixture_unexpected_endpoint")
+	})}}
+	for range 2 {
+		if _, err := s.Credits(t.Context(), account.ID, true); err == nil {
+			t.Error("uncertain refresh was reported successful")
+		}
+	}
+	_, saved := readRefreshState(t, v, account.ID)
+	if wallets.Load() != 1 || refreshes.Load() != 1 || saved["refresh_pending"] != true {
+		t.Fatalf("ambiguous single-use refresh replayed wallets=%d refreshes=%d pending=%v", wallets.Load(), refreshes.Load(), saved["refresh_pending"])
+	}
+}
+
+func TestCreditsDoesNotRefreshOtherWalletFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		expiring bool
+	}{
+		{"unknown business code", http.StatusOK, `{"code":410001}`, false},
+		{"other business error with token words", http.StatusOK, `{"code":1,"msg":"fixture token expired"}`, false},
+		{"quota forbidden", http.StatusForbidden, `{"code":403,"msg":"fixture quota exhausted"}`, false},
+		{"other forbidden", http.StatusForbidden, `{"msg":"fixture token expired"}`, false},
+		{"invalid JSON", http.StatusOK, `{`, false},
+		{"missing business code", http.StatusOK, `{"data":{"total_balance":7}}`, false},
+		{"expiring auth does not discard known wallet", http.StatusOK, `{"code":410000}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCreditCacheForTest(t)
+			v, account := creditFixtureVault(t, "fixture-old-access", "fixture-old-refresh")
+			var refreshes atomic.Int32
+			s := Source{Vault: v, Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == refreshPt {
+					refreshes.Add(1)
+					return refreshSuccess(r), nil
+				}
+				if tc.expiring && strings.HasSuffix(r.URL.Path, "/wallets") {
+					return creditResponse(r, http.StatusOK, `{"code":0,"data":{"total_balance":7}}`)
+				}
+				return creditResponse(r, tc.status, tc.body)
+			})}}
+			view, err := s.Credits(t.Context(), account.ID, true)
+			metadata, saved := readRefreshState(t, v, account.ID)
+			if err == nil || refreshes.Load() != 0 || metadata.Revision != account.Revision || saved["refresh_pending"] == true {
+				t.Fatalf("non-wallet-auth error consumed refresh err=%v calls=%d", err, refreshes.Load())
+			}
+			if tc.expiring && (view.Remain == nil || *view.Remain != 7 || view.FetchedAt == nil || view.ErrorCode != "autoclaw_expiring_unavailable") {
+				t.Fatal("expiring failure discarded the confirmed wallet balance")
+			}
+		})
+	}
+}
+
+func TestCreditsWithoutRefreshDoesNotRetryBusinessAuthentication(t *testing.T) {
+	resetCreditCacheForTest(t)
+	v, account := creditFixtureVault(t, "fixture-old-access", "")
+	var calls atomic.Int32
+	s := Source{Vault: v, Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return creditResponse(r, http.StatusOK, `{"code":410000}`)
+	})}}
+	if _, err := s.Credits(t.Context(), account.ID, true); err == nil || calls.Load() != 1 {
+		t.Fatalf("missing refresh session calls=%d err=%v", calls.Load(), err)
+	}
+}
+
+func TestCreditsConcurrentBusinessAuthenticationRefreshCoalesces(t *testing.T) {
+	resetCreditCacheForTest(t)
+	v, account := creditFixtureVault(t, "fixture-old-access", "fixture-old-refresh")
+	var wallets, refreshes atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	s := Source{Vault: v, Client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.URL.Path == refreshPt:
+			refreshes.Add(1)
+			return refreshSuccess(r), nil
+		case strings.HasSuffix(r.URL.Path, "/wallets"):
+			if wallets.Add(1) == 1 {
+				close(entered)
+				<-release
+				return creditResponse(r, http.StatusOK, `{"code":410000}`)
+			}
+			return creditResponse(r, http.StatusOK, `{"code":0,"data":{"total_balance":9}}`)
+		case strings.HasSuffix(r.URL.Path, "/expiring"):
+			return creditResponse(r, http.StatusOK, `{"code":0,"data":{"expiring_points":0}}`)
+		default:
+			return nil, errors.New("fixture_unexpected_endpoint")
+		}
+	})}}
+	const callers = 8
+	results := make(chan error, callers)
+	read := func(ctx context.Context) {
+		view, err := s.Credits(ctx, account.ID, true)
+		if err == nil && (view.Remain == nil || *view.Remain != 9) {
+			err = errors.New("fixture_missing_balance")
+		}
+		results <- err
+	}
+	go read(t.Context())
+	awaitCreditSignal(t, entered)
+	joined := make(chan struct{}, callers-1)
+	for range callers - 1 {
+		go read(joinCreditContext{Context: t.Context(), joined: joined})
+	}
+	for range callers - 1 {
+		awaitCreditSignal(t, joined)
+	}
+	releaseOnce()
+	for range callers {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("coalesced wallet read: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("coalesced wallet read timed out")
+		}
+	}
+	if wallets.Load() != 2 || refreshes.Load() != 1 {
+		t.Fatalf("coalesced wallet=%d refresh=%d", wallets.Load(), refreshes.Load())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 type joinCreditContext struct {

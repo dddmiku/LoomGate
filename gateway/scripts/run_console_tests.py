@@ -51,7 +51,8 @@ def main() -> int:
         return code
     for script, directory in [("connection_repeat_browser.py", "connections"),
                               ("usage_filters_browser.py", "usage"),
-                              ("token_units_browser.py", "tokens")]:
+                              ("token_units_browser.py", "tokens"),
+                              ("update_frontend_reload_browser.py", "update-reload")]:
         command = [sys.executable, "-I", "-B", str(root / "tests" / script),
                    "--output", str(output / directory)]
         code = subprocess.run(command, cwd=root, check=False).returncode

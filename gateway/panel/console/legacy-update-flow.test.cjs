@@ -11,22 +11,26 @@ const ready = extra => ({enabled:true,state:'idle',current:'v1.0.0',latest_tag:'
 
 function harness(respond = async (path) => path === 'api/update/apply'
   ? {ok:true,status:ready({state:'downloading'})} : {ok:true,status:ready()}) {
-  const nodes = new Map(), timers = new Map(), calls = [];
+  const nodes = new Map(), timers = new Map(), calls = [], reloadTimers=[], reloads=[], storage=new Map();
   let asks = 0, timerID = 0;
   const node = key => {
     if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',style:{},disabled:false,
       classList:{add(){},remove(){}},querySelector(){return node(key+'/fill');},addEventListener(){}});
     return nodes.get(key);
   };
-  const context = {$:node,esc:String,mrow:(key,value)=>key+':'+value,fmtTime:String,relTime:String,
+  const location={hash:'#system',reload:()=>reloads.push(location.hash)};
+  const context = {$:node,window:{location},esc:String,mrow:(key,value)=>key+':'+value,fmtTime:String,relTime:String,
     document:{addEventListener(){}},toast(){},
+    sessionStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},
+    setTimeout(fn,delay){reloadTimers.push({callback:fn,delay});return reloadTimers.length;},
     ask(...args){asks++;return args.at(-1)();},
     async api(path,body){calls.push({path,body});return respond(path,body);},
     setInterval(fn){timers.set(++timerID,fn);return timerID;},
     clearInterval(id){timers.delete(id);}};
   vm.createContext(context);vm.runInContext(code,context);
   context.UP.data={ok:true,status:ready()};
-  return {context,node,calls,get asks(){return asks;},get timerCount(){return timers.size;},
+  context.observeUpdateStatus(context.UP.data.status);
+  return {context,node,calls,reloadTimers,reloads,storage,get asks(){return asks;},get timerCount(){return timers.size;},
     async tick(){const run=timers.values().next().value;if(run)await run();}};
 }
 
@@ -78,7 +82,7 @@ test('legacy reconnect readback survives a temporary outage and requires healthy
     ready({current:'v1.0.2',ready:false}),ready({current:'v1.0.2',healthy:false}),
     ready({current:'v1.0.2',ready:true,healthy:true,update_ready:false})];
   const h=harness(async path=>{assert.equal(path,'api/update');const result=statuses.shift();if(result instanceof Error)throw result;return {ok:true,status:result};});
-  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.openUpdateModal();h.context.UP.modalBusy=true;h.context.startUpdatePoll();
+  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;h.context.openUpdateModal();h.context.UP.modalBusy=true;h.context.startUpdatePoll();
   await h.tick();assert.equal(h.timerCount,1);assert.notEqual(h.node('#updState').textContent,'不可用');
   for(let i=0;i<3;i++){await h.tick();assert.equal(h.context.UP.modalDone,false);assert.equal(h.timerCount,1);}
   await h.tick();assert.equal(h.node('#updModalTitle').textContent,'更新完成');assert.equal(h.timerCount,0);
@@ -87,14 +91,14 @@ test('legacy reconnect readback survives a temporary outage and requires healthy
 
 test('legacy polling allows twenty minutes but never turns an unreachable service into success', async()=>{
   const h=harness(async()=>{throw new Error('fixture offline');});
-  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.openUpdateModal();h.context.startUpdatePoll();
+  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;h.context.openUpdateModal();h.context.startUpdatePoll();
   let ticks=0;while(h.timerCount&&ticks<605){await h.tick();ticks++;}
   assert.equal(h.timerCount,0);assert.equal(ticks,600);assert.notEqual(h.node('#updModalTitle').textContent,'更新完成');
 });
 
 test('legacy server failure preserves the reason even when its version equals the target', async()=>{
   const h=harness(async()=>({ok:true,status:ready({state:'failed',current:'v1.0.2',last_error:'fixture validation rejected'})}));
-  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.openUpdateModal();h.context.startUpdatePoll();
+  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;h.context.openUpdateModal();h.context.startUpdatePoll();
   await h.tick();
   assert.equal(h.timerCount,0);assert.equal(h.node('#updModalTitle').textContent,'更新失败');
   assert.equal(h.node('#updModalText').textContent,'fixture validation rejected');
@@ -131,7 +135,7 @@ test('legacy hung status read cannot overlap or hold the poll loop forever', asy
   let release;
   const waiting=new Promise(done=>{release=done;});
   const h=harness(async()=>waiting);
-  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.openUpdateModal();h.context.startUpdatePoll();
+  h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;h.context.openUpdateModal();h.context.startUpdatePoll();
   const first=h.tick();
   for(let i=1;i<600;i++)await h.tick();
   assert.equal(h.calls.length,1);assert.equal(h.timerCount,0);
@@ -145,4 +149,83 @@ test('legacy staged service without automatic restart keeps the real staged stat
   assert.equal(h.node('#updState').textContent,'等待重启');
   assert.equal(h.node('#updModalTitle').textContent,'等待重启网关');
   assert.notEqual(h.node('#updModalTitle').textContent,'更新完成');
+});
+
+test('legacy verified active update reloads frontend once and retains the hash without posting',()=>{
+  const h=harness();h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;
+  const status=ready({current:'v1.0.2',commit:'fixture-new',ready:true,healthy:true});
+  h.context.UP.data={ok:true,status};h.context.renderUpdate();h.context.renderUpdate();
+  assert.equal(h.context.UP.awaiting,false);assert.equal(h.reloadTimers.length,1);
+  assert.equal(h.reloadTimers[0].delay,0);h.reloadTimers.shift().callback();
+  assert.deepEqual(h.reloads,['#system']);assert.deepEqual(h.calls,[]);
+  assert.deepEqual(JSON.parse(h.storage.get('loomgate.frontendReload')),
+    {repo:'fixture-owner/fixture-product',tag:'v1.0.2',commit:'fixture-new'});
+});
+
+test('legacy frontend reload excludes initial target idle failure and unhealthy readbacks',()=>{
+  for(const extra of [{current:'v1.0.0'}, {current:'v1.0.2',state:'failed'},
+    {current:'v1.0.2',state:'handover'}, {current:'v1.0.2',restart_required:true},
+    {current:'v1.0.2',ready:false}, {current:'v1.0.2',healthy:false}]){
+    const h=harness();h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;
+    h.context.UP.data={ok:true,status:ready(extra)};h.context.renderUpdate();
+    assert.equal(h.reloadTimers.length,0,JSON.stringify(extra));
+  }
+  const h=harness();h.context.UP.data={ok:true,status:ready({current:'v1.0.2',target_version:'v1.0.2'})};
+  h.context.renderUpdate();assert.equal(h.reloadTimers.length,0);
+});
+
+test('legacy frontend marker prevents a stale busy flag from causing a reload loop',()=>{
+  const h=harness();h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;
+  h.storage.set('loomgate.frontendReload',JSON.stringify({repo:'fixture-owner/fixture-product',tag:'v1.0.2',commit:''}));
+  h.context.UP.data={ok:true,status:ready({current:'v1.0.2'})};h.context.renderUpdate();
+  assert.equal(h.reloadTimers.length,0);
+});
+
+test('legacy frontend reload stays manual when its marker cannot be persisted or read back',()=>{
+  for(const failure of ['throw','discard','readback']){
+    const h=harness();h.context.UP.target='v1.0.2';h.context.UP.awaiting=true;h.context.UP.frontendReloadEligible=true;
+    if(failure==='readback')h.context.sessionStorage.getItem=()=>{throw new Error('fixture storage unavailable');};
+    else h.context.sessionStorage.setItem=()=>{if(failure==='throw')throw new Error('fixture storage unavailable');};
+    h.context.UP.data={ok:true,status:ready({current:'v1.0.2'})};h.context.renderUpdate();
+    assert.equal(h.reloadTimers.length,0,failure);assert.deepEqual(h.calls,[]);
+  }
+});
+
+test('legacy historical completed target is not promoted by a pure check into an update reload',()=>{
+  const h=harness();
+  const historical=ready({current:'v1.0.2',target_version:'v1.0.2',update_ready:false});
+  h.context.UP.data={ok:true,status:historical};h.context.renderUpdate();
+  assert.equal(h.reloadTimers.length,0,'initial historical completion reloaded');
+  h.context.UP.data={ok:true,status:{...historical,state:'checking'}};h.context.renderUpdate();
+  assert.equal(h.timerCount,1,'checking must retain read-only polling');
+  h.context.UP.data={ok:true,status:historical};h.context.renderUpdate();
+  assert.equal(h.reloadTimers.length,0,'pure check acquired frontend reload permission');
+  assert.deepEqual(h.calls,[]);
+});
+
+test('legacy submitted update never confirms a different repository with the same target tag',async()=>{
+  const h=harness(async path=>path==='api/update/apply'
+    ? {ok:true,status:ready({repo:'different-owner/different-product',current:'v1.0.2',ready:true,healthy:true})}
+    : {ok:true,status:ready()});
+  await h.context.actUpdateApply();
+  assert.equal(h.calls.filter(c=>c.path==='api/update/apply').length,1);
+  assert.equal(h.context.UP.modalDone,false,'different repository was reported as complete');
+  assert.equal(h.reloadTimers.length,0,'different repository refreshed frontend');
+  assert.equal(h.timerCount,1,'mismatched identity must remain under readback');
+});
+
+test('legacy pure check without a historical target finishes polling without awaiting an application',()=>{
+  const h=harness();h.context.UP.data={ok:true,status:ready({state:'checking'})};h.context.renderUpdate();
+  assert.equal(h.timerCount,1);assert.equal(h.context.UP.awaiting,false);
+  h.context.UP.data={ok:true,status:ready()};h.context.renderUpdate();
+  assert.equal(h.timerCount,0);assert.equal(h.context.UP.awaiting,false);
+  assert.equal(h.reloadTimers.length,0);assert.deepEqual(h.calls,[]);
+});
+
+test('legacy observed switch authorizes exactly one matching-repository reload without posting',()=>{
+  const h=harness();h.context.UP.data={ok:true,status:ready({state:'handover',target_version:'v1.0.2'})};
+  h.context.renderUpdate();assert.equal(h.timerCount,1);
+  h.context.UP.data={ok:true,status:ready({current:'v1.0.2',target_version:'v1.0.2',ready:true,healthy:true})};
+  h.context.renderUpdate();h.context.renderUpdate();
+  assert.equal(h.reloadTimers.length,1);assert.equal(h.timerCount,0);assert.deepEqual(h.calls,[]);
 });

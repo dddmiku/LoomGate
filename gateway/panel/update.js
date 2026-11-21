@@ -6,7 +6,8 @@
  * 2026-10-13：点「立即更新」后弹出进度对话框，全程显示下载/校验/切换进度。
  */
 var UP = { data:null, timer:null, loading:false, modal:false, modalBusy:false, modalDone:false,
-  target:'', submitting:false, awaiting:false, readError:'', applyError:'', pollExpired:false };
+  target:'', targetRepo:'', submitting:false, awaiting:false, readError:'', applyError:'', pollExpired:false,
+  frontendReloadPending:false, frontendReloadEligible:false };
 var UP_STATE = {
   idle:      { t:'空闲',   cls:''   },
   checking:  { t:'检查中', cls:'w'  },
@@ -23,21 +24,47 @@ function upServerBusy(s){
 
 function upRunningTarget(s){
   var target = UP.target || s.target_version || s.staged_version;
-  return !!target && s.current === target && s.state !== 'failed' && !UP_BUSY[s.state] && !s.restart_required &&
+  return !!target && !!UP.targetRepo && s.repo === UP.targetRepo && s.current === target && s.state !== 'failed' && !UP_BUSY[s.state] && !s.restart_required &&
     (!Object.prototype.hasOwnProperty.call(s, 'ready') || s.ready === true) &&
     (!Object.prototype.hasOwnProperty.call(s, 'healthy') || s.healthy === true) && !UP.readError;
 }
 
+function reloadUpdatedFrontend(s){
+  if (UP.frontendReloadPending || typeof s.repo !== 'string' || !s.repo || typeof s.current !== 'string' || !s.current) return;
+  var key = 'loomgate.frontendReload';
+  var marker = JSON.stringify({repo:s.repo, tag:s.current, commit:s.commit || ''});
+  // A single durable marker also protects against a stale readback after the document reload.
+  try{
+    if (sessionStorage.getItem(key) === marker) return;
+    sessionStorage.setItem(key, marker);
+    if (sessionStorage.getItem(key) !== marker) return;
+  }catch(err){ return; }
+  UP.frontendReloadPending = true;
+  setTimeout(function(){ window.location.reload(); }, 0);
+}
+
 function observeUpdateStatus(s){
   if (!UP.target && (s.target_version || s.staged_version)) UP.target = s.target_version || s.staged_version;
+  if (!UP.targetRepo && typeof s.repo === 'string' && s.repo) UP.targetRepo = s.repo;
   if (UP.readError) return;
+  if (s.state === 'downloading' || s.state === 'handover' || s.state === 'restarting' ||
+      (s.auto_restart === true && s.restart_required === true)) UP.frontendReloadEligible = true;
+  var wasUpdating = UP.frontendReloadEligible && (UP.awaiting || UP.submitting);
   if (s.state === 'failed' || upRunningTarget(s) || (s.restart_required && s.auto_restart !== true)){
     UP.awaiting = false;
-    if (upRunningTarget(s)) UP.pollExpired = false;
+    if (upRunningTarget(s)){
+      UP.pollExpired = false;
+      if (wasUpdating) reloadUpdatedFrontend(s);
+    }
+    UP.frontendReloadEligible = false;
     if (UP.timer) stopUpdatePoll();
   } else if (upServerBusy(s) && !UP.pollExpired){
-    UP.awaiting = true;
+    // A check may poll, but it is not an application and cannot authorize navigation.
+    if (s.state !== 'checking' || UP.frontendReloadEligible) UP.awaiting = true;
     startUpdatePoll();
+  } else if (!UP.frontendReloadEligible && !UP.submitting){
+    UP.awaiting = false;
+    if (UP.timer) stopUpdatePoll();
   }
 }
 
@@ -339,6 +366,7 @@ function startUpdatePoll(){
       if (expired()){
         UP.pollExpired = true;
         UP.awaiting = false;
+        UP.frontendReloadEligible = false;
         stopUpdatePoll();
         renderUpdate();
       }
@@ -352,6 +380,7 @@ function startUpdatePoll(){
     } else if (expired()){
       UP.pollExpired = true;
       UP.awaiting = false;
+      UP.frontendReloadEligible = false;
       stopUpdatePoll();
       renderUpdate();
     }
@@ -381,6 +410,7 @@ async function actUpdateApply(){
   if (UP.submitting) return;
   if (UP.awaiting || upServerBusy(s)){
     if (!UP.target) UP.target = s.target_version || s.staged_version || s.latest_tag || '';
+    if (!UP.targetRepo && typeof s.repo === 'string') UP.targetRepo = s.repo;
     UP.awaiting = true;
     if (!UP.modal) openUpdateModal();
     renderUpdate();
@@ -403,6 +433,8 @@ async function actUpdateApply(){
   UP.submitting = true;
   UP.awaiting = true;
   UP.target = s.latest_tag || s.target_version || '';
+  UP.targetRepo = typeof s.repo === 'string' ? s.repo : '';
+  UP.frontendReloadEligible = true;
   UP.readError = '';
   openUpdateModal();
   $('#btnUpdApply').disabled = true;
@@ -411,6 +443,7 @@ async function actUpdateApply(){
     var r = await api('api/update/apply', UP.target ? {tag:UP.target} : {});
     if (!r || r.ok !== true){
       UP.awaiting = false;
+      UP.frontendReloadEligible = false;
       UP.applyError = (r && r.message) || '服务端未接受更新请求。';
       if (r && r.status) UP.data = r;
       toast(UP.applyError, 'err');
@@ -422,6 +455,7 @@ async function actUpdateApply(){
   }catch(err){
     if (err.status >= 400 && err.status < 500 && err.status !== 408){
       UP.awaiting = false;
+      UP.frontendReloadEligible = false;
       UP.applyError = err.message || '更新请求被拒绝。';
       toast(UP.applyError, 'err');
     } else {
