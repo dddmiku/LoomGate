@@ -765,3 +765,47 @@ func TestLoginRewardReferralAlsoReservesTheParentCommitBudget(t *testing.T) {
 		t.Fatal("optional referral timeout invalidated or replayed the saved login")
 	}
 }
+
+func TestInitializeLoginUsesIdentityChannelWithoutChangingSharedHeaders(t *testing.T) {
+	shared, _ := http.NewRequest(http.MethodGet, "https://"+apiBase+walletPath, nil)
+	setHeaders(shared, rewardAccess, "fixture-model")
+	if shared.Header.Get("X-Channel") != "cakegrowth" {
+		t.Fatal("login initialization changed the shared inference and wallet channel")
+	}
+	calls := 0
+	client := rewardInitializeClient(t, func(r *http.Request) (*http.Response, error) {
+		calls++
+		assertRewardInitializeRequest(t, r)
+		if r.Header.Get("X-Auth-Appid") != appID {
+			t.Error("initialization changed the established signing identity")
+		}
+		if r.Header.Get("X-Channel") != "official" {
+			return creditResponse(r, http.StatusOK, ` {"code":410000}`)
+		}
+		return creditResponse(r, http.StatusOK, ` {"code":0}`)
+	})
+	if err := InitializeLogin(t.Context(), rewardInitializeProfile(t), client); err != nil {
+		t.Fatal("identity initialization used the inference channel instead of the official distribution channel")
+	}
+	if calls != 1 || shared.Header.Get("X-Channel") != "cakegrowth" {
+		t.Fatal("identity channel selection retried or mutated the shared header path")
+	}
+}
+
+func TestLoginRewardAuthenticationRefusalKeepsTheSavedLoginWithoutRetry(t *testing.T) {
+	h := newRewardLoginHarness(t)
+	h.transport.userInfoExchange = func(r *http.Request) (*http.Response, error) {
+		return creditResponse(r, http.StatusOK, ` {"code":410000,"msg":"`+rewardPrivateReply+`"}`)
+	}
+	complete := h.commit(t, h.verify(t))
+	if complete.Status != "succeeded" || complete.AccountID == "" || h.saveCalls != 1 {
+		t.Fatal("initialization authentication refusal lost the already saved login")
+	}
+	calls, weekly, events := h.transport.counts()
+	if calls != 1 || weekly || strings.Join(events, ",") != "send_code,login,audience_exchange,save,user_info" {
+		t.Fatal("authentication refusal retried, refreshed, or fabricated a reward")
+	}
+	if !strings.Contains(complete.Notice, "初始化未确认") || strings.Contains(complete.Notice, rewardPrivateReply) {
+		t.Fatal("authentication refusal lost its fixed private notice")
+	}
+}

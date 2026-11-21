@@ -61,6 +61,9 @@ func InitializeLogin(ctx context.Context, profile []byte, client *http.Client) e
 		return errors.New("autoclaw_login_initialize_request_invalid")
 	}
 	setHeaders(req, session.AccessToken, "")
+	// Identity services use the official distribution channel. The shared
+	// cakegrowth channel belongs to the existing inference/wallet path.
+	req.Header.Set("X-Channel", "official")
 	// Identity initialization carries the ordinary identity headers, without
 	// inference-specific model, agent or conversation context.
 	for _, name := range []string{"X-Authorization", "X-Agent-Id", "X-Request-Model", "X-Query-Id", "X-Session-Id", "x_trace_id"} {
