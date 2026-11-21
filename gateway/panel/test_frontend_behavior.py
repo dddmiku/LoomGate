@@ -2052,9 +2052,9 @@ return {afterFail:afterFail, afterReopen:$('#updModalIcon').className,
 
     def test_completion_switches_to_done(self):
         result = self.run_frontend("""
-UP.data={ok:true,status:{enabled:true,current:'v3.0.0',target_version:'v3.0.1',state:'handover',asset_size:100}};
+UP.data={ok:true,status:{enabled:true,repo:'fixture-owner/fixture-product',current:'v3.0.0',target_version:'v3.0.1',state:'handover',asset_size:100}};
 openUpdateModal(); renderUpdate();
-UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',ready:true,healthy:true,asset_size:100}};
+UP.data={ok:true,status:{enabled:true,repo:'fixture-owner/fixture-product',current:'v3.0.1',state:'idle',ready:true,healthy:true,asset_size:100}};
 renderUpdate();
 return {title:$('#updModalTitle').textContent, text:$('#updModalText').textContent,
         icon:$('#updModalIcon').className, width:$('#updModalBar i').style.width};
@@ -2066,9 +2066,9 @@ return {title:$('#updModalTitle').textContent, text:$('#updModalText').textConte
 
     def test_old_runtime_after_handover_is_not_reported_as_done(self):
         result = self.run_frontend("""
-UP.data={ok:true,status:{enabled:true,current:'v3.0.0',target_version:'v3.0.1',state:'handover'}};
+UP.data={ok:true,status:{enabled:true,repo:'fixture-owner/fixture-product',current:'v3.0.0',target_version:'v3.0.1',state:'handover'}};
 openUpdateModal(); renderUpdate();
-UP.data={ok:true,status:{enabled:true,current:'v3.0.0',state:'idle',ready:true,healthy:true}};
+UP.data={ok:true,status:{enabled:true,repo:'fixture-owner/fixture-product',current:'v3.0.0',state:'idle',ready:true,healthy:true}};
 renderUpdate();
 return {title:$('#updModalTitle').textContent,icon:$('#updModalIcon').className};
 """, extra_sources=("update.js",))
@@ -2079,8 +2079,8 @@ return {title:$('#updModalTitle').textContent,icon:$('#updModalIcon').className}
         for field in ("ready", "healthy"):
             with self.subTest(field=field):
                 result = self.run_frontend("""
-UP.target='v3.0.1';
-UP.data={ok:true,status:{enabled:true,current:'v3.0.1',state:'idle',ready:true,healthy:true}};
+UP.target='v3.0.1';UP.targetRepo='fixture-owner/fixture-product';
+UP.data={ok:true,status:{enabled:true,repo:'fixture-owner/fixture-product',current:'v3.0.1',state:'idle',ready:true,healthy:true}};
 """ + "UP.data.status." + field + "=false;" + """
 openUpdateModal(); renderUpdate();
 return {title:$('#updModalTitle').textContent,icon:$('#updModalIcon').className};
