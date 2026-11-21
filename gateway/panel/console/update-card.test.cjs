@@ -112,7 +112,7 @@ test('invalid checked_at is not a successful check', () => {
   }
 });
 
-test('a signed ready release offers a confirmed apply action', () => {
+test('a signed ready release offers a one click apply action', () => {
   const view = seam()(publicStatus({status: {
     enabled: true, state: 'idle', signature_verification: true,
     repo: 'owner/loomgate', current: 'v1.0.0', latest_tag: 'v1.0.2',
@@ -181,17 +181,26 @@ test('signature capability is stated from the real field on every branch', () =>
   assert.ok(off.lines.some((line) => line.includes('未内置发布公钥')), off.lines.join('|'));
 });
 
-test('staged update requires a gateway restart and never claims the new version is running', () => {
+test('a legacy staged update preserves the real running version without a manual protection dialog', () => {
   const view = seam()(publicStatus({status: {enabled: true, state: 'idle',
     current: 'v1.0.5', latest_tag: 'v1.0.6', staged_version: 'v1.0.6',
     restart_required: true, update_ready: true, signature_verification: true,
     repo: 'owner/loomgate', asset_name: 'fixture-runtime.tar.gz'}}));
-  assert.equal(view.badgeText, '等待重启');
+  assert.equal(view.badgeText, '尚未切换');
   assert.equal(view.canApply, false);
-  assert.match(view.detail, /重启网关或容器/);
-  assert.match(view.detail, /当前版本继续服务/);
+  assert.match(view.detail, /尚未完成切换/);
+  assert.match(view.detail, /当前版本仍在运行/);
   assert.ok(view.lines.some(line => line === '当前版本：v1.0.5'));
   assert.ok(view.lines.some(line => line === '待启用版本：v1.0.6'));
+});
+
+test('automatic handover displays the observed target and keeps every apply control disabled',()=>{
+  const view=seam()(publicStatus({status:{enabled:true,state:'handover',auto_restart:true,
+    current:'v1.0.7',target_version:'v1.0.8',repo:'owner/loomgate',signature_verification:true}}));
+  assert.equal(view.badgeText,'自动切换中');assert.equal(view.canApply,false);assert.equal(view.canCheck,false);
+  assert.ok(view.lines.includes('当前版本：v1.0.7'));
+  assert.ok(view.lines.includes('更新目标：v1.0.8'));
+  assert.match(view.detail,/自动切换/);
 });
 
 test('legacy panel also reports a staged runtime as waiting for a gateway restart', () => {

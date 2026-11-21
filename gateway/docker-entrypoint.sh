@@ -81,6 +81,7 @@ except (OSError, ValueError) as error:
 PY
 )" || exit 1
 export WB2API_UPDATE_DIR="$UPDATE_DIR"
+export LOOMGATE_UPDATE_SUPERVISOR=adopt-v1
 CURRENT_POINTER="${UPDATE_DIR}/current"
 EXIT_HANDOVER=75
 

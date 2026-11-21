@@ -36,6 +36,7 @@ type Engine struct {
 	running  map[string]context.CancelFunc
 	accounts map[string]chan struct{}
 	closed   bool
+	draining bool
 	workers  chan struct{}
 	wake     chan struct{}
 	wg       sync.WaitGroup
@@ -69,7 +70,7 @@ func Open(opts Options) (*Engine, error) {
 func (e *Engine) Register(id string, a Adapter) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed || !IDPattern.MatchString(id) || a == nil {
+	if e.closed || e.draining || !IDPattern.MatchString(id) || a == nil {
 		return ErrInvalid
 	}
 	if _, ok := e.adapters[id]; ok {
@@ -119,6 +120,30 @@ func (e *Engine) Close() error {
 	e.wg.Wait()
 	return e.owner.Close()
 }
+
+// Quiesce rejects new runs without canceling work that has already been
+// accepted. Ownership remains held until Drain/Close has waited for workers.
+func (e *Engine) Quiesce() {
+	e.mu.Lock()
+	e.draining = true
+	e.mu.Unlock()
+	e.notify()
+}
+
+// Drain lets accepted work finish. At the grace deadline Close cancels the
+// remaining workers and still waits for their last durable writes before the
+// state lock can be released.
+func (e *Engine) Drain(ctx context.Context) error {
+	e.Quiesce()
+	done := make(chan struct{})
+	go func() { e.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return e.Close()
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), e.Close())
+	}
+}
 func (e *Engine) notify() {
 	select {
 	case e.wake <- struct{}{}:
@@ -160,23 +185,24 @@ func (e *Engine) Catalog(ctx context.Context, provider string, scope Scope) ([]T
 	}
 	return catalog.Tasks, err
 }
+
 // discoveryCodes are the only failure reasons a provider may surface. They are
 // stable panel codes, never upstream text: the console renders one sentence per
 // code so an operator can tell an upstream outage from a missing capability.
 var discoveryCodes = map[string]bool{
-	"module_discovery_failed": true,
-	"upstream_unavailable":    true,
-	"upstream_rate_limited":   true,
-	"authentication_required": true,
-	"account_unavailable":     true,
-	"module_not_offered":      true,
-	"buddy_unrecognized":           true,
-	"travel_state_unrecognized":    true,
-	"travel_directory_unrecognized": true,
-	"makeup_state_unrecognized":    true,
+	"module_discovery_failed":           true,
+	"upstream_unavailable":              true,
+	"upstream_rate_limited":             true,
+	"authentication_required":           true,
+	"account_unavailable":               true,
+	"module_not_offered":                true,
+	"buddy_unrecognized":                true,
+	"travel_state_unrecognized":         true,
+	"travel_directory_unrecognized":     true,
+	"makeup_state_unrecognized":         true,
 	"redemption_directory_unrecognized": true,
-	"redemption_state_unrecognized": true,
-	"streak_unrecognized":          true,
+	"redemption_state_unrecognized":     true,
+	"streak_unrecognized":               true,
 	// Provider-specific codes already exposed by the workbench connection flow.
 	"desktop_activity_unavailable": true,
 	"desktop_identity_mismatch":    true,
@@ -328,7 +354,7 @@ func sameAccountScope(a, b []string) bool {
 }
 
 func (e *Engine) submitScheduleLocked(req Request, schedule *Schedule) (Run, error) {
-	if e.closed || e.adapters[req.ProviderID] == nil || !validRunTaskKey(req.TaskKey, req.TaskSequence) || !validAccountScope(req.AccountIDs) || !validateTaskSequence(req.TaskSequence) {
+	if e.closed || e.draining || e.adapters[req.ProviderID] == nil || !validRunTaskKey(req.TaskKey, req.TaskSequence) || !validAccountScope(req.AccountIDs) || !validateTaskSequence(req.TaskSequence) {
 		return Run{}, ErrInvalid
 	}
 	if len(req.TaskSequence) > 0 {
@@ -1239,6 +1265,9 @@ func (e *Engine) Tick(now time.Time) error {
 	defer e.mu.Unlock()
 	if e.closed {
 		return ErrInvalid
+	}
+	if e.draining {
+		return nil
 	}
 	for _, s := range e.state.Schedules {
 		if !s.Enabled || s.NextRun == nil || s.NextRun.After(now) {

@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-11-21：受监督 Linux 工作台自动排空与顺序交接；候选核验失败自动恢复旧进程。
 // 2026-11-20：工作台独占状态改为验签暂存、重启生效；保留完整运行目录并明确待启用版本。
 // 2026-09-26：下载前验签、下载后与签名摘要对账，不符即拒绝更新。
 // 2026-09-26：交接完成后清理更新目录。
@@ -80,6 +81,8 @@ type Status struct {
 	InheritedFD     bool      `json:"inherited_fd"`
 	RestartRequired bool      `json:"restart_required"`
 	RestartOnUpdate bool      `json:"restart_on_update"`
+	AutoRestart     bool      `json:"auto_restart"`
+	TargetVersion   string    `json:"target_version,omitempty"`
 	StagedVersion   string    `json:"staged_version,omitempty"`
 	// SignatureVerification 报告本二进制是否内置发布验签公钥。
 	// 面板必须按真实值显示「签名校验：已启用 / 未内置公钥」；笼统写「已签名的
@@ -92,7 +95,10 @@ type Options struct {
 	Bundle  bool
 	Enabled bool
 	Repo    string
-	Token   string
+	// APIBase is a trusted caller/test seam; normal deployments leave it empty.
+	APIBase     string
+	AdminPrefix string
+	Token       string
 	// Proxy 是下载加速代理前缀（如 https://gh-proxy.com）。空 = 用 DefaultProxyBase；
 	// 想直连 GitHub 时显式传 "-"（见 NewManager）。
 	Proxy    string
@@ -104,10 +110,17 @@ type Options struct {
 	// 必须一并继承；nil = 本次部署没有管理通道。
 	AdminListener net.Listener
 	OnSwitched    func() // 交接成功后的回调（main 用它触发优雅停机）
-	// RequireRestart preserves exclusive workbench state ownership. A staged
-	// update is verified and committed for the next gateway start; it never
-	// launches a second task engine or closes the currently serving runtime.
+	// RequireRestart preserves exclusive workbench state ownership. Without
+	// PrepareSwitch, verified updates are staged for the next gateway start;
+	// with it, ownership is released before starting one successor.
 	RequireRestart bool
+	// PrepareSwitch drains HTTP/tasks and releases exclusive state only after
+	// the updater has duplicated every listener. Unix can then start exactly
+	// one new owner; the controller stays alive until candidate/rollback ready.
+	PrepareSwitch func(context.Context) error
+	// OnSwitchFailed is terminal: both candidate and rollback could not start.
+	// The controller must exit unsuccessfully rather than remain falsely alive.
+	OnSwitchFailed func()
 	// Repair stages a deployment from a separately invoked recovery CLI. Its
 	// own binary version is not the running deployment version, and it cannot
 	// infer ownership of the running runtime for pruning.
@@ -140,6 +153,10 @@ type Manager struct {
 	// 的回调在下载线程上写入，读侧在 statusLocked 里持同一把锁。
 	downloaded    int64
 	stagedVersion string
+	targetVersion string
+	// Per-manager durable I/O seams keep commit/rollback failure tests isolated.
+	pointerWriter func(string, string) error
+	journalWriter func(string, switchJournal) error
 }
 
 // NewManager 构造管理器；Dir 为空时回落到系统临时目录下的固定子目录。
@@ -153,6 +170,9 @@ func NewManager(opts Options) *Manager {
 		state:  StateIdle,
 	}
 	manager.client.Bundle = opts.Bundle
+	if opts.APIBase != "" {
+		manager.client.APIBase = opts.APIBase
+	}
 	// 下载加速：默认走代理（国内直连 releases 经常超时，热更新等于没有）。
 	// 传 "-" 表示显式关闭（直连 GitHub）——留空与「不想要代理」无法区分，
 	// 所以用一个不可能与真实地址冲突的哨兵值。
@@ -226,6 +246,15 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 	if m == nil || !m.opts.Enabled {
 		return m.Status(), errors.New("自更新未启用（config update.enabled=false）")
 	}
+	m.mu.Lock()
+	if m.busy {
+		status := m.statusLocked()
+		m.mu.Unlock()
+		return status, errors.New("已有更新任务在进行中")
+	}
+	m.busy, m.state = true, StateChecking
+	m.mu.Unlock()
+	defer m.finishApply()
 	if visibility := m.RefreshVisibility(ctx); visibility != VisibilityPublic {
 		m.mu.Lock()
 		available, reason := m.availabilityLocked()
@@ -236,21 +265,6 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 			return m.Status(), err
 		}
 	}
-	m.mu.Lock()
-	if m.busy {
-		status := m.statusLocked()
-		m.mu.Unlock()
-		return status, errors.New("已有更新任务在进行中")
-	}
-	m.busy = true
-	m.state = StateChecking
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		m.busy = false
-		m.mu.Unlock()
-	}()
-
 	release, err := m.client.Latest(ctx)
 	if err != nil {
 		m.fail(err)
@@ -271,8 +285,57 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 // 调用方应异步调用（下载与交接耗时以秒计）。返回前的最后一步是交接：
 // 新实例报告就绪后本进程才开始优雅停机，在途请求继续跑完。
 func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
+	if err := m.reserveApply(target); err != nil {
+		return m.Status(), err
+	}
+	defer m.finishApply()
+	return m.applyReserved(ctx, target)
+}
+
+// StartApply reserves synchronously before acknowledging the HTTP submission.
+// Slow visibility/download I/O must not leave a second-click window at idle.
+func (m *Manager) StartApply(target string) (Status, error) {
+	if err := m.reserveApply(target); err != nil {
+		return m.Status(), err
+	}
+	accepted := m.Status()
+	go func() {
+		defer m.finishApply()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if _, err := m.applyReserved(ctx, target); err != nil {
+			log.Printf("ERROR: [热更新] 应用失败：%v", err)
+		}
+	}()
+	return accepted, nil
+}
+
+func (m *Manager) finishApply() { m.mu.Lock(); m.busy = false; m.mu.Unlock() }
+
+func (m *Manager) reserveApply(target string) error {
 	if m == nil || !m.opts.Enabled {
-		return m.Status(), errors.New("自更新未启用（config update.enabled=false）")
+		return errors.New("自更新未启用（config update.enabled=false）")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.busy {
+		return errors.New("已有更新任务在进行中")
+	}
+	if m.stagedVersion != "" {
+		return errors.New("更新包已准备好，请先重启网关后再检查更新")
+	}
+	m.busy = true
+	m.state = StateChecking
+	m.lastError = ""
+	m.targetVersion = target
+	return nil
+}
+
+func (m *Manager) applyReserved(ctx context.Context, target string) (Status, error) {
+	if m.opts.Listener == nil && !(m.opts.Repair && m.opts.RequireRestart) {
+		err := errors.New("没有可交接的监听套接字（热更新需要以正常启动方式运行）")
+		m.fail(err)
+		return m.Status(), err
 	}
 	if visibility := m.RefreshVisibility(ctx); visibility != VisibilityPublic {
 		m.mu.Lock()
@@ -284,30 +347,6 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 			return m.Status(), err
 		}
 	}
-	m.mu.Lock()
-	if m.busy {
-		status := m.statusLocked()
-		m.mu.Unlock()
-		return status, errors.New("已有更新任务在进行中")
-	}
-	if m.opts.Listener == nil && !(m.opts.Repair && m.opts.RequireRestart) {
-		m.mu.Unlock()
-		return m.Status(), errors.New("没有可交接的监听套接字（热更新需要以正常启动方式运行）")
-	}
-	if m.stagedVersion != "" {
-		status := m.statusLocked()
-		m.mu.Unlock()
-		return status, errors.New("更新包已准备好，请先重启网关后再检查更新")
-	}
-	m.busy = true
-	m.state = StateChecking
-	m.lastError = ""
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		m.busy = false
-		m.mu.Unlock()
-	}()
 
 	release := Release{Tag: target}
 	if strings.TrimSpace(target) == "" {
@@ -369,6 +408,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	m.mu.Lock()
 	m.latest = release
 	m.state = StateDownloading
+	m.targetVersion = release.Tag
 	// 进入下载态时清零进度，避免沿用上一轮的残留值（否则进度条会从 80% 开始）。
 	m.downloaded = 0
 	m.mu.Unlock()
@@ -427,7 +467,11 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 
 	m.mu.Lock()
 	m.state = StateHandover
+	m.targetVersion = release.Tag
 	m.mu.Unlock()
+	if HandoverSupported && m.opts.RequireRestart && m.opts.PrepareSwitch != nil && !m.opts.Repair {
+		return m.applySequential(ctx, path, release.Tag, &committed)
+	}
 
 	// 平台不支持运行中交接（Windows）：下载件已经落盘，写 current 指针让**下次启动**
 	// 用新版，然后如实告诉用户重启生效。
@@ -606,7 +650,7 @@ func runningBinaryTime() *time.Time {
 
 func (m *Manager) statusLocked() Status {
 	available, reason := m.availabilityLocked()
-	return Status{
+	status := Status{
 		Enabled:           m.opts.Enabled,
 		Visibility:        m.visibility,
 		UnavailableReason: reason,
@@ -628,11 +672,14 @@ func (m *Manager) statusLocked() Status {
 		LastError:         m.lastError,
 		InheritedFD:       Inherited(),
 		RestartRequired:   m.stagedVersion != "",
-		RestartOnUpdate:   m.opts.RequireRestart || !HandoverSupported,
+		RestartOnUpdate:   (m.opts.RequireRestart && m.opts.PrepareSwitch == nil) || !HandoverSupported,
+		AutoRestart:       HandoverSupported && m.opts.StageInstaller == nil && (!m.opts.RequireRestart || m.opts.PrepareSwitch != nil),
+		TargetVersion:     m.targetVersion,
 		StagedVersion:     m.stagedVersion,
 
 		SignatureVerification: version.ReleaseVerificationEnabled(),
 	}
+	return m.journalStatus(status)
 }
 
 // fail 记录一次失败。

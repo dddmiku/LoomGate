@@ -446,6 +446,20 @@ func main() {
 	// 热更新管理器：查版本、下载校验、交接。OnSwitched 触发本进程优雅停机——
 	// 新实例已经在同一套接字上 accept，本进程只负责把在途请求跑完。
 	handoverDone := make(chan string, 1)
+	prepareHandover := make(chan chan error)
+	failedHandover := make(chan struct{}, 1)
+	var prepareSwitch func(context.Context) error
+	if workbench != nil && hotupdate.AdoptingSupervisor() {
+		prepareSwitch = func(ctx context.Context) error {
+			done := make(chan error, 1)
+			select {
+			case prepareHandover <- done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return <-done
+		}
+	}
 	updateManager := hotupdate.NewManager(hotupdate.Options{
 		// Bundle 只对 Linux 部署成立：它的运行目录就是完整运行包解压出来的那个目录，
 		// 「解压到目录再整体替换」才说得通。桌面与安卓的数据目录不是运行目录
@@ -453,6 +467,7 @@ func main() {
 		// nativeLibraryDir 里），拿裸二进制当 tar.gz 解包会直接报 gzip 头非法
 		// ——2026-10-13 真机实测踩到。
 		Bundle:        layout.enabled && hotupdate.BundleSupported(),
+		AdminPrefix:   layout.panel.AdminPrefix,
 		Enabled:       cfg.Update.Enabled,
 		Repo:          cfg.Update.Repo,
 		Token:         cfg.Update.Token,
@@ -461,10 +476,16 @@ func main() {
 		Args:          os.Args[1:],
 		Listener:      mainLn,
 		AdminListener: adminLn,
-		// The task engine and provider vaults have lifetime exclusive locks.
-		// A child cannot become ready before this process releases them; stage
-		// the verified runtime for a gateway restart instead of a failed handover.
+		// Unix updates drain and release every exclusive owner before starting
+		// the candidate; Windows keeps the explicitly reported restart step.
 		RequireRestart: workbench != nil,
+		PrepareSwitch:  prepareSwitch,
+		OnSwitchFailed: func() {
+			select {
+			case failedHandover <- struct{}{}:
+			default:
+			}
+		},
 		// 安卓上更新的是 APK（应用私有目录不能执行），交给系统安装器；
 		// 其他平台返回 nil，走既有的进程交接。
 		StageInstaller: hotupdate.StageInstallerForAndroid(updateDir(cfg)),
@@ -632,6 +653,7 @@ func main() {
 	}()
 
 	var panel *panelruntime.Runtime
+	var closeGoPanel func() error
 	var publicHandler http.Handler = h
 	if layout.enabled {
 		// 面板引擎二选一（见 cmd/server/panel_go.go）：
@@ -643,7 +665,7 @@ func main() {
 				log.Printf("ERROR: Go 版面板启动失败 (%v)；网关 API 继续服务", panelErr)
 			} else {
 				if closer, ok := goPanel.(interface{ Close() error }); ok {
-					defer closer.Close()
+					closeGoPanel = closer.Close
 				}
 				publicHandler = withPanel(h, goPanel, lanAllowCIDRs(*cfgPath))
 			}
@@ -678,10 +700,13 @@ func main() {
 	drainDone := make(chan struct{})
 	go func() {
 		reason := "signal"
+		var prepared chan error
 		select {
 		case <-ctx.Done():
 		case why := <-handoverDone:
 			reason = why
+		case prepared = <-prepareHandover:
+			reason = "sequential update"
 		}
 		if reason != "signal" {
 			// 热更新：新实例已接管监听，这里只等在途请求收尾；等待上限放宽到能覆盖
@@ -692,8 +717,23 @@ func main() {
 		wait := hotupdate.ShutdownTimeout()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		if err := drainRuntime(shutdownCtx, runtimeShutdown{
+		drainErr := drainRuntime(shutdownCtx, runtimeShutdown{
 			stopBackground: stopBackground, backgroundDone: backgroundDone,
+			quiesceWorkbench: func() {
+				if workbench != nil {
+					workbench.engine.Quiesce()
+				}
+			},
+			closeWorkbench: func(ctx context.Context) error { return closeWorkbench(ctx, workbench) },
+			closePanel: func() error {
+				if panel != nil {
+					panel.Close()
+				}
+				if closeGoPanel != nil {
+					return closeGoPanel()
+				}
+				return nil
+			},
 			waitConnections: connections.Wait,
 			stopSessions: func() {
 				if sessRouter != nil {
@@ -712,11 +752,22 @@ func main() {
 				}
 				return errors.Join(err, closeOps())
 			},
-		}); err != nil {
-			log.Printf("WARN: [服务] 关停时出错：%v", err)
+		})
+		if drainErr != nil {
+			log.Printf("WARN: [服务] 关停时出错：%v", drainErr)
 		}
-		if panel != nil {
-			panel.Close()
+		if prepared != nil {
+			prepared <- drainErr
+			// Serve has stopped, but this controller must stay alive until a
+			// genuine successor (candidate or rollback) owns the listeners.
+			select {
+			case <-handoverDone:
+			case <-failedHandover:
+				os.Exit(1)
+			case <-ctx.Done():
+				close(drainDone)
+				return
+			}
 		}
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），

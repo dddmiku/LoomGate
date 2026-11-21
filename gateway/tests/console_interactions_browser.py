@@ -105,8 +105,8 @@ class Fixture:
         self.holds[(method, path)] = True
         self.pending[(method, path)] = []
 
-    def wait_held(self, path, method='GET'):
-        for _ in range(100):
+    def wait_held(self, path, method='GET', timeout_ms=1000):
+        for _ in range(max(1, timeout_ms//10)):
             if self.pending.get((method, path)):
                 return self.pending[(method, path)][0]
             self.page.wait_for_timeout(10)
@@ -1057,109 +1057,197 @@ def ready_update(f):
     f.page.evaluate("window.fixtureLoopCard=document.querySelector('#setting-loop');window.fixtureUpdateCard=document.querySelector('#setting-update')")
 
 
-def confirm_update(f):
-    f.page.locator('[data-action=update-apply]').click()
-    f.page.locator('#update-form').wait_for()
-    assert 'v1.0.2' in f.page.locator('#update-form').inner_text()
-    assert not any(call == ('POST', '/api/update/apply') for call in f.requests), 'opening update confirmation submitted the operation'
-    f.page.locator('#update-form [name=acknowledge]').check()
-
-
-def update_apply_is_confirmed_and_scoped(browser, base):
+def stale_update_intent_recovers_automatically(browser, base, failed=False):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
+        f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate',JSON.stringify({tag:'v1.0.2',repo:'fixture-owner/fixture-product'}))")
+        if failed:
+            f.update['status'].update(state='failed', last_error='fixture automatic handover failed')
+        f.page.locator('[data-action=update-status]').click()
+        f.page.wait_for_timeout(80)
+        assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')"), 'authoritative idle/failed status left stale browser protection in place'
+        assert f.page.locator('[data-action=update-review]:visible').count() == 0, 'old intent still asks for manual protection removal'
+        assert f.page.locator('#dialog[open]').count() == 0
+        if failed:
+            assert 'fixture automatic handover failed' in f.page.locator('#setting-update').inner_text()
+            assert f.page.locator('[data-action=update-check]:visible').count() == 1
+        else:
+            assert f.page.locator('[data-action=update-apply]:visible').count() == 1
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 0
+    finally:
+        f.close()
+
+
+def one_click_update_has_no_confirmation_form(browser, base):
+    f = Fixture(browser, base)
+    try:
+        ready_update(f)
         f.hold('/api/update/apply', 'POST')
-        f.page.locator('#update-form button[type=submit]').click()
+        f.page.locator('[data-action=update-apply]').click()
+        f.page.wait_for_timeout(80)
+        assert f.page.locator('#update-form').count() == 0, 'update still opens an unnecessary form/checkbox confirmation'
         request = f.wait_held('/api/update/apply', 'POST').request.post_data_json
-        assert request == {'tag': 'v1.0.2'}, 'update did not freeze the confirmed target tag'
-        assert f.page.evaluate("JSON.parse(sessionStorage.getItem('loomgate.unconfirmedUpdate')).tag") == 'v1.0.2', 'update attempt was not recorded before sending'
-        f.page.locator('#update-form').evaluate("form=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}))")
-        f.page.wait_for_timeout(40)
-        assert len(f.pending[('POST', '/api/update/apply')]) == 1, 'update confirmation submitted twice'
-        f.update['status'].update(state='downloading', downloaded_bytes=1048576)
-        f.release('/api/update/apply', {'ok': True, 'message': '合成下载请求已接受。', 'status': f.update['status']}, 'POST')
-        f.page.wait_for_function("document.querySelector('#setting-update').textContent.includes('已下载')")
-        assert f.page.evaluate("window.fixtureLoopCard===document.querySelector('#setting-loop')&&window.fixtureUpdateCard===document.querySelector('#setting-update')"), 'update submission rebuilt unrelated settings'
-        assert '未核验运行版本' in f.page.locator('[data-update-action-status]').inner_text(), 'accepted update was presented as installed'
+        assert request == {'tag': 'v1.0.2'}
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
     finally:
         f.close()
 
 
-def late_update_read_keeps_password_draft(browser, base):
+def accepted_idle_update_reconnects_without_replay(browser, base):
+    f = Fixture(browser, base)
+    try:
+        ready_update(f)
+        f.hold('/api/update/apply', 'POST')
+        f.page.locator('[data-action=update-apply]').click()
+        f.wait_held('/api/update/apply', 'POST')
+        f.hold('/api/update')
+        f.release('/api/update/apply', {'ok': True}, 'POST')
+        f.wait_held('/api/update')
+        f.release('/api/update', f.update)
+        f.page.wait_for_timeout(80)
+        assert f.page.evaluate("Boolean(sessionStorage.getItem('loomgate.unconfirmedUpdate'))"), 'accepted operation was unlocked by an early idle status'
+        assert f.page.locator('[data-action=update-apply]').is_hidden()
+        f.page.locator('[data-action=update-apply]').evaluate("button=>button.dispatchEvent(new MouseEvent('click',{bubbles:true}))")
+        f.page.wait_for_timeout(60)
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
+        f.hold('/api/update')
+        f.wait_held('/api/update', timeout_ms=4000)
+        f.release('/api/update', {'ok': False, 'error': 'fixture_reconnect'}, status=503)
+        f.update['status'].update(current='v1.0.2', state='idle', update_ready=False, healthy=True)
+        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
+    finally:
+        f.close()
+
+
+def revisited_update_recovers_automatically(browser, base):
+    f = Fixture(browser, base)
+    try:
+        ready_update(f)
+        f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate',JSON.stringify({tag:'v1.0.2',repo:'fixture-owner/fixture-product',started_at:Date.now()}))")
+        f.update['status'].update(state='handover', target_version='v1.0.2', auto_restart=True)
+        f.page.reload()
+        f.page.wait_for_function("document.querySelector('#setting-update')?.textContent.includes('自动切换中')")
+        f.update['status'].update(current='v1.0.2', state='idle', update_ready=False)
+        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 0
+    finally:
+        f.close()
+
+
+def abandoned_update_preflight_never_sends(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
         f.hold('/api/update')
         f.page.locator('[data-action=update-apply]').click()
         f.wait_held('/api/update')
-        f.page.locator('#dialog-close').click()
-        open_password_draft(f)
+        f.page.evaluate("location.hash='tasks'")
+        f.page.locator('[data-plan-row=fixture-plan-checkin]').wait_for()
         f.release('/api/update', f.update)
         f.page.wait_for_timeout(70)
-        assert_password_draft(f, 'late update preflight replaced the newer password draft')
-        assert not any(call == ('POST', '/api/update/apply') for call in f.requests)
+        assert f.page.locator('[data-plan-row=fixture-plan-checkin]').count() == 1
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 0
     finally:
         f.close()
 
 
-def update_target_change_requires_new_confirmation(browser, base):
+def update_apply_is_one_click_and_scoped(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
-        f.update['status']['latest_tag'] = 'v1.0.3'
-        f.page.locator('#update-form button[type=submit]').click()
-        f.page.locator('#update-form #form-message').wait_for(state='visible')
-        assert not any(call == ('POST', '/api/update/apply') for call in f.requests), 'changed update target was applied without a fresh confirmation'
-        assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')"), 'rejected preflight left a fake send attempt'
+        f.hold('/api/update/apply', 'POST')
+        f.page.locator('[data-action=update-apply]').click()
+        request = f.wait_held('/api/update/apply', 'POST').request.post_data_json
+        assert request == {'tag': 'v1.0.2'}, 'update did not freeze the clicked target tag'
+        assert f.page.locator('#dialog[open]').count() == 0
+        assert f.page.evaluate("JSON.parse(sessionStorage.getItem('loomgate.unconfirmedUpdate')).tag") == 'v1.0.2'
+        f.page.locator('[data-action=update-apply]').evaluate("button=>button.dispatchEvent(new MouseEvent('click',{bubbles:true}))")
+        f.page.wait_for_timeout(40)
+        assert len(f.pending[('POST', '/api/update/apply')]) == 1, 'one click update submitted twice'
+        f.update['status'].update(state='downloading', downloaded_bytes=1048576, auto_restart=True)
+        f.release('/api/update/apply', {'ok': True, 'status': f.update['status']}, 'POST')
+        f.page.wait_for_function("document.querySelector('#setting-update').textContent.includes('已下载')")
+        assert f.page.evaluate("window.fixtureLoopCard===document.querySelector('#setting-loop')&&window.fixtureUpdateCard===document.querySelector('#setting-update')")
+        assert '运行版本已核验' not in f.page.locator('[data-update-action-status]').inner_text()
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
     finally:
         f.close()
 
+def late_update_read_keeps_password_draft(browser, base):
+    f = Fixture(browser, base)
+    try:
+        ready_update(f)
+        f.hold('/api/update')
+        f.hold('/api/update/apply', 'POST')
+        f.page.locator('[data-action=update-apply]').click()
+        f.wait_held('/api/update')
+        open_password_draft(f)
+        f.release('/api/update', f.update)
+        f.wait_held('/api/update/apply', 'POST')
+        f.update['status']['state'] = 'handover'
+        f.release('/api/update/apply', {'ok': True}, 'POST')
+        f.page.wait_for_timeout(70)
+        assert_password_draft(f, 'late update preflight replaced the newer password draft')
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
+    finally:
+        f.close()
+
+def update_target_change_is_not_applied_silently(browser, base):
+    f = Fixture(browser, base)
+    try:
+        ready_update(f)
+        f.hold('/api/update')
+        f.page.locator('[data-action=update-apply]').click()
+        f.wait_held('/api/update')
+        f.update['status']['latest_tag'] = 'v1.0.3'
+        f.release('/api/update', f.update)
+        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('目标或运行构建已变化')")
+        assert not any(call == ('POST', '/api/update/apply') for call in f.requests)
+        assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
+        assert f.page.locator('#dialog[open]').count() == 0
+    finally:
+        f.close()
 
 def lost_update_response_is_not_replayed(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
         f.hold('/api/update/apply', 'POST')
-        f.page.locator('#update-form button[type=submit]').click()
+        f.page.locator('[data-action=update-apply]').click()
         f.wait_held('/api/update/apply', 'POST')
+        f.update['status'].update(state='handover', auto_restart=True, staged_version='v1.0.2')
+        f.hold('/api/update')
         f.release('/api/update/apply', {'ok': False, 'error': 'fixture_lost_response'}, 'POST', status=503)
-        f.page.locator('#update-form #form-message').wait_for(state='visible')
-        assert f.page.evaluate("Boolean(sessionStorage.getItem('loomgate.unconfirmedUpdate'))"), 'lost update response cleared the attempt guard'
-        f.page.locator('#update-form').evaluate("form=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}))")
-        f.page.wait_for_timeout(60)
-        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1, 'lost update response was automatically replayed'
-        f.page.locator('#dialog-close').click()
-        f.page.locator('[data-action=update-status]').click()
-        f.page.wait_for_timeout(50)
+        f.wait_held('/api/update')
+        f.release('/api/update', {'ok': False, 'error': 'fixture_restarting'}, status=503)
+        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('自动')")
+        assert f.page.locator('[data-action=update-apply]').is_hidden()
+        assert f.page.evaluate("Boolean(sessionStorage.getItem('loomgate.unconfirmedUpdate'))")
+        f.update['status'].update(current='v1.0.2', state='idle', update_ready=False, staged_version='', restart_required=False, healthy=True)
+        f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
+        assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
-        assert f.page.locator('[data-action=update-apply]').is_hidden(), 'uncertain update enabled another application'
     finally:
         f.close()
-
 
 def late_update_acceptance_preserves_password_draft(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
         f.hold('/api/update/apply', 'POST')
-        f.page.locator('#update-form button[type=submit]').click()
+        f.page.locator('[data-action=update-apply]').click()
         f.wait_held('/api/update/apply', 'POST')
-        f.page.locator('#dialog-close').click()
         open_password_draft(f)
         f.update['status']['state'] = 'downloading'
-        f.release('/api/update/apply', {'ok': True, 'message': '合成请求已接受。', 'status': f.update['status']}, 'POST')
+        f.release('/api/update/apply', {'ok': True, 'status': f.update['status']}, 'POST')
         f.page.wait_for_timeout(70)
         assert_password_draft(f, 'late update acceptance closed or replaced the password draft')
         assert f.page.evaluate("window.fixtureLoopCard===document.querySelector('#setting-loop')&&window.fixtureUpdateCard===document.querySelector('#setting-update')")
     finally:
         f.close()
-
 
 def update_zero_time_is_unchecked(browser, base):
     f = Fixture(browser, base)
@@ -1178,20 +1266,24 @@ def update_completion_requires_running_version(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
         f.hold('/api/update/apply', 'POST')
-        f.page.locator('#update-form button[type=submit]').click()
+        f.page.locator('[data-action=update-apply]').click()
         f.wait_held('/api/update/apply', 'POST')
-        f.update['status'].update(current='v1.0.2', commit='fixture-new-commit', update_ready=False)
-        f.release('/api/update/apply', {'ok': True, 'message': '合成请求已接受。', 'status': f.update['status']}, 'POST')
+        f.update['status'].update(state='handover', staged_version='v1.0.2', auto_restart=True)
+        f.release('/api/update/apply', {'ok': True, 'status': f.update['status']}, 'POST')
+        f.page.wait_for_function("document.querySelector('#setting-update').textContent.includes('自动切换中')")
+        assert '运行版本已核验' not in f.page.locator('[data-update-action-status]').inner_text()
+        f.update['status'].update(current='v1.0.2', commit='fixture-new-commit', state='idle', update_ready=False, healthy=False)
+        f.page.wait_for_timeout(2100)
+        assert '运行版本已核验' not in f.page.locator('[data-update-action-status]').inner_text(), 'unhealthy target was reported as complete'
+        f.update['status']['healthy'] = True
         f.page.wait_for_function("document.querySelector('[data-update-action-status]')?.textContent.includes('运行版本已核验')")
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
         assert '构建时间' in f.page.locator('#setting-update .update-facts').inner_text()
-        assert not any(label.inner_text() == '部署时间' for label in f.page.locator('#setting-update .update-facts dt').all()), 'build timestamp was labeled as deployment time'
+        assert not any(label.inner_text() == '部署时间' for label in f.page.locator('#setting-update .update-facts dt').all())
     finally:
         f.close()
-
 
 def unsigned_update_has_no_apply_action(browser, base):
     f = Fixture(browser, base)
@@ -1232,37 +1324,38 @@ def update_read_order_keeps_newest_status(browser, base, failed=False):
         f.close()
 
 
-def update_guard_review_is_read_only(browser, base):
+def malformed_update_intent_recovers_without_manual_review(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate',JSON.stringify({tag:'v1.0.2',repo:'fixture-owner/fixture-product'}))")
+        f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate','{broken-fixture')")
         f.page.locator('[data-action=update-status]').click()
-        f.page.locator('[data-action=update-review]:visible').wait_for()
-        f.page.locator('[data-action=update-review]').click()
-        f.page.locator('#update-review-form').wait_for()
-        f.page.locator('#update-review-form input[type=checkbox]').check()
-        f.page.locator('#update-review-form button[type=submit]').click()
+        f.page.wait_for_timeout(70)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
-        assert not any(call == ('POST', '/api/update/apply') for call in f.requests), 'reviewing update protection applied an update'
+        assert f.page.locator('[data-action=update-review]').count() == 0
         assert f.page.locator('[data-action=update-apply]:visible').count() == 1
+        assert not any(call == ('POST', '/api/update/apply') for call in f.requests)
     finally:
         f.close()
 
-
-def update_storage_failure_prevents_sending(browser, base):
+def update_storage_failure_uses_in_memory_single_submission(browser, base):
     f = Fixture(browser, base)
     try:
         ready_update(f)
-        confirm_update(f)
         f.page.evaluate("window.fixtureStorageSet=sessionStorage.setItem.bind(sessionStorage);sessionStorage.setItem=function(name,value){if(name==='loomgate.unconfirmedUpdate')throw new Error('fixture blocked storage');return window.fixtureStorageSet(name,value)}")
-        f.page.locator('#update-form button[type=submit]').click()
-        f.page.locator('#update-form #form-message').wait_for(state='visible')
-        assert not any(call == ('POST', '/api/update/apply') for call in f.requests), 'update sent without durable tab submission protection'
-        assert '未提交' in f.page.locator('#update-form #form-message').inner_text()
+        f.hold('/api/update/apply', 'POST')
+        f.page.locator('[data-action=update-apply]').click()
+        f.wait_held('/api/update/apply', 'POST')
+        f.page.locator('[data-action=update-apply]').evaluate("button=>button.dispatchEvent(new MouseEvent('click',{bubbles:true}))")
+        f.page.wait_for_timeout(40)
+        assert sum(call == ('POST', '/api/update/apply') for call in f.requests) == 1
+        f.update['status']['state']='handover'
+        f.release('/api/update/apply',{'ok':True},'POST')
+        f.page.wait_for_function("document.querySelector('#setting-update').textContent.includes('自动切换中')")
+        assert f.page.locator('[data-action=update-apply]').is_hidden()
+        assert f.page.locator('#dialog[open]').count()==0
     finally:
         f.close()
-
 
 def update_check_is_scoped_and_readback_is_truthful(browser, base):
     f = Fixture(browser, base)
@@ -1347,9 +1440,15 @@ def main():
                 ('creation_readback_requires_returned_id_not_same_name', lambda: creation_requires_returned_identity(browser, base)),
                 ('invalid_creation_receipt_preserves_result_without_false_verification', lambda: creation_requires_returned_identity(browser, base, True)),
                 ('old_creation_readback_cannot_revert_revisited_page', lambda: creation_old_readback_cannot_revert_revisited_page(browser, base)),
-                ('update_apply_is_confirmed_and_scoped', lambda: update_apply_is_confirmed_and_scoped(browser, base)),
+                ('update_apply_is_one_click_and_scoped', lambda: update_apply_is_one_click_and_scoped(browser, base)),
+                ('stale_idle_update_intent_recovers_automatically', lambda: stale_update_intent_recovers_automatically(browser, base)),
+                ('stale_failed_update_intent_recovers_automatically', lambda: stale_update_intent_recovers_automatically(browser, base, True)),
+                ('one_click_update_has_no_confirmation_form', lambda: one_click_update_has_no_confirmation_form(browser, base)),
+                ('accepted_idle_update_reconnects_without_replay', lambda: accepted_idle_update_reconnects_without_replay(browser, base)),
+                ('revisited_update_recovers_automatically', lambda: revisited_update_recovers_automatically(browser, base)),
+                ('abandoned_update_preflight_never_sends', lambda: abandoned_update_preflight_never_sends(browser, base)),
                 ('late_update_read_preserves_password_draft', lambda: late_update_read_keeps_password_draft(browser, base)),
-                ('changed_update_target_requires_new_confirmation', lambda: update_target_change_requires_new_confirmation(browser, base)),
+                ('changed_update_target_is_not_applied_silently', lambda: update_target_change_is_not_applied_silently(browser, base)),
                 ('lost_update_response_is_not_replayed', lambda: lost_update_response_is_not_replayed(browser, base)),
                 ('late_update_acceptance_preserves_password_draft', lambda: late_update_acceptance_preserves_password_draft(browser, base)),
                 ('zero_update_time_is_not_latest', lambda: update_zero_time_is_unchecked(browser, base)),
@@ -1357,8 +1456,8 @@ def main():
                 ('unsigned_update_never_offers_apply', lambda: unsigned_update_has_no_apply_action(browser, base)),
                 ('old_update_read_cannot_revert_newest_status', lambda: update_read_order_keeps_newest_status(browser, base)),
                 ('old_update_read_error_cannot_replace_newest_status', lambda: update_read_order_keeps_newest_status(browser, base, True)),
-                ('update_guard_review_never_sends_apply', lambda: update_guard_review_is_read_only(browser, base)),
-                ('update_storage_failure_prevents_submission', lambda: update_storage_failure_prevents_sending(browser, base)),
+                ('malformed_update_intent_recovers_without_manual_review', lambda: malformed_update_intent_recovers_without_manual_review(browser, base)),
+                ('update_storage_failure_uses_in_memory_single_submission', lambda: update_storage_failure_uses_in_memory_single_submission(browser, base)),
                 ('update_check_is_scoped_and_readback_truthful', lambda: update_check_is_scoped_and_readback_is_truthful(browser, base)),
             ]
             base = 'http://127.0.0.1:'+str(server.server_port)

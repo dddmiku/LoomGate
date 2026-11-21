@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os/exec"
@@ -199,10 +200,19 @@ func openWorkbenchWithBuiltinSchedules(stateDir string, p *pool.Pool, up *upstre
 }
 
 func runWorkbench(ctx context.Context, w *workbenchRuntime) error {
-	if w.taskVault != nil {
-		defer w.taskVault.Close()
-	}
-	defer w.vault.Close()
-	defer w.engine.Close()
 	return w.engine.Run(ctx)
+}
+
+// Scheduler cancellation is not ownership release: HTTP inference and active
+// tasks may still use these vaults. Only the shared drain path closes them.
+func closeWorkbench(ctx context.Context, w *workbenchRuntime) error {
+	if w == nil {
+		return nil
+	}
+	err := w.engine.Drain(ctx)
+	err = errors.Join(err, w.vault.Close())
+	if w.taskVault != nil {
+		err = errors.Join(err, w.taskVault.Close())
+	}
+	return err
 }

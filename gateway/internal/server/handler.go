@@ -839,25 +839,24 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	go func() {
-		// 独立 ctx：请求返回后这次下载仍要跑完。
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		if _, err := h.cfg.Update.Apply(ctx, target); err != nil {
-			log.Printf("ERROR: [热更新] 应用失败：%v", err)
-		}
-	}()
+	accepted, err := h.cfg.Update.StartApply(target)
+	if err != nil {
+		_ = writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error(), "status": accepted})
+		return
+	}
 	// 提示语按平台区分：Linux 上是「新实例接管、本实例跑完在途请求再退出」，
 	// 而 Windows 上无法交接监听套接字，只会下载落盘、**重启后生效**。
 	// 用同一句话会让 Windows 用户以为「更新完了」，然后重启发现还是旧版
 	// （2026-10-13 实测：那里的 apply 曾直接报 dup listener 失败）。
 	message := "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出"
-	if status.RestartOnUpdate {
+	if accepted.AutoRestart {
+		message = "已开始自动更新：校验完成后排空在途请求与任务，自动切换；启动核验失败会自动恢复上一版本"
+	} else if accepted.RestartOnUpdate {
 		message = "已开始下载更新：完成后**重启本程序**即生效（本平台不支持运行中替换）"
 	}
 	_ = writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "message": message,
-		"status": h.cfg.Update.Status(),
+		"status": accepted,
 	})
 }
 

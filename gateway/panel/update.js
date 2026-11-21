@@ -5,15 +5,41 @@
  *
  * 2026-10-13：点「立即更新」后弹出进度对话框，全程显示下载/校验/切换进度。
  */
-var UP = { data:null, timer:null, loading:false, modal:false, modalBusy:false, modalDone:false };
+var UP = { data:null, timer:null, loading:false, modal:false, modalBusy:false, modalDone:false,
+  target:'', submitting:false, awaiting:false, readError:'', applyError:'', pollExpired:false };
 var UP_STATE = {
   idle:      { t:'空闲',   cls:''   },
   checking:  { t:'检查中', cls:'w'  },
   downloading:{ t:'下载中', cls:'w' },
   handover:  { t:'切换中', cls:'w'  },
+  restarting:{ t:'重连中', cls:'w' },
   failed:    { t:'失败',   cls:'e'  }
 };
-var UP_BUSY = { checking:1, downloading:1, handover:1 };
+var UP_BUSY = { checking:1, downloading:1, handover:1, restarting:1 };
+
+function upServerBusy(s){
+  return !!UP_BUSY[s.state] || (s.auto_restart === true && s.restart_required === true);
+}
+
+function upRunningTarget(s){
+  var target = UP.target || s.target_version || s.staged_version;
+  return !!target && s.current === target && s.state !== 'failed' && !UP_BUSY[s.state] && !s.restart_required &&
+    (!Object.prototype.hasOwnProperty.call(s, 'ready') || s.ready === true) &&
+    (!Object.prototype.hasOwnProperty.call(s, 'healthy') || s.healthy === true) && !UP.readError;
+}
+
+function observeUpdateStatus(s){
+  if (!UP.target && (s.target_version || s.staged_version)) UP.target = s.target_version || s.staged_version;
+  if (UP.readError) return;
+  if (s.state === 'failed' || upRunningTarget(s) || (s.restart_required && s.auto_restart !== true)){
+    UP.awaiting = false;
+    if (upRunningTarget(s)) UP.pollExpired = false;
+    if (UP.timer) stopUpdatePoll();
+  } else if (upServerBusy(s) && !UP.pollExpired){
+    UP.awaiting = true;
+    startUpdatePoll();
+  }
+}
 
 function upState(st){
   var m = UP_STATE[st] || { t: st || '未知', cls:'' };
@@ -56,6 +82,7 @@ function renderUpdate(){
     return;
   }
   var s = r.status || {};
+  observeUpdateStatus(s);
   // 不可用有两种来源：配置关掉了（update.enabled=false），或发布仓库不开放
   // （私有且没配令牌）。两者都要如实说明原因，而不是让按钮点下去无声失败。
   var unavailable = (s.enabled === false) || !!s.unavailable_reason;
@@ -78,7 +105,7 @@ function renderUpdate(){
     $('#btnUpdCheck').disabled = true;
     return;
   }
-  var busy = !!UP_BUSY[s.state];
+  var busy = upServerBusy(s) || UP.submitting || UP.awaiting;
   var current = s.current || '—';
   var commit = (s.commit && s.commit !== 'unknown') ? ' · ' + s.commit.slice(0, 7) : '';
   var latest = s.latest_tag || (validUpdateTime(s.checked_at) ? '已是最新' : '未检查');
@@ -104,12 +131,21 @@ function renderUpdate(){
   var canApply = !busy && !s.restart_required && (!checked || !!s.update_ready);
   $('#btnUpdApply').disabled = !canApply;
   var hint;
-  if (s.restart_required){
+  if (UP.readError && UP.awaiting){
+    hint = '切换连接暂时中断，正在自动重新连接并核验运行版本；不会重复提交更新。';
+    $('#updState').textContent = '重新连接中';
+  }
+  else if (UP.pollExpired) hint = '自动核验已超时，尚未确认目标版本运行；刷新页面可继续只读查询。';
+  else if (s.restart_required && s.auto_restart === true){
+    hint = '更新包已校验，程序正在自动切换并等待新版本就绪。';
+    $('#updState').textContent = '自动切换中';
+  }
+  else if (s.restart_required){
     hint = '更新包 ' + (s.staged_version || '') + ' 已准备好；当前版本继续服务，重启网关或容器后生效。';
     $('#updState').textContent = '等待重启';
   }
   else if (s.state === 'failed') hint = s.last_error || '更新失败';
-  else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
+  else if (busy) hint = '正在' + ((UP_STATE[s.state] || {}).t || '准备更新') + '…完成后自动核验运行版本';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
   else if (checked) hint = '已是最新版本（' + (s.latest_tag || s.current || '') + '）';
   else hint = '点「立即更新」会先检查远端版本';
@@ -127,6 +163,8 @@ function openUpdateModal(){
   UP.modal = true;
   UP.modalBusy = false;
   UP.modalDone = false;
+  UP.pollExpired = false;
+  UP.applyError = '';
   $('#updModalTitle').textContent = '正在更新';
   // 图标类必须**显式重置**：上一次失败时它被设成 'mic e'，不重置的话重试时
   // 标题写着「正在更新」而图标还是红色叹号，自相矛盾。
@@ -159,7 +197,35 @@ function renderUpdateModal(s){
   var total = Number(s.asset_size) || 0;
   var done = Number(s.downloaded_bytes) || 0;
 
-  if (s.restart_required){
+  if (UP.applyError){
+    UP.modalDone = true;
+    $('#updModalTitle').textContent = '更新未开始';
+    $('#updModalIcon').className = 'mic e';
+    text.textContent = UP.applyError;
+    note.textContent = '未自动重发更新请求。';
+    $('#updModalClose').textContent = '关闭';
+    return;
+  }
+
+  if (UP.pollExpired){
+    $('#updModalTitle').textContent = '运行版本尚未确认';
+    $('#updModalIcon').className = 'mic w';
+    text.textContent = '自动核验已超时，尚未确认目标版本运行。';
+    note.textContent = '刷新页面可继续只读查询；不会自动重发应用请求。';
+    $('#updModalClose').textContent = '关闭';
+    return;
+  }
+
+  if (UP.readError && UP.awaiting){
+    $('#updModalTitle').textContent = '正在重新连接';
+    $('#updModalIcon').className = 'mic w';
+    text.textContent = '更新切换期间连接暂时中断，正在自动重新连接。';
+    note.textContent = '只核验运行版本，不会重复提交更新。';
+    bar.classList.add('unknown');
+    return;
+  }
+
+  if (s.restart_required && s.auto_restart !== true){
     UP.modalDone = true;
     bar.classList.remove('unknown');
     fill.style.width = '100%';
@@ -184,7 +250,7 @@ function renderUpdateModal(s){
     return;
   }
 
-  if (state === 'checking' || state === 'downloading' || state === 'handover'){
+  if (upServerBusy(s)){
     UP.modalBusy = true;
   }
 
@@ -216,26 +282,24 @@ function renderUpdateModal(s){
     return;
   }
 
-  if (state === 'handover'){
+  if (state === 'handover' || state === 'restarting' || (s.restart_required && s.auto_restart === true)){
     // 下载已完成：进度条补满，明确告诉用户「不会再等很久」。
     bar.classList.remove('unknown');
     fill.style.width = '100%';
-    text.textContent = '下载完成，正在切换到新版本…';
-    note.textContent = '正在进行的对话会继续跑完，不会中断。';
+    text.textContent = '更新包已校验，正在自动切换并核验新版本…';
+    note.textContent = '连接恢复后自动读取运行版本，无需再次点击应用。';
     return;
   }
 
-  // 走到 idle 时**不能**直接宣布成功：申请提交后的第一次轮询可能比网关的状态
-  // 更新更早，此时 state 还是 idle，会把「刚开始」误报成「已完成」。
-  // 只有确实经历过 checking/downloading/handover 之后回到 idle，才算完成。
-  if (state === 'idle' && UP.modalBusy){
+  // busy -> idle 也可能仍是旧进程。只有目标版本实际运行、可选健康位为真才完成。
+  if (upRunningTarget(s)){
     UP.modalDone = true;
     bar.classList.remove('unknown');
     fill.style.width = '100%';
     $('#updModalTitle').textContent = '更新完成';
     $('#updModalIcon').className = 'mic ok';
     text.textContent = '已切换到新版本 ' + (s.current || '') + '。';
-    note.textContent = '页面稍后会自动恢复；若长时间无响应，手动刷新一次即可。';
+    note.textContent = '已从当前运行进程读回目标版本。';
     $('#updModalClose').textContent = '关闭';
     return;
   }
@@ -251,8 +315,10 @@ async function loadUpdate(){
   UP.loading = true;
   try{
     UP.data = await api('api/update');
+    UP.readError = '';
   }catch(err){
-    UP.data = { ok:false, message: err.message };
+    if (UP.awaiting || UP.submitting || upServerBusy((UP.data && UP.data.status) || {})) UP.readError = err.message;
+    else UP.data = { ok:false, message: err.message };
   }finally{
     UP.loading = false;
   }
@@ -264,19 +330,40 @@ function stopUpdatePoll(){
 }
 
 function startUpdatePoll(){
-  stopUpdatePoll();
-  var ticks = 0;
+  if (UP.timer || UP.pollExpired) return;
+  var ticks = 0, deadline = Date.now() + 20 * 60 * 1000;
+  function expired(){ return ticks >= 600 || Date.now() >= deadline; }
   UP.timer = setInterval(async function(){
     ticks++;
+    if (UP.loading){
+      if (expired()){
+        UP.pollExpired = true;
+        UP.awaiting = false;
+        stopUpdatePoll();
+        renderUpdate();
+      }
+      return;
+    }
     await loadUpdate();
     var s = (UP.data && UP.data.status) || {};
-    // 交接完成后旧进程随时会退出，继续轮询会看到连接错误，到点就停。
-    if (ticks > 240 || s.state === 'failed') stopUpdatePoll();
-    // 走到 idle 且对话框已经看过下载/切换阶段 → 更新完成，停轮询。
-    if (UP.modalDone && s.state === 'idle') stopUpdatePoll();  }, 2000);
+    if (!UP.readError && (s.state === 'failed' || upRunningTarget(s) || (s.restart_required && s.auto_restart !== true))){
+      UP.awaiting = false;
+      stopUpdatePoll();
+    } else if (expired()){
+      UP.pollExpired = true;
+      UP.awaiting = false;
+      stopUpdatePoll();
+      renderUpdate();
+    }
+  }, 2000);
 }
 
 async function actUpdateCheck(){
+  if (UP.submitting || UP.awaiting || upServerBusy((UP.data && UP.data.status) || {})){
+    await loadUpdate();
+    startUpdatePoll();
+    return;
+  }
   $('#btnUpdCheck').disabled = true;
   try{
     var r = await api('api/update/check', {});
@@ -291,8 +378,21 @@ async function actUpdateCheck(){
 
 async function actUpdateApply(){
   var s = (UP.data && UP.data.status) || {};
+  if (UP.submitting) return;
+  if (UP.awaiting || upServerBusy(s)){
+    if (!UP.target) UP.target = s.target_version || s.staged_version || s.latest_tag || '';
+    UP.awaiting = true;
+    if (!UP.modal) openUpdateModal();
+    renderUpdate();
+    startUpdatePoll();
+    return;
+  }
   if (s.restart_required){
     toast('更新包已准备好，重启网关或容器后生效。', 'ok');
+    return;
+  }
+  if (!UP.data || UP.data.ok !== true || s.enabled !== true || s.unavailable_reason){
+    toast(s.unavailable_reason || '更新服务当前不可用，请先刷新状态。', 'err');
     return;
   }
   // 兜底：按钮已按 update_ready 禁用，这里再挡一次，避免通过其它入口触发无意义的重启。
@@ -300,22 +400,38 @@ async function actUpdateApply(){
     toast('已是最新版本（' + (s.latest_tag || s.current || '') + '），无需更新', 'ok');
     return;
   }
-  ask('立即更新',
-    '将下载并切换到 ' + (s.latest_tag || '最新版本') + '。升级时正在进行的对话会继续跑完，不会中断；' +
-    '控制台页面可能会短暂失去响应，稍后自动恢复。',
-    '开始更新', false, async function(){
-      try{
-        var r = await api('api/update/apply', {});
-        if (r.ok === false){ toast(r.message || '更新未开始', 'err'); await loadUpdate(); return; }
-        // 点完确认就直接弹进度框——用户此刻最想知道的就是「在下没在动」。
-        // 先弹再拉数据，避免开头几秒没有任何反馈。
-        openUpdateModal();
-        renderUpdate();
-        startUpdatePoll();
-      }catch(err){
-        toast(err.message, 'err');
-      }
-    });
+  UP.submitting = true;
+  UP.awaiting = true;
+  UP.target = s.latest_tag || s.target_version || '';
+  UP.readError = '';
+  openUpdateModal();
+  $('#btnUpdApply').disabled = true;
+  $('#btnUpdCheck').disabled = true;
+  try{
+    var r = await api('api/update/apply', UP.target ? {tag:UP.target} : {});
+    if (!r || r.ok !== true){
+      UP.awaiting = false;
+      UP.applyError = (r && r.message) || '服务端未接受更新请求。';
+      if (r && r.status) UP.data = r;
+      toast(UP.applyError, 'err');
+      return;
+    }
+    if (r.status) UP.data = r;
+    if (!UP.target && r.status) UP.target = r.status.target_version || r.status.staged_version || r.status.latest_tag || '';
+    startUpdatePoll();
+  }catch(err){
+    if (err.status >= 400 && err.status < 500 && err.status !== 408){
+      UP.awaiting = false;
+      UP.applyError = err.message || '更新请求被拒绝。';
+      toast(UP.applyError, 'err');
+    } else {
+      UP.readError = err.message || '更新提交连接中断';
+      startUpdatePoll();
+    }
+  }finally{
+    UP.submitting = false;
+    renderUpdate();
+  }
 }
 
 document.addEventListener('click', function(e){

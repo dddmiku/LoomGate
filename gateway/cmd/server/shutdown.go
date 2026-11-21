@@ -12,18 +12,24 @@ import (
 )
 
 type runtimeShutdown struct {
-	stopBackground  func()
-	backgroundDone  <-chan struct{}
-	stopSessions    func()
-	waitConnections func()
-	closePool       func()
-	closeStore      func() error
-	shutdownAdmin   func(context.Context) error
-	shutdownHTTP    func(context.Context) error
-	closeUsage      func() error
+	stopBackground   func()
+	backgroundDone   <-chan struct{}
+	stopSessions     func()
+	waitConnections  func()
+	closePool        func()
+	closeStore       func() error
+	shutdownAdmin    func(context.Context) error
+	shutdownHTTP     func(context.Context) error
+	closeUsage       func() error
+	quiesceWorkbench func()
+	closeWorkbench   func(context.Context) error
+	closePanel       func() error
 }
 
 func drainRuntime(ctx context.Context, services runtimeShutdown) error {
+	if services.quiesceWorkbench != nil {
+		services.quiesceWorkbench()
+	}
 	if services.stopBackground != nil {
 		services.stopBackground()
 	}
@@ -41,10 +47,18 @@ func drainRuntime(ctx context.Context, services runtimeShutdown) error {
 	if services.stopSessions != nil {
 		services.stopSessions()
 	}
+	var workbenchErr error
+	var panelErr error
+	if services.closePanel != nil {
+		panelErr = services.closePanel()
+	}
+	if services.closeWorkbench != nil {
+		workbenchErr = services.closeWorkbench(ctx)
+	}
 	usageErr := services.closeUsage()
 	services.closePool()
 	storeErr := services.closeStore()
-	return errors.Join(firstErr, secondErr, usageErr, storeErr)
+	return errors.Join(firstErr, secondErr, panelErr, workbenchErr, usageErr, storeErr)
 }
 
 func shutdownHTTPServer(ctx context.Context, server *http.Server) error {

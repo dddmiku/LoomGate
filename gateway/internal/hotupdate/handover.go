@@ -135,7 +135,18 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 		}
 		defer adminFile.Close()
 	}
+	if err := handoverFiles(binary, args, file, adminFile, wait, commit); err != nil {
+		return err
+	}
+	if unixLn, ok := adminLn.(*net.UnixListener); ok {
+		unixLn.SetUnlinkOnClose(false)
+	}
+	return nil
+}
 
+// handoverFiles keeps the controller's duplicates open across failed candidates
+// so a drained runtime can launch a genuine rollback process on the same ports.
+func handoverFiles(binary string, args []string, file, adminFile *os.File, wait time.Duration, commit func() error, stopGrace ...time.Duration) error {
 	readPipe, writePipe, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("ready pipe: %w", err)
@@ -181,11 +192,15 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 		ready <- readErr
 	}()
 	stopCandidate := func() {
+		grace := 5 * time.Second
+		if len(stopGrace) > 0 && stopGrace[0] > 0 {
+			grace = stopGrace[0]
+		}
 		children := candidateChildren(cmd.Process.Pid)
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-exited:
-		case <-time.After(5 * time.Second):
+		case <-time.After(grace):
 			_ = cmd.Process.Kill()
 			<-exited
 		}
@@ -211,11 +226,6 @@ func handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 			return fmt.Errorf("commit new instance: %w", err)
 		}
 	}
-	if unixLn, ok := adminLn.(*net.UnixListener); ok {
-		// 仅在交接提交后保留路径；失败时旧实例仍负责关闭和清理自己的 socket。
-		unixLn.SetUnlinkOnClose(false)
-	}
-
 	// 新实例已在服务：后台回收它，父进程继续把手上的在途请求跑完。
 	return nil
 }

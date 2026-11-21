@@ -5,15 +5,58 @@
 package server
 
 import (
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/version"
 )
+
+func TestUpdateApplyAcknowledgesOneReservedJobWhileVisibilityIsBlocked(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer api.Close()
+	defer close(release)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	manager := hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir(), Repo: "fixture/loomgate", APIBase: api.URL, Listener: listener, Proxy: "-"})
+	handler := updateTestHandler(t, manager).InternalHandler()
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}")))
+	var accepted struct {
+		OK     bool             `json:"ok"`
+		Status hotupdate.Status `json:"status"`
+	}
+	if json.Unmarshal(first.Body.Bytes(), &accepted) != nil || !accepted.OK || accepted.Status.State != hotupdate.StateChecking {
+		t.Fatal("accepted response exposed idle before reserving the job")
+	}
+	<-entered
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}")))
+	var duplicate struct {
+		OK     bool             `json:"ok"`
+		Status hotupdate.Status `json:"status"`
+	}
+	if json.Unmarshal(second.Body.Bytes(), &duplicate) != nil || duplicate.OK || duplicate.Status.State != hotupdate.StateChecking || calls.Load() != 1 {
+		t.Fatal("duplicate HTTP submission was accepted while the first visibility request was blocked")
+	}
+}
 
 func updateTestHandler(t *testing.T, manager *hotupdate.Manager) *Handler {
 	t.Helper()

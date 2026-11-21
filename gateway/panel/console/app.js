@@ -1231,7 +1231,9 @@
   //   update_ready                  → 可升级
   //   checked_at 非空且无更新         → 已是最新；否则未检查
   // 曾经除「enabled」外一律显示「待独立验收」，把失败与不可用都说成可交接。
-  const updateStateLabels = {idle:'空闲',checking:'检查中',downloading:'下载中',handover:'切换中',failed:'失败'};
+  const updateStateLabels = {idle:'空闲',checking:'检查中',downloading:'下载中',handover:'自动切换中',restarting:'自动重连中',failed:'失败'};
+  const updateBusy=status=>['checking','downloading','handover','restarting'].includes(status?.state);
+  const updateTransitioning=status=>updateBusy(status)||status?.restart_required===true;
   function updateView(update) {
     const empty = {unread:true,canCheck:false,canApply:false,badge:'manual_action',badgeText:'状态未读取',detail:'',lines:[]};
     if(!update) return empty;
@@ -1242,6 +1244,7 @@
     if(status.repo) lines.push('发布仓库：' + status.repo + (status.visibility ? ' · ' + ({public:'公开',private:'私有',unknown:'未确认'}[status.visibility] || status.visibility) : ''));
     if(status.latest_tag) lines.push('远端最新：' + status.latest_tag);
     if(status.restart_required === true && status.staged_version) lines.push('待启用版本：' + status.staged_version);
+    if(status.target_version)lines.push('更新目标：'+status.target_version);
     if(status.asset_name) lines.push('更新包：' + status.asset_name + (status.asset_size ? ' · ' + Math.round(status.asset_size / 1048576 * 10) / 10 + ' MB' : ''));
     if(validUpdateTime(status.built_at))lines.push('构建时间：'+date(status.built_at));
     if(validUpdateTime(status.deployed_at))lines.push('部署时间：'+date(status.deployed_at));
@@ -1255,129 +1258,130 @@
     lines.push(status.signature_verification === true ? '签名校验：已启用（内置发布公钥）' : '签名校验：未内置发布公钥（构建不验签）');
     if(status.state === 'failed' && status.last_error) lines.push('失败原因：' + status.last_error);
     const base = {unread:false,lines,detail:'',canCheck:true,canApply:false};
-    if(status.restart_required === true) return {...base,badge:'manual_action',badgeText:'等待重启',detail:'更新包已下载、校验并准备好；当前版本继续服务。请重启网关或容器后启用新版本，再刷新核验运行版本。'};
     if(update.ok === false) return {...base,canCheck:false,badge:'disabled',badgeText:'未启用',detail:typeof update.message === 'string' && update.message ? update.message : '当前构建未启用热更新。'};
     if(status.enabled !== true) return {...base,canCheck:false,badge:'disabled',badgeText:'已关闭',detail:status.unavailable_reason || '热更新已在配置中关闭（config update.enabled=false）。'};
     if(status.unavailable_reason) return {...base,canCheck:false,badge:'unavailable',badgeText:'不可用',detail:status.unavailable_reason};
     if(status.state === 'failed') return {...base,badge:'failed',badgeText:'失败',detail:status.last_error || '上次更新失败，可重新检查。'};
-    if(['checking','downloading','handover'].includes(status.state)) return {...base,canCheck:false,badge:'ready',badgeText:updateStateLabels[status.state],detail:'更新任务正在进行，完成后以运行版本读回核验；下载完成不等于已切换。'};
+    if(updateBusy(status)) return {...base,canCheck:false,badge:'ready',badgeText:updateStateLabels[status.state],detail:status.auto_restart===true?'更新正在进行，程序将自动切换并回读运行版本；连接短暂中断时会自动重连，下载完成不等于已更新。':'更新正在进行，正在回读运行状态；连接短暂中断时会自动重连，下载完成不等于已更新。'};
+    if(status.restart_required === true) return {...base,canCheck:false,badge:'manual_action',badgeText:status.auto_restart===true?'自动切换中':'尚未切换',detail:status.auto_restart===true?'更新包已校验，程序正在自动切换并核验运行版本。':'更新包已准备好，当前版本仍在运行；服务尚未完成切换，将继续读取真实运行状态。'};
     if(status.update_ready === true){
       const canApply=status.state==='idle'&&status.signature_verification===true&&typeof status.repo==='string'&&status.repo.trim()!==''&&
         typeof status.asset_name==='string'&&status.asset_name!==''&&typeof status.latest_tag==='string'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(status.latest_tag);
-      return {...base,canApply,badge:'ready',badgeText:'可升级',detail:canApply?'检测到更新；需确认目标后才下载，保留服务端更新代理及签名校验。':'检测到更新，但本构建缺少验签能力或完整目标信息；此界面不会应用未核验的更新。'};
+      return {...base,canApply,badge:'ready',badgeText:'可升级',detail:canApply?'检测到更新；点击「立即更新」后自动下载、验签、切换并确认运行版本。':'检测到更新，但本构建缺少验签能力或完整目标信息；此界面不会应用未核验的更新。'};
     }
     if(checked) return {...base,badge:'ready',badgeText:'已是最新',detail:'已读取远端发布，没有比当前构建更新的版本。'};
     return {...base,badge:'manual_action',badgeText:'未检查',detail:'尚未读取远端发布；点击「检查更新」后再确认是否有新版本。'};
   }
   const updateIntentKey='loomgate.unconfirmedUpdate';
   function readUpdateIntent(){
+    if(state.updateIntent)return state.updateIntent;
     try{
       const raw=sessionStorage.getItem(updateIntentKey);if(!raw)return null;
       const intent=JSON.parse(raw);
-      return typeof intent?.tag==='string'&&typeof intent?.repo==='string'?intent:{blocked:true};
-    }catch{return {blocked:true};}
+      if(typeof intent?.tag==='string'&&typeof intent?.repo==='string'&&intent.tag&&intent.repo){
+        return JSON.stringify(intent)===state.clearedUpdateIntent?null:intent;
+      }
+      sessionStorage.removeItem(updateIntentKey);
+    }catch{try{sessionStorage.removeItem(updateIntentKey);}catch{}}
+    return null;
+  }
+  function saveUpdateIntent(intent){
+    state.updateIntent=intent;
+    try{sessionStorage.setItem(updateIntentKey,JSON.stringify(intent));}catch{}
   }
   function clearUpdateIntent(intent){
-    try{
-      const current=readUpdateIntent();
-      if(current?.tag!==intent.tag||current?.repo!==intent.repo)return false;
-      sessionStorage.removeItem(updateIntentKey);return sessionStorage.getItem(updateIntentKey)===null;
-    }catch{return false;}
+    const current=readUpdateIntent();
+    if(current&&(current.tag!==intent.tag||current.repo!==intent.repo))return false;
+    state.clearedUpdateIntent=JSON.stringify(current||intent);state.updateIntent=null;
+    try{sessionStorage.removeItem(updateIntentKey);}catch{}
+    return true;
   }
   function updateActionNotice(card,text,kind='warn'){
     const node=$('[data-update-action-status]',card);if(!node)return;
     node.textContent=text;node.hidden=!text;node.className='notice '+kind;
   }
+  function updateRunningTarget(status,intent){
+    return Boolean(intent&&status.repo===intent.repo&&status.current===intent.tag&&status.state!=='failed'&&!updateTransitioning(status)&&
+      (status.ready===undefined||status.ready===true)&&(status.healthy===undefined||status.healthy===true));
+  }
   function paintUpdateCard(card,update,error='') {
     if(!card?.isConnected)return;
+    if(update?.status)card._updateSnapshot=update;
     const info=updateView(update),status=update?.status||{};
     let intent=readUpdateIntent(),completed=false;
-    if(intent&&!intent.blocked&&update?.ok===true&&status.repo===intent.repo&&status.current===intent.tag){
-      completed=clearUpdateIntent(intent);if(completed)intent=null;
+    if(intent&&update?.ok===true&&updateRunningTarget(status,intent)){
+      completed=clearUpdateIntent(intent);if(completed){intent=null;card._updateCompleted={repo:status.repo,tag:status.current};}
+    }else if(intent&&update?.ok===true&&!updateTransitioning(status)&&
+      (status.state==='failed'||status.state==='idle'&&(status.current!==intent.tag||status.repo!==intent.repo)&&!(Number.isFinite(intent.started_at)&&Date.now()-intent.started_at>=0&&Date.now()-intent.started_at<15000))){
+      clearUpdateIntent(intent);intent=null;card._updateCompleted=null;
     }
     $('.update-notice',card).innerHTML=info.unread?notice('更新状态读取失败：'+(error||'服务未返回状态')+'。','error'):notice(info.detail,info.badge==='ready'?'':'warn');
     $('.update-facts',card).innerHTML=info.lines.map(line=>{const p=line.indexOf('：');return `<div><dt>${esc(p>0?line.slice(0,p):'状态')}</dt><dd>${esc(p>0?line.slice(p+1):line)}</dd></div>`;}).join('');
     $('.update-facts',card).hidden=!info.lines.length;
-    $('[data-action="update-check"]',card).hidden=!info.canCheck||Boolean(intent);
-    $('[data-action="update-apply"]',card).hidden=!info.canApply||Boolean(intent);
-    $('[data-action="update-review"]',card).hidden=!intent||intent.blocked||info.unread||['checking','downloading','handover'].includes(status.state);
+    const checking=$('[data-action="update-check"]',card),applying=$('[data-action="update-apply"]',card);
+    checking.hidden=!info.canCheck||Boolean(intent);applying.hidden=!info.canApply||Boolean(intent);
+    checking.disabled=applying.disabled=state.pending.has('runtime-update');
     $('.update-badge',card).innerHTML=badge(info.badge,info.badgeText);
-    if(completed)updateActionNotice(card,'运行版本已核验：'+status.current+'。此处是当前进程读回，不是部署时间记录。','');
-    else if(intent?.blocked)updateActionNotice(card,'无法安全读取或记录本标签页的更新提交，已阻止应用更新。可继续只读刷新状态。');
-    else if(intent)updateActionNotice(card,status.restart_required===true?'更新包已准备好，等待重启网关或容器；重启后刷新核验运行版本，不会自动重复下载。':status.state==='failed'?'服务端报告更新失败；原提交保护仍保留，请核对后解除。':'有一次更新提交尚未核验运行版本；只刷新状态，不会自动重复应用。');
+    if(completed||updateRunningTarget(status,card._updateCompleted))updateActionNotice(card,'运行版本已核验：'+status.current+'。此处是当前进程读回，不是部署时间记录。','');
+    else if(intent||updateTransitioning(status))updateActionNotice(card,'更新正在进行，正在自动核验运行版本；短暂断连会自动重连。不会重复提交更新。','');
+    else updateActionNotice(card,'');
   }
-  async function readUpdateStatus(card,generation,polls=0){
+  async function readUpdateStatus(card,generation,polls=600,deadline=Date.now()+20*60*1000){
+    if(!card)return;
     clearTimeout(state.poll);
     card._updateReadSequence=(card._updateReadSequence||0)+1;
     const request=card._updateReadSequence;
     const current=()=>generation===state.version&&request===card._updateReadSequence&&card?.isConnected&&$('#setting-update')===card;
     if(!current())return;
+    const retry=()=>{if(polls>0&&Date.now()<deadline&&current()){state.poll=setTimeout(()=>readUpdateStatus(card,generation,polls-1,deadline),2000);return true;}return false;};
     try{
       const snapshot=await api('update',{signal:null,allowNotOK:true});
       if(!current())return;
       paintUpdateCard(card,snapshot);
-      const intent=readUpdateIntent(),status=snapshot.status||{};
-      if(polls>0&&intent&&!intent.blocked&&snapshot.ok===true&&status.enabled===true&&!status.unavailable_reason&&status.state!=='failed'&&status.restart_required!==true){
-        state.poll=setTimeout(()=>readUpdateStatus(card,generation,polls-1),2000);
-      }
+      if((readUpdateIntent()||updateTransitioning(snapshot.status))&&!retry())updateActionNotice(card,'暂未核验到目标运行版本，可刷新状态继续查看；未重复提交更新。');
     }catch(e){
-      if(current())paintUpdateCard(card,undefined,e instanceof APIError?e.message:'状态读取失败；未重复提交更新。');
+      if(!current())return;
+      const waiting=Boolean(readUpdateIntent())||updateTransitioning(card._updateSnapshot?.status);
+      if(waiting)updateActionNotice(card,retry()?'更新服务暂时断开，正在自动重连并核验运行版本；不会重新提交。':'暂未核验到目标运行版本，可刷新状态继续查看；未重复提交更新。');
+      else paintUpdateCard(card,undefined,e instanceof APIError?e.message:'状态读取失败；未重复提交更新。');
     }
   }
   function updateTarget(status){return JSON.stringify([status.repo,status.current,status.commit,status.latest_tag,status.asset_name]);}
-  async function updateApplyDialog(){
-    return readDialog('核对更新目标',()=>api('update',{allowNotOK:true}),snapshot=>{
-      if(readUpdateIntent())throw new APIError('request_failed',409,'存在未核验的更新提交，请先刷新状态并核对。');
-      if(!updateView(snapshot).canApply)throw new APIError('request_failed',409,'当前没有可应用的已签名更新，请重新检查状态。');
-      const target=snapshot.status,card=$('#setting-update'),generation=state.version;
-      openDialog('确认应用更新',`<form id="update-form" class="form"><p>当前：<code>${esc(target.current)}</code> → 目标：<code>${esc(target.latest_tag)}</code></p><p>仓库：${esc(target.repo)}<br>更新包：${esc(target.asset_name)}</p><p class="notice warn">确认后才提交下载与切换。保留服务端原加速代理、签名和摘要校验；下载或请求受理不等于新版本已运行。不会在此执行系统重启。</p><label class="check"><input name="acknowledge" type="checkbox" required>我确认上述目标，并同意应用更新</label><p id="form-message" class="notice error" hidden></p><div class="actions">${button('close','取消')}<button type="submit" class="primary">确认应用</button></div></form>`);
-      const form=$('#update-form'),submit=$('button[type=submit]',form),message=$('#form-message',form);
-      form.onsubmit=async e=>{
-        e.preventDefault();
-        if(form.dataset.submitting==='1'||form.dataset.submitted==='1'||state.pending.has('runtime-update'))return;
-        if(!form.reportValidity())return;
-        form.dataset.submitting='1';submit.disabled=true;state.pending.add('runtime-update');
-        let attempted=false,rejected=false,intent=null;
-        try{
-          if(readUpdateIntent())throw new APIError('request_failed',409,'已有未核验的更新提交，请先核对。');
-          const fresh=await api('update',{signal:null,allowNotOK:true});
-          if(generation!==state.version||!ownsDialog(form))return;
-          if(!updateView(fresh).canApply||updateTarget(fresh.status)!==updateTarget(target))throw new APIError('request_failed',409,'更新目标或运行构建已变化；请关闭并重新确认，未提交更新。');
-          intent={tag:target.latest_tag,repo:target.repo};
-          const encoded=JSON.stringify(intent);
-          try{sessionStorage.setItem(updateIntentKey,encoded);if(sessionStorage.getItem(updateIntentKey)!==encoded)throw new Error();}
-          catch{throw new APIError('request_failed',409,'无法保存提交保护，未提交更新。');}
-          attempted=true;form.dataset.submitted='1';
-          const data=await api('update/apply',{body:{tag:intent.tag},signal:null,allowNotOK:true});
-          if(data.ok===false){rejected=true;clearUpdateIntent(intent);throw new APIError('request_failed',409,typeof data.message==='string'?data.message:'服务端拒绝了更新请求。');}
-          if(data.ok!==true)throw new APIError('request_failed',502);
-          if(ownsDialog(form))closeDialog();
-          toast('更新请求已接受；将只读核验运行版本，不会重复提交。');
-          await readUpdateStatus(card,generation,30);
-        }catch(e){
-          rejected=rejected||e instanceof APIError&&e.status>=400&&e.status<500&&e.status!==408;
-          if(attempted&&rejected)clearUpdateIntent(intent);
-          const text=!attempted||rejected?(e instanceof APIError?e.message:'更新预检失败，未提交。'):'更新提交结果未确认。请刷新状态核对，不要重复应用。';
-          if(ownsDialog(form)){message.textContent=text;message.hidden=false;}
-          if(generation===state.version&&card?.isConnected){
-            if(attempted)paintUpdateCard(card,undefined,text);
-            updateActionNotice(card,text);
-          }
-        }finally{
-          state.pending.delete('runtime-update');form.dataset.submitting='0';
-          if(!attempted||rejected){form.dataset.submitted='0';if(ownsDialog(form))submit.disabled=false;}
-        }
-      };
-    });
-  }
-  async function reviewUpdateIntent(){
-    return readDialog('核对更新提交保护',()=>api('update',{allowNotOK:true}),snapshot=>{
-      const intent=readUpdateIntent(),status=snapshot.status||{};
-      if(!intent||intent.blocked||snapshot.ok!==true||['checking','downloading','handover'].includes(status.state))throw new APIError('request_failed',409,'更新状态未确认或仍在进行，暂不能解除提交保护。');
-      openDialog('解除更新提交保护',`<form id="update-review-form" class="form"><p>原目标：${esc(intent.tag)}<br>当前运行：${esc(status.current||'未读取')}<br>当前状态：${esc(updateStateLabels[status.state]||'未读取')}</p><p class="notice warn">此操作只解除浏览器防重保护，不会下载、安装或重发更新。尚未确认时请取消。</p><label class="check"><input type="checkbox" required>我已核对运行程序及更新状态，确认可以解除保护</label><div class="actions">${button('close','取消')}<button type="submit">解除保护</button></div></form>`);
-      const form=$('#update-review-form'),card=$('#setting-update');
-      form.onsubmit=e=>{e.preventDefault();if(!form.reportValidity())return;if(clearUpdateIntent(intent)){if(ownsDialog(form))closeDialog();paintUpdateCard(card,snapshot);updateActionNotice(card,'已按人工确认解除提交保护；未执行任何更新。','');}};
-    });
+  async function applyRuntimeUpdate(){
+    if(state.pending.has('runtime-update'))return;
+    const card=$('#setting-update'),generation=state.version,target=card?._updateSnapshot?.status;
+    const current=()=>generation===state.version&&card?.isConnected&&$('#setting-update')===card;
+    if(!current())return;
+    state.pending.add('runtime-update');
+    $('[data-action="update-apply"]',card).disabled=true;
+    let attempted=false,intent=null;
+    try{
+      const fresh=await api('update',{signal:null,allowNotOK:true});
+      if(!current())return;
+      paintUpdateCard(card,fresh);
+      if(readUpdateIntent()||updateTransitioning(fresh.status)){await readUpdateStatus(card,generation);return;}
+      if(!updateView(fresh).canApply||!target||updateTarget(fresh.status)!==updateTarget(target))throw new APIError('request_failed',409,'更新目标或运行构建已变化，已刷新状态；请重新点击更新。未提交更新。');
+      intent={tag:fresh.status.latest_tag,repo:fresh.status.repo,started_at:Date.now()};saveUpdateIntent(intent);attempted=true;paintUpdateCard(card,fresh);
+      updateActionNotice(card,'正在提交更新，随后将自动切换并核验运行版本。','');
+      const data=await api('update/apply',{body:{tag:intent.tag},signal:null,allowNotOK:true});
+      if(data.ok===false){clearUpdateIntent(intent);throw new APIError('request_failed',409,typeof data.message==='string'?data.message:'服务端拒绝了更新请求。');}
+      if(data.ok!==true)throw new APIError('request_failed',502);
+      if(current())await readUpdateStatus(card,generation);
+    }catch(e){
+      const rejected=e instanceof APIError&&e.status>=400&&e.status<500&&e.status!==408;
+      if(attempted&&rejected)clearUpdateIntent(intent);
+      if(current()){
+        if(attempted)await readUpdateStatus(card,generation);
+        if(!attempted||rejected)updateActionNotice(card,e instanceof APIError?e.message:'更新未提交，请重试。');
+        else if(readUpdateIntent())updateActionNotice(card,'更新连接暂时中断，正在自动回读运行状态；不会重复提交。');
+      }
+    }finally{
+      state.pending.delete('runtime-update');
+      if(current()){
+        $('[data-action="update-apply"]',card).disabled=false;
+        $('[data-action="update-check"]',card).disabled=false;
+      }
+    }
   }
   function paintLoopSetting(card,stopOnly,error='') {
     const known=typeof stopOnly==='boolean', control=$('[data-action="loop-toggle"]',card);
@@ -1440,11 +1444,12 @@
       </section>
       <section class="panel" id="setting-update"><div class="panel-title"><h2>迁移与更新</h2></div>
         <div class="update-notice"></div><dl class="detail-specs update-facts" hidden></dl><p data-update-action-status class="notice warn" role="status" hidden></p>
-        <div class="section-gap actions">${button('update-check','检查更新','hidden','quiet')}${button('update-apply','应用更新','hidden','primary')}${button('update-status','刷新状态','','quiet')}${button('update-review','核对后解除提交保护','hidden','quiet')}<span class="update-badge"></span></div>
+        <div class="section-gap actions">${button('update-check','检查更新','hidden','quiet')}${button('update-apply','立即更新','hidden','primary')}${button('update-status','刷新状态','','quiet')}<span class="update-badge"></span></div>
       </section>
     </div>`);
     paintLoopSetting($('#setting-loop'),loop.value?.stop_only,loop.reason?.message);
     paintUpdateCard($('#setting-update'),update.value,update.reason?.message);
+    if(readUpdateIntent()||updateTransitioning(update.value?.status))state.poll=setTimeout(()=>readUpdateStatus($('#setting-update'),generation),1000);
   }
   // 0 在服务端是「不限」的显式语义（keylimit：>0 才生效）。直接打印
   // "0/分 · 并发 0" 会被读成「一个请求都不放行」，与真实行为相反。
@@ -1751,10 +1756,9 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
       },element);return;
     }
     if(name==='update-status'){await readUpdateStatus($('#setting-update'),state.version);return;}
-    if(name==='update-apply'){await updateApplyDialog();return;}
-    if(name==='update-review'){await reviewUpdateIntent();return;}
+    if(name==='update-apply'){await applyRuntimeUpdate();return;}
     if(name==='update-check'){
-      if(state.pending.has('runtime-update')||readUpdateIntent()){toast('有未核验的更新提交，请使用刷新状态。');return;}
+      if(state.pending.has('runtime-update')||readUpdateIntent()){await readUpdateStatus($('#setting-update'),state.version);return;}
       const card=element.closest('#setting-update'),generation=state.version;
       await mutate('update-check','update/check',{},async data=>{
         if(!data.status&&data.ok!==false)throw new APIError('request_failed',502);
