@@ -63,7 +63,13 @@ def run(installer,root,out):
    work=api('workbench');account_view=api('workbench/accounts');legacy=api('state');requests=api('requests?limit=1&offset=0')
    assert isinstance(work['schedules'],list) and len(work['schedules'])==16 and account_view['accounts']==[] and legacy['accounts']==[]
    assert len({plan['id'] for plan in work['schedules']})==16
-   assert {plan['id'] for plan in work['schedules'] if plan['enabled']}=={'legacy-balance','legacy-trae-balance'}
+   # This fixture explicitly disabled every old module. Import must preserve
+   # those choices; only the new Trae read-only balance has no old switch.
+   assert {plan['id'] for plan in work['schedules'] if plan['enabled']}=={'legacy-trae-balance'}
+   imported={plan['id']:plan for plan in work['schedules']}
+   for plan_id in ('legacy-checkin','legacy-trae-check','legacy-travel','legacy-keepalive','legacy-trae-keepalive','legacy-growth','legacy-balance'):
+    assert imported[plan_id]['enabled'] is False and imported[plan_id].get('legacy_enabled') is False
+   report['checks'].append('explicit_disabled_legacy_schedules_preserved')
    assert isinstance(work['runs'],list) and work['runs']==[]
    assert isinstance(requests['total'],int) and requests['total']==0
    for plan in work['schedules']:

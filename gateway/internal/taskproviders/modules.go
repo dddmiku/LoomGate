@@ -2,7 +2,8 @@
 //
 // Layout contract: one task = one file. A task file owns its implementation, its
 // taskengine.Definition and its DefaultPlan (the schedule the product ships
-// with). Nothing else lists task names, hours or stages. The catalogs in
+// with). The builtin catalog owns task names, hours and stages; legacy
+// compatibility may adapt settings for existing plan IDs. The catalogs in
 // workbuddy_modules.go / trae_modules.go only name the file's constructor, so
 // removing a task is "delete its file, delete its catalog line" and removing a
 // schedule is deleting the DefaultPlan in that same file.
@@ -69,7 +70,8 @@ type AccountsOptions struct {
 // DefaultPlan is the schedule a task ships with. Hours/minute are Asia/Shanghai.
 // A sequence stays in one taskengine run and retains ordered per-stage evidence.
 // StartEnabled is true only for read-only balance refresh. Every plan that
-// writes upstream is imported paused so an upgrade never arms a write.
+// writes upstream starts paused in a new workspace. A first legacy import may
+// inherit its existing enabled switch; persisted plans keep their saved choice.
 type DefaultPlan struct {
 	ID            string
 	TaskKey       string
@@ -122,8 +124,8 @@ func DefaultModules(a *Accounts) ([]Module, error) {
 }
 
 // BuiltinSchedules returns the task list the product ships with, straight from
-// the task files that own them. The server imports this once into the engine;
-// it never derives plans from an old config file.
+// the task files that own them. The server can adapt exact legacy counterparts
+// before the first import; later imports preserve all existing saved plans.
 func BuiltinSchedules() []taskengine.Schedule {
 	out := []taskengine.Schedule{}
 	for _, catalog := range [][]moduleCatalogEntry{workbuddyCatalog, traeCatalog} {

@@ -93,6 +93,10 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule config.Schedule `json:"schedule"`
+	// LegacyScheduleConfigured records source intent, not a runtime setting.
+	// An explicit non-null legacy section is inherited only when new-engine
+	// plans are first imported; an empty new workspace retains builtin defaults.
+	LegacyScheduleConfigured bool `json:"-"`
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
@@ -377,7 +381,8 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 		var retired struct {
-			Server struct {
+			Schedule json.RawMessage `json:"schedule"`
+			Server   struct {
 				InputTokenScale json.RawMessage `json:"input_token_scale"`
 			} `json:"server"`
 			Features struct {
@@ -388,6 +393,7 @@ func Load(path string) (*Config, error) {
 		if err := json.Unmarshal(raw, &retired); err != nil {
 			return nil, fmt.Errorf("parse retired config: %w", err)
 		}
+		c.LegacyScheduleConfigured = len(retired.Schedule) > 0 && strings.TrimSpace(string(retired.Schedule)) != "null"
 		if strings.TrimSpace(string(retired.Server.InputTokenScale)) == "null" {
 			return nil, fmt.Errorf("server.input_token_scale: null 非法（已退役兼容值仍需为 [1,5] 内的有限数字）")
 		}

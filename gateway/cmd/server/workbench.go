@@ -180,17 +180,80 @@ func openWorkbenchFor(stateDir string, p *pool.Pool, up *upstream.Client, goos s
 	return workbench, handler, nil
 }
 
-// Import before Run starts. The plan set ships with the build, inside the task
-// files themselves (see taskproviders.BuiltinSchedules); this server never
-// derives plans from an old config file. Every release carries the same fixed
-// list, so an upgrade adds what is missing and never rewrites what the operator
-// edited. The config.Schedule section is now only read by the legacy scheduler.
+// A new empty workspace uses the task-owned builtin defaults. Legacy settings
+// are inherited through openWorkbenchWithConfiguredSchedules before Run starts.
 func openWorkbenchWithBuiltinSchedules(stateDir string, p *pool.Pool, up *upstream.Client, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
+	return openWorkbenchWithScheduleDefaults(stateDir, p, up, taskproviders.BuiltinSchedules(), expiring...)
+}
+
+// Inherit the real legacy switch and hours only for plans with an exact old
+// counterpart. ImportDefaultSchedulesOnce preserves all persisted plans and
+// deletion tombstones, including an operator's deliberate pause or custom scope.
+func openWorkbenchWithConfiguredSchedules(stateDir string, p *pool.Pool, up *upstream.Client, cfg *Config, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
+	return openWorkbenchWithScheduleDefaults(stateDir, p, up, configuredWorkbenchSchedules(cfg, p), expiring...)
+}
+
+func configuredWorkbenchSchedules(cfg *Config, p *pool.Pool) []taskengine.Schedule {
+	plans := taskproviders.BuiltinSchedules()
+	inherit := cfg != nil && cfg.LegacyScheduleConfigured
+	if cfg != nil && !inherit && p != nil {
+		for _, account := range p.List() {
+			if account.Realm == "cn" || account.Realm == "global" || account.Realm == "trae" {
+				inherit = true
+				break
+			}
+		}
+	}
+	if !inherit {
+		return plans
+	}
+	type legacySetting struct {
+		enabled bool
+		hours   []int
+	}
+	// Keep the canonical old modules separate. New sequences and extra tasks
+	// have no independent old switch, so they retain their builtin defaults.
+	source := cfg.Schedule
+	settings := map[string]legacySetting{
+		"legacy-checkin":        {source.CheckinEnabled, source.CheckinHours},
+		"legacy-trae-check":     {source.TraeCheckEnabled, source.TraeCheckHours},
+		"legacy-travel":         {source.TravelEnabled, source.TravelHours},
+		"legacy-growth":         {source.GrowthEnabled, source.GrowthHours},
+		"legacy-keepalive":      {source.KeepaliveEnabled, source.KeepaliveHours},
+		"legacy-trae-keepalive": {source.KeepaliveEnabled, source.KeepaliveHours},
+		"legacy-balance":        {source.BalanceEnabled, source.BalanceHours},
+	}
+	for i := range plans {
+		setting, ok := settings[plans[i].ID]
+		if !ok {
+			// No source switch was observed for a new task. Do not manufacture
+			// a historical "legacy enabled" badge from a shipped constant.
+			plans[i].LegacyEnabled = nil
+			continue
+		}
+		plans[i].Enabled = setting.enabled
+		// The old scheduler treated its hours as membership, so duplicate
+		// entries did not add executions. The new engine requires unique hours.
+		plans[i].Hours = make([]int, 0, len(setting.hours))
+		seenHours := map[int]bool{}
+		for _, hour := range setting.hours {
+			if !seenHours[hour] {
+				plans[i].Hours = append(plans[i].Hours, hour)
+				seenHours[hour] = true
+			}
+		}
+		enabled := setting.enabled
+		plans[i].LegacyEnabled = &enabled
+	}
+	return plans
+}
+
+func openWorkbenchWithScheduleDefaults(stateDir string, p *pool.Pool, up *upstream.Client, plans []taskengine.Schedule, expiring ...time.Duration) (*workbenchRuntime, http.Handler, error) {
 	workbench, handler, err := openWorkbench(stateDir, p, up, expiring...)
 	if err != nil {
 		return nil, nil, err
 	}
-	count, importErr := workbench.engine.ImportDefaultSchedulesOnce("loomgate-builtin-v2", taskproviders.BuiltinSchedules())
+	count, importErr := workbench.engine.ImportDefaultSchedulesOnce("loomgate-builtin-v2", plans)
 	if importErr != nil {
 		log.Printf("[task-engine] 内置计划补齐失败（下次启动会重试）：%v", importErr)
 	} else if count > 0 {

@@ -301,16 +301,15 @@ func main() {
 	var workbenchHandler http.Handler
 	var taskController server.TaskController = sch
 	if useLoomGateWorkbench() {
-		workbench, workbenchHandler, err = openWorkbenchWithBuiltinSchedules(stateDirOf(cfg.StateFile), p, up, cfg.ExpiringSoonDur)
+		workbench, workbenchHandler, err = openWorkbenchWithConfiguredSchedules(stateDirOf(cfg.StateFile), p, up, cfg, cfg.ExpiringSoonDur)
 		if err != nil {
 			log.Fatalf("open task engine: %v", err)
 		}
 		// Never run both schedulers against the same account pool.
 		taskController = nil
 	}
-	// 任务计划属于随包发布的引擎（taskproviders.BuiltinSchedules），旧 config
-	// 的 schedule 段只服务 legacy scheduler。新引擎模式下不再按旧配置打印
-	// 「已启用/已禁用」，避免面板之外的日志与新任务页互相矛盾。
+	// 新引擎首次导入继承可识别的旧定时设置，之后以持久化计划为准。
+	// 日志只打印实际计划状态，避免把旧 config 当作已保存新计划的开关。
 	if useLoomGateWorkbench() {
 		if count := len(workbench.engine.Schedules()); count > 0 {
 			active := 0
