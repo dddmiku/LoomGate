@@ -222,9 +222,9 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 	}
 }
 
-// commit persists the profile proven by submit_code and binds the referral
-// code. It is idempotent: re-running it with the same phone updates the
-// existing vault row instead of creating a second account.
+// commit saves the verified profile, completes normal login initialization,
+// and binds the referral code. Account saving reuses an existing row; external
+// calls are protected by authflow's persisted commit intent, not by that save.
 func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Result, error) {
 	if len(st.Profile) == 0 {
 		return authflow.Result{Status: "manual_action", ErrorCode: "resume_requires_login",
@@ -238,10 +238,21 @@ func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Resu
 		return authflow.Result{}, err
 	}
 	notice := "登录成功，账号已保存到 AutoClaw 账号池。"
+	if initErr := InitializeLogin(ctx, st.Profile, d.client()); initErr != nil {
+		// The usable account is already saved. Do not lose it or blindly retry
+		// an initialization whose upstream result may be unknown.
+		notice += "登录活动初始化未确认，本次不自动重试；奖励以钱包实际到账为准。"
+	}
 	if code := d.inviteCode(st.InviteCode); code != "" {
 		var s stored
 		if json.Unmarshal(st.Profile, &s) == nil {
-			if bindErr := fissionBind(ctx, s.AccessToken, code, s.DeviceID, d.client()); bindErr != nil {
+			bindCtx, cancel := loginActivityContext(ctx)
+			bindErr := bindCtx.Err()
+			if bindErr == nil {
+				bindErr = fissionBind(bindCtx, s.AccessToken, code, s.DeviceID, d.client())
+			}
+			cancel()
+			if bindErr != nil {
 				// A failed referral bind must not fail the login: the account
 				// already works for inference.
 				notice += "（邀请码 " + code + " 绑定失败：" + bindErr.Error() + "）"
