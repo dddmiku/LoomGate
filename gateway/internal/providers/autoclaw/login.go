@@ -83,6 +83,10 @@ type loginState struct {
 	// flow's encrypted Secret between submit_code and commit; the tokens reach
 	// the vault on commit and never enter a public response.
 	Profile json.RawMessage `json:"profile,omitempty"`
+	// IdentityProfile retains only the original sign-in access credential,
+	// device and expiry for initialization. It is private encrypted flow state,
+	// never part of the model-account profile or a public authentication view.
+	IdentityProfile json.RawMessage `json:"identity_profile,omitempty"`
 	// InviteCode is what the operator typed when starting the login. Empty
 	// means "use the provider default"; it is carried in the encrypted secret
 	// so the first step can collect it and commit can use it.
@@ -202,7 +206,7 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 			return authflow.Result{Status: "waiting_code", InputMode: "code",
 				Notice: "请输入 6 位数字验证码。"}, nil
 		}
-		profile, err := d.login(ctx, st.Phone, code, st.DeviceID)
+		profile, identity, err := d.login(ctx, st.Phone, code, st.DeviceID)
 		if err != nil {
 			return authflow.Result{Status: "waiting_code", InputMode: "code",
 				ErrorCode: "code_rejected", Notice: "验证码不正确或已过期：" + err.Error()}, nil
@@ -212,6 +216,7 @@ func (d *LoginDriver) Step(ctx context.Context, f authflow.Flow, action string, 
 		// passport does; returning "succeeded" here is rejected as
 		// authentication_commit_required and the flow lands on uncertain.
 		st.Profile = profile
+		st.IdentityProfile = identity
 		b, _ := json.Marshal(st)
 		return authflow.Result{Status: "verified", Secret: b,
 			Notice: "验证码已通过。正在核验账号并保存…"}, nil
@@ -238,7 +243,11 @@ func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Resu
 		return authflow.Result{}, err
 	}
 	notice := "登录成功，账号已保存到 AutoClaw 账号池。"
-	if initErr := InitializeLogin(ctx, st.Profile, d.client()); initErr != nil {
+	if len(st.IdentityProfile) == 0 {
+		// A verified flow from an older build has only model credentials. Save
+		// that usable account without guessing a missing identity credential.
+		notice += "登录活动初始化需重新完成短信登录；账号已保存。"
+	} else if initErr := InitializeLogin(ctx, st.IdentityProfile, d.client()); initErr != nil {
 		// The usable account is already saved. Do not lose it or blindly retry
 		// an initialization whose upstream result may be unknown.
 		notice += "登录活动初始化未确认，本次不自动重试；奖励以钱包实际到账为准。"
@@ -262,6 +271,7 @@ func (d *LoginDriver) commit(ctx context.Context, st *loginState) (authflow.Resu
 		}
 	}
 	st.Profile = nil
+	st.IdentityProfile = nil
 	return authflow.Result{Status: "succeeded", AccountID: id, Notice: notice}, nil
 }
 
@@ -388,21 +398,21 @@ func (d *LoginDriver) sendCode(ctx context.Context, phone, device string) error 
 }
 
 // login exchanges the SMS code for tokens and swaps the audience to autoclaw.
-func (d *LoginDriver) login(ctx context.Context, phone, code, device string) ([]byte, error) {
+func (d *LoginDriver) login(ctx context.Context, phone, code, device string) ([]byte, []byte, error) {
 	n, err := strconv.Atoi(code)
 	if err != nil {
-		return nil, errors.New("code invalid")
+		return nil, nil, errors.New("code invalid")
 	}
 	body, _ := json.Marshal(map[string]any{"phone": phone, "code": n, "source_id": "autoclaw", "device_id": device})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+apiBase+agentLoginPt, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	setHeaders(req, "", "")
 	req.Header.Del("X-Authorization")
 	resp, err := d.client().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -416,11 +426,19 @@ func (d *LoginDriver) login(ctx context.Context, phone, code, device string) ([]
 		} `json:"data"`
 	}
 	if json.Unmarshal(raw, &out) != nil || out.Code != 0 {
-		return nil, fmt.Errorf("code=%d %s", out.Code, out.Msg)
+		return nil, nil, fmt.Errorf("code=%d %s", out.Code, out.Msg)
 	}
 	if out.Data.AccessToken == "" || out.Data.RefreshToken == "" || out.Data.UserID == "" {
-		return nil, errors.New("login response incomplete")
+		return nil, nil, errors.New("login response incomplete")
 	}
+	// The official initializer uses the access credential issued by sign-in.
+	// Retain its own expiry before preparing the model credential below; do not
+	// retain the original refresh token or phone in this extra flow object.
+	identity, _ := json.Marshal(struct {
+		AccessToken string `json:"accessToken"`
+		DeviceID    string `json:"deviceId"`
+		ExpiresAt   int64  `json:"expiresAt"`
+	}{out.Data.AccessToken, device, tokenExpiry(out.Data.AccessToken)})
 	at, rt := out.Data.AccessToken, out.Data.RefreshToken
 	// The agent token is not accepted by the autoclaw channel; swap the audience.
 	if swappedAt, swappedRt, swapErr := refreshAudience(ctx, rt, device, d.client()); swapErr == nil && swappedAt != "" {
@@ -433,7 +451,8 @@ func (d *LoginDriver) login(ctx context.Context, phone, code, device string) ([]
 		Phone:        phone,
 		ExpiresAt:    tokenExpiry(at),
 	}
-	return json.Marshal(profile)
+	model, err := json.Marshal(profile)
+	return model, identity, err
 }
 
 // refreshAudience exchanges a refresh token for the autoclaw audience.

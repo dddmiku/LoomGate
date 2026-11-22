@@ -29,9 +29,10 @@ func loginActivityContext(parent context.Context) (context.Context, context.Canc
 // current rewards. Success means only that initialization was acknowledged;
 // it is not a reward receipt or a promise of a particular wallet balance.
 //
-// Call only after saving a verified login, or for an explicit, journaled
-// backfill. This deliberately does not refresh, retry, create a device, or run
-// from balance reads. The authflow commit intent protects its normal caller
+// Call only after saving a verified login, using that sign-in's original
+// identity profile, not a prepared model credential. This deliberately does
+// not refresh, retry, create a device, or run from balance reads. The authflow
+// commit intent protects its normal caller
 // against replay of an interrupted operation. A new normal login may initialize
 // again, as in the official client; there is no invented campaign or once flag.
 func InitializeLogin(ctx context.Context, profile []byte, client *http.Client) error {

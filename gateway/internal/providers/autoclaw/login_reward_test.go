@@ -3,6 +3,7 @@ package autoclaw
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,6 +20,7 @@ import (
 
 const rewardUserInfoPath = "/userapi/v1/user-info"
 const rewardAccess = "fixture-autoclaw-access"
+const rewardIdentityAccess = "fixture-agent-access"
 
 // This transport has no permissive fallback. Only user-info changes the
 // synthetic weekly batch; successful authentication by itself does not.
@@ -103,12 +105,17 @@ func (f *rewardLoginTransport) RoundTrip(r *http.Request) (*http.Response, error
 		if len(body) != 2 || body["source_id"] != "autoclaw" || device != f.savedDevice {
 			f.t.Error("user-info did not use exactly the persisted profile device and source")
 		}
-		if r.Header.Get("Authorization") != "Bearer "+rewardAccess || r.Header.Get("x-auth-sign") == "" || r.Header.Get("x-auth-timestamp") == "" || r.Header.Get("x-auth-appid") == "" {
+		if r.Header.Get("x-auth-sign") == "" || r.Header.Get("x-auth-timestamp") == "" || r.Header.Get("x-auth-appid") == "" {
 			f.t.Error("user-info omitted the normal authorization or signature")
 		}
 		profile, saved := f.readSaved()
 		if !saved || profile.DeviceID != device || profile.AccessToken != rewardAccess {
 			f.t.Error("user-info ran before the authenticated profile was durably saved")
+		}
+		// The official initializer receives the credential issued by sign-in.
+		// Model credential preparation must not silently replace its input.
+		if r.Header.Get("Authorization") != "Bearer "+rewardIdentityAccess {
+			return creditResponse(r, http.StatusOK, ` {"code":410000}`)
 		}
 		if f.userInfoExchange != nil {
 			return f.userInfoExchange(r)
@@ -760,9 +767,143 @@ func TestLoginRewardReferralAlsoReservesTheParentCommitBudget(t *testing.T) {
 		saves++
 		return "autoclaw-fixture", nil
 	}}
-	result, err := driver.commit(ctx, &loginState{Profile: rewardInitializeProfile(t)})
+	result, err := driver.commit(ctx, &loginState{Profile: rewardInitializeProfile(t), IdentityProfile: rewardInitializeProfile(t)})
 	if err != nil || result.Status != "succeeded" || ctx.Err() != nil || saves != 1 || calls != 2 {
 		t.Fatal("optional referral timeout invalidated or replayed the saved login")
+	}
+}
+
+func TestLoginIdentityProfileKeepsSignInExpiryAndMinimalPrivateFields(t *testing.T) {
+	for _, exchangeFails := range []bool{false, true} {
+		name := "model_exchange_succeeds"
+		if exchangeFails {
+			name = "model_exchange_fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			makeToken := func(exp int64) string {
+				payload, _ := json.Marshal(map[string]int64{"exp": exp})
+				return "fixture." + base64.RawURLEncoding.EncodeToString(payload) + ".fixture"
+			}
+			identityExpiry := time.Now().Add(time.Hour).Unix()
+			modelExpiry := identityExpiry + 3600
+			identityAccess, modelAccess := makeToken(identityExpiry), makeToken(modelExpiry)
+			calls := 0
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				var body []byte
+				switch r.URL.Path {
+				case agentLoginPt:
+					body, _ = json.Marshal(map[string]any{"code": 0, "data": map[string]string{"access_token": identityAccess, "refresh_token": "fixture-identity-refresh", "user_id": "fixture-user"}})
+				case refreshPt:
+					if exchangeFails {
+						return nil, errors.New("fixture_exchange_failed")
+					}
+					body, _ = json.Marshal(map[string]any{"code": 0, "data": map[string]string{"access_token": modelAccess, "refresh_token": "fixture-model-refresh"}})
+				default:
+					t.Error("login reached an undeclared endpoint")
+					return nil, errors.New("fixture_endpoint_forbidden")
+				}
+				return creditResponse(r, http.StatusOK, string(body))
+			})}
+			driver := &LoginDriver{HTTP: client}
+			model, identity, err := driver.login(t.Context(), "1"+strings.Repeat("0", 10), strings.Repeat("1", 6), "acg-fixture-original-device")
+			if err != nil || calls != 2 {
+				t.Fatal("login credential preparation failed or retried")
+			}
+			defer wipe(model)
+			defer wipe(identity)
+			var identityFields map[string]json.RawMessage
+			var original, prepared stored
+			if json.Unmarshal(identity, &identityFields) != nil || len(identityFields) != 3 || json.Unmarshal(identity, &original) != nil || json.Unmarshal(model, &prepared) != nil {
+				t.Fatal("identity profile did not retain exactly three private initialization fields")
+			}
+			if original.AccessToken != identityAccess || original.ExpiresAt != identityExpiry || original.DeviceID != "acg-fixture-original-device" || original.RefreshToken != "" || original.Phone != "" {
+				t.Fatal("model preparation overwrote the sign-in credential, expiry or minimal identity fields")
+			}
+			wantAccess, wantExpiry := modelAccess, modelExpiry
+			if exchangeFails {
+				wantAccess, wantExpiry = identityAccess, identityExpiry
+			}
+			if prepared.AccessToken != wantAccess || prepared.ExpiresAt != wantExpiry || prepared.DeviceID != original.DeviceID {
+				t.Fatal("identity retention changed the existing model credential preparation")
+			}
+		})
+	}
+}
+
+func TestLoginIdentityProfileSurvivesPrivateFlowReopenAndIsClearedAtCommit(t *testing.T) {
+	h := newRewardLoginHarness(t)
+	verified := h.verify(t)
+	readFlows := func() []authflow.Flow {
+		t.Helper()
+		_, raw, err := h.flowVault.Get("authentication-flows")
+		if err != nil {
+			t.Fatal("could not inspect the private flow fixture")
+		}
+		defer wipe(raw)
+		var flows []authflow.Flow
+		if json.Unmarshal(raw, &flows) != nil || len(flows) != 1 {
+			t.Fatal("unexpected persisted flow fixture")
+		}
+		return flows
+	}
+	flows := readFlows()
+	var secret loginState
+	if json.Unmarshal(flows[0].Secret, &secret) != nil || len(secret.IdentityProfile) == 0 {
+		t.Fatal("verified flow did not persist the initialization credential privately")
+	}
+	public, _ := json.Marshal(verified)
+	if bytes.Contains(public, []byte(rewardIdentityAccess)) || bytes.Contains(public, []byte("identity_profile")) {
+		t.Fatal("initialization credential reached the public authentication view")
+	}
+	if err := h.flowVault.Close(); err != nil {
+		t.Fatal("could not close the private flow fixture")
+	}
+	var err error
+	h.flowVault, err = accountvault.Open(h.flowPath)
+	if err != nil {
+		t.Fatal("could not reopen the private flow fixture")
+	}
+	h.service, err = authflow.Open(authflow.Options{Vault: h.flowVault, Drivers: map[string]authflow.Driver{"autoclaw": h.driver}, Now: func() time.Time { return h.now }})
+	if err != nil {
+		t.Fatal("could not restore the verified flow")
+	}
+	complete := h.commit(t, verified)
+	if complete.Status != "succeeded" {
+		t.Fatal("restored verified login could not initialize")
+	}
+	if calls, weekly, _ := h.transport.counts(); calls != 1 || !weekly || h.saveCalls != 1 {
+		t.Fatal("restored login lost or replayed its original initialization credential")
+	}
+	if len(readFlows()[0].Secret) != 0 {
+		t.Fatal("completed flow retained private initialization state")
+	}
+	_, profile, err := h.vault.Get(complete.AccountID)
+	if err != nil {
+		t.Fatal("saved model account missing")
+	}
+	defer wipe(profile)
+	if bytes.Contains(profile, []byte(rewardIdentityAccess)) || bytes.Contains(profile, []byte("identity_profile")) {
+		t.Fatal("sign-in initialization credential entered the durable model account")
+	}
+}
+
+func TestLoginOldVerifiedFlowSavesWithoutGuessingIdentityCredential(t *testing.T) {
+	calls, saves := 0, 0
+	driver := &LoginDriver{InviteCode: "-", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("fixture_old_flow_must_not_initialize")
+	})}, Save: func(context.Context, []byte) (string, error) {
+		saves++
+		return "autoclaw-fixture", nil
+	}}
+	state := &loginState{Profile: rewardInitializeProfile(t)}
+	result, err := driver.commit(t.Context(), state)
+	if err != nil || result.Status != "succeeded" || saves != 1 || calls != 0 || !strings.Contains(result.Notice, "重新完成短信登录") {
+		t.Fatal("old verified flow guessed a missing identity credential or lost the usable account")
+	}
+	if state.Profile != nil || state.IdentityProfile != nil {
+		t.Fatal("completed old flow retained private state")
 	}
 }
 
