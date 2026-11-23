@@ -344,14 +344,16 @@ func (p *Provider) completeTurn(ctx context.Context, q inference.Dialogue, emit,
 		rows = filtered
 	}
 	p.mu.Lock()
-	start := p.cursor
-	p.cursor = (p.cursor + 1) % len(rows)
-	p.mu.Unlock()
-
-	order := make([]accountvault.Account, len(rows))
-	for i := range rows {
-		order[i] = rows[(start+i)%len(rows)]
+	start := 0
+	if expectedAccount == "" {
+		start = p.cursor
+		p.cursor++
+		if p.cursor < 0 {
+			p.cursor = 0
+		}
 	}
+	p.mu.Unlock()
+	order := p.orderAccounts(rows, start)
 	ids := make([]string, len(order))
 	byID := make(map[string]accountvault.Account, len(order))
 	for i, row := range order {
@@ -548,7 +550,12 @@ func (p *Provider) turnWith(ctx context.Context, row accountvault.Account, q inf
 		emitReasoning = func(delta string) error { reasoning.WriteString(delta); return nil }
 		defer func() { result.Reasoning = reasoning.String() }()
 	}
-	text, events, usage, calls, err := streamSSEWithTools(resp.Body, emit, emitReasoning, emitTool)
+	text, events, usage, calls, err := decodeSSEObserved(resp.Body, emit, emitReasoning, emitTool, func() {
+		result.FirstByteAt = time.Now()
+		if n := len(result.AttemptRecords); n > 0 {
+			result.AttemptRecords[n-1].FirstByteAt = result.FirstByteAt
+		}
+	})
 	result.Text, result.Events, result.ToolCalls = text, events, calls
 	result.Usage = usage.observed()
 	result.UsageReported = result.Usage.Reported()

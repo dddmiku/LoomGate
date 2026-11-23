@@ -92,6 +92,9 @@ func (s *providerStreamSink) start() bool {
 	s.w.Header().Set("X-Gateway-Usage-Status", "not-reported")
 	s.w.Header().Set("X-Gateway-Upstream-Ack", "true")
 	s.w.Header().Add("Trailer", "X-Gateway-Upstream-Complete, X-Gateway-Upstream-Request-Digest, X-Gateway-Stream-Status, X-LoomGate-Conversation")
+	if s.stat != nil && s.stat.ttfb == 0 {
+		s.stat.ttfb = time.Since(s.stat.start)
+	}
 	s.started = true
 	return true
 }
@@ -119,9 +122,6 @@ func (s *providerStreamSink) emit(delta string) error {
 		return err
 	}
 	s.text.WriteString(delta)
-	if first {
-		s.stat.ttfb = time.Since(s.stat.start)
-	}
 	return nil
 }
 
@@ -156,9 +156,6 @@ func (s *providerStreamSink) emitToolDelta(delta inference.ToolCallDelta) error 
 		return err
 	}
 	s.sawToolCalls = true
-	if first {
-		s.stat.ttfb = time.Since(s.stat.start)
-	}
 	return nil
 }
 
@@ -191,9 +188,6 @@ func (s *providerStreamSink) emitReasoning(delta string) error {
 		return err
 	}
 	s.reasoning.WriteString(delta)
-	if first {
-		s.stat.ttfb = time.Since(s.stat.start)
-	}
 	return nil
 }
 func (s *providerStreamSink) validate(result inference.Result) error {

@@ -3,7 +3,10 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,12 +24,16 @@ func (h *Handler) requestHistory(w http.ResponseWriter, r *http.Request) {
 		_ = writeJSON(w, 400, map[string]any{"ok": false, "message": "筛选参数格式错误"})
 		return
 	}
-	allowed := map[string]bool{"key_id": true, "model": true, "status": true, "request_id": true, "offset": true, "limit": true}
+	allowed := map[string]bool{"key_id": true, "model": true, "status": true, "request_id": true, "offset": true, "limit": true, "revision": true}
 	for key, items := range values {
 		if !allowed[key] || len(items) != 1 {
 			_ = writeJSON(w, 400, map[string]any{"ok": false, "message": "包含重复或不支持的筛选参数"})
 			return
 		}
+	}
+	if !validSnapshotRevision(values.Get("revision")) {
+		_ = writeJSON(w, 400, map[string]any{"ok": false, "message": "同步版本无效"})
+		return
 	}
 	query := requestlog.Query{KeyID: values.Get("key_id"), Model: values.Get("model"), Status: requestlog.Status(values.Get("status")), RequestID: values.Get("request_id")}
 	for name, target := range map[string]*int{"offset": &query.Offset, "limit": &query.Limit} {
@@ -49,7 +56,98 @@ func (h *Handler) requestHistory(w http.ResponseWriter, r *http.Request) {
 			page.Items[i].LastDecision.AccountID = h.publicAccountID(page.Items[i].LastDecision.AccountID)
 		}
 	}
-	_ = writeJSON(w, 200, map[string]any{"ok": true, "items": page.Items, "total": page.Total, "offset": page.Offset, "limit": page.Limit, "recovery": page.Recovery, "recording_errors": h.requestLogErrors.Load(), "retention": map[string]any{"max_records": requestlog.DefaultMaxRecords, "max_age_seconds": int64(requestlog.DefaultMaxAge.Seconds()), "max_bytes": requestlog.DefaultMaxBytes}})
+	writeRequestSnapshot(w, r, map[string]any{"ok": true, "items": page.Items, "total": page.Total, "offset": page.Offset, "limit": page.Limit, "recovery": page.Recovery, "recording_errors": h.requestLogErrors.Load(), "retention": map[string]any{"max_records": requestlog.DefaultMaxRecords, "max_age_seconds": int64(requestlog.DefaultMaxAge.Seconds()), "max_bytes": requestlog.DefaultMaxBytes}})
+}
+
+func validSnapshotRevision(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) != 64 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func writeRequestSnapshot(w http.ResponseWriter, r *http.Request, payload map[string]any) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		_ = writeJSON(w, 503, map[string]any{"ok": false})
+		return
+	}
+	revision := fmt.Sprintf("%x", sha256.Sum256(raw))
+	w.Header().Set("Cache-Control", "no-store")
+	if r.URL.Query().Get("revision") == revision {
+		_ = writeJSON(w, 200, map[string]any{"ok": true, "not_modified": true, "revision": revision})
+		return
+	}
+	payload["revision"] = revision
+	_ = writeJSON(w, 200, payload)
+}
+func (h *Handler) requestAccountActivity(w http.ResponseWriter, r *http.Request) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		_ = writeJSON(w, 400, map[string]any{"ok": false})
+		return
+	}
+	for key, items := range q {
+		if (key != "provider" && key != "revision") || len(items) != 1 {
+			_ = writeJSON(w, 400, map[string]any{"ok": false})
+			return
+		}
+	}
+	provider := q.Get("provider")
+	switch provider {
+	case "", "workbuddy", "trae", "autoclaw", "doubao":
+	default:
+		_ = writeJSON(w, 400, map[string]any{"ok": false})
+		return
+	}
+	if !validSnapshotRevision(q.Get("revision")) {
+		_ = writeJSON(w, 400, map[string]any{"ok": false})
+		return
+	}
+	if h.cfg.Requests == nil {
+		_ = writeJSON(w, 503, map[string]any{"ok": false})
+		return
+	}
+	page, err := h.cfg.Requests.AccountActivity(provider)
+	if err != nil {
+		h.requestHistoryError(w, err)
+		return
+	}
+	projected := make([]requestlog.AccountActivity, 0, len(page.Items))
+	byID := make(map[string]int)
+	for _, row := range page.Items {
+		row.AccountID = h.publicAccountID(row.AccountID)
+		key := row.Provider + ":" + row.AccountID
+		if i, ok := byID[key]; ok {
+			previous := projected[i]
+			a, b := row.LastFinishedAt, previous.LastFinishedAt
+			if a.IsZero() {
+				a = row.LastStartedAt
+			}
+			if b.IsZero() {
+				b = previous.LastStartedAt
+			}
+			if a.After(b) {
+				projected[i] = row
+			}
+			projected[i].Attempts24H = previous.Attempts24H + row.Attempts24H
+			projected[i].Success24H = previous.Success24H + row.Success24H
+			projected[i].Error24H = previous.Error24H + row.Error24H
+			projected[i].Canceled24H = previous.Canceled24H + row.Canceled24H
+		} else {
+			byID[key] = len(projected)
+			projected = append(projected, row)
+		}
+	}
+	page.Items = projected
+	writeRequestSnapshot(w, r, map[string]any{"ok": true, "items": page.Items, "window_seconds": page.WindowSeconds, "partial": page.Partial})
 }
 
 func (h *Handler) requestDetail(w http.ResponseWriter, r *http.Request) {

@@ -1695,6 +1695,19 @@ class Handler(BaseHTTPRequestHandler):
             if query:
                 return self._json(400, {"ok": False, "message": "限流状态接口不接受筛选参数"})
             return self.keys_request("GET", "/key-limits")
+        if path == "/api/requests/accounts":
+            try:
+                pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=2) if query else []
+            except (ValueError, UnicodeError):
+                return self._json(400, {"ok": False, "message": "活动筛选参数格式错误"})
+            values = dict(pairs)
+            if len(values) != len(pairs) or set(values) - {"provider", "revision"}:
+                return self._json(400, {"ok": False, "message": "活动筛选参数无效"})
+            if values.get("provider", "") not in ("", "autoclaw", "workbuddy", "trae", "doubao"):
+                return self._json(400, {"ok": False, "message": "服务范围无效"})
+            if "revision" in values and not re.fullmatch(r"[0-9a-f]{64}", values["revision"]):
+                return self._json(400, {"ok": False, "message": "同步版本无效"})
+            return self.keys_request("GET", "/requests/accounts" + ("?" + urlencode(pairs) if pairs else ""))
         if path == "/api/requests/facets":
             # 筛选项列表：不接受参数（与网关同语义），必须排在请求 ID 路由之前，
             # 否则会被当成 request_id="facets" 转发。
@@ -1710,10 +1723,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "message": "请求标识不正确"})
             return self.keys_request("GET", "/requests/" + request_id)
         try:
-            pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=6) if query else []
+            pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=7) if query else []
         except (ValueError, UnicodeError):
             return self._json(400, {"ok": False, "message": "筛选参数格式错误"})
-        allowed = {"key_id", "model", "status", "request_id", "offset", "limit"}
+        allowed = {"key_id", "model", "status", "request_id", "offset", "limit", "revision"}
         values = dict(pairs)
         if len(values) != len(pairs) or set(values) - allowed:
             return self._json(400, {"ok": False, "message": "包含重复或不支持的筛选参数"})
@@ -1722,6 +1735,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "message": "筛选值无效"})
             if name in ("offset", "limit") and (not re.fullmatch(r"[0-9]{1,9}", value) or (name == "limit" and not 1 <= int(value) <= 100)):
                 return self._json(400, {"ok": False, "message": "分页参数无效"})
+            if name == "revision" and not re.fullmatch(r"[0-9a-f]{64}", value):
+                return self._json(400, {"ok": False, "message": "同步版本无效"})
         if values.get("status", "") not in ("", "success", "error", "canceled", "rejected"):
             return self._json(400, {"ok": False, "message": "请求状态无效"})
         return self.keys_request("GET", "/requests" + ("?" + urlencode(pairs) if pairs else ""))

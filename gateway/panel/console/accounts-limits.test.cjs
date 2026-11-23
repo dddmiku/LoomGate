@@ -80,7 +80,7 @@ test('request attempt costs are loaded on demand, with zero and missing values k
   let resolve;
   const context={state,esc:String,api(path){reads.push(path);return new Promise(done=>{resolve=done;});}};
   vm.createContext(context);vm.runInContext(code+'\nthis.load = loadRequestAttemptCredits;',context);
-  const node={isConnected:true,innerHTML:'pending'};
+  const node={isConnected:true,innerHTML:'pending',dataset:{}};
   const attempts=[{number:1,credit:0},{number:2,credit:null}];
   const first=context.load(node,'request-1',1);
   resolve({record:{request_id:'request-1',attempts,attempts_truncated:true}});

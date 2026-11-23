@@ -67,6 +67,7 @@ type sseDecoder struct {
 	terminal            bool
 	emit, reasoning     func(string) error
 	tool                func(inference.ToolCallDelta) error
+	firstFrame          func()
 }
 
 func (d *sseDecoder) reserve(size int) error {
@@ -170,6 +171,10 @@ func (d *sseDecoder) line(line []byte) (done bool, err error) {
 	if len(chunk.Choices) > 1 {
 		return false, invalidStream()
 	}
+	if d.firstFrame != nil {
+		d.firstFrame()
+		d.firstFrame = nil
+	}
 	for _, choice := range chunk.Choices {
 		if choice.Index != nil && *choice.Index != 0 {
 			return false, invalidStream()
@@ -269,7 +274,10 @@ func (d *sseDecoder) line(line []byte) (done bool, err error) {
 }
 
 func decodeSSE(body io.Reader, emit, reasoning func(string) error, tool func(inference.ToolCallDelta) error) (string, int, streamUsage, []inference.ToolCall, error) {
-	d := &sseDecoder{emit: emit, reasoning: reasoning, tool: tool}
+	return decodeSSEObserved(body, emit, reasoning, tool, nil)
+}
+func decodeSSEObserved(body io.Reader, emit, reasoning func(string) error, tool func(inference.ToolCallDelta) error, firstFrame func()) (string, int, streamUsage, []inference.ToolCall, error) {
+	d := &sseDecoder{emit: emit, reasoning: reasoning, tool: tool, firstFrame: firstFrame}
 	reader := bufio.NewReaderSize(body, 8192)
 	var pending []byte
 	wireBytes := 0

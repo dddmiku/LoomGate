@@ -19,7 +19,7 @@ import (
 )
 
 // requestFacetParams 是 /api/requests 允许的筛选参数（与网关同语义）。
-var requestFacetParams = []string{"key_id", "model", "status", "request_id", "offset", "limit"}
+var requestFacetParams = []string{"key_id", "model", "status", "request_id", "offset", "limit", "revision"}
 
 // requestStatuses 是允许的状态取值。
 var requestStatuses = []string{"", "success", "error", "canceled", "rejected"}
@@ -44,6 +44,34 @@ func (s *Server) opsGet(w http.ResponseWriter, r *http.Request, path string) {
 			return
 		}
 		s.keysRequest(w, r, http.MethodGet, "/key-limits", nil)
+		return
+	}
+	if path == "/api/requests/accounts" {
+		q, err := url.ParseQuery(query)
+		if err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false})
+			return
+		}
+		for key, items := range q {
+			if (key != "provider" && key != "revision") || len(items) != 1 {
+				writeJSON(w, 400, map[string]any{"ok": false})
+				return
+			}
+		}
+		p := q.Get("provider")
+		if p != "" && p != "autoclaw" && p != "workbuddy" && p != "trae" && p != "doubao" {
+			writeJSON(w, 400, map[string]any{"ok": false})
+			return
+		}
+		if v := q.Get("revision"); v != "" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(v) {
+			writeJSON(w, 400, map[string]any{"ok": false})
+			return
+		}
+		endpoint := "/requests/accounts"
+		if len(q) > 0 {
+			endpoint += "?" + q.Encode()
+		}
+		s.keysRequest(w, r, http.MethodGet, endpoint, nil)
 		return
 	}
 	if path == "/api/requests/facets" {
@@ -133,6 +161,9 @@ func parseFacetPairs(query string) ([][2]string, string) {
 		}
 		if len(value) > limit || hasControlChar(value) {
 			return nil, "筛选值无效"
+		}
+		if name == "revision" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(value) {
+			return nil, "同步版本无效"
 		}
 		if name == "offset" || name == "limit" {
 			if !digits9Re.MatchString(value) {

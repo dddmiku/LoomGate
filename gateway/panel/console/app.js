@@ -47,7 +47,7 @@
     const legacy={checkin:'每日签到',balance:'余额刷新',travel:'Buddy 旅行',keepalive:'账号会话保活',growth:'成长任务',redemption:'连登奖励兑换',redeem:'连登奖励兑换',makeup:'日历补登',resources:'成长资源状态',compensation:'补偿领取',lottery:'盲盒抽奖',buddy_box:'Buddy 盲盒'};
     return legacy[key]||key;
   }
-  const routes = {overview:['','工作台','先处理需要关注的事项。'], providers:['CONNECTIONS','服务接入','按服务查看已接入账号与真实可用能力。'], accounts:['IDENTITIES','账号','集中查看服务账号的启用状态、会话有效期和目录入口。'], models:['MODEL LIBRARY','模型目录','从上游获取可选模型。能力与可用范围以当前账号的响应为准。'], tasks:['AUTOMATION','任务','按分区查看任务、定时与运行状态。'], runs:['ACTIVITY','执行记录','查看每次派发、执行与服务端复核的结果。'], usage:['OBSERVABILITY','用量','查看网关累计请求与上游报告的用量。'], logs:['REQUEST HISTORY','请求记录','按请求查看模型、状态和耗时，不展示消息内容。'], keys:['API KEYS','API 密钥','用于调用模型接口的密钥；与面板登录账号无关。'], migration:['MIGRATION','迁移','只读核对迁移标记与工具状态；导入需离线确认。'], settings:['PREFERENCES','工作区设置','管理显示偏好、会话与迁移准备。']};
+  const routes = {overview:['','工作台','先处理需要关注的事项。'], providers:['CONNECTIONS','服务接入','按服务查看已接入账号与真实可用能力。'], accounts:['IDENTITIES','账号','集中查看启用状态、积分与最近模型活动。'], models:['MODEL LIBRARY','模型目录','从上游获取可选模型。能力与可用范围以当前账号的响应为准。'], tasks:['AUTOMATION','任务','按分区查看任务、定时与运行状态。'], runs:['ACTIVITY','执行记录','查看每次派发、执行与服务端复核的结果。'], usage:['OBSERVABILITY','用量','查看网关累计请求与上游报告的用量。'], logs:['REQUEST HISTORY','请求记录','按请求查看模型、状态和耗时，不展示消息内容。'], keys:['API KEYS','API 密钥','用于调用模型接口的密钥；与面板登录账号无关。'], migration:['MIGRATION','迁移','只读核对迁移标记与工具状态；导入需离线确认。'], settings:['PREFERENCES','工作区设置','管理显示偏好、会话与迁移准备。']};
   const labels = {ready:'目录已同步',stale:'旧缓存',unavailable:'暂不可用',disabled:'已停用',queued:'等待执行',running:'执行中',succeeded:'已核验完成',failed:'失败',canceled:'已取消',uncertain:'待复核',skipped:'已跳过',manual_action:'需要人工',discover:'发现',inspect:'检查',execute:'执行',claim:'领取',verify:'复核'};
   const errorLabels = {login_required:'登录已失效，请在对应服务重新登录。',doubao_no_account:'尚未添加豆包账号，请导入 Cookie。',doubao_session_invalid:'豆包 Cookie 无效或已过期，请重新导入。',doubao_empty_answer:'上游返回了空回答，请重试。',access_token_expired:'访问令牌已过期，请重新导入 AutoClaw 凭证。',autoclaw_no_account:'尚未添加 AutoClaw 账号。',autoclaw_session_invalid:'AutoClaw 凭证无效，请重新导入。',autoclaw_empty_answer:'上游返回了空回答，请重试。',accounts_unavailable:'账号存储读取失败，请检查服务状态。',catalog_timeout:'目录读取超时，请稍后重试。',migration_timeout:'迁移预检超时：旧工作区可能过大或磁盘较慢，未写入任何文件；可改为在命令行离线执行预检。',catalog_failed:'目录读取失败，请稍后重试。',catalog_unavailable:'上游目录暂不可用。',account_not_found:'账号已不存在，请刷新账号列表。',schedule_not_saved:'计划未保存，请检查时间、时区和任务范围。',run_rejected:'执行请求未被接受，可能已有任务正在运行。',authentication_busy:'该服务还有一个登录窗口未结束，请先完成或取消它，再添加下一个账号。',authentication_request_invalid:'登录请求无效，请重新选择服务与登录方式。',authentication_not_found:'该登录流程已不存在，请重新发起。',authentication_storage_unavailable:'登录状态存储不可用，请检查服务状态。',operation_unconfirmed:'操作结果未确认，请核验官方界面后取消或重新接入。',account_save_failed:'账号保存失败，请检查服务状态。',provider_vault_unavailable:'账号库不可用，登录结果未能保存。',unauthorized:'管理会话已过期，请重新登录。'};
   Object.assign(errorLabels,{desktop_cleanup_uncertain:'客户端清理状态未确认，请检查官方客户端后再试。',desktop_ownership_lost:'本次连接的归属已变化，请重新连接官方客户端。',desktop_submission_uncertain:'请求可能已提交，请先核对官方服务状态，避免重复提交。',composer_not_empty:'官方客户端有未发送内容，请先保留或处理草稿。',desktop_model_unavailable:'当前账号的实时目录中没有此模型，请刷新目录。',desktop_native_tools_unsupported:'该请求需要官方任务运行时，但当前选择或任务上下文不匹配，未发送。',provider_output_budget_unsupported:'官方签名请求没有可兑现的输出 token 上限，本次未发送。',provider_system_instructions_unsupported:'官方签名构造器没有可验证的系统指令字段，本次未发送。'});
@@ -200,6 +200,37 @@
     }
     return state.providers;
   }
+  // One bounded read loop per page. Hidden tabs stop traffic; resuming catches
+  // up immediately. No overlapping reads, background mutations or UI spinners.
+  function createReadMonitor({path,apply,isCurrent,status=()=>{},interval=3000,immediate=true}) {
+    let timer=null,controller=null,busy=false,stopped=false,paused=false,failures=0,revision='',catchUp=false;
+    const active=()=>!stopped&&!paused&&!document.hidden&&isCurrent();
+    const schedule=delay=>{clearTimeout(timer);if(active())timer=setTimeout(tick,delay);};
+    const stop=()=>{stopped=true;clearTimeout(timer);controller?.abort();document.removeEventListener('visibilitychange',visibility);window.removeEventListener('focus',focus);};
+    async function tick(){
+      if(!active()||busy)return;busy=true;catchUp=false;controller=new AbortController();
+      try{
+        const base=typeof path==='function'?path():path;
+        const query=base+(revision?(base.includes('?')?'&':'?')+'revision='+encodeURIComponent(revision):'');
+        const data=await api(query,{signal:controller.signal});
+        if(!active())return;
+        if(data.not_modified===true&&(!revision||data.revision!==revision))throw new Error('snapshot_revision_mismatch');
+        if(data.not_modified!==true)await apply(data);
+        if(!active())return;
+        revision=typeof data.revision==='string'&&/^[0-9a-f]{64}$/.test(data.revision)?data.revision:'';failures=0;status('live');
+      }catch(e){
+        if(!active()||e.name==='AbortError')return;
+        if(e.status===401||e.status===403){status('unauthorized');stop();return;}
+        failures++;status('retrying');
+      }finally{busy=false;controller=null;schedule(catchUp?0:Math.min(60000,interval*2**Math.min(failures,5)));}
+    }
+    function soon(){catchUp=true;schedule(0);}
+    function visibility(){clearTimeout(timer);if(document.hidden){controller?.abort();status('hidden');}else if(!paused){soon();}}
+    function focus(){soon();}
+    document.addEventListener('visibilitychange',visibility);window.addEventListener('focus',focus);
+    schedule(immediate?0:interval);
+    return {stop,refresh(){revision='';soon();},setPaused(value){paused=!!value;clearTimeout(timer);if(paused){catchUp=false;controller?.abort();status('paused');}else soon();}};
+  }
   // 服务端 /api/state 的 AuthSummary 带了三项旧版账号信息，控制台曾把它们整体
   // 丢掉：parsable（凭证文件能否解析）、mobile（Trae 掩码手机号）、
   // enterpriseId（WorkBuddy 企业租户）。丢掉 parsable 的后果最重——损坏或旧格式
@@ -275,7 +306,7 @@
       sourceControl?.removeAttribute('aria-busy');
     }
   }
-  function begin() { state.controller?.abort(); clearTimeout(state.poll); clearTimeout(state.creditTimer); state.controller=new AbortController(); state.version++; return state.version; }
+  function begin() { state.readMonitor?.stop();state.readMonitor=null;state.controller?.abort(); clearTimeout(state.poll); clearTimeout(state.creditTimer); state.controller=new AbortController(); state.version++; return state.version; }
   function showRouteLoading() {
     const view=$('#view'),old=view.querySelector('[data-view-content]');
     if(old){old.inert=true;old.setAttribute('aria-hidden','true');}
@@ -418,6 +449,7 @@
     const selected=state.accountProvider || state.providers[0]?.id || '';
     state.accountProvider=selected;
     const generation=state.version;
+    state.accountActivity=new Map();state.accountActivityStatus='loading';state.accountActivityPartial=false;
     const showsCredits=['workbuddy','trae','autoclaw'].includes(selected);
     installViewContent(heading((showsCredits?button('reload','刷新积分','','quiet'):'')+button('connect-account','添加账号','','primary'))+
       `<div class="context-bar scope-toolbar">${providerFilter('account-provider',selected)}<label class="search"><span class="sr-only">搜索昵称或账号标识</span><input id="account-search" placeholder="搜索昵称或账号标识"></label><div id="account-realm" class="realm-filter" role="group" aria-label="区域筛选"></div></div><div id="account-credit-summary"></div><div id="account-list" class="loading">正在读取账号…</div>`);
@@ -428,7 +460,7 @@
     let querying=showsCredits&&pending();
     const summary=$('#account-credit-summary');
     const drawCreditSummary=()=>{summary.innerHTML=accountCreditSummary(rows,querying);};
-    state.accountRows=rows;if(showsCredits)drawCreditSummary();const clientStates=new Map();
+    state.accountRows=rows;if(showsCredits)drawCreditSummary();
     // 区域筛选只在 WorkBuddy（有 CN/Global 两个独立站点）显示；Trae 与 AutoClaw 各自
     // 只有一个域，出现 CN/Global 只会误导。
     const realmBar=$('#account-realm');
@@ -449,15 +481,24 @@
       const realm=selected==='workbuddy'?(state.accountRealm||''):'';
       const list=rows.filter(a=>(!realm||a.realm===realm)&&(a.id+' '+(a.nickname||'')+' '+(a.mobile||'')+' '+(a.enterpriseId||'')).toLowerCase().includes(query));
       $('#account-list').className='account-directory';
-      $('#account-list').innerHTML=list.length?table(['账号','状态与限流','积分与过期','会话与连接','操作'],list.map(a=>{
-        const credit=a.credits,connection=clientStates.get(a.id);
+      $('#account-list').innerHTML=list.length?table(['账号','状态与限流','积分与过期','活动时间','操作'],list.map(a=>{
+        const credit=a.credits;
         const status=`<div data-account-status>${accountStatus(a)}</div>`;
         const balance=showsCredits?`<div data-credit-account="${esc(a.id)}">${accountCreditCell(credit,querying)}</div>`:'<span class="muted">—</span>';
-        const sessionText=connection?esc(LoomConnections.clientLabels[connection.state]||'待核验')+(connection.verified_at?`<p>最近核验 ${esc(date(connection.verified_at))}</p>`:''):selected==='autoclaw'?'<p>纯 HTTP 模型调用，不创建会话，不依赖任何客户端</p>':selected==='doubao'?(a.bot_id?'<p>已绑定一个固定会话，不依赖客户端</p>':'<p>首次调用时会创建一个固定会话</p>'):`${esc(date(a.expires_at))}${a.expires_at&&a.expires_at*1000<Date.now()?'<p>会话已过期</p>':''}`;
-        return [`<strong class="account-name">${esc(a.nickname||a.mobile||'未提供昵称')}</strong>${a.nickname&&a.mobile?`<p class="account-mobile">${esc(a.mobile)}</p>`:''}<p>${esc({cn:'WorkBuddy 国内版',global:'WorkBuddy 国际版',trae:'Trae'}[a.realm]||providerName(selected))}</p><details class="account-id"><summary>账号标识</summary><code>${esc(a.id)}</code>${a.enterpriseId?`<p class="muted small">企业：<code>${esc(a.enterpriseId)}</code></p>`:''}${a.botId?`<p class="muted small">官方 Bot：<code>${esc(a.botId)}</code></p>`:''}${a.verifiedAt?`<p class="muted small">核验于 ${esc(date(a.verifiedAt))}</p>`:''}</details>`,status,balance,sessionText,`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}" data-realm="${esc(a.realm||'')}"`,'quiet compact')}</div>`];
+        return [`<strong class="account-name">${esc(a.nickname||a.mobile||'未提供昵称')}</strong>${a.nickname&&a.mobile?`<p class="account-mobile">${esc(a.mobile)}</p>`:''}<p>${esc({cn:'WorkBuddy 国内版',global:'WorkBuddy 国际版',trae:'Trae'}[a.realm]||providerName(selected))}</p><details class="account-id"><summary>账号标识</summary><code>${esc(a.id)}</code>${a.enterpriseId?`<p class="muted small">企业：<code>${esc(a.enterpriseId)}</code></p>`:''}${a.botId?`<p class="muted small">官方 Bot：<code>${esc(a.botId)}</code></p>`:''}${a.verifiedAt?`<p class="muted small">核验于 ${esc(date(a.verifiedAt))}</p>`:''}</details>`,status,balance,accountActivityCell(a),`<div class="actions">${button('account-models','查看目录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}"`,'compact')}${button('toggle-account',a.enabled?'停用':'启用',`data-provider="${esc(selected)}" data-index="${rows.indexOf(a)}"`,'compact')}${button('reconnect-account','重新登录',`data-provider="${esc(selected)}" data-account="${esc(a.id)}" data-realm="${esc(a.realm||'')}"`,'quiet compact')}</div>`];
       })):empty(query?'没有匹配的账号':realm?'该区域下没有账号':'尚未接入账号',query?'试试其他昵称或账号标识。':(realm?'可切换区域查看全部账号。':'接入账号后在这里查看状态、限流与积分过期。'));
     };
     drawRealms();draw();
+    const paintActivity=()=>{
+      document.querySelectorAll('[data-account-activity]').forEach(cell=>{
+        const html=accountActivityHtml(state.accountActivity.get(cell.dataset.accountActivity),state.accountActivityStatus,state.accountActivityPartial);
+        if(cell.dataset.activityHtml!==html){cell.innerHTML=html;cell.dataset.activityHtml=html;}
+      });
+    };
+    state.readMonitor=createReadMonitor({path:'requests/accounts?provider='+encodeURIComponent(selected),interval:5000,
+      isCurrent:()=>generation===state.version&&state.route==='accounts'&&state.accountProvider===selected,
+      apply:data=>{if(!Array.isArray(data.items))throw new APIError('request_failed',503);state.accountActivity=new Map(data.items.map(row=>[row.account_id,row]));state.accountActivityPartial=!!data.partial;state.accountActivityStatus='live';paintActivity();},
+      status:value=>{state.accountActivityStatus=value;paintActivity();}});
     $('#account-search').addEventListener('input',draw);
     if(querying)scheduleCreditReadback(()=>generation===state.version&&state.route==='accounts'&&state.accountProvider===selected,
       async()=>{let nextSnapshot;const nextRows=await accountsFor(selected,undefined,data=>{nextSnapshot=data;});return {nextRows,nextSnapshot};},(result,canRetry)=>{
@@ -475,6 +516,17 @@
   }
   // 模型限流与积分过期必须常显、用高亮色，不能折叠进 details 或只有 hover 才
   // 能看到——用户明确要求「看到了，还在，不要自动隐藏」「还是用高亮色显示」。
+  function accountActivityCell(a){
+    return '<div data-account-activity="'+esc(a.id)+'">'+accountActivityHtml(state.accountActivity?.get(a.id),state.accountActivityStatus,state.accountActivityPartial)+'</div>';
+  }
+  function accountActivityHtml(row,status,partial=false){
+    if(!row)return '<p class="small muted">'+(status==='loading'?'正在读取模型活动…':status==='unauthorized'?'活动读取需要重新登录':status==='retrying'?'活动暂不可读，稍后自动恢复':partial?'留存记录不完整，暂无可归属活动':'留存记录内暂无模型调用')+'</p>';
+    const finished=typeof row.last_finished_at==='string'&&!row.last_finished_at.startsWith('0001-')&&Number.isFinite(Date.parse(row.last_finished_at));
+    const activityTime=finished?row.last_finished_at:row.last_started_at,activityLabel=finished?'最近完成':'最近发起（结束未记录）';
+    const labels={success:'成功',error:'失败',canceled:'已取消',rejected:'已拒绝'};
+    const requestStatus=row.last_request_status&&row.last_request_status!==row.last_status?'<p class="small muted">本次请求整体：'+esc(labels[row.last_request_status]||'未确认')+'</p>':'';
+    return '<div class="account-activity"><p>'+activityLabel+' <time>'+esc(date(activityTime))+'</time></p><p>'+badge(statusTone(row.last_status),labels[row.last_status]||'未确认')+(row.last_http_status?' · HTTP '+esc(row.last_http_status):'')+'</p>'+requestStatus+'<p><code class="small">'+esc(row.last_model||'未记录模型')+'</code></p><p class="small">近 24h '+number(row.attempts_24h)+' 次上游尝试 · 成功 '+number(row.success_24h)+' · 失败 '+number(row.error_24h)+' · 取消 '+number(row.canceled_24h)+'</p>'+(row.last_error_code?'<p class="small muted">'+esc(row.last_error_code)+'</p>':'')+(row.last_request_id?button('account-last-request','查看最近请求','data-request-id="'+esc(row.last_request_id)+'"','quiet compact'):'')+'<small class="muted">仅留存记录，不含余额查询'+(partial?' · 记录不完整':'')+(status==='retrying'?' · 显示上次快照，稍后重连':'')+(status==='unauthorized'?' · 登录已失效':'')+'</small></div>';
+  }
   function limitNotices(pool){
     if(!pool?.rateLimitedModels?.length)return '';
     return `<div class="limit-list">${pool.rateLimitedModels.map(m=>{
@@ -1121,8 +1173,7 @@
   }
   function requestRow(r,i,open){
     const tone=statusTone(r.status);
-    const secs=ms=>ms==null?'—':(ms/1000).toFixed(1)+'s';
-    const tps=r.output_tokens!=null&&r.duration_ms>0?Math.round(r.output_tokens/(r.duration_ms/1000)*10)/10:null;
+    const tps=requestTokenRate(r);
     // The log records one cached-token figure; Anthropic splits it into write and
     // read tiers, which this ledger does not separate. Showing one number is
     // honest; inventing a second would not be.
@@ -1133,7 +1184,7 @@
       <td><code>${esc(r.key_name||r.key_id||'—')}</code></td>
       <td><span class="small">${esc(protocolName(r.protocol))}</span></td>
       <td><strong>${esc(r.model||'—')}</strong></td>
-      <td>${secs(r.ttfb_ms)} / ${secs(r.duration_ms)}</td>
+      <td>${requestTimingHtml(r)}</td>
       <td>${r.input_tokens==null?'—':token(r.input_tokens)}</td>
       <td>${hit}</td>
       <td>${r.output_tokens==null?'—':token(r.output_tokens)}</td>
@@ -1160,6 +1211,7 @@
     return `<ul class="request-credit-attempts">${rows}</ul>${record.attempts_truncated?'<p class="small muted">部分尝试没有留存明细</p>':''}`;
   }
   async function loadRequestAttemptCredits(node,requestID,generation){
+    if(node.dataset.creditReadStarted===requestID)return;node.dataset.creditReadStarted=requestID;
     const isCurrent=()=>generation===state.version&&state.route==='logs'&&node.isConnected;
     try{
       const {record}=await api('requests/'+encodeURIComponent(requestID));
@@ -1193,25 +1245,72 @@
       <p class="small muted">展开只显示请求元数据；消息内容与凭据不在留存量中。</p>
     </div>`;
   }
-  async function logs() {
-    const data=await api('requests?limit=30&offset='+String(state.logOffset || 0));
-    const rows=data.items || data.requests || data.rows;
-    if(!Array.isArray(rows))throw new APIError('request_failed',503);
-    state.requestRows=rows;
-    state.logOpen=new Set();
+  function requestLogPath(){const q=new URLSearchParams({limit:'30',offset:String(state.logOffset||0)});if(state.logRequestID)q.set('request_id',state.logRequestID);return 'requests?'+q;}
+  function requestDuration(ms){if(typeof ms!=='number'||!Number.isFinite(ms)||ms<0)return '—';return ms<1000?Math.round(ms)+'ms':Number((ms/1000).toFixed(2))+'s';}
+  function requestTokenRate(row){const duration=row.duration_ms,first=row.ttfb_ms;if(!Number.isFinite(row.output_tokens)||row.output_tokens<0||!Number.isFinite(duration)||!Number.isFinite(first)||first<0||!(duration>first))return null;return Math.round(row.output_tokens/((duration-first)/1000)*10)/10;}
+  function requestTimingHtml(r){return '<span title="首个有效响应帧：'+esc(r.ttfb_ms==null?'未观测':r.ttfb_ms+' ms')+'；全程：'+esc(r.duration_ms)+' ms">'+requestDuration(r.ttfb_ms)+' / '+requestDuration(r.duration_ms)+'</span>';}
+  function requestTableMarkup(rows){
     const head=['','时间','调用方','协议','模型','TTFB / total','输入','缓存命中','输出','tok/s','状态','花费','请求 ID'];
-    $('#view').innerHTML=heading(button('reload','刷新记录','','quiet'))+
-      (rows.length?`<div class="log-table-wrap"><table class="log-table"><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map((r,i)=>requestRow(r,i,false)).join('')}</tbody></table></div>`:empty('暂无请求记录','记录由网关真实请求生成，不包括面板的目录读取。'))+
-      `<div class="pagination"><span>共 ${number(data.total)} 条</span><div class="actions">${button('logs-prev','上一页',!state.logOffset?'disabled':'')}${button('logs-next','下一页',(state.logOffset || 0)+30>=data.total?'disabled':'')}</div></div>`;
+    return rows.length?'<div class="log-table-wrap"><table class="log-table"><thead><tr>'+head.map(h=>'<th'+(h==='TTFB / total'?' title="首包：上游有效数据帧；全程：请求结束，包含排队和下游收尾。"':'')+'>'+esc(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>requestRow(r,i,state.logOpen.has(r.request_id))).join('')+'</tbody></table></div>':empty('暂无请求记录','记录会根据真实请求生成，不包括模型目录读取。');
   }
+  async function logs() {
+    const generation=state.version,path=requestLogPath(),data=await api(path);if(generation!==state.version)return;
+    const rows=data.items||data.requests||data.rows;if(!Array.isArray(rows))throw new APIError('request_failed',503);
+    state.requestRows=rows;state.logOpen=new Set([...(state.logOpen||[])].filter(id=>rows.some(row=>row.request_id===id)));state.logPending=null;state.logTotal=data.total;
+    $('#view').innerHTML=heading(button('reload','刷新记录','','quiet'))+
+      '<div class="live-records-bar"><span id="records-live-status" class="small muted" role="status" aria-live="polite">自动同步已开启</span><div class="actions"><button type="button" data-action="logs-show-new" id="records-new" class="quiet compact" hidden></button>'+(state.logRequestID?button('logs-all','返回全部记录','','quiet compact'):'')+button('logs-pause',state.logsPaused?'继续更新':'暂停更新','','quiet compact')+'</div></div>'+
+      '<div id="records-content">'+requestTableMarkup(rows)+'</div>'+
+      '<div class="pagination"><span id="records-total">共 '+number(data.total)+' 条</span><div class="actions">'+button('logs-prev','上一页',!state.logOffset?'disabled':'')+button('logs-next','下一页',(state.logOffset||0)+30>=data.total?'disabled':'')+'</div></div>';
+    state.readMonitor=createReadMonitor({path,immediate:false,isCurrent:()=>generation===state.version&&state.route==='logs',apply:refreshRequestRows,status:paintRecordsStatus});
+    if(state.logsPaused)state.readMonitor.setPaused(true);loadOpenRequestCredits();
+  }
+  function paintRecordsStatus(status='live'){
+    const node=$('#records-live-status');if(!node)return;
+    const texts={live:'自动同步已开启',paused:'已暂停自动同步',hidden:'页面隐藏，已暂停同步',retrying:'连接暂不可用，正在退避重连',unauthorized:'登录已失效，已停止自动同步'};
+    node.textContent=texts[status]||texts.live;
+    const b=$('#records-new');if(b){b.hidden=!state.logPending;b.textContent=state.logPending?'有新记录，点击查看':'';}
+  }
+  function refreshRequestRows(data,force=false){
+    const rows=data.items||data.requests||data.rows;if(!Array.isArray(rows))throw new APIError('request_failed',503);
+    const old=state.requestRows||[],oldIDs=new Set(old.map(row=>row.request_id)),newIDs=new Set(rows.map(row=>row.request_id));
+    const hasNew=rows.some(row=>!oldIDs.has(row.request_id));
+    const losesOpen=[...(state.logOpen||[])].some(id=>oldIDs.has(id)&&!newIDs.has(id));
+    if(!force&&((state.logOffset||0)>0||window.scrollY>160||window.getSelection()?.type==='Range'||$('#dialog')?.open||losesOpen)){
+      if(hasNew||losesOpen||data.total!==state.logTotal){state.logPending=data;paintRecordsStatus();}return;
+    }
+    if(JSON.stringify(old)===JSON.stringify(rows)&&state.logTotal===data.total)return;
+    const tbody=$('.log-table tbody');
+    if(!tbody){$('#records-content').innerHTML=requestTableMarkup(rows);}
+    else{
+      const pairs=new Map();for(const node of tbody.querySelectorAll('.log-row')){const detail=node.nextElementSibling;pairs.set(old[Number(node.dataset.requestRow)]?.request_id,{node,detail:detail?.classList.contains('log-detail-row')?detail:null});}
+      const focused=document.activeElement,fragment=document.createDocumentFragment();
+      rows.forEach((r,i)=>{
+        let pair=pairs.get(r.request_id);
+        if(!pair){const body=document.createElement('tbody');body.innerHTML=requestRow(r,i,state.logOpen.has(r.request_id));pair={node:body.firstElementChild,detail:body.children[1]||null};}
+        pair.node.dataset.requestRow=String(i);const b=pair.node.querySelector('[data-action=request-expand]');if(b)b.dataset.index=String(i);
+        fragment.append(pair.node);if(pair.detail&&state.logOpen.has(r.request_id))fragment.append(pair.detail);
+      });
+      tbody.replaceChildren(fragment);if(focused?.isConnected)focused.focus({preventScroll:true});
+    }
+    state.requestRows=rows;state.logTotal=data.total;state.logPending=null;
+    $('#records-total').textContent='共 '+number(data.total)+' 条';
+    $('[data-action=logs-next]').disabled=(state.logOffset||0)+30>=data.total;paintRecordsStatus();loadOpenRequestCredits();
+  }
+  function loadOpenRequestCredits(){
+    for(const [i,r] of (state.requestRows||[]).entries())if(state.logOpen?.has(r.request_id)){
+      const row=document.querySelector('tr[data-request-row="'+i+'"]'),node=row?.nextElementSibling?.querySelector('[data-request-attempt-credit]');
+      if(node)void loadRequestAttemptCredits(node,r.request_id,state.version);
+    }
+  }
+
   // Toggle one row in place. Re-rendering the single row keeps scroll position and
   // avoids refetching the page for what is already in the DOM.
   function toggleRequestRow(index){
     const rows=state.requestRows||[],r=rows[index];
     if(!r)return;
     state.logOpen=state.logOpen||new Set();
-    const open=!state.logOpen.has(index);
-    if(open)state.logOpen.add(index);else state.logOpen.delete(index);
+    const open=!state.logOpen.has(r.request_id);
+    if(open)state.logOpen.add(r.request_id);else state.logOpen.delete(r.request_id);
     const current=document.querySelector(`tr[data-request-row="${index}"]`);
     if(!current)return;
     const next=document.createElement('tbody');
@@ -1755,6 +1854,10 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
     if(name==='copy-endpoint'){const value=element.dataset.value||'';try{await navigator.clipboard.writeText(value);toast('接入地址已复制。');}catch{const box=document.getElementById('endpoint-base');if(box){const range=document.createRange();range.selectNodeContents(box);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);}toast('已选中地址，请按 Ctrl+C 复制。');}return;}
     if(name==='logs-prev' || name==='logs-next'){state.logOffset=Math.max(0,(state.logOffset || 0)+(name==='logs-next'?30:-30));await reload();return;}
     if(name==='request-expand'){toggleRequestRow(index);return;}
+    if(name==='logs-pause'){state.logsPaused=!state.logsPaused;state.readMonitor?.setPaused(state.logsPaused);element.textContent=state.logsPaused?'继续更新':'暂停更新';return;}
+    if(name==='logs-show-new'){state.logOffset=0;window.scrollTo({top:0,behavior:'smooth'});await reload();return;}
+    if(name==='logs-all'){state.logRequestID='';state.logOffset=0;await reload();return;}
+    if(name==='account-last-request'){state.logRequestID=element.dataset.requestId;state.logOffset=0;state.logOpen=new Set([state.logRequestID]);location.hash='logs';return;}
     if(name==='usage-range'){state.usageRange={from:element.dataset.from||'',to:element.dataset.to||''};filterUsage();return;}
     if(name==='usage-apply'){const from=document.getElementById('usage-from')?.value||'',to=document.getElementById('usage-to')?.value||'';if(from&&to&&from>to){toast('起始日期不能晚于结束日期。');return;}state.usageRange={from,to};filterUsage();return;}
     if(name==='usage-reset'){state.usageRange={from:'',to:''};filterUsage();return;}

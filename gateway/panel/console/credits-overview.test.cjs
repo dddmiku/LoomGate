@@ -15,6 +15,9 @@ function consoleCredits({route = 'overview', providers = [], accounts = [], next
   let currentAccounts = accounts;
   const fn = (from, to) => source.slice(source.indexOf(from), source.indexOf(to, source.indexOf(from)));
   const context = {state, esc: String, number: String, date: String, $: elementFor,
+    // This fixture isolates the existing wallet readback loop. The new local
+    // activity observer has separate timer/visibility and browser regressions.
+    createReadMonitor:()=>({stop(){},setPaused(){}}),
     table: (_, rows) => rows.map(r => r.join('')).join(''), empty: String,
     accountStatus: () => '', providerName: String, installViewContent: value => { elementFor('#view').innerHTML = value; },
     heading: String, button: () => '', notice: String, providerFilter: () => '', bindProviderFilter() {},
@@ -23,7 +26,7 @@ function consoleCredits({route = 'overview', providers = [], accounts = [], next
     async accountsFor(provider, _, onSnapshot) { reads.push('accounts:'+provider); onSnapshot({}); return currentAccounts.map(a=>({...a})); },
   };
   vm.createContext(context);
-  const code = [fn('  const creditIsPending', '  function providerFilter'), fn('  async function providers(', '  // 服务端 /api/state'), fn('  const num =', '  async function services('), fn('  async function accounts()', '  // 模型限流与积分过期必须常显')].join('\n');
+  const code = [fn('  const creditIsPending', '  function providerFilter'), fn('  async function providers(', '  function createReadMonitor('), fn('  const num =', '  async function services('), fn('  async function accounts()', '  // 模型限流与积分过期必须常显'),fn('  function accountActivityCell(', '  function limitNotices(')].join('\n');
   vm.runInContext(code + '\nthis.renderOverview = overview; this.renderAccounts = accounts; this.readback = scheduleCreditReadback;', context);
   return {context, reads, timers, state, elementFor, setAccounts(rows) {currentAccounts = rows;}};
 }

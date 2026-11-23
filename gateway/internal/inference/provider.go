@@ -17,6 +17,9 @@ type Model struct {
 	Credits string
 }
 type Result struct {
+	// FirstByteAt is the first valid upstream data frame, before downstream
+	// adapters/writes. Zero means unobserved, not the completion timestamp.
+	FirstByteAt                       time.Time
 	Text, AccountRef, RequestDigest   string
 	Reasoning                         string // Buffered reasoning, separate from the answer.
 	Attempted, Acknowledged, Complete bool
@@ -150,6 +153,7 @@ type Attempt struct {
 	// AccountRef identifies the provider account used for this upstream call.
 	AccountRef            string
 	StartedAt, FinishedAt time.Time
+	FirstByteAt           time.Time
 	// HTTPStatus is zero if no response headers arrived.
 	HTTPStatus   int
 	ErrorCode    string

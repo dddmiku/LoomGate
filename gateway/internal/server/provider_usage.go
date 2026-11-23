@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"time"
 
 	"workbuddy2api/internal/inference"
 	"workbuddy2api/internal/requestlog"
@@ -60,12 +61,26 @@ func providerTokenValue(n *int) int {
 }
 
 func recordProviderAttempts(st *chatStat, result inference.Result, model string, err error) {
+	if result.Attempted && !result.FirstByteAt.IsZero() && !result.FirstByteAt.Before(st.start) && !result.FirstByteAt.After(time.Now()) {
+		observed := result.FirstByteAt.Sub(st.start)
+		if st.ttfb == 0 || observed < st.ttfb {
+			st.ttfb = observed
+		}
+	}
 	st.upstreamStarted = result.Attempted
 	st.uid = result.AccountRef
 	u := providerUsage(result)
 	st.unreported = !u.Complete()
 	st.prompt, st.toks, st.cached = providerTokenValue(u.Prompt), providerTokenValue(u.Completion), providerTokenValue(u.Cached)
 	records := result.AttemptRecords
+	for _, a := range records {
+		if !a.FirstByteAt.IsZero() && !a.FirstByteAt.Before(st.start) && !a.FirstByteAt.After(time.Now()) {
+			d := a.FirstByteAt.Sub(st.start)
+			if st.ttfb == 0 || d < st.ttfb {
+				st.ttfb = d
+			}
+		}
+	}
 	summarized := len(records) == 0 && result.Attempted
 	if summarized {
 		// Some providers signal submission but cannot report the transport status.

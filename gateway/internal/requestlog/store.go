@@ -34,8 +34,9 @@ type frame struct {
 }
 
 type entry struct {
-	line    []byte
-	summary Summary
+	line     []byte
+	summary  Summary
+	activity []activitySample
 }
 
 type snapshot struct {
@@ -260,7 +261,7 @@ func encodeEntry(r Record) (entry, error) {
 	if len(line) > MaxRecordBytes {
 		return entry{}, ErrRecordTooLarge
 	}
-	return entry{line: line, summary: summarize(r)}, nil
+	return entry{line: line, summary: summarize(r), activity: activitySamples(r)}, nil
 }
 
 func decodeEntry(line []byte) (entry, error) {
@@ -282,7 +283,7 @@ func decodeEntry(line []byte) (entry, error) {
 	if err != nil {
 		return entry{}, ErrCorrupt
 	}
-	return entry{line: bytes.Clone(line), summary: summarize(r)}, nil
+	return entry{line: bytes.Clone(line), summary: summarize(r), activity: activitySamples(r)}, nil
 }
 
 func decodeStrict(data []byte, value any) error {
