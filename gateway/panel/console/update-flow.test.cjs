@@ -27,6 +27,19 @@ function flow(storage=new Map()) {
 const ready = extra => ({ok:true,status:{enabled:true,repo:'fixture/repo',current:'v1.0.0',state:'idle',
   signature_verification:true,latest_tag:'v1.0.2',asset_name:'fixture.zip',update_ready:true,...extra}});
 
+test('only the always-present check and a confirmed update remain as controls',()=>{
+  const f=flow();
+  f.context.paint(f.card,ready({state:'failed',visibility:'unknown',update_ready:false,unavailable_reason:'fixture visibility probe failed'}));
+  const check=f.nodes.get('[data-action="update-check"]'),apply=f.nodes.get('[data-action="update-apply"]');
+  assert.equal(check.hidden,false);assert.equal(check.disabled,false);assert.equal(apply.hidden,true);
+  f.context.paint(f.card,{ok:false,enabled:false,message:'fixture disabled'});
+  assert.equal(check.hidden,false);assert.equal(check.disabled,true);assert.equal(apply.hidden,true);
+  f.context.paint(f.card,ready());assert.equal(apply.hidden,false);
+  f.context.state.pending.add('update-check');f.context.paint(f.card,ready());
+  assert.equal(check.disabled,true);assert.equal(apply.hidden,true);
+  assert.doesNotMatch(source,/button\('update-status'/);
+});
+
 test('stale tab protection self-clears for authoritative idle and failure without discarding the real error',()=>{
   for(const state of ['idle','failed']) {
     const f=flow();f.storage.set('loomgate.unconfirmedUpdate',JSON.stringify({repo:'fixture/repo',tag:'v1.0.2'}));

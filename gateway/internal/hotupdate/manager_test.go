@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -186,6 +187,42 @@ func TestFailedCheckDoesNotStampCheckedAt(t *testing.T) {
 	}
 	if status.UpdateReady {
 		t.Fatal("检查失败时不应报告可升级")
+	}
+}
+
+func TestCheckRecoversAfterAnUnknownVisibilityProbe(t *testing.T) {
+	var metadataOK atomic.Bool
+	var metadataCalls, latestCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/fixture/repo" {
+			metadataCalls.Add(1)
+			if !metadataOK.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
+		if r.URL.Path == "/repos/fixture/repo/releases/latest" {
+			latestCalls.Add(1)
+			_, _ = w.Write([]byte(`{"tag_name":"v1.0.15","assets":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	m := &Manager{opts: Options{Enabled: true}, client: &Client{Repo: "fixture/repo", APIBase: server.URL, HTTP: server.Client()}}
+	first, err := m.Check(t.Context())
+	if err == nil || !first.Enabled || first.Visibility != VisibilityUnknown || first.State != StateFailed || !first.CheckedAt.IsZero() || first.UpdateReady {
+		t.Fatal("failed probe must remain enabled but unconfirmed and not ready")
+	}
+	metadataOK.Store(true)
+	second, err := m.Check(t.Context())
+	if err != nil || !second.Enabled || second.Visibility != VisibilityPublic || second.State != StateIdle || second.LatestTag != "v1.0.15" || second.CheckedAt.IsZero() || second.LastError != "" || second.UnavailableReason != "" {
+		t.Fatal("a fresh check must recover without restart or configuration edits")
+	}
+	if metadataCalls.Load() != 2 || latestCalls.Load() != 1 {
+		t.Fatal("recovery must use the actual metadata and release paths without hidden retries")
 	}
 }
 

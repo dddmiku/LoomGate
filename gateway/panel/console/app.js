@@ -170,7 +170,7 @@
   function heading(actions='') { const r=routes[state.route]; return `<div class="page-heading"><div><h1>${r[1]}</h1><p>${r[2]}</p></div><div class="actions">${actions}</div></div>`; }
   function table(headers, rows) { return `<div class="table-wrap"><table class="responsive"><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map((cell,i)=>`<td data-label="${esc(headers[i])}"><div>${cell}</div></td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
   class APIError extends Error { constructor(code,status,detail='') { super(detail || errorLabels[code] || (status===403?'没有执行此操作的权限，请重新登录。':status===429?'请求过于频繁，请稍后重试。':'请求未完成，请检查服务状态后重试。')); this.code=code; this.status=status; } }
-  function requestTimeout(path){return path==='connections/start'||path==='connections/step'?40000:path==='migration/preflight'?120000:18000;}
+  function requestTimeout(path){return path==='connections/start'||path==='connections/step'?40000:path==='migration/preflight'?120000:path==='update/check'?65000:18000;}
   function timeoutErrorCode(path){return path==='migration/preflight'?'migration_timeout':'catalog_timeout';}
   async function api(path, {body, signal=state.controller?.signal, allowNotOK=false} = {}) {
     const controller=new AbortController(), abort=()=>controller.abort();
@@ -1350,7 +1350,7 @@
   const updateBusy=status=>['checking','downloading','handover','restarting'].includes(status?.state);
   const updateTransitioning=status=>updateBusy(status)||status?.restart_required===true;
   function updateView(update) {
-    const empty = {unread:true,canCheck:false,canApply:false,badge:'manual_action',badgeText:'状态未读取',detail:'',lines:[]};
+    const empty = {unread:true,canCheck:true,canApply:false,badge:'manual_action',badgeText:'状态未读取',detail:'',lines:[]};
     if(!update) return empty;
     const status = update.status || {};
     const lines = [];
@@ -1373,16 +1373,18 @@
     lines.push(status.signature_verification === true ? '签名校验：已启用（内置发布公钥）' : '签名校验：未内置发布公钥（构建不验签）');
     if(status.state === 'failed' && status.last_error) lines.push('失败原因：' + status.last_error);
     const base = {unread:false,lines,detail:'',canCheck:true,canApply:false};
-    if(update.ok === false) return {...base,canCheck:false,badge:'disabled',badgeText:'未启用',detail:typeof update.message === 'string' && update.message ? update.message : '当前构建未启用热更新。'};
+    if(update.ok === false&&status.enabled!==true) return {...base,canCheck:false,badge:'disabled',badgeText:'未启用',detail:typeof update.message === 'string' && update.message ? update.message : '当前构建未启用热更新。'};
     if(status.enabled !== true) return {...base,canCheck:false,badge:'disabled',badgeText:'已关闭',detail:status.unavailable_reason || '热更新已在配置中关闭（config update.enabled=false）。'};
-    if(status.unavailable_reason) return {...base,canCheck:false,badge:'unavailable',badgeText:'不可用',detail:status.unavailable_reason};
-    if(status.state === 'failed') return {...base,badge:'failed',badgeText:'失败',detail:status.last_error || '上次更新失败，可重新检查。'};
+    // A visibility probe result is not the feature switch: re-check it, but
+    // never offer Apply while visibility or update discovery is unconfirmed.
+    if(status.unavailable_reason) return {...base,canCheck:!updateBusy(status),badge:'unavailable',badgeText:'不可用',detail:status.unavailable_reason};
+    if(status.state === 'failed'||update.ok===false) return {...base,canCheck:!updateBusy(status),badge:'failed',badgeText:'失败',detail:status.last_error || update.message || '上次更新失败，可重新检查。'};
     if(updateBusy(status)) return {...base,canCheck:false,badge:'ready',badgeText:updateStateLabels[status.state],detail:status.auto_restart===true?'更新正在进行，程序将自动切换并回读运行版本；连接短暂中断时会自动重连，下载完成不等于已更新。':'更新正在进行，正在回读运行状态；连接短暂中断时会自动重连，下载完成不等于已更新。'};
     if(status.restart_required === true) return {...base,canCheck:false,badge:'manual_action',badgeText:status.auto_restart===true?'自动切换中':'尚未切换',detail:status.auto_restart===true?'更新包已校验，程序正在自动切换并核验运行版本。':'更新包已准备好，当前版本仍在运行；服务尚未完成切换，将继续读取真实运行状态。'};
     if(status.update_ready === true){
       const canApply=status.state==='idle'&&status.signature_verification===true&&typeof status.repo==='string'&&status.repo.trim()!==''&&
         typeof status.asset_name==='string'&&status.asset_name!==''&&typeof status.latest_tag==='string'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(status.latest_tag);
-      return {...base,canApply,badge:'ready',badgeText:'可升级',detail:canApply?'检测到更新；点击「立即更新」后自动下载、验签、切换并确认运行版本。':'检测到更新，但本构建缺少验签能力或完整目标信息；此界面不会应用未核验的更新。'};
+      return {...base,canApply,badge:'ready',badgeText:'可升级',detail:canApply?'检测到更新；点击「更新」后自动下载、验签、切换并确认运行版本。':'检测到更新，但本构建缺少验签能力或完整目标信息；此界面不会应用未核验的更新。'};
     }
     if(checked) return {...base,badge:'ready',badgeText:'已是最新',detail:'已读取远端发布，没有比当前构建更新的版本。'};
     return {...base,badge:'manual_action',badgeText:'未检查',detail:'尚未读取远端发布；点击「检查更新」后再确认是否有新版本。'};
@@ -1447,8 +1449,9 @@
     $('.update-facts',card).innerHTML=info.lines.map(line=>{const p=line.indexOf('：');return `<div><dt>${esc(p>0?line.slice(0,p):'状态')}</dt><dd>${esc(p>0?line.slice(p+1):line)}</dd></div>`;}).join('');
     $('.update-facts',card).hidden=!info.lines.length;
     const checking=$('[data-action="update-check"]',card),applying=$('[data-action="update-apply"]',card);
-    checking.hidden=!info.canCheck||Boolean(intent);applying.hidden=!info.canApply||Boolean(intent);
-    checking.disabled=applying.disabled=state.pending.has('runtime-update');
+    const pending=state.pending.has('runtime-update')||state.pending.has('update-check');
+    checking.hidden=false;applying.hidden=!info.canApply||Boolean(intent)||pending;
+    checking.disabled=pending||(!info.canCheck&&!intent&&!updateTransitioning(status));applying.disabled=pending;
     $('.update-badge',card).innerHTML=badge(info.badge,info.badgeText);
     if(completed||updateRunningTarget(status,card._updateCompleted))updateActionNotice(card,'运行版本已核验：'+status.current+'。此处是当前进程读回，不是部署时间记录。','');
     else if(intent||updateTransitioning(status))updateActionNotice(card,'更新正在进行，正在自动核验运行版本；短暂断连会自动重连。不会重复提交更新。','');
@@ -1466,17 +1469,17 @@
       const snapshot=await api('update',{signal:null,allowNotOK:true});
       if(!current())return;
       paintUpdateCard(card,snapshot);
-      if((readUpdateIntent()||updateTransitioning(snapshot.status))&&!retry())updateActionNotice(card,'暂未核验到目标运行版本，可刷新状态继续查看；未重复提交更新。');
+      if((readUpdateIntent()||updateTransitioning(snapshot.status))&&!retry())updateActionNotice(card,'暂未核验到目标运行版本，可再次点击「检查更新」继续核验；未重复提交更新。');
     }catch(e){
       if(!current())return;
       const waiting=Boolean(readUpdateIntent())||updateTransitioning(card._updateSnapshot?.status);
-      if(waiting)updateActionNotice(card,retry()?'更新服务暂时断开，正在自动重连并核验运行版本；不会重新提交。':'暂未核验到目标运行版本，可刷新状态继续查看；未重复提交更新。');
+      if(waiting)updateActionNotice(card,retry()?'更新服务暂时断开，正在自动重连并核验运行版本；不会重新提交。':'暂未核验到目标运行版本，可再次点击「检查更新」继续核验；未重复提交更新。');
       else paintUpdateCard(card,undefined,e instanceof APIError?e.message:'状态读取失败；未重复提交更新。');
     }
   }
   function updateTarget(status){return JSON.stringify([status.repo,status.current,status.commit,status.latest_tag,status.asset_name]);}
   async function applyRuntimeUpdate(){
-    if(state.pending.has('runtime-update'))return;
+    if(state.pending.has('runtime-update')||state.pending.has('update-check'))return;
     const card=$('#setting-update'),generation=state.version,target=card?._updateSnapshot?.status;
     const current=()=>generation===state.version&&card?.isConnected&&$('#setting-update')===card;
     if(!current())return;
@@ -1572,7 +1575,7 @@
       </section>
       <section class="panel" id="setting-update"><div class="panel-title"><h2>迁移与更新</h2></div>
         <div class="update-notice"></div><dl class="detail-specs update-facts" hidden></dl><p data-update-action-status class="notice warn" role="status" hidden></p>
-        <div class="section-gap actions">${button('update-check','检查更新','hidden','quiet')}${button('update-apply','立即更新','hidden','primary')}${button('update-status','刷新状态','','quiet')}<span class="update-badge"></span></div>
+        <div class="section-gap actions">${button('update-check','检查更新','','quiet')}${button('update-apply','更新','hidden','primary')}<span class="update-badge"></span></div>
       </section>
     </div>`);
     paintLoopSetting($('#setting-loop'),loop.value?.stop_only,loop.reason?.message);
@@ -1887,17 +1890,30 @@ python -I -X utf8 tools/migration/migrate.py rollback --destination &lt;新工�
         toast('重复推理保护已从服务端核验。');
       },element);return;
     }
-    if(name==='update-status'){await readUpdateStatus($('#setting-update'),state.version);return;}
     if(name==='update-apply'){await applyRuntimeUpdate();return;}
     if(name==='update-check'){
-      if(state.pending.has('runtime-update')||readUpdateIntent()){await readUpdateStatus($('#setting-update'),state.version);return;}
+      if(state.pending.has('update-check'))return;
       const card=element.closest('#setting-update'),generation=state.version;
-      await mutate('update-check','update/check',{},async data=>{
+      // Reuse the only check control for read-only progress of an existing job.
+      if(state.pending.has('runtime-update')||readUpdateIntent()||updateTransitioning(card?._updateSnapshot?.status)){await readUpdateStatus(card,generation);return;}
+      $('[data-action=update-apply]',card).hidden=true;
+      element.disabled=true;
+      let received=null;
+      try{await mutate('update-check','update/check',{},async data=>{
+        if(!card?.isConnected||generation!==state.version)return;
         if(!data.status&&data.ok!==false)throw new APIError('request_failed',502);
+        received=data;
         if(card?.isConnected)paintUpdateCard(card,data);
         if(data.ok===false)throw new APIError('request_failed',400,typeof data.message==='string'?data.message:'更新检查失败。');
         toast('已检查更新。');
-      },element,{allowNotOK:true,isCurrent:()=>card?.isConnected&&generation===state.version});return;
+      },element,{allowNotOK:true,isCurrent:()=>card?.isConnected&&generation===state.version});}
+      finally{
+        const active=$('#setting-update');
+        if(active?.isConnected&&state.route==='settings'){
+          if(active===card&&generation===state.version&&received)paintUpdateCard(card,received);
+          else await readUpdateStatus(active,state.version);
+        }
+      }return;
     }
     if(name==='key-new'){await keyNewDialog();return;}
     if(name==='key-edit'){await keyEditDialog(element.dataset.id);return;}

@@ -26,12 +26,31 @@ const publicStatus = (extra) => Object.assign({
   },
 }, extra);
 
+test('a failed visibility probe remains retryable rather than hiding the only recovery action', () => {
+  const status={enabled:true,visibility:'unknown',state:'failed',current:'v1.0.13',latest_tag:'v1.0.13',
+    unavailable_reason:'尚未确认发布仓库可见性，请稍后重试「检查更新」',update_ready:false};
+  for(const ok of [true,false]){
+    const view=seam()({ok,status,message:status.unavailable_reason});
+    assert.equal(view.canCheck,true);
+    assert.equal(view.canApply,false);
+    assert.doesNotMatch(view.badgeText,/已关闭|未启用|已是最新/);
+  }
+});
+
+test('update checks have a bounded timeout covering the server metadata budget', () => {
+  const code=source.slice(source.indexOf('  function requestTimeout('),source.indexOf('  async function api('));
+  const context={};vm.createContext(context);vm.runInContext(code+';this.timeout=requestTimeout;',context);
+  assert.equal(context.timeout('update/check'),65000);
+  assert.equal(context.timeout('update'),18000);
+  assert.equal(context.timeout('connections/start'),40000);
+});
+
 test('unread envelope is reported as unread, never as disabled or downloaded', () => {
   const view = seam()(undefined);
   assert.equal(view.unread, true);
   assert.equal(view.badge, 'manual_action');
   assert.equal(view.badgeText, '状态未读取');
-  assert.equal(view.canCheck, false);
+  assert.equal(view.canCheck, true);
 });
 
 test('ok=false keeps the server message and does not offer the check button', () => {
@@ -41,7 +60,7 @@ test('ok=false keeps the server message and does not offer the check button', ()
   assert.ok(view.detail.includes('热更新未启用'), view.detail);
 });
 
-test('private repository reason is shown verbatim and the check button is disabled', () => {
+test('private repository blocks applying but remains re-checkable if visibility changes', () => {
   const reason = '发布仓库已转为私有，匿名读不到 Release；把仓库改回公开，或配置 update.token';
   const view = seam()(publicStatus({status: {
     enabled: true, visibility: 'private', unavailable_reason: reason,
@@ -50,7 +69,8 @@ test('private repository reason is shown verbatim and the check button is disabl
   assert.equal(view.badge, 'unavailable');
   assert.equal(view.badgeText, '不可用');
   assert.equal(view.detail, reason);
-  assert.equal(view.canCheck, false);
+  assert.equal(view.canCheck, true);
+  assert.equal(view.canApply, false);
   assert.ok(view.lines.some((line) => line.includes('owner/loomgate')), view.lines.join('|'));
 });
 

@@ -53,6 +53,7 @@ def main() -> int:
                               ("usage_filters_browser.py", "usage"),
                               ("token_units_browser.py", "tokens"),
                               ("update_frontend_reload_browser.py", "update-reload"),
+                              ("update_check_recovery_browser.py", "update-check-recovery"),
                               ("console_live_records_browser.py", "live-activity")]:
         command = [sys.executable, "-I", "-B", str(root / "tests" / script),
                    "--output", str(output / directory)]

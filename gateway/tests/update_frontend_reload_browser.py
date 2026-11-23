@@ -103,7 +103,7 @@ def successful_reload(browser, base, legacy=False):
             f.page.evaluate('loadUpdate()')
         else:
             expect(f.page.locator('#setting-update .update-facts')).to_contain_text('v1.0.2')
-            f.page.locator('[data-action=update-status]').click()
+            f.page.locator('[data-action=update-check]').click()
             assert f.app_versions == ['fixture-old', 'fixture-new'], 'app.js was not fetched again'
         f.page.wait_for_timeout(120)
         assert len(f.documents) == 2, 'status revisit caused another reload'

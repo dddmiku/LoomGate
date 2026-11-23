@@ -1074,7 +1074,7 @@ def stale_update_intent_recovers_automatically(browser, base, failed=False):
         f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate',JSON.stringify({tag:'v1.0.2',repo:'fixture-owner/fixture-product'}))")
         if failed:
             f.update['status'].update(state='failed', last_error='fixture automatic handover failed')
-        f.page.locator('[data-action=update-status]').click()
+        f.page.locator('[data-action=update-check]').click()
         f.page.wait_for_timeout(80)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')"), 'authoritative idle/failed status left stale browser protection in place'
         assert f.page.locator('[data-action=update-review]:visible').count() == 0, 'old intent still asks for manual protection removal'
@@ -1317,10 +1317,11 @@ def update_read_order_keeps_newest_status(browser, base, failed=False):
     f = Fixture(browser, base)
     try:
         ready_update(f)
+        f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate',JSON.stringify({tag:'v1.0.2',repo:'fixture-owner/fixture-product',started_at:Date.now()}))")
         f.hold('/api/update')
-        f.page.locator('[data-action=update-status]').click()
+        f.page.locator('[data-action=update-check]').click()
         f.wait_held('/api/update')
-        f.page.locator('[data-action=update-status]').click()
+        f.page.locator('[data-action=update-check]').click()
         for _ in range(100):
             if len(f.pending[('GET', '/api/update')]) == 2:
                 break
@@ -1343,7 +1344,7 @@ def malformed_update_intent_recovers_without_manual_review(browser, base):
     try:
         ready_update(f)
         f.page.evaluate("sessionStorage.setItem('loomgate.unconfirmedUpdate','{broken-fixture')")
-        f.page.locator('[data-action=update-status]').click()
+        f.page.locator('[data-action=update-check]').click()
         f.page.wait_for_timeout(70)
         assert not f.page.evaluate("sessionStorage.getItem('loomgate.unconfirmedUpdate')")
         assert f.page.locator('[data-action=update-review]').count() == 0
@@ -1380,7 +1381,7 @@ def update_check_is_scoped_and_readback_is_truthful(browser, base):
         request = f.wait_held('/api/update/check', 'POST').request.post_data_json
         assert request == {}
         f.release('/api/update/check', f.update, 'POST')
-        f.page.wait_for_function("document.querySelector('#setting-update .update-notice')?.textContent.includes('检测到更新')")
+        f.page.wait_for_function("document.querySelector('#setting-update .update-notice')?.textContent.includes('检测到更新') && !document.querySelector('[data-action=update-check]').disabled && !document.querySelector('[data-action=update-apply]').hidden")
         assert f.page.locator('[data-action=update-apply]:visible').count() == 1
         assert sum(call == ('POST', '/api/update/check') for call in f.requests) == 1
         assert f.page.evaluate("window.fixtureLoopCard===document.querySelector('#setting-loop')&&window.fixtureUpdateCard===document.querySelector('#setting-update')")
