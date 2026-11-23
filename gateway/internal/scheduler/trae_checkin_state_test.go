@@ -283,6 +283,9 @@ func TestTraeRetryCycleRetriesAfter9074(t *testing.T) {
 		},
 	}
 	s, _ := newTraeS(t, stub, t.TempDir())
+	// This test covers backoff, not the wall-clock schedule gate. Midnight
+	// gating is covered separately with fixed times in trae_schedule_test.go.
+	s.cfg.TraeCheckHours = nil
 
 	// 第一轮：撞 9074，留下退避 + 代数。
 	if _, err := s.traeCheckAll(context.Background()); err != nil {
@@ -330,6 +333,7 @@ func TestTraeRetryCycleSkipsAlreadyCheckedIn(t *testing.T) {
 		claimBodies: []string{`{"code":9074,"message":"限流"}`},
 	}
 	s, _ := newTraeS(t, stub, t.TempDir())
+	s.cfg.TraeCheckHours = nil // Exercise the account guard even before the daily fire.
 	// 手动标成「今天已签」，同时留一个 9074 痕迹。
 	s.markTraeCheckedIn("2081842786229369", 100)
 	s.noteTraeBackoff("2081842786229369")
@@ -353,6 +357,7 @@ func TestTraeRetryCycleIgnoresAccountsWithout9074(t *testing.T) {
 		claimBodies: []string{`{"code":0,"message":"success"}`},
 	}
 	s, _ := newTraeS(t, stub, t.TempDir())
+	s.cfg.TraeCheckHours = nil // Exercise retry eligibility independently of the clock.
 	// 全新账号：没有任何 9074 痕迹。
 	s.traeRetryCycle(context.Background())
 	if got := stub.claimCalls.Load(); got != 0 {
