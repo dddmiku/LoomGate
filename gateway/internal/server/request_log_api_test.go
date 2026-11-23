@@ -95,6 +95,36 @@ func TestRequestHistoryProjectsLegacyAutoClawAccountIDs(t *testing.T) {
 	if strings.Contains(string(recordJSON), "autoclaw-") == false {
 		t.Fatal("public identity lost its provider namespace")
 	}
+	var projected requestlog.Record
+	if err := json.Unmarshal(recordJSON, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Attempts) != 1 || projected.Attempts[0].AccountID != provider.PublicAccountID(record.Attempts[0].AccountID) {
+		t.Fatal("detail must retain the actual attempt's public account ID")
+	}
+}
+
+func TestRequestDetailKeepsRetryAccountAttributionAndMissingHistory(t *testing.T) {
+	record := facetsRecord("fixture-retry", "fixture-caller", "caller", "cn:fixture")
+	record.UpstreamStarted, record.AttemptCount, record.AttemptsTruncated = true, 4, true
+	record.Attempts = []requestlog.Attempt{
+		{Number: 1, AccountID: "fixture-first", Status: requestlog.StatusError},
+		{Number: 2, AccountID: "fixture-second", Status: requestlog.StatusSuccess},
+		{Number: 3, Status: requestlog.StatusError},
+	}
+	h := facetsFixture(t, []requestlog.Record{record})
+	code, body := facetsGet(t, h, "/requests/fixture-retry")
+	if code != http.StatusOK {
+		t.Fatal("detail request unavailable")
+	}
+	raw, _ := json.Marshal(body["record"])
+	var got requestlog.Record
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attempts) != 3 || got.Attempts[0].AccountID != "fixture-first" || got.Attempts[1].AccountID != "fixture-second" || got.Attempts[2].AccountID != "" || !got.AttemptsTruncated || got.AttemptCount != 4 {
+		t.Fatal("detail lost actual retry attribution or invented missing account history")
+	}
 }
 
 func TestRequestFacetsListsAllKeysAndModels(t *testing.T) {

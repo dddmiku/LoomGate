@@ -173,7 +173,7 @@ pre.code{display:block;max-width:100%;overflow-x:auto;white-space:pre;padding:14
 .log-specs{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 22px;margin:0 0 10px}
 .log-specs dt{font-size:11px;color:var(--muted);margin-bottom:2px}
 .log-specs dd{margin:0;overflow-wrap:anywhere}
-.request-credit-attempts{margin:0;padding-left:18px;max-height:106px;overflow:auto;overscroll-behavior:contain}
+.request-credit-attempts,.request-account-attempts{margin:0;padding-left:18px;max-height:106px;overflow:auto;overscroll-behavior:contain}
 @media (max-width:720px){.donut-wrap{grid-template-columns:1fr}.donut{margin:0 auto}.usage-bar-row{grid-template-columns:78px minmax(0,1fr) 80px;row-gap:2px}.usage-bar-row .small{grid-column:1/-1}}
 .task-log-row>td{background:var(--soft);padding:0!important}
 .task-log-row .log-detail{padding:14px 18px}

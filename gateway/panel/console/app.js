@@ -1210,18 +1210,32 @@
     const rows=attempts.map(a=>`<li>第 ${esc(a.number)} 次：${a.credit==null?'上游未上报':esc(a.credit)}</li>`).join('');
     return `<ul class="request-credit-attempts">${rows}</ul>${record.attempts_truncated?'<p class="small muted">部分尝试没有留存明细</p>':''}`;
   }
-  async function loadRequestAttemptCredits(node,requestID,generation){
-    if(node.dataset.creditReadStarted===requestID)return;node.dataset.creditReadStarted=requestID;
-    const isCurrent=()=>generation===state.version&&state.route==='logs'&&node.isConnected;
+  function requestAttemptAccounts(record){
+    if(record?.upstream_started===false)return '未调用上游';
+    const attempts=Array.isArray(record?.attempts)?record.attempts:[];
+    if(!attempts.length)return '账号信息未保留';
+    // Only IDs from actual upstream attempts, already projected by the detail
+    // API. Never substitute the current default, pool choice or caller key.
+    const rows=attempts.map(a=>`<li>第 ${esc(a.number)} 次：${a.account_id?`<code>${esc(a.account_id)}</code>`:'账号信息未保留'}</li>`).join('');
+    const partial=record.attempts_truncated||record.attempt_count>attempts.length;
+    return `<ul class="request-account-attempts">${rows}</ul>${partial?'<p class="small muted">部分尝试没有留存账号明细</p>':''}`;
+  }
+  async function loadRequestAttemptDetails(node,requestID,generation){
+    if(node.dataset.detailReadStarted===requestID)return;node.dataset.detailReadStarted=requestID;
+    const isCurrent=()=>generation===state.version&&state.route==='logs'&&node.isConnected&&node.dataset.requestDetail===requestID&&node.dataset.detailReadStarted===requestID;
+    const accounts=node.querySelector('[data-request-attempt-account]'),credits=node.querySelector('[data-request-attempt-credit]');
     try{
       const {record}=await api('requests/'+encodeURIComponent(requestID));
-      if(isCurrent())node.innerHTML=requestAttemptCredits(record?.request_id===requestID?record:null);
-    }catch{if(isCurrent())node.textContent='逐次花费暂不可读';}
+      if(!isCurrent())return;
+      if(record?.request_id!==requestID)throw new Error('request_detail_mismatch');
+      if(accounts)accounts.innerHTML=requestAttemptAccounts(record);
+      if(credits)credits.innerHTML=requestAttemptCredits(record);
+    }catch{if(isCurrent()){if(accounts)accounts.textContent='账号信息暂不可读';if(credits)credits.textContent='逐次花费暂不可读';}}
   }
   // The list and expanded panel use the same summary; partial charges remain partial.
   function requestDetailHtml(r){
     const k=(name,value)=>`<div><dt>${esc(name)}</dt><dd>${value??'—'}</dd></div>`;
-    return `<div class="log-detail">
+    return `<div class="log-detail" data-request-detail="${esc(r.request_id||'')}">
       <dl class="log-specs">
         ${k('请求标识',`<code>${esc(r.request_id||'—')}</code>`)}
         ${k('协议',`<code>${esc(protocolName(r.protocol))}</code>`)}
@@ -1229,6 +1243,7 @@
         ${k('状态',badge(statusTone(r.status),r.status||'未知')+(r.http_status?' · HTTP '+esc(r.http_status):''))}
         ${k('错误码',r.error_code?`<code>${esc(r.error_code)}</code>`:'—')}
         ${k('调用密钥',esc(r.key_name||r.key_id||'—'))}
+        ${k('使用账号',r.upstream_started===false?'未调用上游':r.request_id?'<div data-request-attempt-account title="公开账号标识，可在账号页核对；重试按真实尝试逐次列出" class="muted">正在读取…</div>':'账号信息未保留')}
         ${k('流式',r.stream?'是':'否')}
         ${k('开始时间',esc(date(r.started_at)))}
         ${k('结束时间',r.finished_at?esc(date(r.finished_at)):'—')}
@@ -1298,8 +1313,8 @@
   }
   function loadOpenRequestCredits(){
     for(const [i,r] of (state.requestRows||[]).entries())if(state.logOpen?.has(r.request_id)){
-      const row=document.querySelector('tr[data-request-row="'+i+'"]'),node=row?.nextElementSibling?.querySelector('[data-request-attempt-credit]');
-      if(node)void loadRequestAttemptCredits(node,r.request_id,state.version);
+      const row=document.querySelector('tr[data-request-row="'+i+'"]'),node=row?.nextElementSibling?.querySelector('[data-request-detail]');
+      if(node?.querySelector('[data-request-attempt-account],[data-request-attempt-credit]'))void loadRequestAttemptDetails(node,r.request_id,state.version);
     }
   }
 
@@ -1320,8 +1335,8 @@
     if(detailRow?.classList.contains('log-detail-row'))detailRow.remove();
     if(open)nodes[1]&&current.after(nodes[1]);
     current.replaceWith(nodes[0]);
-    const attemptCredit=open&&nodes[1]?.querySelector('[data-request-attempt-credit]');
-    if(attemptCredit)void loadRequestAttemptCredits(attemptCredit,r.request_id,state.version);
+    const detail=open&&nodes[1]?.querySelector('[data-request-detail]');
+    if(detail?.querySelector('[data-request-attempt-account],[data-request-attempt-credit]'))void loadRequestAttemptDetails(detail,r.request_id,state.version);
   }
 
   // /api/update 的信封有五种真实形态，控制台必须逐一说实话：
