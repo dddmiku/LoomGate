@@ -91,7 +91,9 @@ def exercise(browser,base,output):
         token(row.locator('td').nth(6),'1.23B',1234567890)
         token(row.locator('td').nth(7),'1M',999999)
         token(row.locator('td').nth(8),'1.23M',1234567)
-        expect(row.locator('td').nth(9)).to_have_text('1234567 tok/s')
+        # Throughput excludes the 100ms first-frame wait from the 1000ms total;
+        # it stays an exact numeric rate, never a compact token-count label.
+        expect(row.locator('td').nth(9)).to_have_text('1371741.1 tok/s')
         token(page.locator('[data-request-row="1"] td').nth(6),'0',0)
         expect(page.locator('[data-request-row="1"] td').nth(8)).to_have_text('—')
         expect(page.locator('[data-request-row="2"] td').nth(6)).to_have_text('—')
