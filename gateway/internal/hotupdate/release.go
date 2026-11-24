@@ -386,6 +386,12 @@ func armAssetName(goarm string) string {
 }
 
 // Latest 查询最新发布版本（含本机架构的二进制资产）。
+// Latest queries the latest release and resolves this host's asset.
+//
+// During the asset-name transition the same release carries both LoomGate-*
+// and historical wb2api-* names. The new name wins when present; the alias is
+// accepted so an upgraded updater can still consume an alias-only release.
+//
 // queryRelease fetches the release metadata, falling back to the download
 // proxy when the API refuses us.
 //
