@@ -169,6 +169,51 @@ func TestCooldownDurationIsHonoured(t *testing.T) {
 
 type longCoolingError struct{}
 
-func (longCoolingError) Error() string             { return "quota exhausted" }
-func (longCoolingError) RetryClass() Class         { return RetryAccount }
+func (longCoolingError) Error() string                   { return "quota exhausted" }
+func (longCoolingError) RetryClass() Class               { return RetryAccount }
 func (longCoolingError) CooldownDuration() time.Duration { return time.Hour }
+
+// A provider-wide 5xx must rotate accounts without cooling them. The production
+// AutoClaw incident had every account answer 500; cooling each one turned the
+// next request into an empty no_available_account 502 before any upstream call.
+func TestRotateNoCooldownDoesNotPoisonPool(t *testing.T) {
+	calls := []string{}
+	cool := NewCooldown()
+	value, err := Run(context.Background(), []string{"a", "b"}, 3, cool, func(_ context.Context, account string) (int, error) {
+		calls = append(calls, account)
+		if account == "a" {
+			return 0, fixedClass{class: RetryRotateNoCooldown, msg: "upstream 500"}
+		}
+		return 11, nil
+	})
+	if err != nil || value != 11 {
+		t.Fatalf("value=%d err=%v", value, err)
+	}
+	if len(calls) != 2 || calls[0] != "a" || calls[1] != "b" {
+		t.Fatalf("unexpected rotation: %v", calls)
+	}
+	if !cool.Ready("a") {
+		t.Fatal("provider-wide failure cooled a healthy account")
+	}
+}
+
+// Once every account has failed with a provider-wide 5xx, a later request must
+// still reach upstream instead of short-circuiting on an empty cooldown pool.
+func TestRotateNoCooldownPoolRemainsUsable(t *testing.T) {
+	cool := NewCooldown()
+	calls := 0
+	_, err := Run(context.Background(), []string{"a", "b"}, 3, cool, func(context.Context, string) (int, error) {
+		calls++
+		return 0, fixedClass{class: RetryRotateNoCooldown, msg: "upstream 500"}
+	})
+	if err == nil || calls != 2 {
+		t.Fatalf("first request calls=%d err=%v", calls, err)
+	}
+	value, err := Run(context.Background(), []string{"a", "b"}, 3, cool, func(context.Context, string) (int, error) {
+		calls++
+		return 21, nil
+	})
+	if err != nil || value != 21 || calls != 3 {
+		t.Fatalf("second request call=%d value=%d err=%v", calls, value, err)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"workbuddy2api/internal/accountvault"
 	"workbuddy2api/internal/inference"
 )
 
@@ -106,5 +107,49 @@ func TestAttemptAccountingPartialUsageSurvivesBrokenBody(t *testing.T) {
 	}
 	if result.Complete || !result.Attempted || !result.Usage.Reported() || !result.UsageReported || result.Usage.Prompt == nil || *result.Usage.Prompt != 17 || result.Usage.Completion != nil || result.AccountRef != a.ID {
 		t.Fatalf("broken body discarded observed usage/account facts: attempted=%v usage=%v account_present=%v", result.Attempted, result.Usage.Reported(), result.AccountRef != "")
+	}
+}
+
+// Production 2026-11-24: four different AutoClaw accounts each answered HTTP
+// 500 within ~2s. The old policy cooled every one; the next request had zero
+// available accounts and returned no_available_account without any upstream
+// call. A provider-wide 5xx must rotate without poisoning the pool.
+func TestProviderWide500DoesNotPoisonEveryAccount(t *testing.T) {
+	v, first := refreshFixture(t)
+	second := accountvault.Account{ID: "autoclaw-fixture-2", Provider: "autoclaw", Enabled: true}
+	profile, _ := json.Marshal(stored{AccessToken: "fixture-access-2", RefreshToken: "fixture-refresh-2"})
+	if _, err := v.Put(second, profile, 0); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	p := offlineRefreshProvider(t, v, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != chatPath {
+			return refreshSuccess(r), nil
+		}
+		calls.Add(1)
+		resp := refreshSuccess(r)
+		resp.StatusCode = http.StatusInternalServerError
+		resp.Body = io.NopCloser(strings.NewReader(`{"error":"upstream outage"}`))
+		return resp, nil
+	})
+	if _, err := p.CompleteDialogue(t.Context(), attemptDialogue(), nil); err == nil {
+		t.Fatal("provider-wide 500 was reported as success")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want both accounts tried", calls.Load())
+	}
+	// Both accounts must remain usable for the next request.
+	if !p.cooldown().Ready(first.ID) {
+		t.Fatal("first account was cooled by a provider-wide 500")
+	}
+	if !p.cooldown().Ready(second.ID) {
+		t.Fatal("second account was cooled by a provider-wide 500")
+	}
+	calls.Store(0)
+	if _, err := p.CompleteDialogue(t.Context(), attemptDialogue(), nil); err == nil {
+		t.Fatal("second request unexpectedly succeeded")
+	}
+	if calls.Load() == 0 {
+		t.Fatal("second request short-circuited with no upstream call")
 	}
 }

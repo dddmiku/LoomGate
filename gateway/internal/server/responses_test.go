@@ -817,3 +817,78 @@ func TestResponsesStreamFailureStaysInsideTheStream(t *testing.T) {
 		t.Fatalf("JSON body written into a started stream: %s", body)
 	}
 }
+
+// Codex 0.171 responses_lite sends its entire tool catalog in
+// input[0]={type:"additional_tools",role:"developer",tools:[...]}, not in the
+// top-level tools array. Reading only req.Tools left the upstream request with
+// zero tools while the transcript still had custom `exec` calls; the model
+// copied that name and the gateway rejected the turn as outside tool_choice.
+func TestResponsesLiteAdditionalToolsCatalogIsForwarded(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-6.1-sol",
+		"stream":true,
+		"tool_choice":"auto",
+		"input":[
+			{"type":"additional_tools","id":"at_1","role":"developer","tools":[
+				{"type":"namespace","name":"functions","description":"","tools":[
+					{"type":"custom","name":"exec","description":"Run JavaScript"},
+					{"type":"function","name":"exec_command","parameters":{"type":"object"}}
+				]}
+			]},
+			{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"run it"}]}
+		]
+	}`)
+	chatBody, req, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("lite request rejected: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := chat["tools"].([]any)
+	byName := map[string]map[string]any{}
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		fn := tool["function"].(map[string]any)
+		byName[fn["name"].(string)] = fn
+	}
+	if byName["exec"] == nil || byName["exec_command"] == nil {
+		t.Fatalf("lite catalog not forwarded by flat names: %v", byName)
+	}
+	// The default namespace must disappear; otherwise callers see
+	// functions__exec, which does not match their history or tool_choice.
+	if _, bad := byName["functions__exec"]; bad {
+		t.Fatalf("reserved functions namespace leaked into wire name: %v", byName)
+	}
+	if len(tools) != 2 {
+		t.Fatalf("unexpected forwarded tool count: %d", len(tools))
+	}
+	if req.customTools["exec"] != true {
+		t.Fatalf("custom exec bridge was lost: %v", req.customTools)
+	}
+	// The historical custom call has no namespace and must stay `exec`.
+	history := []byte(`{"model":"gpt-6.1-sol","stream":true,"input":[
+		{"type":"custom_tool_call","call_id":"c1","name":"exec","input":"text('ok')"},
+		{"type":"custom_tool_call_output","call_id":"c1","output":"ok"},
+		{"type":"message","role":"user","content":"continue"}
+	]}`)
+	chatBody, _, err = responsesToChat(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat = map[string]any{}
+	_ = json.Unmarshal(chatBody, &chat)
+	msgs := chat["messages"].([]any)
+	call := msgs[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	name := call["function"].(map[string]any)["name"]
+	if name != "exec" {
+		t.Fatalf("history tool name drifted: %v", name)
+	}
+	// A lite response must not invent a top-level tools echo the client never sent.
+	echo := map[string]any{}
+	req.applyEcho(echo)
+	if _, present := echo["tools"]; present {
+		t.Fatalf("lite response echoed synthetic tools: %v", echo["tools"])
+	}
+}

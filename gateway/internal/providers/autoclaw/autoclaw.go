@@ -427,20 +427,21 @@ func (e *accountError) PublicCode() string {
 	return ""
 }
 
-// RetryClass keeps the same policy the legacy path uses: auth/quota/rate-limit
-// and server faults implicate the account, a client error does not.
+// RetryClass distinguishes "this account is bad" from "the provider is down".
 //
-// 429/402 (rate limit, quota exhausted) get the long cooldown: retrying them
-// after 30s just burns the same wall-clock wait again. 401/403 get the short
-// one because the request path already tried a token renewal; reaching here
-// means the account itself is bad, and the operator needs to see it fail
-// rather than have it disappear for ten minutes.
+// 401/403/409 and 429/402 are account-scoped: the next account may work, so
+// rotate and cool this one down. A plain 5xx is not: in the 2026-11-24
+// production incident every AutoClaw account returned HTTP 500 within two
+// seconds, each failed account was cooled for 30s, and the very next request
+// found zero available accounts and returned an empty no_available_account
+// 502 without even trying upstream. Provider-wide failures rotate without
+// cooling; the request still gets one honest upstream attempt per account.
 func (e *accountError) RetryClass() providerretry.Class {
 	switch {
 	case e.status == 401 || e.status == 403 || e.status == 429 || e.status == 402 || e.status == 409:
 		return providerretry.RetryAccount
 	case e.status >= 500:
-		return providerretry.RetryAccount
+		return providerretry.RetryRotateNoCooldown
 	}
 	return providerretry.Fatal
 }

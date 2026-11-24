@@ -122,8 +122,9 @@ func TestEmptyAnswerIsAnError(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorClassifiesForRotation checks the rotation policy: auth,
-// quota and server errors implicate the account; a client error does not.
+// TestUpstreamErrorClassifiesForRotation checks the rotation policy: auth and
+// quota errors implicate the account, provider-wide 5xx rotate without cooling
+// an otherwise healthy account, and client errors do not rotate.
 func TestUpstreamErrorClassifiesForRotation(t *testing.T) {
 	for _, tc := range []struct {
 		status int
@@ -131,7 +132,7 @@ func TestUpstreamErrorClassifiesForRotation(t *testing.T) {
 	}{
 		{401, providerretry.RetryAccount}, {403, providerretry.RetryAccount},
 		{429, providerretry.RetryAccount}, {402, providerretry.RetryAccount},
-		{500, providerretry.RetryAccount}, {503, providerretry.RetryAccount},
+		{500, providerretry.RetryRotateNoCooldown}, {503, providerretry.RetryRotateNoCooldown},
 		{400, providerretry.Fatal}, {404, providerretry.Fatal}, {422, providerretry.Fatal},
 	} {
 		got := (&accountError{status: tc.status}).RetryClass()

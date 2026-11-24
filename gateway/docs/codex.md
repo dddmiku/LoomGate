@@ -32,6 +32,17 @@
 
 ## 配置
 
+### 新版 Codex 的工具目录
+
+v1.0.16 起支持 Codex `responses_lite` 的 `input[].type=additional_tools` 工具目录。
+目录、历史调用、`tool_choice` 与返回调用使用同一份工具身份映射；保留默认
+`functions` 组的原始名字和 custom 工具输入，不为 lite 响应补造顶层 `tools`。
+顶层目录和附加目录按单个工具合并，非法 schema 或冲突声明返回明确错误。
+`allowed_tools`、`none`、强制调用与 strict 参数校验仍然有效，未声明工具不会被放行。
+
+这部分已由 Codex 0.171.0-alpha.13 请求形态和流式/非流式回归验证；本机如还使用
+独立 `codex-idfix`，其兼容层也必须能读取附加目录，而不是只桥接顶层工具。
+
 最小可用配置（网关与 Codex 在同一台 Linux 服务器上）：
 
 ```toml

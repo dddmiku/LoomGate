@@ -24,6 +24,11 @@ const (
 	// RetryTransient: the account is fine; the upstream hiccupped (an
 	// acknowledged turn with no answer). Retry once on the same account.
 	RetryTransient
+	// RetryRotateNoCooldown: the provider itself is failing (typically an HTTP
+	// 5xx). Move to the next account but do not cool this one down: a global
+	// upstream outage affects every account equally, and cooling the whole pool
+	// turns one failed request into a minutes-long no_available_account outage.
+	RetryRotateNoCooldown
 	// Fatal: retrying cannot help (bad request, unsupported model). Return it.
 	Fatal
 )
@@ -162,6 +167,9 @@ func Run[T any](ctx context.Context, accounts []string, budget int, cool *Cooldo
 			switch classOf(err) {
 			case Fatal:
 				return zero, err
+			case RetryRotateNoCooldown:
+				// Provider-wide failure: rotate without poisoning the account pool.
+				goto next
 			case RetryTransient:
 				if try == 0 {
 					continue

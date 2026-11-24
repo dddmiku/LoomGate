@@ -234,9 +234,20 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 		return nil, nil, outputErr
 	}
 	// 工具先展开：命名空间分组的扁平名要先定下来，历史里的命名空间调用才能写回同名。
+	//
+	// Codex 0.171 的 responses_lite 把工具目录放在 input[0] 的
+	// {type:"additional_tools", role:"developer", tools:[...]} 里，顶层 tools
+	// 为空。只读 req.Tools 会让工具声明、白名单和回程别名全部丢失，模型于是
+	// 复读历史里的 custom `exec`，网关按空声明判成越权。这里在翻译历史前把
+	// additional_tools 合并进实际工具目录；目录不作为消息重复下发，也不
+	// 改写 req.Tools，以免给 lite 客户端回显合成的顶层 tools。
+	toolDecls, err := responsesToolDeclarations(req.Tools, req.Input)
+	if err != nil {
+		return nil, nil, err
+	}
 	var chatTools []any
-	if len(req.Tools) > 0 {
-		chatTools = responsesTools(req.Tools, &req)
+	if len(toolDecls) > 0 {
+		chatTools = responsesTools(toolDecls, &req)
 	}
 	chatTools, chatChoice, err := req.prepareToolPolicy(chatTools)
 	if err != nil {
@@ -318,6 +329,119 @@ type reasoningStats struct {
 	// EncryptedOnly 记录被跳过的「只有密文、没有可读推理」的条目数：它们来自别的
 	// 服务，网关与上游都读不懂，跳过比让整个会话 400 更可用。
 	EncryptedOnly int
+}
+
+// responsesToolDeclarations merges the top-level tools array with Codex
+// responses_lite's input[0].additional_tools declaration. The latter is a
+// history item on the wire but semantically the *only* tool catalog in lite
+// mode; ignoring it creates an empty allowlist while the transcript still
+// contains those tool calls.
+func responsesToolDeclarations(top []any, input json.RawMessage) ([]any, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(input, &items); err != nil {
+		return top, nil
+	}
+	catalogs := [][]any{top}
+	for _, raw := range items {
+		var item map[string]any
+		if jsonutil.Decode(raw, &item) != nil || item["type"] != "additional_tools" {
+			continue
+		}
+		children, ok := item["tools"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("additional_tools.tools must be an array")
+		}
+		if err := requestValidationTools(children, "additional_tools.tools", true); err != nil {
+			return nil, err
+		}
+		catalogs = append(catalogs, children)
+	}
+	if len(catalogs) == 1 {
+		return top, nil
+	}
+	// Merge individual public identities, not whole namespace names. A later
+	// catalog can add a child to an existing group without losing that child.
+	// Conflicting definitions fail closed rather than silently losing a schema.
+	seen := map[string]string{}
+	accept := func(namespace string, tool map[string]any) (bool, error) {
+		if tool == nil {
+			return false, fmt.Errorf("additional_tools contains an invalid tool")
+		}
+		kind, _ := tool["type"].(string)
+		if kind != "function" && kind != "custom" {
+			return true, nil // Unsupported built-ins retain the existing policy.
+		}
+		name := chatToolName(tool)
+		if strings.TrimSpace(name) == "" {
+			return false, fmt.Errorf("additional_tools contains an unnamed tool")
+		}
+		if namespace == "functions" {
+			namespace = ""
+		}
+		canonical := make(map[string]any, len(tool))
+		for key, value := range tool {
+			if key != "namespace" {
+				canonical[key] = value
+			}
+		}
+		encoded, err := json.Marshal(canonical)
+		if err != nil {
+			return false, err
+		}
+		identity := namespace + "\x00" + name
+		if prior, exists := seen[identity]; exists {
+			if prior != string(encoded) {
+				return false, fmt.Errorf("additional_tools has conflicting declarations for tool %q", name)
+			}
+			return false, nil
+		}
+		seen[identity] = string(encoded)
+		return true, nil
+	}
+	var tools []any
+	for _, catalog := range catalogs {
+		for _, raw := range catalog {
+			tool, ok := raw.(map[string]any)
+			if !ok || tool == nil {
+				return nil, fmt.Errorf("additional_tools contains an invalid tool")
+			}
+			if tool["type"] != "namespace" {
+				keep, err := accept(namespaceOf(tool), tool)
+				if err != nil {
+					return nil, err
+				}
+				if keep {
+					tools = append(tools, tool)
+				}
+				continue
+			}
+			namespace, _ := tool["name"].(string)
+			children, ok := tool["tools"].([]any)
+			if !ok || strings.TrimSpace(namespace) == "" {
+				return nil, fmt.Errorf("additional_tools contains an invalid namespace")
+			}
+			var merged []any
+			for _, rawChild := range children {
+				child, _ := rawChild.(map[string]any)
+				keep, err := accept(namespace, child)
+				if err != nil {
+					return nil, err
+				}
+				if keep {
+					merged = append(merged, child)
+				}
+			}
+			if len(merged) > 0 {
+				group := make(map[string]any, len(tool))
+				for key, value := range tool {
+					group[key] = value
+				}
+				group["tools"] = merged
+				tools = append(tools, group)
+			}
+		}
+	}
+	return tools, nil
 }
 
 // responsesMessages 把 Responses 的 input（字符串或 item 数组）+ instructions 折成 chat messages。
@@ -439,6 +563,11 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			}
 			continue
 		case "", "message":
+		case "additional_tools":
+			// The lite tool catalog is not a chat message. Its declarations are
+			// consumed by responsesToolDeclarations; emitting them as developer
+			// text would duplicate a multi-kilobyte tool schema on every turn.
+			continue
 		default:
 			continue
 		}
@@ -785,6 +914,37 @@ func responsesToolOutput(v any) any {
 //
 // 其余非 function 类型（web_search / file_search / mcp）网关侧确无对应实现，仍丢弃。
 func responsesTools(tools []any, req *responsesRequest) []any {
+	// "functions" is Codex's exact, reserved default namespace. Expand it
+	// before allocating aliases so its names are reserved alongside top-level
+	// tools. Other namespaces, including "Functions", remain distinct.
+	var expanded []any
+	for _, raw := range tools {
+		group, _ := raw.(map[string]any)
+		if group["type"] != "namespace" || group["name"] != "functions" {
+			expanded = append(expanded, raw)
+			continue
+		}
+		children, _ := group["tools"].([]any)
+		for _, rawChild := range children {
+			child, ok := rawChild.(map[string]any)
+			if !ok {
+				continue
+			}
+			copy := make(map[string]any, len(child))
+			for key, value := range child {
+				copy[key] = value
+			}
+			if description, _ := group["description"].(string); strings.TrimSpace(description) != "" {
+				context := "Namespace functions: " + description
+				if original, _ := child["description"].(string); original != "" {
+					context = original + "\n\n" + context
+				}
+				copy["description"] = context
+			}
+			expanded = append(expanded, copy)
+		}
+	}
+	tools = expanded
 	out := make([]any, 0, len(tools))
 	customNames := map[string]bool{}
 	aliases := map[string]toolAlias{}
@@ -850,6 +1010,13 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 				if fn == nil {
 					continue
 				}
+				flat := flatToolName(namespace, inner, taken)
+				taken[flat] = true
+				setChatToolName(fn, flat)
+				if flat != namespace+namespaceSeparator+inner {
+					function, _ := fn["function"].(map[string]any)
+					describeToolAlias(function, namespace+namespaceSeparator+inner)
+				}
 				if groupDescription, _ := tm["description"].(string); strings.TrimSpace(groupDescription) != "" {
 					function, _ := fn["function"].(map[string]any)
 					description, _ := function["description"].(string)
@@ -858,13 +1025,6 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 						context = description + "\n\n" + context
 					}
 					function["description"] = context
-				}
-				flat := flatToolName(namespace, inner, taken)
-				taken[flat] = true
-				setChatToolName(fn, flat)
-				if flat != namespace+namespaceSeparator+inner {
-					function, _ := fn["function"].(map[string]any)
-					describeToolAlias(function, namespace+namespaceSeparator+inner)
 				}
 				out = append(out, fn)
 				if custom {
@@ -1029,6 +1189,12 @@ func (req *responsesRequest) toolAliasIndex() map[string]string {
 // upstreamToolName 把 Responses 历史项的（命名空间, 名字）还原成出站扁平名。
 // 顶层长名与命名空间名字都经相同索引，避免声明与历史使用不同名字。
 func upstreamToolName(toolNames map[string]string, namespace, name string) string {
+	// "functions" is Codex's reserved default namespace. It is semantically the
+	// same as no namespace on the chat wire; keeping the prefix would make
+	// declarations (functions__exec) and history (plain exec) disagree.
+	if namespace == "functions" {
+		namespace = ""
+	}
 	if flat, ok := toolNames[namespace+"\x00"+name]; ok {
 		return flat
 	}

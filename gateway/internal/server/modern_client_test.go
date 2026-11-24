@@ -125,3 +125,52 @@ func TestServerCapabilitiesStayRejected(t *testing.T) {
 		}
 	}
 }
+
+// responses_lite is the wire shape Codex 0.171 uses when the model declares
+// use_responses_lite=true. The catalog lives in input[0], and the same real
+// transcript can still contain old top-level custom `exec` calls. A live
+// 2026-11-24 request failed with "model called tool \"exec\" outside
+// tool_choice" because only the (empty) top-level tools array was registered.
+func TestModernCodexLiteHistoryKeepsFlatDefaultTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-6.1-sol",
+		"stream":true,
+		"tool_choice":"auto",
+		"input":[
+			{"type":"additional_tools","id":"at_1","role":"developer","tools":[
+				{"type":"namespace","name":"functions","tools":[
+					{"type":"custom","name":"exec","description":"Run JavaScript"},
+					{"type":"function","name":"exec_command","parameters":{"type":"object"}}
+				]}
+			]},
+			{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"exec","input":"text('ok')"},
+			{"type":"custom_tool_call_output","call_id":"call_1","output":"ok"},
+			{"type":"message","role":"user","content":"next"}
+		]
+	}`)
+	chatBody, req, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("lite history rejected: %v", err)
+	}
+	chat := decodeChat(t, chatBody)
+	tools, _ := chat["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("all lite tools must be forwarded: %#v", tools)
+	}
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if strings.HasPrefix(name, "functions__") {
+			t.Fatalf("reserved functions namespace leaked: %v", name)
+		}
+	}
+	first := chat["messages"].([]any)[0].(map[string]any)
+	call := first["tool_calls"].([]any)[0].(map[string]any)
+	if got := call["function"].(map[string]any)["name"]; got != "exec" {
+		t.Fatalf("historical exec call drifted to %v", got)
+	}
+	if !req.customTools["exec"] {
+		t.Fatalf("custom exec was not recorded: %v", req.customTools)
+	}
+}
