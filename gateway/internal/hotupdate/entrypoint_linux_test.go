@@ -206,3 +206,83 @@ func TestEntrypointExitsWhenUpdatedInstanceDies(t *testing.T) {
 		t.Fatal("supervisor stayed alive after the updated instance exited")
 	}
 }
+
+// Regression: the old supervisor polled has_live_children exactly once after
+// exit 75. During the reparent window the successor (especially a rollback
+// process) is not yet visible in /proc/1/task/1/children, so PID1 exited and
+// killed the whole container before adoption. The supervisor must give the
+// kernel a bounded grace period to reparent the successor.
+func TestEntrypointWaitsForLateSuccessorAdoption(t *testing.T) {
+	requireListenerInheritance(t)
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("Python is required to establish an isolated Linux subreaper")
+	}
+	root := t.TempDir()
+	body, err := os.ReadFile(filepath.Join("..", "..", "docker-entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback := filepath.Join(root, "unused-image-binary")
+	if err := os.WriteFile(fallback, []byte("#!/bin/sh\nexit 64\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entryBody := strings.ReplaceAll(string(body), "\r\n", "\n")
+	entryBody = strings.ReplaceAll(entryBody, "IMAGE_BIN=\"/app/wb2api\"", "IMAGE_BIN=\""+fallback+"\"")
+	entry := filepath.Join(root, "entrypoint.sh")
+	if err := os.WriteFile(entry, []byte(entryBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(root, "late-successor")
+	pidFile := filepath.Join(root, "late.pid")
+	childBody := "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$WB2API_TEST_PID\"\nexec sleep 30\n"
+	if err := os.WriteFile(child, []byte(childBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The successor appears only after a short delay; this deterministically
+	// opens the reparent window the old single-poll loop missed.
+	launcher := filepath.Join(root, "old-instance")
+	launcherBody := "#!/bin/sh\n( sleep 0.4; exec \"$WB2API_TEST_NEXT\" ) &\nexit 75\n"
+	if err := os.WriteFile(launcher, []byte(launcherBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "current"), []byte(launcher+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code := "import ctypes,os,sys; assert ctypes.CDLL(None).prctl(36,1,0,0,0)==0; os.execv('/bin/sh',['sh']+sys.argv[1:])"
+	cmd := exec.Command(python, append([]string{"-c", code, entry})...)
+	cmd.Dir = root
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	for _, item := range os.Environ() {
+		if strings.HasPrefix(item, "WB2API_UPDATE_DIR=") || strings.HasPrefix(item, "WB2A_STATE_FILE=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, item)
+	}
+	cmd.Env = append(cmd.Env, "WB2API_UPDATE_DIR="+root, "WB2API_TEST_NEXT="+child, "WB2API_TEST_PID="+pidFile)
+	logFile, err := os.Create(filepath.Join(root, "supervisor.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = cmd.Wait(); close(done) }()
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); <-done; _ = logFile.Close() })
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-done:
+			t.Fatalf("supervisor exited during the adoption window: %v", waitErr)
+		default:
+		}
+		if raw, err := os.ReadFile(pidFile); err == nil && strings.TrimSpace(string(raw)) != "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("late successor was never adopted")
+}

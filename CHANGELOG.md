@@ -5,6 +5,7 @@
 - 发布资产统一改为 `LoomGate-*` 命名：`LoomGate-runtime-linux-*.tar.gz`、`LoomGate-linux-*`、`LoomGate-windows-amd64`、`LoomGate-android-arm64.apk`。
 - 过渡期每个资产同时保留旧 `wb2api-*` / `workbuddy2api-android-*` 别名，新旧两份字节一致并共同签入 `SHA256SUMS.txt`；v1.0.16 及更早更新器仍能升级，新版本优先使用新名称。
 - 更新器的资产选择、构建清单、Android 构建输出和发布测试同步到新命名，并保留 `server.max_body_mb` 修复。
+- 修复容器 PID1 监督脚本在后继进程 reparent 窗口内误判“无后继”并退出、导致自动回滚连带容器退出的竞态；热更新交接后有 30 秒有界收养宽限。
 
 ## v1.0.17
 

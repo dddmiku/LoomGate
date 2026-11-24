@@ -182,7 +182,25 @@ while :; do
   if [ "$code" -eq "$EXIT_HANDOVER" ]; then
     # 热更新：监听套接字已在新实例手里，这里不再拉起第二个实例，
     # 持续监督被收养的后继，避免它退出后容器却永远显示运行。
+    #
+    # 旧实例退出到内核把后继 reparent 给 PID1 之间有极短窗口。若此时立刻
+    # has_live_children，脚本会误判“没有后继”并以 1 退出，把正在回滚/交接的
+    # 容器一起带走（2026-11-25 fullmain 已复现）。先给收养一个有限宽限。
     echo "[entrypoint] hot update handover complete; supervising the updated instance"
+    adopt_wait=0
+    while ! has_live_children; do
+      if [ "$terminating" -eq 1 ]; then
+        wait_for_children
+        echo "[entrypoint] stopping after handover"
+        exit 0
+      fi
+      if [ "$adopt_wait" -ge 300 ]; then
+        echo "[entrypoint] no successor appeared after handover"
+        exit 1
+      fi
+      sleep 0.1
+      adopt_wait=$((adopt_wait + 1))
+    done
     while has_live_children; do
       if [ "$terminating" -eq 1 ]; then
         wait_for_children
