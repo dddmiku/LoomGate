@@ -254,3 +254,28 @@ func TestProviderAttemptsPreserveExplicitChargesAndMissingCharges(t *testing.T) 
 		t.Fatal("request log conflated absent charges with free or dropped an observed charge")
 	}
 }
+
+// Codex responses_lite history with images and a full tool catalog crossed the
+// old hard-coded 8 MiB provider ceiling while the configured server limit was
+// 32 MiB. Production returned 11 consecutive HTTP 413 without ever reaching
+// upstream. The provider layer must honour server.max_body_mb, not a private
+// smaller limit.
+func TestProviderBodyLimitFollowsConfiguredMaximum(t *testing.T) {
+	p := &fixtureProvider{complete: true}
+	h := NewHandler(Config{
+		Pool: testPoolWith(), APIKey: "synthetic-key", MaxBodyBytes: 12 << 20,
+		Inference: map[string]inference.Provider{"fixture": p},
+	})
+	prefix := `{"model":"fixture:dynamic","messages":[{"role":"user","content":"`
+	suffix := `"}]}`
+	body := prefix + strings.Repeat("x", 9<<20) + suffix
+	request := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer synthetic-key")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != 200 || p.calls.Load() != 1 {
+		t.Fatalf("a request under the configured limit was rejected: status=%d calls=%d body=%s",
+			response.Code, p.calls.Load(), response.Body.String()[:500])
+	}
+}

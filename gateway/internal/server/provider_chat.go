@@ -113,9 +113,17 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	// them turned a reachable model into a permanent 400 for that client. The
 	// fields below are read because they change what is sent; everything else is
 	// simply not read.
-	if len(body) > 8<<20 {
+	//
+	// The byte limit must be the same one the HTTP entrypoint and nginx enforce.
+	// This used to be a hard-coded 8 MiB check, so a request that passed the
+	// configured 32 MiB limit (long Codex responses_lite history with images and
+	// a large tool catalog) was rejected here with an opaque 413 before any
+	// provider was called. A configurable 32 MiB server that silently rejects at
+	// 8 MiB is worse than either limit alone.
+	if h.cfg.MaxBodyBytes > 0 && int64(len(body)) > h.cfg.MaxBodyBytes {
 		st.status = 413
-		writeOpenAIError(w, 413, "request_body_too_large", "request body exceeds provider limit")
+		writeOpenAIError(w, 413, "request_body_too_large",
+			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", h.cfg.MaxBodyBytes>>20))
 		return
 	}
 	var text string
@@ -176,12 +184,16 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 	// prompt by the provider, so a client that sends two user turns in a row, a
 	// trailing assistant prefill or an assistant-first history still works. Only
 	// empty turns and size limits are enforced.
-	// The catalog advertises a 1M-token window; a 1 MiB character cap made
-	// that unreachable and rejected legitimate long-context calls with a 400
-	// that looked like a client mistake. The cap is a guard against unbounded
-	// request bodies (the server's own byte limit already applies) rather than
-	// a model-side context decision, so it must not contradict the catalog.
-	const maxDialogueChars = 8 << 20
+	// The catalog advertises a 1M-token window; a smaller hard-coded character
+	// cap made that unreachable and rejected legitimate long-context calls with
+	// a 400 that looked like a client mistake. The cap is a guard against
+	// unbounded request bodies (the server's own byte limit already applies)
+	// rather than a model-side context decision, so it must not contradict the
+	// configured body limit or the catalog.
+	maxDialogueChars := 8 << 20
+	if h.cfg.MaxBodyBytes > 0 {
+		maxDialogueChars = int(h.cfg.MaxBodyBytes)
+	}
 	parsed := []inference.Message{}
 	total := 0
 	text = ""

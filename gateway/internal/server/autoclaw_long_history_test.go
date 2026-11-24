@@ -127,6 +127,10 @@ func TestAutoClawAcceptsLongHistoryAcrossProtocols(t *testing.T) {
 	}
 }
 
+// The provider layer used to impose a private 8 MiB ceiling regardless of
+// server.max_body_mb; on 2026-11-25 a configured 32 MiB server returned 413 to
+// ordinary Codex history. The single configured limit must be the sole byte
+// authority, so exercise it at 4 MiB instead of assuming the old constant.
 func TestAutoClawOversizedHistoryRejectedBeforeUpstream(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
 		t.Run(path, func(t *testing.T) {
@@ -135,9 +139,9 @@ func TestAutoClawOversizedHistoryRejectedBeforeUpstream(t *testing.T) {
 				calls++
 				return nil, fmt.Errorf("unexpected upstream request")
 			})}}
-			h := NewHandler(Config{Pool: testPoolWith(), APIKey: "fixture-key", MaxBodyBytes: 16 << 20, Inference: map[string]inference.Provider{"autoclaw": p}})
+			h := NewHandler(Config{Pool: testPoolWith(), APIKey: "fixture-key", MaxBodyBytes: 4 << 20, Inference: map[string]inference.Provider{"autoclaw": p}})
 			defer h.cfg.KeyLimits.Close()
-			body := map[string]any{"model": autoclaw.Models[0].ID, "max_tokens": 64, "messages": []any{map[string]any{"role": "user", "content": strings.Repeat("x", (8<<20)+1)}}}
+			body := map[string]any{"model": autoclaw.Models[0].ID, "max_tokens": 64, "messages": []any{map[string]any{"role": "user", "content": strings.Repeat("x", (4<<20)+1)}}}
 			raw, _ := json.Marshal(body)
 			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(raw)))
 			req.Header.Set("Authorization", "Bearer fixture-key")

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.17
+
+- 修复 provider 路径把请求体上限写死为 8 MiB 的问题；现在统一遵守 `server.max_body_mb`（线上为 32 MB），长 Codex 会话不再在进入 AutoClaw 前被网关自身 413。
+- 413 文案改为明确的客户端可操作说明，并保留 413 不占账号、不轮转的既有语义。
+- 补 9 MiB 请求在 12 MiB 配置下必须成功到达 provider 的回归用例，同时保留超配置上限时前置拒绝的用例。
+
 ## v1.0.16
 
 - 修复 Codex `responses_lite` 将工具目录放在 `input[].additional_tools` 时，网关漏读声明并误报 `exec outside tool_choice` 的问题。
