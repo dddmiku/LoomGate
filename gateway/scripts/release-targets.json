@@ -8,16 +8,16 @@
       "id": "linux-amd64",
       "goos": "linux",
       "goarch": "amd64",
-      "update_asset": "wb2api-linux-amd64",
-      "runtime_asset": "wb2api-runtime-linux-amd64.tar.gz",
+      "update_asset": "LoomGate-linux-amd64",
+      "runtime_asset": "LoomGate-runtime-linux-amd64.tar.gz",
       "ci_build": true
     },
     {
       "id": "linux-arm64",
       "goos": "linux",
       "goarch": "arm64",
-      "update_asset": "wb2api-linux-arm64",
-      "runtime_asset": "wb2api-runtime-linux-arm64.tar.gz",
+      "update_asset": "LoomGate-linux-arm64",
+      "runtime_asset": "LoomGate-runtime-linux-arm64.tar.gz",
       "ci_build": true
     },
     {
@@ -25,22 +25,22 @@
       "goos": "linux",
       "goarch": "arm",
       "goarm": "7",
-      "update_asset": "wb2api-linux-armv7",
-      "runtime_asset": "wb2api-runtime-linux-armv7.tar.gz",
+      "update_asset": "LoomGate-linux-armv7",
+      "runtime_asset": "LoomGate-runtime-linux-armv7.tar.gz",
       "ci_build": true
     },
     {
       "id": "windows-amd64",
       "goos": "windows",
       "goarch": "amd64",
-      "update_asset": "wb2api-windows-amd64",
+      "update_asset": "LoomGate-windows-amd64",
       "ci_build": true
     },
     {
       "id": "android-arm64",
       "goos": "android",
       "goarch": "arm64",
-      "update_asset": "workbuddy2api-android-arm64.apk",
+      "update_asset": "LoomGate-android-arm64.apk",
       "ci_build": false,
       "manual_requirement": "Build with Android NDK/CGO and the existing APK signing identity; do not generate a CI debug signing key."
     }

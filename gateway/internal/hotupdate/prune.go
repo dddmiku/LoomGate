@@ -30,7 +30,7 @@ func managedRuntime(dir string) bool {
 // pruneUpdateDir 清理更新目录，避免每次升级都留下一份运行目录与压缩包。
 //
 // 只删自己生成的东西：带固定所有权标记的 `runtime-*` 运行目录（保留两个）、下载的
-// `*-wb2api-linux-*` 二进制、`*-wb2api-runtime-linux-*` 包及 `.download-*.part`。
+// `*-wb2api-linux-*` / `*-LoomGate-linux-*` 二进制、`*-wb2api-runtime-linux-*` / `*-LoomGate-runtime-linux-*` 包及 `.download-*.part`。
 // `current` 指针指向的文件及其所在目录永不删除；其余文件一律不动。
 func pruneUpdateDir(dir, current string, alsoKeep ...string) {
 	if strings.TrimSpace(dir) == "" {
@@ -71,7 +71,8 @@ func pruneUpdateDir(dir, current string, alsoKeep ...string) {
 			continue
 		}
 		if (strings.HasPrefix(name, ".download-") && strings.HasSuffix(name, ".part")) ||
-			strings.Contains(name, "-wb2api-linux-") || strings.Contains(name, "-wb2api-runtime-linux-") {
+			strings.Contains(name, "-wb2api-linux-") || strings.Contains(name, "-wb2api-runtime-linux-") ||
+			strings.Contains(name, "-LoomGate-linux-") || strings.Contains(name, "-LoomGate-runtime-linux-") {
 			removeAndLog(path)
 		}
 	}

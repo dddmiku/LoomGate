@@ -323,8 +323,11 @@ func assetName() (string, error) {
 // 安卓主机上才会执行，而本项目从不在安卓上跑 `go test`，那个断言写错了也永远
 // 不会失败。参数化之后，三端的命名都能在任意主机上被断言。
 func assetNameFor(goos, goarch string) (string, error) {
+	// Public assets are LoomGate-* names. Every release also carries the
+	// historical wb2api-* alias so v1.0.16 and older updaters can still move to
+	// this release; see legacyAssetName.
 	if goos == "windows" {
-		return "wb2api-windows-" + goarch, nil
+		return "LoomGate-windows-" + goarch, nil
 	}
 	if goos == "android" {
 		// 安卓上更新的是 **APK**，不是裸二进制。
@@ -342,13 +345,13 @@ func assetNameFor(goos, goarch string) (string, error) {
 		// 前缀是 "workbuddy2api-"（与 APK 文件名一致），不是 linux/windows 那种
 		// "wb2api-"：安卓的资产就是 android/build.py 打出来的那个 APK，两边必须
 		// 同名，否则手机永远找不到可更新的资产。
-		return "workbuddy2api-android-" + goarch + ".apk", nil
+		return "LoomGate-android-" + goarch + ".apk", nil
 	}
 	switch goarch {
 	case "amd64":
-		return "wb2api-linux-amd64", nil
+		return "LoomGate-linux-amd64", nil
 	case "arm64":
-		return "wb2api-linux-arm64", nil
+		return "LoomGate-linux-arm64", nil
 	case "arm":
 		// 32 位 ARM（armv7）。行空板 M10（DFRobot UNIHIKER）是四核 Cortex-A7、
 		// 423 MB 内存，用户 2026-10-13 要求支持它。
@@ -379,7 +382,7 @@ func goarmVersion() string {
 
 // armAssetName 32 位 ARM 的资产名。
 func armAssetName(goarm string) string {
-	return "wb2api-linux-armv" + goarm
+	return "LoomGate-linux-armv" + goarm
 }
 
 // Latest 查询最新发布版本（含本机架构的二进制资产）。
@@ -452,6 +455,12 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 			name = runtimeAssetName()
 		}
 	}
+	// During the naming transition every release carries both the historical
+	// wb2api-* asset and its LoomGate-* successor. Prefer the successor, but
+	// fall back to the historical name so a new updater can still consume
+	// releases published before the rename completed.
+	preferred := name
+	legacy, _ := legacyAssetName(name)
 	if !validRepo(c.Repo) {
 		return Release{}, errors.New("invalid update repository")
 	}
@@ -485,12 +494,16 @@ func (c *Client) Latest(ctx context.Context) (Release, error) {
 	}
 	for _, asset := range payload.Assets {
 		switch asset.Name {
-		case name:
-			release.AssetName = asset.Name
-			release.AssetURL = asset.BrowserDownloadURL
-			release.AssetAPIURL = asset.URL
-			release.AssetSize = asset.Size
-			release.Digest = asset.Digest
+		case preferred, legacy:
+			// Prefer the new public name when both exist in one release; this
+			// branch can run for either, so only take legacy when still unset.
+			if release.AssetName == "" || asset.Name == preferred {
+				release.AssetName = asset.Name
+				release.AssetURL = asset.BrowserDownloadURL
+				release.AssetAPIURL = asset.URL
+				release.AssetSize = asset.Size
+				release.Digest = asset.Digest
+			}
 		case sumsAssetName:
 			release.SumsURL = asset.BrowserDownloadURL
 			release.SumsAPIURL = asset.URL
@@ -716,6 +729,13 @@ func (c *Client) fetchAsset(ctx context.Context, url, target string, assetSize i
 // 安卓的程序在 APK 的 nativeLibraryDir 里，完整包那套「解压到目录再整体替换」
 // 的前提不成立。
 func runtimeAssetName() string {
+	return "LoomGate-runtime-linux-" + runtimeArchName() + ".tar.gz"
+}
+
+// legacyRuntimeAssetName is the pre-rename public name. Releases during the
+// transition contain both assets with identical bytes, so v1.0.16 and older
+// updaters keep working while v1.0.18+ prefers the LoomGate name.
+func legacyRuntimeAssetName() string {
 	return "wb2api-runtime-linux-" + runtimeArchName() + ".tar.gz"
 }
 
@@ -986,4 +1006,22 @@ func (w *idleWatchdog) reset() {
 		return
 	}
 	w.timer.Reset(w.timeout)
+}
+
+// legacyAssetName returns the historical wb2api name for a new LoomGate asset
+// name, or "" when the name has no known predecessor. It is intentionally
+// closed-form: the transition only renames the release assets, never the
+// platform/architecture rules that decide which asset a host needs.
+func legacyAssetName(name string) (string, bool) {
+	switch {
+	case strings.HasPrefix(name, "LoomGate-runtime-linux-"):
+		return "wb2api-runtime-linux-" + strings.TrimPrefix(name, "LoomGate-runtime-linux-"), true
+	case strings.HasPrefix(name, "LoomGate-windows-"):
+		return "wb2api-windows-" + strings.TrimPrefix(name, "LoomGate-windows-"), true
+	case strings.HasPrefix(name, "LoomGate-linux-"):
+		return "wb2api-linux-" + strings.TrimPrefix(name, "LoomGate-linux-"), true
+	case strings.HasPrefix(name, "LoomGate-android-"):
+		return "workbuddy2api-android-" + strings.TrimPrefix(name, "LoomGate-android-"), true
+	}
+	return "", false
 }

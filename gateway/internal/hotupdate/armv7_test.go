@@ -19,8 +19,8 @@ func TestAssetNameForArmv7(t *testing.T) {
 	if err != nil {
 		t.Fatalf("arm 应当被支持：%v", err)
 	}
-	if name != "wb2api-linux-armv7" {
-		t.Fatalf("资产名 = %q，期望 wb2api-linux-armv7", name)
+	if name != "LoomGate-linux-armv7" {
+		t.Fatalf("资产名 = %q，期望 LoomGate-linux-armv7", name)
 	}
 }
 
@@ -34,8 +34,8 @@ func TestAssetNameForArmDefaultsToV7(t *testing.T) {
 	if err != nil {
 		t.Fatalf("arm 应当被支持：%v", err)
 	}
-	if name != "wb2api-linux-armv7" {
-		t.Fatalf("未设 GOARM 时资产名 = %q，期望 wb2api-linux-armv7", name)
+	if name != "LoomGate-linux-armv7" {
+		t.Fatalf("未设 GOARM 时资产名 = %q，期望 LoomGate-linux-armv7", name)
 	}
 }
 
@@ -46,8 +46,8 @@ func TestAssetNameForArmHonoursGoarm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("arm 应当被支持：%v", err)
 	}
-	if name != "wb2api-linux-armv6" {
-		t.Fatalf("GOARM=6 时资产名 = %q，期望 wb2api-linux-armv6", name)
+	if name != "LoomGate-linux-armv6" {
+		t.Fatalf("GOARM=6 时资产名 = %q，期望 LoomGate-linux-armv6", name)
 	}
 }
 
@@ -61,10 +61,10 @@ func TestRuntimeAssetNameMatchesBinaryNaming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binaryArch := strings.TrimPrefix(binary, "wb2api-linux-")
-	runtimeName := "wb2api-runtime-linux-" + binaryArch + ".tar.gz"
-	if runtimeName != "wb2api-runtime-linux-armv7.tar.gz" {
-		t.Fatalf("运行包名推导 = %q，期望 wb2api-runtime-linux-armv7.tar.gz", runtimeName)
+	binaryArch := strings.TrimPrefix(binary, "LoomGate-linux-")
+	runtimeName := "LoomGate-runtime-linux-" + binaryArch + ".tar.gz"
+	if runtimeName != "LoomGate-runtime-linux-armv7.tar.gz" {
+		t.Fatalf("运行包名推导 = %q，期望 LoomGate-runtime-linux-armv7.tar.gz", runtimeName)
 	}
 }
 

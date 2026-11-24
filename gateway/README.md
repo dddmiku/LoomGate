@@ -151,12 +151,12 @@ curl -sS http://127.0.0.1:7863/v1/capabilities \
 **默认开启**（`config update.enabled` 缺省 `true`）。管理台「版本与热更新」页可直接检查并应用新版本：
 
 - 新进程先接管监听套接字，旧进程把在途请求（含长 SSE 对话）跑完才退出——**升级不打断正在进行的对话**，容器也不重建。
-- 依赖 Release 里的**完整运行包** `wb2api-runtime-linux-<arch>.tar.gz`，不是裸二进制。发布时漏 `--runtime` 会表现为面板报「没有本机架构的二进制资产」且 `asset_name` 为空；发布工具已把这条做成硬门禁。
+- 依赖 Release 里的**完整运行包** `LoomGate-runtime-linux-<arch>.tar.gz`（过渡版本同时提供 `wb2api-runtime-linux-<arch>.tar.gz` 旧名别名），不是裸二进制。发布时漏 `--runtime` 会表现为面板报「没有本机架构的二进制资产」且 `asset_name` 为空；发布工具已把这条做成硬门禁。
 - 下载走 `update.proxy` 指定的加速前缀（默认 `https://gh-proxy.com`，设成 `-` 表示直连）。国内直连 GitHub Releases 经常超时，代理不可用时热更新会一直卡在下载。
 
 关闭热更新（`update.enabled=false`）后 `/update/*` 一律拒绝，只能手工部署：
 
-1. 本地构建运行包：`python tools/private_gateway_release_20260925.py prepare --tag <tag> --runtime`，产物为 `wb2api-runtime-linux-<arch>.tar.gz`，构建时注入发布公钥；
+1. 本地构建运行包：`python tools/private_gateway_release_20260925.py prepare --tag <tag> --runtime`，产物为 `LoomGate-runtime-linux-<arch>.tar.gz`，构建时注入发布公钥；
 2. 上传到服务器任意临时目录，解压到 `/opt/workbuddy2api/data/updates/runtime-<时间戳>/`。**属主与权限必须对齐容器用户**：`chown -R 10001:10001 <目录> && chmod 700 <目录>`——目录归 root 且 0700 时容器内的 app 用户进不去，表现为「重启后仍是旧版本」；
 3. 校验 `manifest.json` 里每个文件的 sha256 与解压结果一致（`wb2api` 需 `0755`）；
 4. 把 `data/updates/current` 指向新目录里的 `wb2api`（改前记下旧值，便于回滚）；

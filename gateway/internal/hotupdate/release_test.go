@@ -34,14 +34,24 @@ func TestLatestPicksAssetForThisArchitecture(t *testing.T) {
 		// 资产清单覆盖三端：测试跑在哪个平台上，就得有对应的那份资产。
 		// 只列 linux 会让 Windows/安卓上跑测试时找不到本机资产而失败。
 		"assets": []map[string]any{
-			{"name": "wb2api-linux-amd64", "size": 11, "browser_download_url": "https://example.invalid/amd64",
+			{"name": "LoomGate-linux-amd64", "size": 11, "browser_download_url": "https://example.invalid/amd64",
 				"digest": "sha256:aaaa"},
-			{"name": "wb2api-linux-arm64", "size": 22, "browser_download_url": "https://example.invalid/arm64",
+			{"name": "LoomGate-linux-arm64", "size": 22, "browser_download_url": "https://example.invalid/arm64",
 				"digest": "sha256:bbbb"},
-			{"name": "wb2api-windows-amd64", "size": 44, "browser_download_url": "https://example.invalid/win-amd64",
+			{"name": "LoomGate-windows-amd64", "size": 44, "browser_download_url": "https://example.invalid/win-amd64",
 				"digest": "sha256:cccc"},
-			{"name": "workbuddy2api-android-arm64.apk", "size": 55, "browser_download_url": "https://example.invalid/android-arm64.apk",
+			{"name": "LoomGate-android-arm64.apk", "size": 55, "browser_download_url": "https://example.invalid/android-arm64.apk",
 				"digest": "sha256:dddd"},
+			// Transition release also carries the historical aliases. The new
+			// names above must win, but an alias-only release must still work.
+			{"name": "wb2api-linux-amd64", "size": 1, "browser_download_url": "https://example.invalid/amd64-legacy",
+				"digest": "sha256:eeee"},
+			{"name": "wb2api-linux-arm64", "size": 2, "browser_download_url": "https://example.invalid/arm64-legacy",
+				"digest": "sha256:ffff"},
+			{"name": "wb2api-windows-amd64", "size": 3, "browser_download_url": "https://example.invalid/win-legacy",
+				"digest": "sha256:1111"},
+			{"name": "workbuddy2api-android-arm64.apk", "size": 4, "browser_download_url": "https://example.invalid/android-legacy",
+				"digest": "sha256:2222"},
 			{"name": "SHA256SUMS.txt", "size": 33, "browser_download_url": "https://example.invalid/sums"},
 		},
 	}
@@ -270,7 +280,10 @@ func TestReleaseAssetNamesMatchManifest(t *testing.T) {
 				t.Fatalf("manifest asset %q != actual updater asset %q", target.UpdateAsset, actual)
 			}
 			if target.GOOS == "linux" {
-				want := strings.Replace(actual, "wb2api-linux-", "wb2api-runtime-linux-", 1) + ".tar.gz"
+				// The public naming transition keeps a LoomGate-* runtime alias in
+				// addition to the historical wb2api-* runtime asset. The manifest
+				// still names the primary asset produced by the build.
+				want := strings.Replace(actual, "LoomGate-linux-", "LoomGate-runtime-linux-", 1) + ".tar.gz"
 				if target.RuntimeAsset != want {
 					t.Fatalf("runtime bundle = %q, want %q", target.RuntimeAsset, want)
 				}
@@ -349,10 +362,10 @@ func TestAssetNamePerPlatform(t *testing.T) {
 		goos, goarch string
 		want         string
 	}{
-		{"linux", "amd64", "wb2api-linux-amd64"},
-		{"linux", "arm64", "wb2api-linux-arm64"},
-		{"windows", "amd64", "wb2api-windows-amd64"},
-		{"android", "arm64", "workbuddy2api-android-arm64.apk"},
+		{"linux", "amd64", "LoomGate-linux-amd64"},
+		{"linux", "arm64", "LoomGate-linux-arm64"},
+		{"windows", "amd64", "LoomGate-windows-amd64"},
+		{"android", "arm64", "LoomGate-android-arm64.apk"},
 	}
 	for _, c := range cases {
 		got, err := assetNameFor(c.goos, c.goarch)
@@ -399,5 +412,75 @@ func TestBundleOnlyOnLinux(t *testing.T) {
 	}
 	if runtime.GOOS != "linux" && bundleSupported() {
 		t.Fatalf("%s 不该走完整运行包路径", runtime.GOOS)
+	}
+}
+
+// The rename must not strand v1.0.16. Each release carries both names: the new
+// LoomGate-* asset is preferred, but a release with only the historical
+// wb2api-* asset still resolves. Both names are byte-identical, and the signed
+// checksum file covers both, so this is a naming compatibility layer rather
+// than a second trust path.
+func TestLatestFallsBackToHistoricalAssetName(t *testing.T) {
+	current, err := assetName()
+	if err != nil {
+		t.Skipf("unsupported arch %s", runtime.GOARCH)
+	}
+	legacy, ok := legacyAssetName(current)
+	if !ok || legacy == "" {
+		t.Fatalf("legacy mapping = %q,%v", legacy, ok)
+	}
+	payload := map[string]any{
+		"tag_name": "v9.9.9",
+		"assets": []map[string]any{
+			{"name": legacy, "size": 7, "browser_download_url": "https://example.invalid/legacy",
+				"digest": "sha256:aaaa"},
+			{"name": "SHA256SUMS.txt", "size": 33, "browser_download_url": "https://example.invalid/sums"},
+		},
+	}
+	body, _ := json.Marshal(payload)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+	defer server.Close()
+	client := NewClient("", "")
+	client.APIBase = server.URL
+	release, err := client.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.AssetName != legacy || release.AssetSize != 7 {
+		t.Fatalf("legacy asset not selected: %+v", release)
+	}
+}
+
+// When both names exist, the new public name must win even if the legacy
+// marker appears later in the GitHub asset array.
+func TestLatestPrefersNewAssetNameOverAlias(t *testing.T) {
+	current, err := assetName()
+	if err != nil {
+		t.Skipf("unsupported arch %s", runtime.GOARCH)
+	}
+	legacy, ok := legacyAssetName(current)
+	if !ok {
+		t.Skip("no legacy alias for this platform")
+	}
+	payload := map[string]any{
+		"tag_name": "v9.9.9",
+		"assets": []map[string]any{
+			{"name": legacy, "size": 1, "browser_download_url": "https://example.invalid/old",
+				"digest": "sha256:1111"},
+			{"name": current, "size": 2, "browser_download_url": "https://example.invalid/new",
+				"digest": "sha256:2222"},
+		},
+	}
+	body, _ := json.Marshal(payload)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+	defer server.Close()
+	client := NewClient("", "")
+	client.APIBase = server.URL
+	release, err := client.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.AssetName != current || release.AssetSize != 2 {
+		t.Fatalf("new asset did not win: %+v", release)
 	}
 }

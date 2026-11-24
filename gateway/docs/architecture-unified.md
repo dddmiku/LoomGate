@@ -37,7 +37,7 @@ v2.4.0 沿用已完成的单容器方案。`docker-compose.published.yml` 是历
 
 面板已嵌入 `wb2api`，不再产生独立面板版本包。`runtime_bundle.py` 是构建工具，本身不在上述运行清单中；基础镜像、解释器和 PID 1 的 `docker-entrypoint.sh` 由完整镜像升级。
 
-发布资产名为 `wb2api-runtime-linux-amd64.tar.gz`、`wb2api-runtime-linux-arm64.tar.gz`。下载器使用 GitHub asset API 和 Release 摘要，默认公开仓库无需下载凭据；自选私有源时，凭据只发给指定仓库 API 路径，跳转时不泄露给 CDN。解包拒绝未知/重复文件、路径越界、链接、错误格式/版本/架构、缺失文件及摘要不符，并限制压缩与解包体积。
+发布资产名为 `LoomGate-runtime-linux-amd64.tar.gz`、`LoomGate-runtime-linux-arm64.tar.gz`；过渡版本同时附带同字节的 `wb2api-runtime-linux-*` 旧名，供 v1.0.16 及更早更新器读取。下载器使用 GitHub asset API 和 Release 摘要，默认公开仓库无需下载凭据；自选私有源时，凭据只发给指定仓库 API 路径，跳转时不泄露给 CDN。解包拒绝未知/重复文件、路径越界、链接、错误格式/版本/架构、缺失文件及摘要不符，并限制压缩与解包体积。
 
 验证后的候选进程启动同版面板并继承公共及管理监听器；完整就绪后才提交 `current`。失败回收候选、保留旧版本。旧请求、任务和状态提交按统一 15 分钟预算收尾，Compose 留出 16 分钟停止宽限。配置重载复用这一流程；首次两容器迁移仍使用完整镜像与维护窗口。
 

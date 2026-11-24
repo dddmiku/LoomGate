@@ -143,7 +143,7 @@ def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
     arches 默认是部署用的两个 64 位目标。要发 Release 给行空板（armv7，
     DFRobot UNIHIKER M10）时传
     (("arm64","arm64"), ("amd64","amd64"), ("armv7","arm"))，
-    脚本会自动补 GOARM=7——资产名必须是 wb2api-runtime-linux-armv7.tar.gz，
+    脚本会自动补 GOARM=7——资产名必须是 LoomGate-runtime-linux-armv7.tar.gz，
     与 hotupdate 的 runtimeArchName() 对齐，否则板子找不到本机架构的资产。
     """
     assets = OUT / version / "assets"
@@ -165,7 +165,7 @@ def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
         env = dict(env_base, GOARCH=goarch)
         # 32 位 ARM 必须显式给 GOARM：Go 的 arm 目标有 v5/v6/v7 三个 ABI，
         # 而 hotupdate 的 goarmVersion() 运行期读的也是 GOARM——两端必须一致，
-        # 否则资产名（wb2api-runtime-linux-armv7.tar.gz）对不上。
+        # 否则资产名（LoomGate-runtime-linux-armv7.tar.gz）对不上。
         if goarch == "arm":
             env["GOARM"] = "7"
         targets = [("wb2api", "./cmd/server", flags)]
@@ -189,7 +189,7 @@ def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
             dst = stage / name
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(runtime_bundle.source_path(GATEWAY, name).read_bytes().replace(b"\r\n", b"\n"))
-        archive = assets / ("wb2api-runtime-linux-%s.tar.gz" % arch)
+        archive = assets / ("LoomGate-runtime-linux-%s.tar.gz" % arch)
         subprocess.run([sys.executable, str(GATEWAY / "scripts" / "runtime_bundle.py"),
                         "--stage", str(stage), "--version", version,
                         "--arch", arch, "--archive", str(archive)], check=True)
@@ -206,7 +206,7 @@ def build(version, commit, arches=(("arm64", "arm64"), ("amd64", "amd64"))):
 def deploy(env, version, expect_commit=None, allow_dirty=False):
     cfg = ENVS[env]
     assets = OUT / version / "assets"
-    archive = assets / ("wb2api-runtime-linux-%s.tar.gz" % cfg["arch"])
+    archive = assets / ("LoomGate-runtime-linux-%s.tar.gz" % cfg["arch"])
     if not archive.is_file():
         raise SystemExit("缺产物：%s（先跑 build）" % archive)
     expected_sha = sha(archive)

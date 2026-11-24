@@ -11,7 +11,7 @@
 
 产出（默认在 D:/LoomGate-work/build/android，可设 LOOMGATE_WORK_ROOT）：
 
-    workbuddy2api-android-arm64.apk
+    LoomGate-android-arm64.apk
 
 ═══════════════════════════════════════════════════════════════════════════
 为什么要走 jniLibs（而不是 assets / 私有目录）
@@ -71,7 +71,7 @@ DIST = WORK_ROOT / "build" / "android"
 GATEWAY_BINARY = "wb2api"
 GATEWAY_PACKAGE = "./cmd/server"
 # 安卓端的热更新资产就是 **APK 本身**（见 internal/hotupdate/release.go 的
-# assetName：android 分支返回 "workbuddy2api-android-<arch>.apk"），而 dist/ 下
+# assetName：android 分支返回 "LoomGate-android-<arch>.apk"），而 dist/ 下
 # 打出来的那个 APK 正好同名，所以不需要另外再导出一份。
 #
 # 这里**不能**再导出一份裸二进制：应用私有目录不能执行（SELinux），裸二进制在手机
@@ -404,7 +404,7 @@ def build_apk(gradle, variant, abi, tag, go=None, clang=None):
     verify_apk_signature(apks[0], find_sdk())
     verify_apk_manifest(apks[0], find_sdk(), tag)
     DIST.mkdir(parents=True, exist_ok=True)
-    target = DIST / ("workbuddy2api-android-%s.apk" % TARGETS[abi][2])
+    target = DIST / ("LoomGate-android-%s.apk" % TARGETS[abi][2])
     shutil.copy2(apks[0], target)
     return target
 
@@ -465,7 +465,7 @@ def write_readme(abi):
 
 安装
 ----
-把 workbuddy2api-android-arm64.apk 拷到手机安装即可（需要允许「安装未知来源应用」）。
+把 LoomGate-android-arm64.apk 拷到手机安装即可（需要允许「安装未知来源应用」）。
 只支持 arm64 设备（近几年的手机都是）。
 
 首次使用

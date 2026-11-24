@@ -153,6 +153,23 @@ def runtime_identity_status(path, public_key, version):
     return "verified_on_host"
 
 
+# During the release-asset naming transition, every artifact is published twice:
+# once under the new LoomGate name and once under the historical wb2api name.
+# Older updaters only know the latter; newer updaters prefer the former. Both
+# copies are byte-identical and are covered by the same signed checksum file.
+def legacy_transition_asset(name):
+    prefixes = (
+        ("LoomGate-runtime-linux-", "wb2api-runtime-linux-"),
+        ("LoomGate-linux-", "wb2api-linux-"),
+        ("LoomGate-windows-", "wb2api-windows-"),
+        ("LoomGate-android-", "workbuddy2api-android-"),
+    )
+    for new_prefix, old_prefix in prefixes:
+        if name.startswith(new_prefix):
+            return old_prefix + name[len(new_prefix):]
+    return ""
+
+
 def build_target(data, ident, work_root, commit, release_version=""):
     if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
         raise ValueError("a full source commit is required for build attribution")
@@ -173,6 +190,13 @@ def build_target(data, ident, work_root, commit, release_version=""):
     allowed = {target["update_asset"], data["checksums_asset"], "build-report.json"}
     if target.get("runtime_asset"):
         allowed.add(target["runtime_asset"])
+    # The naming transition intentionally emits a historical alias next to each
+    # new public asset. Keep the output allowlist exact: only those declared
+    # aliases are permitted, never arbitrary extra files.
+    for declared in list(allowed):
+        alias = legacy_transition_asset(declared)
+        if alias:
+            allowed.add(alias)
     if out.exists() and any(p.name not in allowed or not p.is_file() or p.is_symlink() for p in out.iterdir()):
         raise ValueError("artifact output contains files outside the declared build allowlist")
     stage.mkdir(parents=True, exist_ok=True)
@@ -208,6 +232,10 @@ def build_target(data, ident, work_root, commit, release_version=""):
     identity = runtime_identity_status(stage / "wb2api", public_key, version)
     artifacts = [target["update_asset"]]
     shutil.copyfile(stage / "wb2api", out / target["update_asset"])
+    legacy_update = legacy_transition_asset(target["update_asset"])
+    if legacy_update:
+        shutil.copyfile(stage / "wb2api", out / legacy_update)
+        artifacts.append(legacy_update)
     if target.get("runtime_asset"):
         members = runtime_bundle.LEGACY_FILES if legacy_transition else runtime_bundle.FILES
         for name in members:
@@ -223,6 +251,10 @@ def build_target(data, ident, work_root, commit, release_version=""):
         runtime_bundle.package(stage, version, arch, out / target["runtime_asset"],
                                include_doubao=not legacy_transition)
         artifacts.append(target["runtime_asset"])
+        legacy_runtime = legacy_transition_asset(target["runtime_asset"])
+        if legacy_runtime:
+            shutil.copyfile(out / target["runtime_asset"], out / legacy_runtime)
+            artifacts.append(legacy_runtime)
     sums = {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in artifacts}
     (out / data["checksums_asset"]).write_text("".join("%s  %s\n" % (sums[name], name) for name in sorted(sums)), encoding="ascii")
     report = {"schema_version": 1, "target": ident, "commit": commit, "version": version,

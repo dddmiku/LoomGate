@@ -243,7 +243,7 @@ required`，在 `/status` 的 `disabled` + `disabled_reason` 可见。请求内�
 
 ## 热更新
 
-统一运行模式从公开 GitHub Release 获取本机架构的完整运行包：`wb2api-runtime-linux-amd64.tar.gz` 或 `wb2api-runtime-linux-arm64.tar.gz`。包内包含主程序、内嵌面板、5 个辅助程序、4 个 shell 脚本和 5 个 Python 脚本；固定清单与校验设计见 [统一架构](architecture-unified.md#完整运行包)。
+统一运行模式从公开 GitHub Release 获取本机架构的完整运行包：`LoomGate-runtime-linux-amd64.tar.gz` 或 `LoomGate-runtime-linux-arm64.tar.gz`。过渡版本同时提供 `wb2api-runtime-linux-*` 旧名别名。包内包含主程序、内嵌面板、5 个辅助程序、4 个 shell 脚本和 5 个 Python 脚本；固定清单与校验设计见 [统一架构](architecture-unified.md#完整运行包)。
 
 ```json
 {

@@ -89,10 +89,16 @@ class ReleaseTargetsTests(unittest.TestCase):
         self.assertEqual(verify.call_count, len(build.PROGRAMS))
         identity.assert_called_once()
         out = work / "artifacts" / "linux-amd64"
-        self.assertTrue((out / "wb2api-linux-amd64").is_file())
-        with tarfile.open(out / "wb2api-runtime-linux-amd64.tar.gz") as archive:
+        self.assertTrue((out / "LoomGate-linux-amd64").is_file())
+        with tarfile.open(out / "LoomGate-runtime-linux-amd64.tar.gz") as archive:
             self.assertEqual(set(archive.getnames()), set(build.runtime_bundle.FILES) | {"manifest.json"})
             self.assertNotIn("config.json", archive.getnames())
+        # Both public names must exist during the transition, with identical
+        # bytes. Older updaters only know wb2api-*; newer ones prefer LoomGate-*.
+        self.assertEqual((out / "wb2api-linux-amd64").read_bytes(),
+                         (out / "LoomGate-linux-amd64").read_bytes())
+        self.assertEqual((out / "wb2api-runtime-linux-amd64.tar.gz").read_bytes(),
+                         (out / "LoomGate-runtime-linux-amd64.tar.gz").read_bytes())
         # CI artifacts are versioned "dev" (a fixed test/deploy marker); the
         # source commit is recorded separately and must still be attributed.
         self.assertEqual(report["version"], "dev")
@@ -107,7 +113,7 @@ class ReleaseTargetsTests(unittest.TestCase):
                 patch.object(build, "verify_platform"), patch.object(build, "verify_runtime_identity"):
             report = build.build_target(self.data, "windows-amd64", work, "b" * 40)
         self.assertEqual(checked.call_count, 1)
-        self.assertEqual(set(report["artifacts"]), {"wb2api-windows-amd64"})
+        self.assertEqual(set(report["artifacts"]), {"LoomGate-windows-amd64", "wb2api-windows-amd64"})
         self.assertEqual(checked.call_args.kwargs["env"]["GOOS"], "windows")
 
     def test_transition_release_uses_exact_legacy_loader_members(self):
@@ -115,7 +121,7 @@ class ReleaseTargetsTests(unittest.TestCase):
         with patch.object(build, "checked", side_effect=self.fake_compile), \
                 patch.object(build, "verify_platform"), patch.object(build, "verify_runtime_identity"):
             report = build.build_target(self.data, "linux-amd64", work, "a" * 40, "v3.17.1")
-        with tarfile.open(work / "artifacts/linux-amd64/wb2api-runtime-linux-amd64.tar.gz") as archive:
+        with tarfile.open(work / "artifacts/linux-amd64/LoomGate-runtime-linux-amd64.tar.gz") as archive:
             self.assertEqual(set(archive.getnames()), set(build.runtime_bundle.LEGACY_FILES) | {"manifest.json"})
             manifest = json.loads(archive.extractfile("manifest.json").read())
             self.assertEqual(manifest["version"], "v3.17.1")
